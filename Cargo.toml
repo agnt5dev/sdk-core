@@ -18,6 +18,8 @@ prost-types = "0.13"
 # Async runtime
 tokio = { version = "1.0", features = ["full"] }
 tokio-stream = "0.1"
+async-stream = "0.3"
+flume = "0.11"
 
 # Error handling
 anyhow = "1.0"
@@ -37,3 +39,8 @@ uuid = { version = "1.0", features = ["v4"] }
 # Build dependencies
 [build-dependencies]
 tonic-build = "0.12"
+
+# Examples
+[[example]]
+name = "debug_registration"
+path = "examples/debug_registration.rs"

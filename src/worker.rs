@@ -1,8 +1,6 @@
 use crate::client::WorkerCoordinatorClient;
 use crate::error::Result;
-use crate::pb::{ServiceMessage, RuntimeMessage, RegisterService};
-use tokio::sync::mpsc;
-use tokio_stream::StreamExt;
+use crate::pb::{ServiceMessage, RuntimeMessage, RegisterService, ComponentInfo};
 use tracing::{info, debug, error};
 use uuid::Uuid;
 
@@ -14,6 +12,7 @@ pub struct Worker {
     service_name: String,
     service_version: String,
     service_type: String,
+    components: Vec<ComponentInfo>,
 }
 
 impl Worker {
@@ -33,6 +32,28 @@ impl Worker {
             service_name,
             service_version,
             service_type,
+            components: vec![],
+        }
+    }
+
+    /// Create a new worker with components
+    pub fn new_with_components(
+        coordinator_endpoint: String,
+        service_name: String,
+        service_version: String,
+        service_type: String,
+        components: Vec<ComponentInfo>,
+    ) -> Self {
+        let worker_id = Uuid::new_v4().to_string();
+        info!("Creating worker {} for service {} with {} components", worker_id, service_name, components.len());
+
+        Self {
+            worker_id,
+            coordinator_endpoint,
+            service_name,
+            service_version,
+            service_type,
+            components,
         }
     }
 
@@ -42,19 +63,6 @@ impl Worker {
     }
 
 
-    /// Create a stream connection to the coordinator
-    pub async fn create_stream(&self) -> Result<(
-        mpsc::Sender<ServiceMessage>,
-        tokio_stream::wrappers::UnboundedReceiverStream<std::result::Result<RuntimeMessage, tonic::Status>>,
-    )> {
-        info!("Creating stream connection for worker {}", self.worker_id);
-        
-        let mut client = WorkerCoordinatorClient::connect(self.coordinator_endpoint.clone()).await?;
-        let (tx, rx) = client.create_worker_stream().await?;
-        
-        info!("Stream connection established for worker {}", self.worker_id);
-        Ok((tx, rx))
-    }
 
     /// Run the worker with a message handler
     pub async fn run<F, Fut>(&self, mut message_handler: F) -> Result<()>
@@ -62,77 +70,96 @@ impl Worker {
         F: FnMut(RuntimeMessage) -> Fut + Send,
         Fut: std::future::Future<Output = Result<Option<ServiceMessage>>> + Send,
     {
-        info!("Starting worker {}", self.worker_id);
+        info!("Starting worker {} with auto-reconnect", self.worker_id);
         
-        let (tx, mut rx) = self.create_stream().await?;
+        // Retry configuration
+        let max_retries = 5;
+        let base_delay = std::time::Duration::from_secs(1);
         
-        // Send registration message immediately
-        let register_message = ServiceMessage {
-            worker_id: self.worker_id.clone(),
-            message_type: Some(crate::pb::service_message::MessageType::RegisterService(
-                RegisterService {
-                    service_name: self.service_name.clone(),
-                    service_version: self.service_version.clone(),
-                    service_type: self.service_type.clone(),
-                    components: vec![], // Empty for now
+        loop {
+            for retry_count in 0..max_retries {
+                let delay = base_delay * 2_u32.pow(retry_count); // Exponential backoff
+                
+                if retry_count > 0 {
+                    info!("Worker {} reconnect attempt {} of {} (waiting {:?})", 
+                          self.worker_id, retry_count + 1, max_retries, delay);
+                    tokio::time::sleep(delay).await;
                 }
-            )),
-        };
-        
-        info!("Registering worker {} with service {}", self.worker_id, self.service_name);
-        tx.send(register_message).await
-            .map_err(|e| crate::error::SdkError::Worker(format!("Failed to send registration: {}", e)))?;
-        
-        // Wait for registration response
-        if let Some(message_result) = rx.next().await {
-            match message_result {
-                Ok(runtime_message) => {
-                    match runtime_message.message_data {
-                        Some(crate::pb::runtime_message::MessageData::RegisterServiceResponse(response)) => {
-                            if !response.ack {
-                                return Err(crate::error::SdkError::Worker(
-                                    format!("Registration failed: {}", response.error)
-                                ));
-                            }
-                            info!("Worker {} registered successfully", self.worker_id);
-                        }
-                        _ => {
-                            return Err(crate::error::SdkError::Worker(
-                                "Expected registration response, got different message".to_string()
-                            ));
+                
+                // Try to connect and register
+                match self.connect_and_run(&mut message_handler).await {
+                    Ok(()) => {
+                        info!("Worker {} completed successfully", self.worker_id);
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        error!("Worker {} connection failed (attempt {}): {}", 
+                               self.worker_id, retry_count + 1, e);
+                        
+                        if retry_count == max_retries - 1 {
+                            error!("Worker {} max retries exceeded, backing off", self.worker_id);
+                            break;
                         }
                     }
                 }
-                Err(e) => {
-                    return Err(crate::error::SdkError::Worker(
-                        format!("Stream error during registration: {}", e)
-                    ));
-                }
             }
-        } else {
-            return Err(crate::error::SdkError::Worker(
-                "Stream closed before registration response".to_string()
-            ));
+            
+            // After max retries, wait longer before trying again
+            let long_delay = std::time::Duration::from_secs(30);
+            info!("Worker {} waiting {:?} before retrying connection", self.worker_id, long_delay);
+            tokio::time::sleep(long_delay).await;
         }
+    }
+
+    /// Internal method to connect and run until disconnection
+    async fn connect_and_run<F, Fut>(&self, message_handler: &mut F) -> Result<()>
+    where
+        F: FnMut(RuntimeMessage) -> Fut + Send,
+        Fut: std::future::Future<Output = Result<Option<ServiceMessage>>> + Send,
+    {
+        debug!("🔄 Creating stream connection with immediate registration...");
+        let mut client = WorkerCoordinatorClient::connect(self.coordinator_endpoint.clone()).await?;
+        
+        // Create registration message with components
+        let registration = RegisterService {
+            service_name: self.service_name.clone(),
+            service_version: self.service_version.clone(),
+            service_type: self.service_type.clone(),
+            components: self.components.clone(),
+        };
+        
+        debug!("📝 Registration details: service_name={}, service_type={}, service_version={}", 
+               self.service_name, self.service_type, self.service_version);
+        
+        info!("Registering worker {} with service {}", self.worker_id, self.service_name);
+        
+        // Use the working pattern - create stream with immediate registration
+        let (tx, rx) = client.create_worker_stream_with_registration(self.worker_id.clone(), registration).await?;
+        
+        info!("✅ Worker {} registered successfully and connected", self.worker_id);
         
         info!("Worker {} is running and waiting for messages", self.worker_id);
         
-        // Continue with normal message handling
-        while let Some(message_result) = rx.next().await {
-            match message_result {
+        // Continue with normal message handling using flume receiver
+        loop {
+            match rx.recv_async().await {
                 Ok(runtime_message) => {
                     debug!("Received message for worker {}: {:?}", self.worker_id, runtime_message);
                     
                     // Call the user-provided message handler
                     match message_handler(runtime_message).await {
                         Ok(Some(response)) => {
-                            // Send response if handler provided one
-                            if let Err(e) = tx.send(response).await {
-                                error!("Failed to send response from worker {}: {}", self.worker_id, e);
+                            // Send response back to coordinator
+                            debug!("Sending response back to coordinator");
+                            if let Err(e) = tx.send_async(response).await {
+                                error!("Failed to send response for worker {}: {}", self.worker_id, e);
+                                // Connection lost, return error to trigger reconnection
+                                return Err(crate::error::SdkError::Connection(format!("Send failed: {}", e)));
                             }
                         }
                         Ok(None) => {
                             // No response needed
+                            debug!("Handler completed without response");
                         }
                         Err(e) => {
                             error!("Message handler error in worker {}: {}", self.worker_id, e);
@@ -140,13 +167,11 @@ impl Worker {
                     }
                 }
                 Err(e) => {
-                    error!("Stream error for worker {}: {}", self.worker_id, e);
-                    break;
+                    error!("Channel error for worker {}, will reconnect: {}", self.worker_id, e);
+                    // Return error to trigger reconnection
+                    return Err(crate::error::SdkError::Connection(format!("Receive failed: {}", e)));
                 }
             }
         }
-        
-        info!("Worker {} stopped", self.worker_id);
-        Ok(())
     }
 }
