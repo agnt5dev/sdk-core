@@ -3,11 +3,13 @@
 pub mod worker;
 pub mod client;
 pub mod error;
+pub mod logging;
 
 // Re-export main types
 pub use worker::Worker;
 pub use client::WorkerCoordinatorClient;
 pub use error::{SdkError, Result};
+pub use logging::{init_logging, get_error_buffer, clear_error_buffer};
 
 // Generated protobuf modules
 pub mod pb {

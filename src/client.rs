@@ -44,9 +44,9 @@ impl WorkerCoordinatorClient {
         };
         debug!("📝 Registration message created");
         
-        // Create channels for ongoing communication
-        let (outgoing_tx, outgoing_rx) = flume::unbounded::<ServiceMessage>();
-        let (runtime_msg_tx, runtime_msg_rx) = flume::unbounded::<RuntimeMessage>();
+        // Create bounded channels for ongoing communication (reasonable default capacity)
+        let (outgoing_tx, outgoing_rx) = flume::bounded::<ServiceMessage>(1000);
+        let (runtime_msg_tx, runtime_msg_rx) = flume::bounded::<RuntimeMessage>(1000);
         
         // Create stream that yields registration immediately, then handles ongoing messages
         let outgoing_stream = async_stream::stream! {
@@ -122,7 +122,7 @@ impl WorkerCoordinatorClient {
             return Err(SdkError::Connection("No registration response received".to_string()));
         }
         
-        // Spawn task to forward remaining stream messages to runtime channel
+        // Spawn simple task to forward stream messages to runtime channel
         tokio::spawn(async move {
             while let Some(message_result) = tokio_stream::StreamExt::next(&mut response_stream).await {
                 match message_result {
