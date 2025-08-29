@@ -1,15 +1,17 @@
 // AGNT5 SDK Core - Simple, focused foundation for worker coordination
 
-pub mod worker;
 pub mod client;
 pub mod error;
 pub mod logging;
+pub mod runtime_adapter;
+pub mod worker;
 
 // Re-export main types
-pub use worker::Worker;
 pub use client::WorkerCoordinatorClient;
-pub use error::{SdkError, Result};
-pub use logging::{init_logging, get_error_buffer, clear_error_buffer};
+pub use error::{Result, SdkError};
+pub use logging::{clear_error_buffer, get_error_buffer, init_logging};
+pub use runtime_adapter::{RuntimeAdapter, RuntimeContext, InvocationRequest, InvocationResponse, RuntimeCapabilities, StateManager, DummyStateManager};
+pub use worker::Worker;
 
 // Generated protobuf modules
 pub mod pb {

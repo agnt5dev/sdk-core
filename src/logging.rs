@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 use std::collections::VecDeque;
 use tracing_subscriber::{EnvFilter, fmt};
 use tracing_subscriber::prelude::*;
+use tracing_log::LogTracer;
 
 // Global error buffer for capturing errors to send to Python
 lazy_static::lazy_static! {
@@ -15,6 +16,11 @@ pub fn init_logging() -> Result<(), Box<dyn std::error::Error>> {
     let mut result = Ok(());
     
     INIT.call_once(|| {
+        // Initialize log -> tracing compatibility
+        if let Err(e) = LogTracer::init() {
+            eprintln!("Warning: Failed to initialize LogTracer: {}", e);
+        }
+        
         // Create env filter from RUST_LOG or default to info
         let filter = EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| EnvFilter::new("info"));
@@ -22,7 +28,7 @@ pub fn init_logging() -> Result<(), Box<dyn std::error::Error>> {
         // Create a layer that captures errors
         let error_capture_layer = ErrorCaptureLayer;
         
-        // Build the subscriber
+        // Build the subscriber with log compatibility
         let subscriber = tracing_subscriber::registry()
             .with(filter)
             .with(fmt::layer().with_target(false))

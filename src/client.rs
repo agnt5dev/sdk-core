@@ -25,7 +25,6 @@ impl WorkerCoordinatorClient {
 
         let client = WorkerCoordinatorServiceClient::new(channel);
         
-        info!("Successfully connected to Worker Coordinator");
         Ok(Self { client })
     }
 
@@ -35,14 +34,12 @@ impl WorkerCoordinatorClient {
         worker_id: String,
         registration: RegisterService,
     ) -> Result<(flume::Sender<ServiceMessage>, flume::Receiver<RuntimeMessage>)> {
-        debug!("Creating worker stream with immediate registration");
         
         // Create the registration message first
         let registration_message = ServiceMessage {
             worker_id: worker_id.clone(),
             message_type: Some(crate::pb::service_message::MessageType::RegisterService(registration)),
         };
-        debug!("📝 Registration message created");
         
         // Create bounded channels for ongoing communication (reasonable default capacity)
         let (outgoing_tx, outgoing_rx) = flume::bounded::<ServiceMessage>(1000);
@@ -51,25 +48,21 @@ impl WorkerCoordinatorClient {
         // Create stream that yields registration immediately, then handles ongoing messages
         let outgoing_stream = async_stream::stream! {
             // First, yield the registration message immediately
-            debug!("📤 Yielding registration message to stream");
             yield registration_message;
             
             // Then, handle ongoing messages from the channel
             loop {
                 match outgoing_rx.recv_async().await {
                     Ok(msg) => {
-                        debug!("📤 Yielding ongoing message to stream");
                         yield msg;
                     },
                     Err(_) => {
-                        debug!("📪 Outgoing channel closed, ending stream");
                         break;
                     }
                 }
             }
         };
         
-        debug!("🔄 Initiating gRPC bidirectional stream with registration...");
         
         // Establish the gRPC stream
         let mut response_stream = self
@@ -77,48 +70,41 @@ impl WorkerCoordinatorClient {
             .worker_stream(outgoing_stream)
             .await
             .map_err(|e| {
-                error!("❌ Failed to create gRPC worker stream: {}", e);
+                error!("Failed to create gRPC worker stream: {}", e);
                 SdkError::Connection(format!("gRPC stream failed: {}", e))
             })?
             .into_inner();
-        
-        debug!("✅ gRPC bidirectional stream established successfully");
-        
-        // Wait for registration response with timeout
-        debug!("⏳ Waiting for registration acknowledgment...");
+                
         let registration_response = tokio::time::timeout(
             Duration::from_secs(10),
             response_stream.message()
         )
         .await
         .map_err(|_| {
-            error!("❌ Timeout waiting for registration response");
+            error!("Timeout waiting for registration response");
             SdkError::Connection("Registration timeout - no response from runtime".to_string())
         })?
         .map_err(|e| {
-            error!("❌ Failed to receive registration response: {}", e);
+            error!("Failed to receive registration response: {}", e);
             SdkError::Connection(format!("Stream error: {}", e))
         })?;
         
         // Process registration response
         if let Some(runtime_message) = registration_response {
-            debug!("📥 Received registration response");
             match &runtime_message.message_data {
                 Some(crate::pb::runtime_message::MessageData::RegisterServiceResponse(resp)) => {
-                    if resp.ack {
-                        info!("✅ Registration successful!");
-                    } else {
-                        error!("❌ Registration failed: {}", resp.error);
+                    if !resp.ack {
+                        error!("Registration failed: {}", resp.error);
                         return Err(SdkError::Connection(format!("Registration failed: {}", resp.error)));
                     }
                 }
                 _ => {
-                    error!("❌ Unexpected response type to registration");
+                    error!("Unexpected response type to registration");
                     return Err(SdkError::Connection("Unexpected response to registration".to_string()));
                 }
             }
         } else {
-            error!("❌ No registration response received");
+            error!("No registration response received");
             return Err(SdkError::Connection("No registration response received".to_string()));
         }
         
@@ -127,22 +113,19 @@ impl WorkerCoordinatorClient {
             while let Some(message_result) = tokio_stream::StreamExt::next(&mut response_stream).await {
                 match message_result {
                     Ok(runtime_message) => {
-                        debug!("📨 Forwarding runtime message");
                         if runtime_msg_tx.send_async(runtime_message).await.is_err() {
                             debug!("📪 Runtime message channel closed, stopping forwarder");
                             break;
                         }
                     }
                     Err(e) => {
-                        error!("❌ Stream error: {}", e);
+                        error!("Stream error: {}", e);
                         break;
                     }
                 }
             }
-            debug!("🔚 Message forwarder completed");
         });
         
-        debug!("✅ Worker stream with registration completed successfully");
         Ok((outgoing_tx, runtime_msg_rx))
     }
 }

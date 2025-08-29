@@ -5,7 +5,6 @@ use tracing::{info, debug, error, warn};
 use uuid::Uuid;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Connection states for tracking worker status
 #[derive(Debug, Clone, PartialEq)]
@@ -16,34 +15,38 @@ pub enum ConnectionState {
     Error(String),
 }
 
-/// RAII guard to ensure heartbeat task is always cleaned up
-struct HeartbeatGuard {
-    task_handle: tokio::task::JoinHandle<()>,
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkerConfig {
+    pub service_name: String,
+    pub service_version: String,
+    pub service_type: String,
+
+    pub worker_id: String,
+    pub coordinator_endpoint: String,
+    pub tenant_id: String,
+    pub deployment_id: String,
 }
 
-impl HeartbeatGuard {
-    fn new(task_handle: tokio::task::JoinHandle<()>) -> Self {
-        Self { task_handle }
+impl WorkerConfig {
+    pub fn new(service_name: String, service_version: String, service_type: String) -> Self {
+
+        // Generate a default worker ID, but allow override from environment
+        let default_worker_id = Uuid::new_v4().to_string();
+        let worker_id = std::env::var("AGNT5_WORKER_ID").unwrap_or_else(|_| default_worker_id);
+
+        let coordinator_endpoint = std::env::var("AGNT5_COORDINATOR_ENDPOINT").unwrap_or_else(|_| "http://localhost:9091".to_string());
+        let tenant_id = std::env::var("AGNT5_TENANT_ID").unwrap_or_else(|_| "default".to_string());
+        let deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").unwrap_or_else(|_| "default".to_string());
+
+        Self { service_name, service_version, service_type, worker_id, coordinator_endpoint, tenant_id, deployment_id   }
     }
+
 }
 
-impl Drop for HeartbeatGuard {
-    fn drop(&mut self) {
-        debug!("Cleaning up heartbeat task");
-        self.task_handle.abort();
-    }
-}
-
-/// Simple worker that connects to the Worker Coordinator
 #[derive(Debug, Clone)]
 pub struct Worker {
-    worker_id: String,
-    coordinator_endpoint: String,
-    service_name: String,
-    service_version: String,
-    service_type: String,
-    tenant_id: String,
-    deployment_id: String,
+    config: WorkerConfig,
     components: Vec<ComponentInfo>,
     connection_state: Arc<std::sync::Mutex<ConnectionState>>,
 }
@@ -51,92 +54,14 @@ pub struct Worker {
 impl Worker {
     /// Create a new worker
     pub fn new(
-        coordinator_endpoint: String,
-        service_name: String,
-        service_version: String,
-        service_type: String,
-    ) -> Self {
-        let worker_id = Uuid::new_v4().to_string();
-        
-        // Get tenant and deployment from environment variables, default to "default"
-        let tenant_id = std::env::var("AGNT5_TENANT_ID").unwrap_or_else(|_| "default".to_string());
-        let deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").unwrap_or_else(|_| "default".to_string());
-        
-        info!("Creating worker {} for service {} (tenant: {}, deployment: {}) connecting to {}", 
-              worker_id, service_name, tenant_id, deployment_id, coordinator_endpoint);
-
-        Self {
-            worker_id,
-            coordinator_endpoint,
-            service_name,
-            service_version,
-            service_type,
-            tenant_id,
-            deployment_id,
-            components: vec![],
-            connection_state: Arc::new(std::sync::Mutex::new(ConnectionState::Disconnected)),
-        }
-    }
-
-    /// Create a new worker with components
-    pub fn new_with_components(
-        coordinator_endpoint: String,
-        service_name: String,
-        service_version: String,
-        service_type: String,
+        config: WorkerConfig,
         components: Vec<ComponentInfo>,
     ) -> Self {
-        let worker_id = Uuid::new_v4().to_string();
-        
-        // Get tenant and deployment from environment variables, default to "default"
-        let tenant_id = std::env::var("AGNT5_TENANT_ID").unwrap_or_else(|_| "default".to_string());
-        let deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").unwrap_or_else(|_| "default".to_string());
-        
-        info!("Creating worker {} for service {} (tenant: {}, deployment: {}) with {} components", 
-              worker_id, service_name, tenant_id, deployment_id, components.len());
-
         Self {
-            worker_id,
-            coordinator_endpoint,
-            service_name,
-            service_version,
-            service_type,
-            tenant_id,
-            deployment_id,
+            config,
             components,
             connection_state: Arc::new(std::sync::Mutex::new(ConnectionState::Disconnected)),
         }
-    }
-
-    /// Create a new worker with explicit tenant and deployment
-    pub fn new_with_tenant(
-        coordinator_endpoint: String,
-        service_name: String,
-        service_version: String,
-        service_type: String,
-        tenant_id: String,
-        deployment_id: String,
-    ) -> Self {
-        let worker_id = Uuid::new_v4().to_string();
-        info!("Creating worker {} for service {} (tenant: {}, deployment: {}) connecting to {}", 
-              worker_id, service_name, tenant_id, deployment_id, coordinator_endpoint);
-
-        Self {
-            worker_id,
-            coordinator_endpoint,
-            service_name,
-            service_version,
-            service_type,
-            tenant_id,
-            deployment_id,
-            components: vec![],
-            connection_state: Arc::new(std::sync::Mutex::new(ConnectionState::Disconnected)),
-        }
-    }
-
-    /// Get the worker ID
-    pub fn worker_id(&self) -> &str {
-        &self.worker_id
     }
 
     /// Set components for the worker
@@ -174,200 +99,167 @@ impl Worker {
         F: FnMut(RuntimeMessage) -> Fut + Send,
         Fut: std::future::Future<Output = Result<Option<ServiceMessage>>> + Send,
     {
-        info!("Starting worker {} with auto-reconnect", self.worker_id);
+        info!("Starting worker {}", self.config.worker_id);
         
-        // Setup shutdown signal handling
-        let shutdown_flag = Arc::new(AtomicBool::new(false));
-        let shutdown_flag_clone = shutdown_flag.clone();
+        // Create shutdown broadcast channel for immediate response
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        let shutdown_tx = Arc::new(shutdown_tx);
         
-        // Spawn signal handler
+        // Spawn signal handler that broadcasts immediate notification
+        let shutdown_tx_clone = shutdown_tx.clone();
         tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
             info!("Received shutdown signal (Ctrl+C)");
-            shutdown_flag_clone.store(true, Ordering::Relaxed);
+            let _ = shutdown_tx_clone.send(()); // Broadcast to all receivers
         });
         
-        // Retry configuration with jitter
+        // Retry configuration with jitter to prevent thundering herd
         let max_retries = 5;
         let base_delay = std::time::Duration::from_secs(1);
+        let mut retry_count = 0;
         
         loop {
-            // Check for shutdown signal
-            if shutdown_flag.load(Ordering::Relaxed) {
-                info!("Worker {} shutting down due to signal", self.worker_id);
+            // Check for shutdown signal (non-blocking)
+            if let Ok(()) = shutdown_rx.try_recv() {
+                info!("Worker {} shutting down due to signal", self.config.worker_id);
                 return Ok(());
             }
             
-            for retry_count in 0..max_retries {
-                // Check for shutdown signal
-                if shutdown_flag.load(Ordering::Relaxed) {
-                    info!("Worker {} shutting down due to signal", self.worker_id);
-                    return Ok(());
-                }
+            // Exponential backoff with jitter  
+            if retry_count > 0 {
+                let exp_delay = base_delay * 2_u32.pow((retry_count - 1).min(5));
+                // Add jitter (±25% of delay)
+                let jitter = rand::random::<f64>() * 0.5 - 0.25;
+                let jitter_ms = (exp_delay.as_millis() as f64 * jitter) as u64;
+                let delay = exp_delay + std::time::Duration::from_millis(jitter_ms);
                 
-                // Exponential backoff with jitter
-                let mut delay = base_delay * 2_u32.pow(retry_count);
-                if retry_count > 0 {
-                    // Add jitter (±25% of delay)
-                    let jitter = rand::random::<f64>() * 0.5 - 0.25;
-                    let jitter_ms = (delay.as_millis() as f64 * jitter) as u64;
-                    delay = delay + std::time::Duration::from_millis(jitter_ms);
-                    
-                    info!("Worker {} reconnect attempt {} of {} (waiting {:?})", 
-                          self.worker_id, retry_count + 1, max_retries, delay);
-                    
-                    // Simple interruptible sleep
-                    tokio::time::sleep(delay).await;
-                }
+                info!("Worker {} reconnect attempt {} (waiting {:?})", 
+                      self.config.worker_id, retry_count, delay);
                 
-                // Try to connect and register
-                self.set_connection_state(ConnectionState::Connecting);
-                let shutdown_for_connect = shutdown_flag.clone();
-                match self.connect_and_run(&mut message_handler, shutdown_for_connect).await {
-                    Ok(()) => {
-                        info!("Worker {} completed successfully", self.worker_id);
-                        self.set_connection_state(ConnectionState::Disconnected);
+                // Use select to allow shutdown during delay
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {},
+                    _ = shutdown_rx.recv() => {
+                        info!("Worker {} shutting down during reconnect delay", self.config.worker_id);
                         return Ok(());
-                    }
-                    Err(e) => {
-                        let error_msg = format!("Worker {} connection failed (attempt {}): {}", 
-                                               self.worker_id, retry_count + 1, e);
-                        error!("{}", error_msg);
-                        self.set_connection_state(ConnectionState::Error(error_msg.clone()));
-                        
-                        if retry_count == max_retries - 1 {
-                            error!("Worker {} max retries exceeded, backing off", self.worker_id);
-                            break;
-                        }
                     }
                 }
             }
             
-            // After max retries, wait longer before trying again
-            let long_delay = std::time::Duration::from_secs(30);
-            info!("Worker {} waiting {:?} before retrying connection", self.worker_id, long_delay);
+            // Try to connect and run
+            self.set_connection_state(ConnectionState::Connecting);
             
-            // Simple long sleep
-            tokio::time::sleep(long_delay).await;
+            // Create a new receiver for this connection attempt
+            let shutdown_rx_inner = shutdown_tx.subscribe();
+            
+            match self.try_connect_and_run(&mut message_handler, shutdown_rx_inner).await {
+                Ok(()) => {
+                    self.set_connection_state(ConnectionState::Disconnected);
+                    return Ok(());
+                }
+                Err(e) => {
+                    let error_msg = format!("Worker {} connection failed (attempt {}): {}", 
+                                           self.config.worker_id, retry_count + 1, e);
+                    error!("{}", error_msg);
+                    self.set_connection_state(ConnectionState::Error(error_msg));
+                    
+                    retry_count += 1;
+                    if retry_count >= max_retries {
+                        // After max retries, use longer delays but keep trying
+                        info!("Worker {} max retries exceeded, using longer delays", self.config.worker_id);
+                        let long_delay = std::time::Duration::from_secs(30);
+                        let jitter = rand::random::<f64>() * 0.3 - 0.15; // ±15% jitter
+                        let jitter_ms = (long_delay.as_millis() as f64 * jitter) as u64;
+                        let delay = long_delay + std::time::Duration::from_millis(jitter_ms);
+                        tokio::time::sleep(delay).await;
+                        retry_count = max_retries; // Keep at max to use long delays
+                    }
+                }
+            }
         }
     }
 
-    /// Attempt to connect once and return immediately after registration
-    pub async fn connect_and_run_once(&self) -> Result<()> {
-        debug!("🔄 Testing connection to coordinator...");
-        let mut client = WorkerCoordinatorClient::connect(self.coordinator_endpoint.clone()).await?;
-        
-        // Create registration message with components
-        let registration = RegisterService {
-            service_name: self.service_name.clone(),
-            service_version: self.service_version.clone(),
-            service_type: self.service_type.clone(),
-            components: self.components.clone(),
-            tenant_id: self.tenant_id.clone(),
-            deployment_id: self.deployment_id.clone(),
-            metadata: std::collections::HashMap::new(),
-        };
-        
-        info!("Testing registration for worker {} with service {}", self.worker_id, self.service_name);
-        
-        // Test connection with immediate registration - we don't need the channels for this test
-        let (_tx, _rx) = client.create_worker_stream_with_registration(self.worker_id.clone(), registration).await?;
-        
-        info!("✅ Connection test successful for worker {}", self.worker_id);
-        Ok(())
-    }
 
     /// Internal method to connect and run until disconnection
-    async fn connect_and_run<F, Fut>(&self, message_handler: &mut F, shutdown_flag: Arc<AtomicBool>) -> Result<()>
+    async fn try_connect_and_run<F, Fut>(&self, message_handler: &mut F, mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) -> Result<()>
     where
         F: FnMut(RuntimeMessage) -> Fut + Send,
         Fut: std::future::Future<Output = Result<Option<ServiceMessage>>> + Send,
     {
-        debug!("🔄 Creating stream connection with immediate registration...");
-        let mut client = WorkerCoordinatorClient::connect(self.coordinator_endpoint.clone()).await?;
+        let mut client = WorkerCoordinatorClient::connect(self.config.coordinator_endpoint.clone()).await?;
         
         // Create registration message with components
         let registration = RegisterService {
-            service_name: self.service_name.clone(),
-            service_version: self.service_version.clone(),
-            service_type: self.service_type.clone(),
+            service_name: self.config.service_name.clone(),
+            service_version: self.config.service_version.clone(),
+            service_type: self.config.service_type.clone(),
             components: self.components.clone(),
-            tenant_id: self.tenant_id.clone(),
-            deployment_id: self.deployment_id.clone(),
+            tenant_id: self.config.tenant_id.clone(),
+            deployment_id: self.config.deployment_id.clone(),
             metadata: std::collections::HashMap::new(),
         };
         
-        debug!("📝 Registration details: service_name={}, service_type={}, service_version={}, tenant_id={}, deployment_id={}", 
-               self.service_name, self.service_type, self.service_version, self.tenant_id, self.deployment_id);
-        
-        info!("Registering worker {} with service {}", self.worker_id, self.service_name);
         
         // Use the working pattern - create stream with immediate registration
-        let (tx, rx) = client.create_worker_stream_with_registration(self.worker_id.clone(), registration).await?;
+        let (tx, rx) = client.create_worker_stream_with_registration(self.config.worker_id.clone(), registration).await?;
         
-        info!("✅ Worker {} registered successfully and connected", self.worker_id);
+        info!("Worker {} registered successfully and connected", self.config.worker_id);
         self.set_connection_state(ConnectionState::Connected);
         
-        // Start heartbeat task with RAII guard for cleanup
+        // Start heartbeat task
         let heartbeat_task = self.spawn_heartbeat_task(tx.clone());
-        let _heartbeat_guard = HeartbeatGuard::new(heartbeat_task);
         
-        info!("Worker {} is running and waiting for messages", self.worker_id);
         
-        // Use reasonable timeout for message processing (30 seconds)
-        let message_timeout = std::time::Duration::from_secs(30);
         
-        // Continue with normal message handling using flume receiver
+        // Continue with normal message handling using tokio::select!
         loop {
-            // Check for shutdown signal
-            if shutdown_flag.load(Ordering::Relaxed) {
-                info!("Worker {} received shutdown signal, stopping gracefully", self.worker_id);
-                let _ = self.send_shutdown_message(&tx).await;
-                return Ok(()); // HeartbeatGuard will clean up automatically
-            }
-            
-            // Use configurable timeout for message processing
-            match tokio::time::timeout(message_timeout, rx.recv_async()).await {
-                Ok(Ok(runtime_message)) => {
-                    debug!("Received message for worker {}: {:?}", self.worker_id, runtime_message);
-                    
-                    // Call the user-provided message handler
-                    match message_handler(runtime_message).await {
-                        Ok(Some(response)) => {
-                            // Send response back to coordinator
-                            debug!("Sending response back to coordinator");
-                            if let Err(e) = tx.send_async(response).await {
-                                error!("Failed to send response for worker {}: {}", self.worker_id, e);
-                                // Connection lost, return error to trigger reconnection
-                                return Err(crate::error::SdkError::Connection(format!("Send failed: {}", e)));
+            tokio::select! {
+                // Wait for incoming message
+                result = rx.recv_async() => {
+                    match result {
+                        Ok(runtime_message) => {
+                            debug!("Received message for worker {}", self.config.worker_id);
+                            
+                            let response = message_handler(runtime_message).await;
+                            
+                            match response {
+                                Ok(Some(response)) => {
+                                    // Send response back to coordinator
+                                    debug!("Sending response back to coordinator");
+                                    if let Err(e) = tx.send_async(response).await {
+                                        error!("Failed to send response for worker {}: {}", self.config.worker_id, e);
+                                        // Connection lost, return error to trigger reconnection
+                                        heartbeat_task.abort();
+                                        return Err(crate::error::SdkError::Connection(format!("Send failed: {}", e)));
+                                    }
+                                }
+                                Ok(None) => {
+                                    // No response needed
+                                }
+                                Err(e) => {
+                                    error!("Message handler error in worker {}: {}", self.config.worker_id, e);
+                                }
                             }
                         }
-                        Ok(None) => {
-                            // No response needed
-                            debug!("Handler completed without response");
-                        }
                         Err(e) => {
-                            error!("Message handler error in worker {}: {}", self.worker_id, e);
+                            error!("Channel error for worker {}, will reconnect: {}", self.config.worker_id, e);
+                            
+                            // Try to send graceful shutdown message
+                            let _ = self.send_shutdown_message(&tx).await;
+                            heartbeat_task.abort();
+                            
+                            // Return error to trigger reconnection
+                            return Err(crate::error::SdkError::Connection(format!("Receive failed: {}", e)));
                         }
                     }
                 }
-                Ok(Err(e)) => {
-                    error!("Channel error for worker {}, will reconnect: {}", self.worker_id, e);
-                    
-                    // Try to send graceful shutdown message
+                // Wait for shutdown signal - immediate response!
+                _ = shutdown_rx.recv() => {
+                    info!("Worker {} received shutdown signal, stopping gracefully", self.config.worker_id);
                     let _ = self.send_shutdown_message(&tx).await;
-                    
-                    // Return error to trigger reconnection (HeartbeatGuard will clean up)
-                    return Err(crate::error::SdkError::Connection(format!("Receive failed: {}", e)));
-                }
-                Err(_) => {
-                    // Timeout - check for shutdown and continue
-                    if shutdown_flag.load(Ordering::Relaxed) {
-                        info!("Worker {} shutting down after timeout check", self.worker_id);
-                        let _ = self.send_shutdown_message(&tx).await;
-                        return Ok(());
-                    }
-                    continue;
+                    heartbeat_task.abort();
+                    return Ok(());
                 }
             }
         }
@@ -375,9 +267,9 @@ impl Worker {
 
     /// Spawn a simple heartbeat task that sends periodic health checks
     fn spawn_heartbeat_task(&self, tx: flume::Sender<ServiceMessage>) -> tokio::task::JoinHandle<()> {
-        let worker_id = self.worker_id.clone();
+        let worker_id = self.config.worker_id.clone();
         
-        info!("Starting heartbeat task for worker {} (interval: 30s)", worker_id);
+        debug!("Starting heartbeat task (interval: 30s)");
         
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -408,10 +300,10 @@ impl Worker {
                     break;
                 }
                 
-                debug!("Sent heartbeat for worker {}", worker_id);
+                // Heartbeat sent successfully
             }
             
-            info!("Heartbeat task ended for worker {}", worker_id);
+            debug!("Heartbeat task ended");
         })
     }
 
@@ -428,19 +320,19 @@ impl Worker {
         };
         
         let service_message = ServiceMessage {
-            worker_id: self.worker_id.clone(),
+            worker_id: self.config.worker_id.clone(),
             message_type: Some(crate::pb::service_message::MessageType::UnregisterService(unregister)),
         };
         
         match tx.send_async(service_message).await {
             Ok(_) => {
-                info!("Sent graceful shutdown message for worker {}", self.worker_id);
+                info!("Sent graceful shutdown message for worker {}", self.config.worker_id);
                 // Give a moment for the message to be processed
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 Ok(())
             }
             Err(e) => {
-                warn!("Failed to send shutdown message for worker {}: {}", self.worker_id, e);
+                warn!("Failed to send shutdown message for worker {}: {}", self.config.worker_id, e);
                 Err(crate::error::SdkError::Connection(format!("Shutdown message failed: {}", e)))
             }
         }
