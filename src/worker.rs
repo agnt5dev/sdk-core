@@ -101,6 +101,11 @@ impl Worker {
     {
         info!("Starting worker {}", self.config.worker_id);
         
+        // Initialize telemetry automatically in async context
+        if let Err(e) = crate::telemetry::init_telemetry(&self.config.service_name, &self.config.service_version) {
+            warn!("Failed to initialize telemetry: {}", e);
+        }
+        
         // Create shutdown broadcast channel for immediate response
         let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
         let mut shutdown_rx = shutdown_tx.subscribe();
