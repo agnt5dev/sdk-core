@@ -1,4 +1,4 @@
-// OpenTelemetry telemetry module with OTLP exporter
+// OpenTelemetry telemetry module with OTLP exporter for traces and logs
 use std::collections::HashMap;
 use opentelemetry::{global, KeyValue, Context};
 use opentelemetry::trace::{Span, SpanKind, Tracer, Status};
@@ -6,6 +6,7 @@ use opentelemetry::propagation::TextMapPropagator;
 use opentelemetry::global::BoxedSpan;
 use opentelemetry_sdk::{trace::SdkTracerProvider, Resource, propagation::TraceContextPropagator};
 use opentelemetry_otlp::{SpanExporter, WithExportConfig};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Registry};
 use crate::error::SdkError;
 
 /// Initialize OpenTelemetry with OTLP exporter (should be called from async context)
@@ -94,6 +95,11 @@ pub fn record_span_error(span: &mut BoxedSpan, error_msg: &str) {
     span.set_attribute(KeyValue::new("function.status", "error"));
     span.set_attribute(KeyValue::new("function.error", error_msg.to_string()));
     span.set_status(Status::error(error_msg.to_string()));
+}
+
+/// End a span (helper function since Span trait may not be accessible)
+pub fn end_span(mut span: BoxedSpan) {
+    span.end();
 }
 
 /// Stub shutdown function - implementation pending due to known issues
