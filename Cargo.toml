@@ -91,6 +91,7 @@ unicode-segmentation = "1.10"
 # Build dependencies
 [build-dependencies]
 tonic-prost-build = "0.14"
+protobuf-src = "2.0"
 
 # Examples
 [[example]]
