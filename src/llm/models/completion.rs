@@ -1,6 +1,6 @@
 // Text completion models (legacy OpenAI completions API)
-use serde::{Deserialize, Serialize};
 use super::Usage;
+use serde::{Deserialize, Serialize};
 
 /// Text completion request
 #[derive(Debug, Clone, Serialize, Deserialize)]

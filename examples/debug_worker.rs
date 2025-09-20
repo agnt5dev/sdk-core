@@ -1,5 +1,5 @@
-use agnt5_sdk_core::{Worker, Result, pb::ComponentInfo};
-use tracing::{info, error, Level};
+use agnt5_sdk_core::{pb::ComponentInfo, Result, Worker};
+use tracing::{error, info, Level};
 use tracing_subscriber::{self, EnvFilter};
 
 #[tokio::main]
@@ -17,7 +17,7 @@ async fn main() -> Result<()> {
                 .add_directive("h2=warn".parse().unwrap())
                 .add_directive("hyper=warn".parse().unwrap())
                 .add_directive("tonic=warn".parse().unwrap())
-                .add_directive("tower=warn".parse().unwrap())
+                .add_directive("tower=warn".parse().unwrap()),
         )
         .init();
 
@@ -26,7 +26,7 @@ async fn main() -> Result<()> {
     // Create a test component
     let test_component = ComponentInfo {
         name: "test_handler".to_string(),
-        component_type: 1, // COMPONENT_TYPE_FUNCTION
+        component_type: 1,  // COMPONENT_TYPE_FUNCTION
         input_schema: None, // For simplicity, no schema validation in debug
         output_schema: None,
         config: std::collections::HashMap::new(),
@@ -40,12 +40,11 @@ async fn main() -> Result<()> {
         vec![test_component],
     );
 
-
     // Create a simple handler that echoes back the message
     let handler = |message| {
         async move {
             info!("Handler received message: {:?}", message);
-            
+
             // For testing purposes, we can echo back a simple response
             // In a real application, you would process the message and return appropriate response
             Ok(None) // No response needed for this debug test

@@ -3,14 +3,13 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Result, SdkError};
-use super::super::provider::{Provider, ProviderType, ProviderConfig};
 use super::super::models::{
-    ChatCompletionRequest, ChatCompletionResponse, ChatCompletion, ChatChoice, ChatMessage, ChatMessageContent,
-    CompletionRequest, CompletionResponse,
-    EmbeddingsRequest, EmbeddingsResponse,
-    Usage,
+    ChatChoice, ChatCompletion, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
+    ChatMessageContent, CompletionRequest, CompletionResponse, EmbeddingsRequest,
+    EmbeddingsResponse, Usage,
 };
+use super::super::provider::{Provider, ProviderConfig, ProviderType};
+use crate::error::{Result, SdkError};
 
 /// Anthropic-specific message format
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,13 +70,22 @@ enum AnthropicStreamEvent {
     #[serde(rename = "message_start")]
     MessageStart { message: AnthropicStreamMessage },
     #[serde(rename = "content_block_start")]
-    ContentBlockStart { index: u32, content_block: AnthropicContentBlock },
+    ContentBlockStart {
+        index: u32,
+        content_block: AnthropicContentBlock,
+    },
     #[serde(rename = "content_block_delta")]
-    ContentBlockDelta { index: u32, delta: AnthropicContentDelta },
+    ContentBlockDelta {
+        index: u32,
+        delta: AnthropicContentDelta,
+    },
     #[serde(rename = "content_block_stop")]
     ContentBlockStop { index: u32 },
     #[serde(rename = "message_delta")]
-    MessageDelta { delta: AnthropicMessageDelta, usage: Option<AnthropicUsage> },
+    MessageDelta {
+        delta: AnthropicMessageDelta,
+        usage: Option<AnthropicUsage>,
+    },
     #[serde(rename = "message_stop")]
     MessageStop,
 }
@@ -135,7 +143,8 @@ impl From<ChatCompletionRequest> for AnthropicChatCompletionRequest {
                             ChatMessageContent::String(text) => text,
                             ChatMessageContent::Array(parts) => {
                                 // For now, just concatenate text parts
-                                parts.into_iter()
+                                parts
+                                    .into_iter()
                                     .filter_map(|part| part.text)
                                     .collect::<Vec<_>>()
                                     .join("\n")
@@ -155,7 +164,8 @@ impl From<ChatCompletionRequest> for AnthropicChatCompletionRequest {
         }
 
         // Use max_completion_tokens if available, otherwise default to 1024
-        let max_tokens = request.max_completion_tokens
+        let max_tokens = request
+            .max_completion_tokens
             .or(request.max_tokens)
             .unwrap_or(1024);
 
@@ -174,7 +184,8 @@ impl From<ChatCompletionRequest> for AnthropicChatCompletionRequest {
 
 impl From<AnthropicChatCompletionResponse> for ChatCompletion {
     fn from(response: AnthropicChatCompletionResponse) -> Self {
-        let content = response.content
+        let content = response
+            .content
             .into_iter()
             .map(|block| block.text)
             .collect::<Vec<_>>()
@@ -247,11 +258,17 @@ impl Provider for AnthropicProvider {
         if let Some(reasoning) = &request.reasoning {
             if let Err(e) = reasoning.validate() {
                 tracing::error!("Invalid reasoning config: {}", e);
-                return Err(SdkError::Other(anyhow::anyhow!("Invalid reasoning config: {}", e)));
+                return Err(SdkError::Other(anyhow::anyhow!(
+                    "Invalid reasoning config: {}",
+                    e
+                )));
             }
 
             if let Some(max_tokens) = reasoning.max_tokens {
-                tracing::info!("✅ Anthropic reasoning enabled with max_tokens: {}", max_tokens);
+                tracing::info!(
+                    "✅ Anthropic reasoning enabled with max_tokens: {}",
+                    max_tokens
+                );
             } else if let Some(thinking_prompt) = reasoning.to_thinking_prompt() {
                 tracing::info!(
                     "✅ Anthropic reasoning enabled with effort level: {:?} -> prompt: \"{}\"",
@@ -286,18 +303,22 @@ impl Provider for AnthropicProvider {
                     "Streaming not yet implemented for Anthropic - use stream: false"
                 )));
             } else {
-                let anthropic_response: AnthropicChatCompletionResponse = response
-                    .json()
-                    .await
-                    .map_err(|e| {
+                let anthropic_response: AnthropicChatCompletionResponse =
+                    response.json().await.map_err(|e| {
                         tracing::error!("Anthropic API response parsing error: {}", e);
-                        SdkError::Other(anyhow::anyhow!("Failed to parse Anthropic response: {}", e))
+                        SdkError::Other(anyhow::anyhow!(
+                            "Failed to parse Anthropic response: {}",
+                            e
+                        ))
                     })?;
 
                 Ok(ChatCompletionResponse::NonStream(anthropic_response.into()))
             }
         } else {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
             tracing::error!("Anthropic API error ({}): {}", status, error_text);
             Err(SdkError::Other(anyhow::anyhow!(
                 "Anthropic API error ({}): {}",
@@ -307,20 +328,14 @@ impl Provider for AnthropicProvider {
         }
     }
 
-    async fn completion(
-        &self,
-        _request: CompletionRequest,
-    ) -> Result<CompletionResponse> {
+    async fn completion(&self, _request: CompletionRequest) -> Result<CompletionResponse> {
         // Anthropic doesn't support the legacy completions endpoint
         Err(SdkError::Other(anyhow::anyhow!(
             "Anthropic does not support the legacy completions API. Use chat_completion instead."
         )))
     }
 
-    async fn embeddings(
-        &self,
-        _request: EmbeddingsRequest,
-    ) -> Result<EmbeddingsResponse> {
+    async fn embeddings(&self, _request: EmbeddingsRequest) -> Result<EmbeddingsResponse> {
         // Anthropic doesn't provide embeddings API
         Err(SdkError::Other(anyhow::anyhow!(
             "Anthropic does not provide an embeddings API"

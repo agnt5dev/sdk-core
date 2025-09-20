@@ -2,18 +2,18 @@
 // Provides unified interface for vector storage and retrieval operations
 
 pub mod providers;
-pub mod types;
 pub mod rag;
+pub mod types;
 
 // Re-export core types
+pub use providers::{pgvector::PgVectorProvider, qdrant::QdrantProvider};
 pub use types::{
-    VectorEntry, VectorMetadata, SearchQuery, SearchResult,
-    DistanceMetric, VectorFilter, Collection
+    Collection, DistanceMetric, SearchQuery, SearchResult, VectorEntry, VectorFilter,
+    VectorMetadata,
 };
-pub use providers::{qdrant::QdrantProvider, pgvector::PgVectorProvider};
 
-use async_trait::async_trait;
 use crate::error::Result;
+use async_trait::async_trait;
 use serde_json::Value;
 
 /// Core trait that all vector database providers must implement
@@ -35,11 +35,7 @@ pub trait VectorDatabase: Send + Sync {
     async fn list_collections(&self) -> Result<Vec<String>>;
 
     /// Insert or update vectors in a collection
-    async fn upsert_vectors(
-        &self,
-        collection_name: &str,
-        vectors: Vec<VectorEntry>,
-    ) -> Result<()>;
+    async fn upsert_vectors(&self, collection_name: &str, vectors: Vec<VectorEntry>) -> Result<()>;
 
     /// Search for similar vectors
     async fn search_vectors(
@@ -49,25 +45,13 @@ pub trait VectorDatabase: Send + Sync {
     ) -> Result<Vec<SearchResult>>;
 
     /// Delete vectors by IDs
-    async fn delete_vectors(
-        &self,
-        collection_name: &str,
-        ids: Vec<String>,
-    ) -> Result<()>;
+    async fn delete_vectors(&self, collection_name: &str, ids: Vec<String>) -> Result<()>;
 
     /// Delete vectors by filter
-    async fn delete_by_filter(
-        &self,
-        collection_name: &str,
-        filter: VectorFilter,
-    ) -> Result<()>;
+    async fn delete_by_filter(&self, collection_name: &str, filter: VectorFilter) -> Result<()>;
 
     /// Get vector by ID
-    async fn get_vector(
-        &self,
-        collection_name: &str,
-        id: &str,
-    ) -> Result<Option<VectorEntry>>;
+    async fn get_vector(&self, collection_name: &str, id: &str) -> Result<Option<VectorEntry>>;
 
     /// Get collection statistics
     async fn collection_info(&self, collection_name: &str) -> Result<CollectionInfo>;
@@ -101,8 +85,16 @@ impl VectorDbRegistry {
     }
 
     /// Register a vector database provider
-    pub fn register_provider(&mut self, name: String, provider: std::sync::Arc<dyn VectorDatabase>) {
-        tracing::info!("Registering vector database provider: {} (type: {})", name, provider.provider_name());
+    pub fn register_provider(
+        &mut self,
+        name: String,
+        provider: std::sync::Arc<dyn VectorDatabase>,
+    ) {
+        tracing::info!(
+            "Registering vector database provider: {} (type: {})",
+            name,
+            provider.provider_name()
+        );
         self.providers.insert(name, provider);
     }
 
@@ -117,13 +109,17 @@ impl VectorDbRegistry {
             self.default_provider = Some(name);
             Ok(())
         } else {
-            Err(crate::error::SdkError::Other(anyhow::anyhow!("Vector database provider not found: {}", name)))
+            Err(crate::error::SdkError::Other(anyhow::anyhow!(
+                "Vector database provider not found: {}",
+                name
+            )))
         }
     }
 
     /// Get the default provider
     pub fn get_default_provider(&self) -> Option<std::sync::Arc<dyn VectorDatabase>> {
-        self.default_provider.as_ref()
+        self.default_provider
+            .as_ref()
             .and_then(|name| self.get_provider(name))
     }
 
@@ -148,7 +144,9 @@ impl VectorDbRegistry {
         }
 
         // pgvector (PostgreSQL)
-        if let Ok(database_url) = std::env::var("POSTGRES_URL").or_else(|_| std::env::var("DATABASE_URL")) {
+        if let Ok(database_url) =
+            std::env::var("POSTGRES_URL").or_else(|_| std::env::var("DATABASE_URL"))
+        {
             let provider = PgVectorProvider::new(&database_url).await?;
             self.register_provider("pgvector".to_string(), std::sync::Arc::new(provider));
             loaded_count += 1;
@@ -160,9 +158,14 @@ impl VectorDbRegistry {
 
         if loaded_count == 0 {
             tracing::warn!("No vector database providers loaded from environment. Set QDRANT_URL or POSTGRES_URL.");
-            return Err(crate::error::SdkError::Other(anyhow::anyhow!("No vector database providers available")));
+            return Err(crate::error::SdkError::Other(anyhow::anyhow!(
+                "No vector database providers available"
+            )));
         } else {
-            tracing::info!("Loaded {} vector database providers from environment", loaded_count);
+            tracing::info!(
+                "Loaded {} vector database providers from environment",
+                loaded_count
+            );
         }
 
         Ok(())

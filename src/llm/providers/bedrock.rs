@@ -1,13 +1,12 @@
 // AWS Bedrock provider implementation
 use async_trait::async_trait;
 
-use crate::error::{Result, SdkError};
-use super::super::provider::{Provider, ProviderType, ProviderConfig};
 use super::super::models::{
-    ChatCompletionRequest, ChatCompletionResponse,
-    CompletionRequest, CompletionResponse,
+    ChatCompletionRequest, ChatCompletionResponse, CompletionRequest, CompletionResponse,
     EmbeddingsRequest, EmbeddingsResponse,
 };
+use super::super::provider::{Provider, ProviderConfig, ProviderType};
+use crate::error::{Result, SdkError};
 
 pub struct BedrockProvider {
     config: ProviderConfig,
@@ -21,7 +20,8 @@ impl BedrockProvider {
     }
 
     fn region(&self) -> String {
-        self.config.get_param("region")
+        self.config
+            .get_param("region")
             .unwrap_or(&"us-east-1".to_string())
             .clone()
     }
@@ -49,10 +49,7 @@ impl Provider for BedrockProvider {
         )))
     }
 
-    async fn completion(
-        &self,
-        _request: CompletionRequest,
-    ) -> Result<CompletionResponse> {
+    async fn completion(&self, _request: CompletionRequest) -> Result<CompletionResponse> {
         // AWS Bedrock integration requires AWS SDK dependencies which need Rust 1.86+
         Err(SdkError::Other(anyhow::anyhow!(
             "Bedrock provider requires AWS SDK dependencies (commented out in Cargo.toml). \
@@ -60,10 +57,7 @@ impl Provider for BedrockProvider {
         )))
     }
 
-    async fn embeddings(
-        &self,
-        _request: EmbeddingsRequest,
-    ) -> Result<EmbeddingsResponse> {
+    async fn embeddings(&self, _request: EmbeddingsRequest) -> Result<EmbeddingsResponse> {
         // AWS Bedrock integration requires AWS SDK dependencies which need Rust 1.86+
         Err(SdkError::Other(anyhow::anyhow!(
             "Bedrock provider requires AWS SDK dependencies (commented out in Cargo.toml). \

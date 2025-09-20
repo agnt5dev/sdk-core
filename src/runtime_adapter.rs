@@ -1,6 +1,6 @@
+use crate::error::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
-use crate::error::Result;
 
 #[derive(Debug, Clone)]
 pub struct InvocationRequest {
@@ -70,14 +70,20 @@ pub struct DummyStateManager;
 #[async_trait::async_trait]
 impl StateManager for DummyStateManager {
     async fn get(&self, _key: String) -> Result<Vec<u8>> {
-        Err(crate::error::SdkError::Other(anyhow::anyhow!("State management not implemented")))
+        Err(crate::error::SdkError::Other(anyhow::anyhow!(
+            "State management not implemented"
+        )))
     }
 
     async fn set(&self, _key: String, _value: Vec<u8>) -> Result<()> {
-        Err(crate::error::SdkError::Other(anyhow::anyhow!("State management not implemented")))
+        Err(crate::error::SdkError::Other(anyhow::anyhow!(
+            "State management not implemented"
+        )))
     }
 
     async fn delete(&self, _key: String) -> Result<()> {
-        Err(crate::error::SdkError::Other(anyhow::anyhow!("State management not implemented")))
+        Err(crate::error::SdkError::Other(anyhow::anyhow!(
+            "State management not implemented"
+        )))
     }
 }

@@ -1,15 +1,14 @@
 // LLM telemetry integration with AGNT5's OpenTelemetry infrastructure
-use opentelemetry::{global, KeyValue};
-use opentelemetry::trace::{Span, SpanKind, Tracer, Status};
-use opentelemetry_semantic_conventions::trace::*;
-use crate::telemetry::{create_function_span, record_span_success, record_span_error};
-use super::provider::{ProviderType, get_vendor_name};
 use super::models::{
-    ChatCompletionRequest, ChatCompletion, ChatCompletionChunk, ChatCompletionResponse,
-    CompletionRequest, CompletionResponse,
-    EmbeddingsRequest, EmbeddingsResponse, EmbeddingsInput,
-    Usage, EmbeddingUsage, ChatMessageContent
+    ChatCompletion, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
+    ChatMessageContent, CompletionRequest, CompletionResponse, EmbeddingUsage, EmbeddingsInput,
+    EmbeddingsRequest, EmbeddingsResponse, Usage,
 };
+use super::provider::{get_vendor_name, ProviderType};
+use crate::telemetry::{create_function_span, record_span_error, record_span_success};
+use opentelemetry::trace::{Span, SpanKind, Status, Tracer};
+use opentelemetry::{global, KeyValue};
+use opentelemetry_semantic_conventions::trace::*;
 
 /// Trait for recording span attributes from LLM requests/responses
 pub trait RecordSpan {
@@ -24,7 +23,10 @@ pub struct LlmSpan {
 
 impl LlmSpan {
     /// Start a new span for chat completion
-    pub fn start_chat_completion(request: &ChatCompletionRequest, provider_type: ProviderType) -> Self {
+    pub fn start_chat_completion(
+        request: &ChatCompletionRequest,
+        provider_type: ProviderType,
+    ) -> Self {
         let span = create_function_span(
             "llm.chat_completion",
             "llm-service",
@@ -87,7 +89,8 @@ impl LlmSpan {
     /// Set the vendor attribute for the span
     pub fn set_vendor(&mut self, provider_type: &ProviderType) {
         let vendor = get_vendor_name(provider_type);
-        self.span.set_attribute(KeyValue::new("gen_ai.system", vendor.into_owned()));
+        self.span
+            .set_attribute(KeyValue::new("gen_ai.system", vendor.into_owned()));
     }
 
     /// Log a streaming chunk
@@ -107,9 +110,13 @@ impl LlmSpan {
         // Accumulate chunk content
         if let Some(completion) = &mut self.accumulated_completion {
             for chunk_choice in &chunk.choices {
-                if let Some(existing_choice) = completion.choices.get_mut(chunk_choice.index as usize) {
+                if let Some(existing_choice) =
+                    completion.choices.get_mut(chunk_choice.index as usize)
+                {
                     if let Some(content) = &chunk_choice.delta.content {
-                        if let Some(ChatMessageContent::String(existing_content)) = &mut existing_choice.message.content {
+                        if let Some(ChatMessageContent::String(existing_content)) =
+                            &mut existing_choice.message.content
+                        {
                             existing_content.push_str(content);
                         }
                     }
@@ -121,7 +128,11 @@ impl LlmSpan {
                     completion.choices.push(ChatChoice {
                         index: chunk_choice.index,
                         message: ChatMessage {
-                            role: chunk_choice.delta.role.clone().unwrap_or_else(|| "assistant".to_string()),
+                            role: chunk_choice
+                                .delta
+                                .role
+                                .clone()
+                                .unwrap_or_else(|| "assistant".to_string()),
                             content: Some(ChatMessageContent::String(
                                 chunk_choice.delta.content.clone().unwrap_or_default(),
                             )),
@@ -184,10 +195,16 @@ impl RecordSpan for ChatCompletionRequest {
         }
 
         if let Some(freq_penalty) = self.frequency_penalty {
-            span.set_attribute(KeyValue::new(GEN_AI_REQUEST_FREQUENCY_PENALTY, freq_penalty as f64));
+            span.set_attribute(KeyValue::new(
+                GEN_AI_REQUEST_FREQUENCY_PENALTY,
+                freq_penalty as f64,
+            ));
         }
         if let Some(pres_penalty) = self.presence_penalty {
-            span.set_attribute(KeyValue::new(GEN_AI_REQUEST_PRESENCE_PENALTY, pres_penalty as f64));
+            span.set_attribute(KeyValue::new(
+                GEN_AI_REQUEST_PRESENCE_PENALTY,
+                pres_penalty as f64,
+            ));
         }
         if let Some(top_p) = self.top_p {
             span.set_attribute(KeyValue::new(GEN_AI_REQUEST_TOP_P, top_p as f64));
@@ -266,7 +283,6 @@ impl RecordSpan for ChatCompletionResponse {
     }
 }
 
-
 impl RecordSpan for CompletionRequest {
     fn record_span(&self, span: &mut opentelemetry::global::BoxedSpan) {
         span.set_attribute(KeyValue::new("llm.request.type", "completion"));
@@ -277,10 +293,16 @@ impl RecordSpan for CompletionRequest {
         }
 
         if let Some(freq_penalty) = self.frequency_penalty {
-            span.set_attribute(KeyValue::new(GEN_AI_REQUEST_FREQUENCY_PENALTY, freq_penalty as f64));
+            span.set_attribute(KeyValue::new(
+                GEN_AI_REQUEST_FREQUENCY_PENALTY,
+                freq_penalty as f64,
+            ));
         }
         if let Some(pres_penalty) = self.presence_penalty {
-            span.set_attribute(KeyValue::new(GEN_AI_REQUEST_PRESENCE_PENALTY, pres_penalty as f64));
+            span.set_attribute(KeyValue::new(
+                GEN_AI_REQUEST_PRESENCE_PENALTY,
+                pres_penalty as f64,
+            ));
         }
         if let Some(top_p) = self.top_p {
             span.set_attribute(KeyValue::new(GEN_AI_REQUEST_TOP_P, top_p as f64));
@@ -326,10 +348,16 @@ impl RecordSpan for EmbeddingsRequest {
             EmbeddingsInput::String(_) => 1,
             EmbeddingsInput::Array(arr) => arr.len(),
         };
-        span.set_attribute(KeyValue::new("gen_ai.embeddings.input_count", input_count as i64));
+        span.set_attribute(KeyValue::new(
+            "gen_ai.embeddings.input_count",
+            input_count as i64,
+        ));
 
         if let Some(dimensions) = self.dimensions {
-            span.set_attribute(KeyValue::new("gen_ai.embeddings.dimensions", dimensions as i64));
+            span.set_attribute(KeyValue::new(
+                "gen_ai.embeddings.dimensions",
+                dimensions as i64,
+            ));
         }
     }
 }
@@ -337,10 +365,16 @@ impl RecordSpan for EmbeddingsRequest {
 impl RecordSpan for EmbeddingsResponse {
     fn record_span(&self, span: &mut opentelemetry::global::BoxedSpan) {
         span.set_attribute(KeyValue::new(GEN_AI_RESPONSE_MODEL, self.model.clone()));
-        span.set_attribute(KeyValue::new("gen_ai.embeddings.vector_count", self.data.len() as i64));
+        span.set_attribute(KeyValue::new(
+            "gen_ai.embeddings.vector_count",
+            self.data.len() as i64,
+        ));
 
         if let Some(dimension) = self.dimension() {
-            span.set_attribute(KeyValue::new("gen_ai.embeddings.dimension", dimension as i64));
+            span.set_attribute(KeyValue::new(
+                "gen_ai.embeddings.dimension",
+                dimension as i64,
+            ));
         }
 
         self.usage.record_span(span);
@@ -349,20 +383,32 @@ impl RecordSpan for EmbeddingsResponse {
 
 impl RecordSpan for Usage {
     fn record_span(&self, span: &mut opentelemetry::global::BoxedSpan) {
-        span.set_attribute(KeyValue::new(GEN_AI_USAGE_INPUT_TOKENS, self.prompt_tokens as i64));
-        span.set_attribute(KeyValue::new(GEN_AI_USAGE_OUTPUT_TOKENS, self.completion_tokens as i64));
+        span.set_attribute(KeyValue::new(
+            GEN_AI_USAGE_INPUT_TOKENS,
+            self.prompt_tokens as i64,
+        ));
+        span.set_attribute(KeyValue::new(
+            GEN_AI_USAGE_OUTPUT_TOKENS,
+            self.completion_tokens as i64,
+        ));
 
         // Add reasoning tokens if available
         if let Some(details) = &self.completion_tokens_details {
             if let Some(reasoning_tokens) = details.reasoning_tokens {
-                span.set_attribute(KeyValue::new("gen_ai.usage.reasoning_tokens", reasoning_tokens as i64));
+                span.set_attribute(KeyValue::new(
+                    "gen_ai.usage.reasoning_tokens",
+                    reasoning_tokens as i64,
+                ));
             }
         }
 
         // Add cached tokens if available
         if let Some(details) = &self.prompt_tokens_details {
             if let Some(cached_tokens) = details.cached_tokens {
-                span.set_attribute(KeyValue::new("gen_ai.usage.cached_tokens", cached_tokens as i64));
+                span.set_attribute(KeyValue::new(
+                    "gen_ai.usage.cached_tokens",
+                    cached_tokens as i64,
+                ));
             }
         }
     }
@@ -370,7 +416,10 @@ impl RecordSpan for Usage {
 
 impl RecordSpan for EmbeddingUsage {
     fn record_span(&self, span: &mut opentelemetry::global::BoxedSpan) {
-        span.set_attribute(KeyValue::new(GEN_AI_USAGE_INPUT_TOKENS, self.prompt_tokens as i64));
+        span.set_attribute(KeyValue::new(
+            GEN_AI_USAGE_INPUT_TOKENS,
+            self.prompt_tokens as i64,
+        ));
     }
 }
 

@@ -2,8 +2,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::provider::{Provider, ProviderConfig, ProviderType};
 use crate::error::{Result, SdkError};
-use super::provider::{Provider, ProviderType, ProviderConfig};
 
 pub struct LlmRegistry {
     providers: HashMap<String, Arc<dyn Provider>>,
@@ -20,7 +20,11 @@ impl LlmRegistry {
 
     /// Register a provider with the given name
     pub fn register_provider(&mut self, name: String, provider: Arc<dyn Provider>) {
-        tracing::info!("Registering LLM provider: {} (type: {})", name, provider.r#type());
+        tracing::info!(
+            "Registering LLM provider: {} (type: {})",
+            name,
+            provider.r#type()
+        );
         self.providers.insert(name, provider);
     }
 
@@ -35,13 +39,17 @@ impl LlmRegistry {
             self.default_provider = Some(name);
             Ok(())
         } else {
-            Err(SdkError::Other(anyhow::anyhow!("Provider not found: {}", name)))
+            Err(SdkError::Other(anyhow::anyhow!(
+                "Provider not found: {}",
+                name
+            )))
         }
     }
 
     /// Get the default provider
     pub fn get_default_provider(&self) -> Option<Arc<dyn Provider>> {
-        self.default_provider.as_ref()
+        self.default_provider
+            .as_ref()
             .and_then(|name| self.get_provider(name))
     }
 
@@ -56,11 +64,7 @@ impl LlmRegistry {
 
         // OpenAI
         if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
-            let config = ProviderConfig::new(
-                "openai".to_string(),
-                api_key,
-                ProviderType::OpenAI,
-            );
+            let config = ProviderConfig::new("openai".to_string(), api_key, ProviderType::OpenAI);
 
             // Add base_url if specified
             let config = if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
@@ -81,11 +85,8 @@ impl LlmRegistry {
 
         // Anthropic
         if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
-            let config = ProviderConfig::new(
-                "anthropic".to_string(),
-                api_key,
-                ProviderType::Anthropic,
-            );
+            let config =
+                ProviderConfig::new("anthropic".to_string(), api_key, ProviderType::Anthropic);
 
             let provider = super::providers::anthropic::AnthropicProvider::new(&config);
             self.register_provider("anthropic".to_string(), Arc::new(provider));
@@ -100,13 +101,9 @@ impl LlmRegistry {
         // Azure OpenAI
         if let (Ok(api_key), Ok(endpoint)) = (
             std::env::var("AZURE_OPENAI_API_KEY"),
-            std::env::var("AZURE_OPENAI_ENDPOINT")
+            std::env::var("AZURE_OPENAI_ENDPOINT"),
         ) {
-            let mut config = ProviderConfig::new(
-                "azure".to_string(),
-                api_key,
-                ProviderType::Azure,
-            );
+            let mut config = ProviderConfig::new("azure".to_string(), api_key, ProviderType::Azure);
             config = config.with_param("endpoint".to_string(), endpoint);
 
             if let Ok(api_version) = std::env::var("AZURE_OPENAI_API_VERSION") {
@@ -123,9 +120,10 @@ impl LlmRegistry {
         }
 
         // AWS Bedrock
-        if std::env::var("AWS_ACCESS_KEY_ID").is_ok() ||
-           std::env::var("AWS_PROFILE").is_ok() ||
-           std::env::var("AWS_REGION").is_ok() {
+        if std::env::var("AWS_ACCESS_KEY_ID").is_ok()
+            || std::env::var("AWS_PROFILE").is_ok()
+            || std::env::var("AWS_REGION").is_ok()
+        {
             let config = ProviderConfig::new(
                 "bedrock".to_string(),
                 "aws_credentials".to_string(), // Not used for AWS, credentials from environment
@@ -178,11 +176,8 @@ impl LlmRegistry {
 
         // OpenRouter
         if let Ok(api_key) = std::env::var("OPENROUTER_API_KEY") {
-            let mut config = ProviderConfig::new(
-                "openrouter".to_string(),
-                api_key,
-                ProviderType::OpenRouter,
-            );
+            let mut config =
+                ProviderConfig::new("openrouter".to_string(), api_key, ProviderType::OpenRouter);
 
             // Add optional base URL override
             if let Ok(base_url) = std::env::var("OPENROUTER_BASE_URL") {
@@ -219,8 +214,12 @@ impl LlmRegistry {
         }
 
         if loaded_count == 0 {
-            tracing::warn!("No LLM providers loaded from environment. Set API keys in environment variables.");
-            return Err(SdkError::Other(anyhow::anyhow!("No LLM providers available")));
+            tracing::warn!(
+                "No LLM providers loaded from environment. Set API keys in environment variables."
+            );
+            return Err(SdkError::Other(anyhow::anyhow!(
+                "No LLM providers available"
+            )));
         } else {
             tracing::info!("Loaded {} LLM providers from environment", loaded_count);
         }

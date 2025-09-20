@@ -3,16 +3,15 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Result, SdkError};
-use super::super::provider::{Provider, ProviderType, ProviderConfig};
 use super::super::models::{
-    ChatCompletionRequest, ChatCompletionResponse, ChatCompletion, ChatChoice, ChatMessage, ChatMessageContent,
-    CompletionRequest, CompletionResponse,
-    EmbeddingsRequest, EmbeddingsResponse,
-    Usage,
+    ChatChoice, ChatCompletion, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
+    ChatMessageContent, CompletionRequest, CompletionResponse, EmbeddingsRequest,
+    EmbeddingsResponse, Usage,
 };
-use uuid;
+use super::super::provider::{Provider, ProviderConfig, ProviderType};
+use crate::error::{Result, SdkError};
 use chrono;
+use uuid;
 
 /// Gemini API request format
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,13 +81,17 @@ impl VertexAIProvider {
     }
 
     fn project_id(&self) -> Result<String> {
-        self.config.get_param("project_id")
-            .ok_or_else(|| SdkError::Other(anyhow::anyhow!("Google Cloud project ID not configured")))
+        self.config
+            .get_param("project_id")
+            .ok_or_else(|| {
+                SdkError::Other(anyhow::anyhow!("Google Cloud project ID not configured"))
+            })
             .map(|s| s.clone())
     }
 
     fn location(&self) -> String {
-        self.config.get_param("location")
+        self.config
+            .get_param("location")
             .unwrap_or(&"us-central1".to_string())
             .clone()
     }
@@ -101,7 +104,7 @@ impl VertexAIProvider {
                 "user" => "user",
                 "assistant" => "model",
                 "system" => "user", // Gemini treats system messages as user messages
-                _ => "user", // Default fallback
+                _ => "user",        // Default fallback
             };
 
             if let Some(content) = message.content {
@@ -109,7 +112,8 @@ impl VertexAIProvider {
                     ChatMessageContent::String(text) => text,
                     ChatMessageContent::Array(parts) => {
                         // For now, just concatenate text parts
-                        parts.into_iter()
+                        parts
+                            .into_iter()
                             .filter_map(|part| part.text)
                             .collect::<Vec<_>>()
                             .join("\n")
@@ -126,7 +130,8 @@ impl VertexAIProvider {
         let generation_config = if request.temperature.is_some()
             || request.max_tokens.is_some()
             || request.max_completion_tokens.is_some()
-            || request.top_p.is_some() {
+            || request.top_p.is_some()
+        {
             Some(GeminiGenerationConfig {
                 temperature: request.temperature,
                 max_output_tokens: request.max_completion_tokens.or(request.max_tokens),
@@ -142,11 +147,20 @@ impl VertexAIProvider {
         })
     }
 
-    fn convert_from_gemini_response(&self, response: GeminiResponse, model: &str) -> Result<ChatCompletion> {
-        let candidate = response.candidates.into_iter().next()
-            .ok_or_else(|| SdkError::Other(anyhow::anyhow!("No candidates in Gemini response")))?;
+    fn convert_from_gemini_response(
+        &self,
+        response: GeminiResponse,
+        model: &str,
+    ) -> Result<ChatCompletion> {
+        let candidate =
+            response.candidates.into_iter().next().ok_or_else(|| {
+                SdkError::Other(anyhow::anyhow!("No candidates in Gemini response"))
+            })?;
 
-        let content = candidate.content.parts.into_iter()
+        let content = candidate
+            .content
+            .parts
+            .into_iter()
             .map(|part| part.text)
             .collect::<Vec<_>>()
             .join("");
@@ -165,13 +179,16 @@ impl VertexAIProvider {
             logprobs: None,
         };
 
-        let usage = response.usage_metadata.map(|u| Usage {
-            prompt_tokens: u.prompt_token_count,
-            completion_tokens: u.candidates_token_count,
-            total_tokens: u.total_token_count,
-            completion_tokens_details: None,
-            prompt_tokens_details: None,
-        }).unwrap_or_default();
+        let usage = response
+            .usage_metadata
+            .map(|u| Usage {
+                prompt_tokens: u.prompt_token_count,
+                completion_tokens: u.candidates_token_count,
+                total_tokens: u.total_token_count,
+                completion_tokens_details: None,
+                prompt_tokens_details: None,
+            })
+            .unwrap_or_default();
 
         Ok(ChatCompletion {
             id: format!("gemini-{}", uuid::Uuid::new_v4()),
@@ -215,11 +232,11 @@ impl Provider for VertexAIProvider {
         // Use public Gemini API (simpler than Vertex AI endpoint)
         let url = format!(
             "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-            model,
-            self.config.api_key
+            model, self.config.api_key
         );
 
-        let response = self.http_client
+        let response = self
+            .http_client
             .post(&url)
             .header("Content-Type", "application/json")
             .json(&gemini_request)
@@ -232,18 +249,21 @@ impl Provider for VertexAIProvider {
 
         let status = response.status();
         if status.is_success() {
-            let gemini_response: GeminiResponse = response
-                .json()
-                .await
-                .map_err(|e| {
-                    tracing::error!("Google Gemini API response parsing error: {}", e);
-                    SdkError::Other(anyhow::anyhow!("Failed to parse Google Gemini response: {}", e))
-                })?;
+            let gemini_response: GeminiResponse = response.json().await.map_err(|e| {
+                tracing::error!("Google Gemini API response parsing error: {}", e);
+                SdkError::Other(anyhow::anyhow!(
+                    "Failed to parse Google Gemini response: {}",
+                    e
+                ))
+            })?;
 
             let completion = self.convert_from_gemini_response(gemini_response, &model)?;
             Ok(ChatCompletionResponse::NonStream(completion))
         } else {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
             tracing::error!("Google Gemini API error ({}): {}", status, error_text);
             Err(SdkError::Other(anyhow::anyhow!(
                 "Google Gemini API error ({}): {}",
@@ -253,20 +273,14 @@ impl Provider for VertexAIProvider {
         }
     }
 
-    async fn completion(
-        &self,
-        _request: CompletionRequest,
-    ) -> Result<CompletionResponse> {
+    async fn completion(&self, _request: CompletionRequest) -> Result<CompletionResponse> {
         // Gemini API doesn't support legacy completions - use chat completions instead
         Err(SdkError::Other(anyhow::anyhow!(
             "Legacy completions not supported by Gemini API - use chat completions instead"
         )))
     }
 
-    async fn embeddings(
-        &self,
-        _request: EmbeddingsRequest,
-    ) -> Result<EmbeddingsResponse> {
+    async fn embeddings(&self, _request: EmbeddingsRequest) -> Result<EmbeddingsResponse> {
         // Gemini API embeddings would require a different endpoint
         // For now, recommend using a dedicated embedding service
         Err(SdkError::Other(anyhow::anyhow!(
@@ -281,21 +295,27 @@ impl Provider for VertexAIProvider {
             self.config.api_key
         );
 
-        let response = self.http_client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| {
-                tracing::error!("Google Gemini API health check request error: {}", e);
-                SdkError::Other(anyhow::anyhow!("Google Gemini API health check failed: {}", e))
-            })?;
+        let response = self.http_client.get(&url).send().await.map_err(|e| {
+            tracing::error!("Google Gemini API health check request error: {}", e);
+            SdkError::Other(anyhow::anyhow!(
+                "Google Gemini API health check failed: {}",
+                e
+            ))
+        })?;
 
         let status = response.status();
         if status.is_success() {
             Ok(())
         } else {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-            tracing::error!("Google Gemini API health check failed ({}): {}", status, error_text);
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            tracing::error!(
+                "Google Gemini API health check failed ({}): {}",
+                status,
+                error_text
+            );
             Err(SdkError::Other(anyhow::anyhow!(
                 "Google Gemini API health check failed ({}): {}",
                 status,

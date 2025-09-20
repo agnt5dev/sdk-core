@@ -1,13 +1,18 @@
 // OpenTelemetry telemetry module with OTLP exporter for traces and logs
-use std::collections::HashMap;
-use opentelemetry::{global, KeyValue, Context, baggage::BaggageExt};
-use opentelemetry::trace::{Span, SpanKind, Tracer, Status, TracerProvider};
-use opentelemetry::propagation::TextMapPropagator;
-use opentelemetry::global::BoxedSpan;
-use opentelemetry_sdk::{trace::SdkTracerProvider, Resource, propagation::{TraceContextPropagator, BaggagePropagator}, logs::SdkLoggerProvider};
-use opentelemetry_otlp::{SpanExporter, LogExporter, WithExportConfig};
-use tracing_subscriber::{layer::SubscriberExt, EnvFilter, Registry, fmt::format::Writer};
 use crate::error::SdkError;
+use opentelemetry::global::BoxedSpan;
+use opentelemetry::propagation::TextMapPropagator;
+use opentelemetry::trace::{Span, SpanKind, Status, Tracer, TracerProvider};
+use opentelemetry::{baggage::BaggageExt, global, Context, KeyValue};
+use opentelemetry_otlp::{LogExporter, SpanExporter, WithExportConfig};
+use opentelemetry_sdk::{
+    logs::SdkLoggerProvider,
+    propagation::{BaggagePropagator, TraceContextPropagator},
+    trace::SdkTracerProvider,
+    Resource,
+};
+use std::collections::HashMap;
+use tracing_subscriber::{fmt::format::Writer, layer::SubscriberExt, EnvFilter, Registry};
 
 /// Custom field formatter that prioritizes invocation.id in log output
 struct InvocationFieldFormatter;
@@ -19,54 +24,56 @@ impl<'writer> tracing_subscriber::fmt::format::FormatFields<'writer> for Invocat
         fields: R,
     ) -> std::fmt::Result {
         use tracing::field::{Field, Visit};
-        
+
         struct FieldVisitor<'a> {
             writer: Writer<'a>,
             result: std::fmt::Result,
             invocation_id: Option<String>,
             other_fields: Vec<(String, String)>,
         }
-        
+
         impl<'a> Visit for FieldVisitor<'a> {
             fn record_str(&mut self, field: &Field, value: &str) {
                 if field.name() == "invocation.id" {
                     self.invocation_id = Some(value.to_string());
                 } else {
-                    self.other_fields.push((field.name().to_string(), value.to_string()));
+                    self.other_fields
+                        .push((field.name().to_string(), value.to_string()));
                 }
             }
-            
+
             fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
                 let formatted = format!("{:?}", value);
                 if field.name() == "invocation.id" {
                     self.invocation_id = Some(formatted);
                 } else {
-                    self.other_fields.push((field.name().to_string(), formatted));
+                    self.other_fields
+                        .push((field.name().to_string(), formatted));
                 }
             }
         }
-        
+
         let mut visitor = FieldVisitor {
             writer,
             result: Ok(()),
             invocation_id: None,
             other_fields: Vec::new(),
         };
-        
+
         fields.record(&mut visitor);
-        
+
         // Write invocation.id first if present
         if let Some(inv_id) = visitor.invocation_id {
             write!(visitor.writer, "invocation.id={} ", inv_id)?;
         }
-        
+
         // Write other fields
         for (name, value) in visitor.other_fields {
             if !name.is_empty() {
                 write!(visitor.writer, "{}={} ", name, value)?;
             }
         }
-        
+
         visitor.result
     }
 }
@@ -75,15 +82,19 @@ impl<'writer> tracing_subscriber::fmt::format::FormatFields<'writer> for Invocat
 pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), SdkError> {
     let otel_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
         .unwrap_or_else(|_| "http://localhost:4317".to_string());
-    
-    tracing::info!("Initializing OpenTelemetry with OTLP endpoint: {}", otel_endpoint);
+
+    tracing::info!(
+        "Initializing OpenTelemetry with OTLP endpoint: {}",
+        otel_endpoint
+    );
 
     // Create resource with service information
     let resource = Resource::builder()
         .with_service_name(service_name.to_string())
-        .with_attributes(vec![
-            KeyValue::new("service.version", service_version.to_string()),
-        ])
+        .with_attributes(vec![KeyValue::new(
+            "service.version",
+            service_version.to_string(),
+        )])
         .build();
 
     // Build OTLP exporters for traces and logs
@@ -91,21 +102,28 @@ pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), S
         .with_tonic()
         .with_endpoint(otel_endpoint.clone())
         .build()
-        .map_err(|e| SdkError::Other(anyhow::anyhow!("Failed to create OTLP trace exporter: {}", e)))?;
-    
+        .map_err(|e| {
+            SdkError::Other(anyhow::anyhow!(
+                "Failed to create OTLP trace exporter: {}",
+                e
+            ))
+        })?;
+
     let log_exporter = LogExporter::builder()
         .with_tonic()
         .with_endpoint(otel_endpoint)
         .build()
-        .map_err(|e| SdkError::Other(anyhow::anyhow!("Failed to create OTLP log exporter: {}", e)))?;
+        .map_err(|e| {
+            SdkError::Other(anyhow::anyhow!("Failed to create OTLP log exporter: {}", e))
+        })?;
 
     // Create tracer provider with batch exporter
     let trace_provider = SdkTracerProvider::builder()
         .with_resource(resource.clone())
         .with_batch_exporter(trace_exporter)
         .build();
-    
-    // Create logger provider with batch exporter 
+
+    // Create logger provider with batch exporter
     let log_provider = SdkLoggerProvider::builder()
         .with_resource(resource)
         .with_batch_exporter(log_exporter)
@@ -113,31 +131,31 @@ pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), S
 
     // Get tracer from provider before setting as global
     let tracer = trace_provider.tracer("agnt5-sdk-core");
-    
+
     // Set as global tracer provider
     global::set_tracer_provider(trace_provider);
-    
+
     // Set up composite propagation for both trace context and baggage
     // Using a simple approach: set up both propagators sequentially
     let trace_propagator = TraceContextPropagator::new();
     let baggage_propagator = BaggagePropagator::new();
-    
+
     // For now, just use trace propagator - baggage will be handled in extract function
     global::set_text_map_propagator(trace_propagator);
-    
+
     // Set up tracing subscriber with OpenTelemetry layers
     let telemetry_layer = tracing_opentelemetry::layer().with_tracer(tracer);
-    
+
     // Set up OpenTelemetry logs appender
-    let log_appender = opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&log_provider);
-    
+    let log_appender =
+        opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&log_provider);
+
     // Create subscriber with filtered console output and OpenTelemetry
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| {
-            // Default filter: info level for our code, warn for dependencies
-            EnvFilter::new("agnt5=info,h2=warn,hyper=warn,tonic=warn,tower=warn,info")
-        });
-    
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        // Default filter: info level for our code, warn for dependencies
+        EnvFilter::new("agnt5=info,h2=warn,hyper=warn,tonic=warn,tower=warn,info")
+    });
+
     // Create custom fmt layer that includes invocation.id in log output
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
@@ -146,38 +164,43 @@ pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), S
         .with_file(true)
         .with_line_number(true)
         .fmt_fields(InvocationFieldFormatter);
-    
+
     let subscriber = Registry::default()
         .with(telemetry_layer)
         .with(log_appender)
         .with(fmt_layer)
         .with(env_filter);
-        
+
     // Set as global default subscriber
     tracing::subscriber::set_global_default(subscriber)
         .map_err(|e| SdkError::Other(anyhow::anyhow!("Failed to set tracing subscriber: {}", e)))?;
-    
-    tracing::info!("OpenTelemetry with tracing integration initialized successfully for service: {}", service_name);
+
+    tracing::info!(
+        "OpenTelemetry with tracing integration initialized successfully for service: {}",
+        service_name
+    );
     Ok(())
 }
 
 /// Extract trace context and baggage from runtime message metadata
 pub fn extract_context_from_runtime_message(metadata: &HashMap<String, String>) -> Context {
     tracing::debug!("Extracting context from metadata: {:?}", metadata);
-    
+
     // Extract trace context first
     let trace_propagator = TraceContextPropagator::new();
     let ctx = trace_propagator.extract(metadata);
-    
+
     // Then extract baggage using the trace context
     let baggage_propagator = BaggagePropagator::new();
     let final_ctx = baggage_propagator.extract_with_context(&ctx, metadata);
-    
+
     // Debug log baggage contents
     let baggage = final_ctx.baggage();
-    tracing::debug!("Extracted baggage items: {:?}", 
-        baggage.iter().collect::<Vec<_>>());
-    
+    tracing::debug!(
+        "Extracted baggage items: {:?}",
+        baggage.iter().collect::<Vec<_>>()
+    );
+
     final_ctx
 }
 
@@ -190,21 +213,24 @@ pub fn create_function_span(
     parent_context: Option<Context>,
 ) -> BoxedSpan {
     let tracer = global::tracer("agnt5-sdk-core");
-    
+
     let mut attributes = vec![
         KeyValue::new("function.name", function_name.to_string()),
         KeyValue::new("service.name", service_name.to_string()),
         KeyValue::new("worker.id", worker_id.to_string()),
         KeyValue::new("invocation.id", invocation_id.to_string()),
     ];
-    
+
     // Extract baggage items as span attributes if parent context exists
     if let Some(ref ctx) = parent_context {
         let baggage = ctx.baggage();
         let baggage_items: Vec<_> = baggage.iter().collect();
-        tracing::debug!("Adding {} baggage items as span attributes: {:?}", 
-            baggage_items.len(), baggage_items);
-        
+        tracing::debug!(
+            "Adding {} baggage items as span attributes: {:?}",
+            baggage_items.len(),
+            baggage_items
+        );
+
         for (key, (value, _metadata)) in baggage.iter() {
             // Add baggage items with "baggage." prefix to distinguish them
             let attr_key = format!("baggage.{}", key);
@@ -214,7 +240,7 @@ pub fn create_function_span(
     } else {
         tracing::debug!("No parent context provided for baggage extraction");
     }
-    
+
     let span_builder = tracer
         .span_builder(format!("function.{}", function_name))
         .with_kind(SpanKind::Server)

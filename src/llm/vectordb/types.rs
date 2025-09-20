@@ -1,7 +1,7 @@
 // Core types for vector database operations
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use serde_json::Value;
+use std::collections::HashMap;
 
 /// A vector entry containing the vector data and associated metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]

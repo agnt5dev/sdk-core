@@ -1,9 +1,8 @@
 // Example demonstrating OpenRouter's unique features in AGNT5 SDK-Core
 use agnt5_sdk_core::llm::{
-    LlmClient, Provider,
-    providers::openrouter::{OpenRouterProvider, ProviderPreferences, RouteStrategy},
     models::{ChatCompletionRequest, ChatMessage, ChatMessageContent},
-    ProviderConfig, ProviderType
+    providers::openrouter::{OpenRouterProvider, ProviderPreferences, RouteStrategy},
+    LlmClient, Provider, ProviderConfig, ProviderType,
 };
 use agnt5_sdk_core::{init_logging, init_telemetry};
 
@@ -43,10 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "meta-llama/llama-3.1-8b-instruct:free".to_string(),
         ])
         .with_route(RouteStrategy::Fallback)
-        .with_provider_preferences(
-            ProviderPreferences::new()
-                .require(vec!["chat".to_string()])
-        )
+        .with_provider_preferences(ProviderPreferences::new().require(vec!["chat".to_string()]))
         .with_app_name("AGNT5 SDK Example".to_string())
         .with_referer("https://agnt5.ai".to_string());
 
@@ -107,18 +103,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Example 4: Chat completion with fallback routing
     println!("\n💬 Example 4: Chat completion with multi-model fallback");
 
-    let messages = vec![
-        ChatMessage {
-            role: "user".to_string(),
-            content: Some(ChatMessageContent::String(
-                "Explain the benefits of using OpenRouter for AI applications in exactly 2 sentences.".to_string()
-            )),
-            name: None,
-            tool_calls: None,
-            tool_call_id: None,
-            refusal: None,
-        }
-    ];
+    let messages = vec![ChatMessage {
+        role: "user".to_string(),
+        content: Some(ChatMessageContent::String(
+            "Explain the benefits of using OpenRouter for AI applications in exactly 2 sentences."
+                .to_string(),
+        )),
+        name: None,
+        tool_calls: None,
+        tool_call_id: None,
+        refusal: None,
+    }];
 
     let request = ChatCompletionRequest {
         model: "anthropic/claude-3-haiku".to_string(), // Primary model
@@ -145,7 +140,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🔄 Sending request with fallback routing...");
     match openrouter.chat_completion(request).await {
         Ok(response) => {
-            if let agnt5_sdk_core::llm::models::ChatCompletionResponse::NonStream(completion) = response {
+            if let agnt5_sdk_core::llm::models::ChatCompletionResponse::NonStream(completion) =
+                response
+            {
                 println!("✅ Received response:");
                 println!("   🤖 Model: {}", completion.model);
                 if let Some(choice) = completion.choices.first() {
@@ -154,10 +151,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 let usage = completion.usage;
-                println!("   📊 Token usage: {} prompt + {} completion = {} total",
-                    usage.prompt_tokens,
-                    usage.completion_tokens,
-                    usage.total_tokens
+                println!(
+                    "   📊 Token usage: {} prompt + {} completion = {} total",
+                    usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
                 );
             }
         }
@@ -169,7 +165,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Set environment variable for registry loading
     std::env::set_var("OPENROUTER_API_KEY", api_key);
-    std::env::set_var("OPENROUTER_DEFAULT_MODELS", "anthropic/claude-3-haiku,openai/gpt-3.5-turbo");
+    std::env::set_var(
+        "OPENROUTER_DEFAULT_MODELS",
+        "anthropic/claude-3-haiku,openai/gpt-3.5-turbo",
+    );
     std::env::set_var("OPENROUTER_APP_NAME", "AGNT5 SDK");
     std::env::set_var("OPENROUTER_ROUTE", "fallback");
 
@@ -183,18 +182,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let simple_request = ChatCompletionRequest {
                     model: "anthropic/claude-3-haiku".to_string(),
-                    messages: vec![
-                        ChatMessage {
-                            role: "user".to_string(),
-                            content: Some(ChatMessageContent::String(
-                                "What makes OpenRouter unique for developers?".to_string()
-                            )),
-                            name: None,
-                            tool_calls: None,
-                            tool_call_id: None,
-                            refusal: None,
-                        }
-                    ],
+                    messages: vec![ChatMessage {
+                        role: "user".to_string(),
+                        content: Some(ChatMessageContent::String(
+                            "What makes OpenRouter unique for developers?".to_string(),
+                        )),
+                        name: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                        refusal: None,
+                    }],
                     max_tokens: Some(100),
                     temperature: Some(0.8),
                     stream: Some(false),
@@ -216,10 +213,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 match client.chat_completion("openrouter", simple_request).await {
                     Ok(response) => {
-                        if let agnt5_sdk_core::llm::models::ChatCompletionResponse::NonStream(completion) = response {
+                        if let agnt5_sdk_core::llm::models::ChatCompletionResponse::NonStream(
+                            completion,
+                        ) = response
+                        {
                             println!("✅ LLM client response received:");
                             if let Some(choice) = completion.choices.first() {
-                                if let Some(ChatMessageContent::String(content)) = &choice.message.content {
+                                if let Some(ChatMessageContent::String(content)) =
+                                    &choice.message.content
+                                {
                                     println!("   💭 {}", content);
                                 }
                             }

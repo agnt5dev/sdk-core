@@ -1,7 +1,7 @@
 // Vector database provider implementations
-pub mod qdrant;
 pub mod pgvector;
+pub mod qdrant;
 
 // Re-export provider types for convenience
-pub use qdrant::QdrantProvider;
 pub use pgvector::PgVectorProvider;
+pub use qdrant::QdrantProvider;

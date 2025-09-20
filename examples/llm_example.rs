@@ -1,6 +1,6 @@
 // Example demonstrating LLM integration in AGNT5 SDK-Core
 use agnt5_sdk_core::llm::{ChatCompletionRequest, ChatMessage, ChatMessageContent, LlmClient};
-use agnt5_sdk_core::{init_telemetry, init_logging};
+use agnt5_sdk_core::{init_logging, init_telemetry};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -25,7 +25,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     model: "gpt-3.5-turbo".to_string(),
                     messages: vec![ChatMessage {
                         role: "user".to_string(),
-                        content: Some(ChatMessageContent::String("Hello! How are you?".to_string())),
+                        content: Some(ChatMessageContent::String(
+                            "Hello! How are you?".to_string(),
+                        )),
                         name: None,
                         tool_calls: None,
                         tool_call_id: None,
@@ -61,13 +63,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         match response {
                             agnt5_sdk_core::llm::ChatCompletionResponse::NonStream(completion) => {
                                 if let Some(choice) = completion.choices.first() {
-                                    if let Some(ChatMessageContent::String(content)) = &choice.message.content {
+                                    if let Some(ChatMessageContent::String(content)) =
+                                        &choice.message.content
+                                    {
                                         println!("💬 Response: {}", content);
                                     }
                                 }
-                                println!("📊 Usage: {} prompt tokens, {} completion tokens",
+                                println!(
+                                    "📊 Usage: {} prompt tokens, {} completion tokens",
                                     completion.usage.prompt_tokens,
-                                    completion.usage.completion_tokens);
+                                    completion.usage.completion_tokens
+                                );
                             }
                             agnt5_sdk_core::llm::ChatCompletionResponse::Stream(_) => {
                                 println!("📡 Received streaming response (streaming not implemented yet)");

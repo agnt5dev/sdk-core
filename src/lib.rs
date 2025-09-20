@@ -13,8 +13,14 @@ pub use client::WorkerCoordinatorClient;
 pub use error::{Result, SdkError};
 pub use llm::LlmClient;
 pub use logging::{clear_error_buffer, get_error_buffer, init_logging};
-pub use runtime_adapter::{RuntimeAdapter, RuntimeContext, InvocationRequest, InvocationResponse, RuntimeCapabilities, StateManager, DummyStateManager};
-pub use telemetry::{init_telemetry, shutdown_telemetry, extract_context_from_runtime_message, create_function_span, record_span_success, record_span_error, end_span};
+pub use runtime_adapter::{
+    DummyStateManager, InvocationRequest, InvocationResponse, RuntimeAdapter, RuntimeCapabilities,
+    RuntimeContext, StateManager,
+};
+pub use telemetry::{
+    create_function_span, end_span, extract_context_from_runtime_message, init_telemetry,
+    record_span_error, record_span_success, shutdown_telemetry,
+};
 pub use worker::Worker;
 
 // Generated protobuf modules

@@ -3,17 +3,16 @@ use async_trait::async_trait;
 use reqwest::Client;
 use std::time::Duration;
 
-use crate::error::{Result, SdkError};
-use crate::llm::{Provider, ProviderConfig, ProviderType};
-use crate::llm::models::{
-    ChatCompletionRequest, ChatCompletionResponse,
-    CompletionRequest, CompletionResponse, EmbeddingsRequest, EmbeddingsResponse,
-    Choice
-};
 use super::types::{
-    RouteStrategy, ProviderPreferences, Transform, OpenRouterModel, GenerationInfo,
-    OpenRouterLimits, OpenRouterChatRequest, OpenRouterChatResponse, ResponseFormat
+    GenerationInfo, OpenRouterChatRequest, OpenRouterChatResponse, OpenRouterLimits,
+    OpenRouterModel, ProviderPreferences, ResponseFormat, RouteStrategy, Transform,
 };
+use crate::error::{Result, SdkError};
+use crate::llm::models::{
+    ChatCompletionRequest, ChatCompletionResponse, Choice, CompletionRequest, CompletionResponse,
+    EmbeddingsRequest, EmbeddingsResponse,
+};
+use crate::llm::{Provider, ProviderConfig, ProviderType};
 
 /// OpenRouter provider with native API support
 pub struct OpenRouterProvider {
@@ -48,12 +47,10 @@ impl OpenRouterProvider {
             .map(|models| models.split(',').map(|s| s.trim().to_string()).collect())
             .unwrap_or_else(|| vec!["anthropic/claude-3-haiku".to_string()]);
 
-        let route = config
-            .get_param("route")
-            .and_then(|r| match r.as_str() {
-                "fallback" => Some(RouteStrategy::Fallback),
-                _ => None,
-            });
+        let route = config.get_param("route").and_then(|r| match r.as_str() {
+            "fallback" => Some(RouteStrategy::Fallback),
+            _ => None,
+        });
 
         let app_name = config.get_param("app_name").cloned();
         let referer = config.get_param("referer").cloned();
@@ -111,9 +108,7 @@ impl OpenRouterProvider {
     pub async fn list_models(&self) -> Result<Vec<OpenRouterModel>> {
         let url = format!("{}/models", self.base_url);
 
-        let mut request = self.http_client
-            .get(&url)
-            .bearer_auth(&self.config.api_key);
+        let mut request = self.http_client.get(&url).bearer_auth(&self.config.api_key);
 
         // Add optional headers
         if let Some(ref referer) = self.referer {
@@ -131,7 +126,8 @@ impl OpenRouterProvider {
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
             return Err(SdkError::Other(anyhow::anyhow!(
-                "OpenRouter API error: {}", error_text
+                "OpenRouter API error: {}",
+                error_text
             )));
         }
 
@@ -152,9 +148,7 @@ impl OpenRouterProvider {
     pub async fn get_generation_info(&self, generation_id: &str) -> Result<GenerationInfo> {
         let url = format!("{}/generation?id={}", self.base_url, generation_id);
 
-        let mut request = self.http_client
-            .get(&url)
-            .bearer_auth(&self.config.api_key);
+        let mut request = self.http_client.get(&url).bearer_auth(&self.config.api_key);
 
         // Add optional headers
         if let Some(ref referer) = self.referer {
@@ -172,7 +166,8 @@ impl OpenRouterProvider {
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
             return Err(SdkError::Other(anyhow::anyhow!(
-                "OpenRouter API error: {}", error_text
+                "OpenRouter API error: {}",
+                error_text
             )));
         }
 
@@ -188,9 +183,7 @@ impl OpenRouterProvider {
     pub async fn get_limits(&self) -> Result<OpenRouterLimits> {
         let url = format!("{}/auth/key", self.base_url);
 
-        let mut request = self.http_client
-            .get(&url)
-            .bearer_auth(&self.config.api_key);
+        let mut request = self.http_client.get(&url).bearer_auth(&self.config.api_key);
 
         // Add optional headers
         if let Some(ref referer) = self.referer {
@@ -208,7 +201,8 @@ impl OpenRouterProvider {
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
             return Err(SdkError::Other(anyhow::anyhow!(
-                "OpenRouter API error: {}", error_text
+                "OpenRouter API error: {}",
+                error_text
             )));
         }
 
@@ -256,7 +250,11 @@ impl OpenRouterProvider {
             stream: request.stream,
             route: self.route.clone(),
             provider: self.provider_preferences.clone(),
-            transforms: if self.transforms.is_empty() { None } else { Some(self.transforms.clone()) },
+            transforms: if self.transforms.is_empty() {
+                None
+            } else {
+                Some(self.transforms.clone())
+            },
             response_format,
             tools: request.tools,
             tool_choice: request.tool_choice,
@@ -266,14 +264,16 @@ impl OpenRouterProvider {
 
     /// Convert OpenRouter response to standard format
     fn convert_response(&self, response: OpenRouterChatResponse) -> ChatCompletionResponse {
-        let choices = response.choices.into_iter().map(|choice| {
-            Choice {
+        let choices = response
+            .choices
+            .into_iter()
+            .map(|choice| Choice {
                 index: choice.index,
                 message: choice.message,
                 finish_reason: choice.finish_reason,
                 logprobs: choice.logprobs,
-            }
-        }).collect();
+            })
+            .collect();
 
         ChatCompletionResponse::NonStream(crate::llm::models::ChatCompletion {
             id: response.id,
@@ -297,11 +297,15 @@ impl Provider for OpenRouterProvider {
         ProviderType::OpenRouter
     }
 
-    async fn chat_completion(&self, request: ChatCompletionRequest) -> Result<ChatCompletionResponse> {
+    async fn chat_completion(
+        &self,
+        request: ChatCompletionRequest,
+    ) -> Result<ChatCompletionResponse> {
         let url = format!("{}/chat/completions", self.base_url);
         let openrouter_request = self.build_chat_request(request.clone());
 
-        let mut http_request = self.http_client
+        let mut http_request = self
+            .http_client
             .post(&url)
             .bearer_auth(&self.config.api_key)
             .header("Content-Type", "application/json")
@@ -323,7 +327,8 @@ impl Provider for OpenRouterProvider {
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
             return Err(SdkError::Other(anyhow::anyhow!(
-                "OpenRouter API error: {}", error_text
+                "OpenRouter API error: {}",
+                error_text
             )));
         }
 

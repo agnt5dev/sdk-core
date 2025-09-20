@@ -1,6 +1,6 @@
 // Embeddings models for vector representations
-use serde::{Deserialize, Serialize};
 use super::EmbeddingUsage;
+use serde::{Deserialize, Serialize};
 
 /// Input data for embeddings - can be string or array of strings
 #[derive(Debug, Clone, Serialize, Deserialize)]

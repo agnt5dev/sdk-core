@@ -11,17 +11,17 @@ pub mod vectordb;
 // Re-export core types for easy access
 pub use models::{
     ChatCompletionRequest, ChatCompletionResponse, ChatMessage, ChatMessageContent,
-    CompletionRequest, CompletionResponse, EmbeddingsRequest, EmbeddingsResponse,
-    StreamingResponse, Usage, ReasoningConfig
+    CompletionRequest, CompletionResponse, EmbeddingsRequest, EmbeddingsResponse, ReasoningConfig,
+    StreamingResponse, Usage,
 };
-pub use provider::{Provider, ProviderType, get_vendor_name};
-pub use registry::LlmRegistry;
 pub use provider::ProviderConfig;
+pub use provider::{get_vendor_name, Provider, ProviderType};
+pub use registry::LlmRegistry;
 pub use telemetry::LlmSpan;
 pub use vectordb::{
-    VectorDatabase, VectorDbRegistry, VectorEntry, VectorMetadata,
-    SearchQuery, SearchResult, Collection, DistanceMetric,
-    rag::{RagPipeline, RagConfig, DocumentProcessor}
+    rag::{DocumentProcessor, RagConfig, RagPipeline},
+    Collection, DistanceMetric, SearchQuery, SearchResult, VectorDatabase, VectorDbRegistry,
+    VectorEntry, VectorMetadata,
 };
 
 // Public API for SDK consumers
@@ -57,8 +57,9 @@ impl LlmClient {
         provider_name: &str,
         request: ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse> {
-        let provider = self.registry.get_provider(provider_name)
-            .ok_or_else(|| SdkError::Other(anyhow::anyhow!("Provider not found: {}", provider_name)))?;
+        let provider = self.registry.get_provider(provider_name).ok_or_else(|| {
+            SdkError::Other(anyhow::anyhow!("Provider not found: {}", provider_name))
+        })?;
 
         // Create telemetry span for this operation
         let mut span = telemetry::LlmSpan::start_chat_completion(&request, provider.r#type());
@@ -81,8 +82,9 @@ impl LlmClient {
         provider_name: &str,
         request: CompletionRequest,
     ) -> Result<CompletionResponse> {
-        let provider = self.registry.get_provider(provider_name)
-            .ok_or_else(|| SdkError::Other(anyhow::anyhow!("Provider not found: {}", provider_name)))?;
+        let provider = self.registry.get_provider(provider_name).ok_or_else(|| {
+            SdkError::Other(anyhow::anyhow!("Provider not found: {}", provider_name))
+        })?;
 
         let mut span = telemetry::LlmSpan::start_completion(&request, provider.r#type());
 
@@ -104,8 +106,9 @@ impl LlmClient {
         provider_name: &str,
         request: EmbeddingsRequest,
     ) -> Result<EmbeddingsResponse> {
-        let provider = self.registry.get_provider(provider_name)
-            .ok_or_else(|| SdkError::Other(anyhow::anyhow!("Provider not found: {}", provider_name)))?;
+        let provider = self.registry.get_provider(provider_name).ok_or_else(|| {
+            SdkError::Other(anyhow::anyhow!("Provider not found: {}", provider_name))
+        })?;
 
         let mut span = telemetry::LlmSpan::start_embeddings(&request, provider.r#type());
 

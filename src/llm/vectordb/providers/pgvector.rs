@@ -1,11 +1,11 @@
 // PostgreSQL pgvector provider implementation
 use async_trait::async_trait;
 
-use crate::error::{Result, SdkError};
 use super::super::{
-    VectorDatabase, VectorEntry, SearchQuery, SearchResult,
-    VectorFilter, Collection, CollectionInfo
+    Collection, CollectionInfo, SearchQuery, SearchResult, VectorDatabase, VectorEntry,
+    VectorFilter,
 };
+use crate::error::{Result, SdkError};
 
 pub struct PgVectorProvider {
     database_url: String,
@@ -76,31 +76,19 @@ impl VectorDatabase for PgVectorProvider {
         )))
     }
 
-    async fn delete_vectors(
-        &self,
-        _collection_name: &str,
-        _ids: Vec<String>,
-    ) -> Result<()> {
+    async fn delete_vectors(&self, _collection_name: &str, _ids: Vec<String>) -> Result<()> {
         Err(SdkError::Other(anyhow::anyhow!(
             "PgVector provider requires PostgreSQL implementation. See constructor error for setup instructions."
         )))
     }
 
-    async fn delete_by_filter(
-        &self,
-        _collection_name: &str,
-        _filter: VectorFilter,
-    ) -> Result<()> {
+    async fn delete_by_filter(&self, _collection_name: &str, _filter: VectorFilter) -> Result<()> {
         Err(SdkError::Other(anyhow::anyhow!(
             "PgVector provider requires PostgreSQL implementation. See constructor error for setup instructions."
         )))
     }
 
-    async fn get_vector(
-        &self,
-        _collection_name: &str,
-        _id: &str,
-    ) -> Result<Option<VectorEntry>> {
+    async fn get_vector(&self, _collection_name: &str, _id: &str) -> Result<Option<VectorEntry>> {
         Err(SdkError::Other(anyhow::anyhow!(
             "PgVector provider requires PostgreSQL implementation. See constructor error for setup instructions."
         )))

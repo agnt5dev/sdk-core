@@ -2,12 +2,11 @@
 use async_trait::async_trait;
 use std::borrow::Cow;
 
-use crate::error::{Result, SdkError};
 use super::models::{
-    ChatCompletionRequest, ChatCompletionResponse,
-    CompletionRequest, CompletionResponse,
+    ChatCompletionRequest, ChatCompletionResponse, CompletionRequest, CompletionResponse,
     EmbeddingsRequest, EmbeddingsResponse,
 };
+use crate::error::{Result, SdkError};
 
 /// Enumeration of supported LLM provider types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -44,7 +43,10 @@ impl std::str::FromStr for ProviderType {
             "bedrock" => Ok(ProviderType::Bedrock),
             "vertexai" | "vertex_ai" => Ok(ProviderType::VertexAI),
             "openrouter" | "open_router" => Ok(ProviderType::OpenRouter),
-            _ => Err(SdkError::Other(anyhow::anyhow!("Unknown provider type: {}", s))),
+            _ => Err(SdkError::Other(anyhow::anyhow!(
+                "Unknown provider type: {}",
+                s
+            ))),
         }
     }
 }
@@ -65,16 +67,10 @@ pub trait Provider: Send + Sync {
     ) -> Result<ChatCompletionResponse>;
 
     /// Execute a completion request
-    async fn completion(
-        &self,
-        request: CompletionRequest,
-    ) -> Result<CompletionResponse>;
+    async fn completion(&self, request: CompletionRequest) -> Result<CompletionResponse>;
 
     /// Execute an embeddings request
-    async fn embeddings(
-        &self,
-        request: EmbeddingsRequest,
-    ) -> Result<EmbeddingsResponse>;
+    async fn embeddings(&self, request: EmbeddingsRequest) -> Result<EmbeddingsResponse>;
 
     /// Check if the provider is healthy/available
     async fn health_check(&self) -> Result<()> {

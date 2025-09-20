@@ -3,13 +3,12 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Result, SdkError};
-use super::super::provider::{Provider, ProviderType, ProviderConfig};
 use super::super::models::{
-    ChatCompletionRequest, ChatCompletionResponse, ChatCompletion,
-    CompletionRequest, CompletionResponse,
-    EmbeddingsRequest, EmbeddingsResponse,
+    ChatCompletion, ChatCompletionRequest, ChatCompletionResponse, CompletionRequest,
+    CompletionResponse, EmbeddingsRequest, EmbeddingsResponse,
 };
+use super::super::provider::{Provider, ProviderConfig, ProviderType};
+use crate::error::{Result, SdkError};
 
 /// Azure OpenAI-specific request format
 #[derive(Serialize, Deserialize, Clone)]
@@ -47,17 +46,22 @@ impl AzureProvider {
     }
 
     fn base_url(&self) -> Result<String> {
-        let endpoint = self.config.get_param("endpoint")
+        let endpoint = self
+            .config
+            .get_param("endpoint")
             .ok_or_else(|| SdkError::Other(anyhow::anyhow!("Azure endpoint not configured")))?;
 
-        let api_version = self.config.get_param("api_version")
+        let api_version = self
+            .config
+            .get_param("api_version")
             .unwrap_or(&"2024-02-01".to_string());
 
         Ok(format!("{}/openai", endpoint.trim_end_matches('/')))
     }
 
     fn api_version(&self) -> String {
-        self.config.get_param("api_version")
+        self.config
+            .get_param("api_version")
             .unwrap_or(&"2024-02-01".to_string())
             .clone()
     }
@@ -85,8 +89,9 @@ impl Provider for AzureProvider {
         }
 
         let base_url = self.base_url()?;
-        let deployment_name = self.config.get_param("deployment_name")
-            .ok_or_else(|| SdkError::Other(anyhow::anyhow!("Azure deployment_name not configured")))?;
+        let deployment_name = self.config.get_param("deployment_name").ok_or_else(|| {
+            SdkError::Other(anyhow::anyhow!("Azure deployment_name not configured"))
+        })?;
 
         let url = format!(
             "{}/deployments/{}/chat/completions?api-version={}",
@@ -97,7 +102,8 @@ impl Provider for AzureProvider {
 
         let azure_request = AzureChatCompletionRequest::from(request);
 
-        let response = self.http_client
+        let response = self
+            .http_client
             .post(&url)
             .header("api-key", &self.config.api_key)
             .header("Content-Type", "application/json")
@@ -111,17 +117,20 @@ impl Provider for AzureProvider {
 
         let status = response.status();
         if status.is_success() {
-            let completion: ChatCompletion = response
-                .json()
-                .await
-                .map_err(|e| {
-                    tracing::error!("Azure OpenAI API response parsing error: {}", e);
-                    SdkError::Other(anyhow::anyhow!("Failed to parse Azure OpenAI response: {}", e))
-                })?;
+            let completion: ChatCompletion = response.json().await.map_err(|e| {
+                tracing::error!("Azure OpenAI API response parsing error: {}", e);
+                SdkError::Other(anyhow::anyhow!(
+                    "Failed to parse Azure OpenAI response: {}",
+                    e
+                ))
+            })?;
 
             Ok(ChatCompletionResponse::NonStream(completion))
         } else {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
             tracing::error!("Azure OpenAI API error ({}): {}", status, error_text);
             Err(SdkError::Other(anyhow::anyhow!(
                 "Azure OpenAI API error ({}): {}",
@@ -131,13 +140,11 @@ impl Provider for AzureProvider {
         }
     }
 
-    async fn completion(
-        &self,
-        request: CompletionRequest,
-    ) -> Result<CompletionResponse> {
+    async fn completion(&self, request: CompletionRequest) -> Result<CompletionResponse> {
         let base_url = self.base_url()?;
-        let deployment_name = self.config.get_param("deployment_name")
-            .ok_or_else(|| SdkError::Other(anyhow::anyhow!("Azure deployment_name not configured")))?;
+        let deployment_name = self.config.get_param("deployment_name").ok_or_else(|| {
+            SdkError::Other(anyhow::anyhow!("Azure deployment_name not configured"))
+        })?;
 
         let url = format!(
             "{}/deployments/{}/completions?api-version={}",
@@ -146,7 +153,8 @@ impl Provider for AzureProvider {
             self.api_version()
         );
 
-        let response = self.http_client
+        let response = self
+            .http_client
             .post(&url)
             .header("api-key", &self.config.api_key)
             .header("Content-Type", "application/json")
@@ -155,23 +163,33 @@ impl Provider for AzureProvider {
             .await
             .map_err(|e| {
                 tracing::error!("Azure OpenAI completions API request error: {}", e);
-                SdkError::Other(anyhow::anyhow!("Azure OpenAI completions API request failed: {}", e))
+                SdkError::Other(anyhow::anyhow!(
+                    "Azure OpenAI completions API request failed: {}",
+                    e
+                ))
             })?;
 
         let status = response.status();
         if status.is_success() {
-            let completion: CompletionResponse = response
-                .json()
-                .await
-                .map_err(|e| {
-                    tracing::error!("Azure OpenAI completions API response parsing error: {}", e);
-                    SdkError::Other(anyhow::anyhow!("Failed to parse Azure OpenAI completions response: {}", e))
-                })?;
+            let completion: CompletionResponse = response.json().await.map_err(|e| {
+                tracing::error!("Azure OpenAI completions API response parsing error: {}", e);
+                SdkError::Other(anyhow::anyhow!(
+                    "Failed to parse Azure OpenAI completions response: {}",
+                    e
+                ))
+            })?;
 
             Ok(completion)
         } else {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-            tracing::error!("Azure OpenAI completions API error ({}): {}", status, error_text);
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            tracing::error!(
+                "Azure OpenAI completions API error ({}): {}",
+                status,
+                error_text
+            );
             Err(SdkError::Other(anyhow::anyhow!(
                 "Azure OpenAI completions API error ({}): {}",
                 status,
@@ -180,13 +198,11 @@ impl Provider for AzureProvider {
         }
     }
 
-    async fn embeddings(
-        &self,
-        request: EmbeddingsRequest,
-    ) -> Result<EmbeddingsResponse> {
+    async fn embeddings(&self, request: EmbeddingsRequest) -> Result<EmbeddingsResponse> {
         let base_url = self.base_url()?;
-        let deployment_name = self.config.get_param("deployment_name")
-            .ok_or_else(|| SdkError::Other(anyhow::anyhow!("Azure deployment_name not configured")))?;
+        let deployment_name = self.config.get_param("deployment_name").ok_or_else(|| {
+            SdkError::Other(anyhow::anyhow!("Azure deployment_name not configured"))
+        })?;
 
         let url = format!(
             "{}/deployments/{}/embeddings?api-version={}",
@@ -195,7 +211,8 @@ impl Provider for AzureProvider {
             self.api_version()
         );
 
-        let response = self.http_client
+        let response = self
+            .http_client
             .post(&url)
             .header("api-key", &self.config.api_key)
             .header("Content-Type", "application/json")
@@ -204,23 +221,33 @@ impl Provider for AzureProvider {
             .await
             .map_err(|e| {
                 tracing::error!("Azure OpenAI embeddings API request error: {}", e);
-                SdkError::Other(anyhow::anyhow!("Azure OpenAI embeddings API request failed: {}", e))
+                SdkError::Other(anyhow::anyhow!(
+                    "Azure OpenAI embeddings API request failed: {}",
+                    e
+                ))
             })?;
 
         let status = response.status();
         if status.is_success() {
-            let embeddings: EmbeddingsResponse = response
-                .json()
-                .await
-                .map_err(|e| {
-                    tracing::error!("Azure OpenAI embeddings API response parsing error: {}", e);
-                    SdkError::Other(anyhow::anyhow!("Failed to parse Azure OpenAI embeddings response: {}", e))
-                })?;
+            let embeddings: EmbeddingsResponse = response.json().await.map_err(|e| {
+                tracing::error!("Azure OpenAI embeddings API response parsing error: {}", e);
+                SdkError::Other(anyhow::anyhow!(
+                    "Failed to parse Azure OpenAI embeddings response: {}",
+                    e
+                ))
+            })?;
 
             Ok(embeddings)
         } else {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-            tracing::error!("Azure OpenAI embeddings API error ({}): {}", status, error_text);
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            tracing::error!(
+                "Azure OpenAI embeddings API error ({}): {}",
+                status,
+                error_text
+            );
             Err(SdkError::Other(anyhow::anyhow!(
                 "Azure OpenAI embeddings API error ({}): {}",
                 status,
@@ -234,7 +261,8 @@ impl Provider for AzureProvider {
         let base_url = self.base_url()?;
         let url = format!("{}/models?api-version={}", base_url, self.api_version());
 
-        let response = self.http_client
+        let response = self
+            .http_client
             .get(&url)
             .header("api-key", &self.config.api_key)
             .send()
@@ -248,8 +276,15 @@ impl Provider for AzureProvider {
         if status.is_success() {
             Ok(())
         } else {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-            tracing::error!("Azure OpenAI health check failed ({}): {}", status, error_text);
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            tracing::error!(
+                "Azure OpenAI health check failed ({}): {}",
+                status,
+                error_text
+            );
             Err(SdkError::Other(anyhow::anyhow!(
                 "Azure OpenAI health check failed ({}): {}",
                 status,

@@ -7,13 +7,13 @@ pub mod usage;
 
 // Re-export commonly used types
 pub use chat::{
-    ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
-    ChatMessageContent, ChatChoice, ReasoningConfig, ChatCompletion, ContentPart
+    ChatChoice, ChatCompletion, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
+    ChatMessageContent, ContentPart, ReasoningConfig,
 };
-pub use completion::{CompletionRequest, CompletionResponse, CompletionChoice};
-pub use embeddings::{EmbeddingsRequest, EmbeddingsResponse, EmbeddingData, EmbeddingsInput};
-pub use streaming::{StreamingResponse, ChatCompletionChunk, CompletionChunk};
-pub use usage::{Usage, EmbeddingUsage};
+pub use completion::{CompletionChoice, CompletionRequest, CompletionResponse};
+pub use embeddings::{EmbeddingData, EmbeddingsInput, EmbeddingsRequest, EmbeddingsResponse};
+pub use streaming::{ChatCompletionChunk, CompletionChunk, StreamingResponse};
+pub use usage::{EmbeddingUsage, Usage};
 
 // Tool types (defined in this module - exports only the alias)
 pub use ToolDefinition as Tool;

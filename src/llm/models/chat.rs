@@ -1,6 +1,6 @@
 // Chat completion models extracted and adapted from Hub
+use super::{ResponseFormat, ToolCall, ToolChoice, ToolDefinition, Usage};
 use serde::{Deserialize, Serialize};
-use super::{ToolDefinition, ToolCall, ToolChoice, ResponseFormat, Usage};
 
 /// Configuration for reasoning/thinking mode (o1-style models)
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -200,7 +200,14 @@ pub struct ChatCompletion {
 /// Chat completion response (streaming or non-streaming)
 pub enum ChatCompletionResponse {
     NonStream(ChatCompletion),
-    Stream(Box<dyn futures::Stream<Item = Result<super::streaming::ChatCompletionChunk, crate::error::SdkError>> + Send + Unpin>),
+    Stream(
+        Box<
+            dyn futures::Stream<
+                    Item = Result<super::streaming::ChatCompletionChunk, crate::error::SdkError>,
+                > + Send
+                + Unpin,
+        >,
+    ),
 }
 
 impl std::fmt::Debug for ChatCompletionResponse {

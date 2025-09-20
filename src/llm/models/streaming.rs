@@ -1,6 +1,6 @@
 // Streaming response models for real-time LLM interactions
+use super::{ToolCall, Usage};
 use serde::{Deserialize, Serialize};
-use super::{Usage, ToolCall};
 
 /// Delta message for streaming chat completions
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,15 +122,21 @@ pub struct AccumulatedChoice {
 
 impl ChatCompletionAccumulator {
     pub fn new(first_chunk: &ChatCompletionChunk) -> Self {
-        let choices = first_chunk.choices.iter().map(|choice| {
-            AccumulatedChoice {
+        let choices = first_chunk
+            .choices
+            .iter()
+            .map(|choice| AccumulatedChoice {
                 index: choice.index,
                 content: choice.delta.content.clone().unwrap_or_default(),
-                role: choice.delta.role.clone().unwrap_or_else(|| "assistant".to_string()),
+                role: choice
+                    .delta
+                    .role
+                    .clone()
+                    .unwrap_or_else(|| "assistant".to_string()),
                 tool_calls: choice.delta.tool_calls.clone(),
                 finish_reason: choice.finish_reason.clone(),
-            }
-        }).collect();
+            })
+            .collect();
 
         Self {
             id: first_chunk.id.clone(),

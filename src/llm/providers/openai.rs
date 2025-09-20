@@ -3,13 +3,12 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Result, SdkError};
-use super::super::provider::{Provider, ProviderType, ProviderConfig};
 use super::super::models::{
-    ChatCompletionRequest, ChatCompletionResponse, ChatCompletion,
-    CompletionRequest, CompletionResponse,
-    EmbeddingsRequest, EmbeddingsResponse,
+    ChatCompletion, ChatCompletionRequest, ChatCompletionResponse, CompletionRequest,
+    CompletionResponse, EmbeddingsRequest, EmbeddingsResponse,
 };
+use super::super::provider::{Provider, ProviderConfig, ProviderType};
+use crate::error::{Result, SdkError};
 
 /// OpenAI-specific request format with reasoning support
 #[derive(Serialize, Deserialize, Clone)]
@@ -83,7 +82,10 @@ impl Provider for OpenAIProvider {
         if let Some(reasoning) = &request.reasoning {
             if let Err(e) = reasoning.validate() {
                 tracing::error!("Invalid reasoning config: {}", e);
-                return Err(SdkError::Other(anyhow::anyhow!("Invalid reasoning config: {}", e)));
+                return Err(SdkError::Other(anyhow::anyhow!(
+                    "Invalid reasoning config: {}",
+                    e
+                )));
             }
         }
 
@@ -112,18 +114,18 @@ impl Provider for OpenAIProvider {
                     "Streaming not yet implemented for OpenAI - use stream: false"
                 )));
             } else {
-                let completion: ChatCompletion = response
-                    .json()
-                    .await
-                    .map_err(|e| {
-                        tracing::error!("OpenAI API response parsing error: {}", e);
-                        SdkError::Other(anyhow::anyhow!("Failed to parse OpenAI response: {}", e))
-                    })?;
+                let completion: ChatCompletion = response.json().await.map_err(|e| {
+                    tracing::error!("OpenAI API response parsing error: {}", e);
+                    SdkError::Other(anyhow::anyhow!("Failed to parse OpenAI response: {}", e))
+                })?;
 
                 Ok(ChatCompletionResponse::NonStream(completion))
             }
         } else {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
             tracing::error!("OpenAI API error ({}): {}", status, error_text);
             Err(SdkError::Other(anyhow::anyhow!(
                 "OpenAI API error ({}): {}",
@@ -133,10 +135,7 @@ impl Provider for OpenAIProvider {
         }
     }
 
-    async fn completion(
-        &self,
-        request: CompletionRequest,
-    ) -> Result<CompletionResponse> {
+    async fn completion(&self, request: CompletionRequest) -> Result<CompletionResponse> {
         let response = self
             .http_client
             .post(format!("{}/completions", self.base_url()))
@@ -147,22 +146,28 @@ impl Provider for OpenAIProvider {
             .await
             .map_err(|e| {
                 tracing::error!("OpenAI completions API request error: {}", e);
-                SdkError::Other(anyhow::anyhow!("OpenAI completions API request failed: {}", e))
+                SdkError::Other(anyhow::anyhow!(
+                    "OpenAI completions API request failed: {}",
+                    e
+                ))
             })?;
 
         let status = response.status();
         if status.is_success() {
-            let completion: CompletionResponse = response
-                .json()
-                .await
-                .map_err(|e| {
-                    tracing::error!("OpenAI completions API response parsing error: {}", e);
-                    SdkError::Other(anyhow::anyhow!("Failed to parse OpenAI completions response: {}", e))
-                })?;
+            let completion: CompletionResponse = response.json().await.map_err(|e| {
+                tracing::error!("OpenAI completions API response parsing error: {}", e);
+                SdkError::Other(anyhow::anyhow!(
+                    "Failed to parse OpenAI completions response: {}",
+                    e
+                ))
+            })?;
 
             Ok(completion)
         } else {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
             tracing::error!("OpenAI completions API error ({}): {}", status, error_text);
             Err(SdkError::Other(anyhow::anyhow!(
                 "OpenAI completions API error ({}): {}",
@@ -172,10 +177,7 @@ impl Provider for OpenAIProvider {
         }
     }
 
-    async fn embeddings(
-        &self,
-        request: EmbeddingsRequest,
-    ) -> Result<EmbeddingsResponse> {
+    async fn embeddings(&self, request: EmbeddingsRequest) -> Result<EmbeddingsResponse> {
         let response = self
             .http_client
             .post(format!("{}/embeddings", self.base_url()))
@@ -186,22 +188,28 @@ impl Provider for OpenAIProvider {
             .await
             .map_err(|e| {
                 tracing::error!("OpenAI embeddings API request error: {}", e);
-                SdkError::Other(anyhow::anyhow!("OpenAI embeddings API request failed: {}", e))
+                SdkError::Other(anyhow::anyhow!(
+                    "OpenAI embeddings API request failed: {}",
+                    e
+                ))
             })?;
 
         let status = response.status();
         if status.is_success() {
-            let embeddings: EmbeddingsResponse = response
-                .json()
-                .await
-                .map_err(|e| {
-                    tracing::error!("OpenAI embeddings API response parsing error: {}", e);
-                    SdkError::Other(anyhow::anyhow!("Failed to parse OpenAI embeddings response: {}", e))
-                })?;
+            let embeddings: EmbeddingsResponse = response.json().await.map_err(|e| {
+                tracing::error!("OpenAI embeddings API response parsing error: {}", e);
+                SdkError::Other(anyhow::anyhow!(
+                    "Failed to parse OpenAI embeddings response: {}",
+                    e
+                ))
+            })?;
 
             Ok(embeddings)
         } else {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
             tracing::error!("OpenAI embeddings API error ({}): {}", status, error_text);
             Err(SdkError::Other(anyhow::anyhow!(
                 "OpenAI embeddings API error ({}): {}",
@@ -219,9 +227,7 @@ impl Provider for OpenAIProvider {
             .header("Authorization", format!("Bearer {}", self.config.api_key))
             .send()
             .await
-            .map_err(|e| {
-                SdkError::Other(anyhow::anyhow!("OpenAI health check failed: {}", e))
-            })?;
+            .map_err(|e| SdkError::Other(anyhow::anyhow!("OpenAI health check failed: {}", e)))?;
 
         if response.status().is_success() {
             Ok(())

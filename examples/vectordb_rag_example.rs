@@ -1,8 +1,7 @@
 // Example demonstrating Vector Database and RAG functionality in AGNT5 SDK-Core
 use agnt5_sdk_core::llm::{
-    LlmClient, VectorDbRegistry, Collection, DistanceMetric,
-    RagPipeline, RagConfig, DocumentProcessor,
-    EmbeddingsRequest, models::EmbeddingsInput
+    models::EmbeddingsInput, Collection, DistanceMetric, DocumentProcessor, EmbeddingsRequest,
+    LlmClient, RagConfig, RagPipeline, VectorDbRegistry,
 };
 use agnt5_sdk_core::{init_logging, init_telemetry};
 use std::sync::Arc;
@@ -72,7 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn test_basic_vectordb_operations(
-    vector_db: &Arc<dyn agnt5_sdk_core::llm::VectorDatabase>
+    vector_db: &Arc<dyn agnt5_sdk_core::llm::VectorDatabase>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("\n🧪 Testing Basic Vector DB Operations");
 
@@ -100,7 +99,7 @@ async fn test_basic_vectordb_operations(
 
 async fn test_rag_pipeline(
     llm_client: &Arc<LlmClient>,
-    vector_db: &Arc<dyn agnt5_sdk_core::llm::VectorDatabase>
+    vector_db: &Arc<dyn agnt5_sdk_core::llm::VectorDatabase>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("\n🤖 Testing RAG Pipeline");
 
@@ -119,7 +118,8 @@ async fn test_rag_pipeline(
         llm_provider.clone(),
         "gpt-3.5-turbo".to_string(),
         "test_documents".to_string(),
-    ).with_num_results(3);
+    )
+    .with_num_results(3);
 
     let rag_pipeline = RagPipeline::new(
         llm_client.clone(),
@@ -140,7 +140,10 @@ async fn test_rag_pipeline(
     // Ingest documents
     println!("📄 Ingesting {} documents...", documents.len());
     for (text, source) in documents {
-        match rag_pipeline.ingest_document(text, Some(source.to_string())).await {
+        match rag_pipeline
+            .ingest_document(text, Some(source.to_string()))
+            .await
+        {
             Ok(()) => println!("✅ Ingested: {}", source),
             Err(e) => println!("❌ Failed to ingest {}: {}", source, e),
         }
@@ -177,7 +180,7 @@ async fn test_rag_pipeline(
 }
 
 async fn demonstrate_vectordb_concepts(
-    llm_client: &Arc<LlmClient>
+    llm_client: &Arc<LlmClient>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("\n🎓 Demonstrating Vector Database Concepts (without actual DB)");
 
@@ -210,7 +213,8 @@ async fn demonstrate_vectordb_concepts(
         match llm_client.embeddings(provider, request).await {
             Ok(response) => {
                 if let Some(embedding) = response.first_embedding() {
-                    println!("✅ Text {}: {} dimensions, first 5 values: {:?}",
+                    println!(
+                        "✅ Text {}: {} dimensions, first 5 values: {:?}",
                         i + 1,
                         embedding.len(),
                         &embedding[..5.min(embedding.len())]
@@ -235,7 +239,8 @@ async fn demonstrate_vectordb_concepts(
     println!("Generated {} chunks:", chunks.len());
 
     for (i, chunk) in chunks.iter().enumerate() {
-        println!("  Chunk {}: {} chars - \"{}...\"",
+        println!(
+            "  Chunk {}: {} chars - \"{}...\"",
             i + 1,
             chunk.text.len(),
             chunk.text.chars().take(50).collect::<String>()

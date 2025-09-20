@@ -1,11 +1,11 @@
 // RAG (Retrieval-Augmented Generation) pipeline components
-use std::sync::Arc;
 use regex::Regex;
+use std::sync::Arc;
 use unicode_segmentation::UnicodeSegmentation;
 
+use super::super::{ChatCompletionRequest, ChatMessage, ChatMessageContent, LlmClient};
+use super::{SearchQuery, SearchResult, VectorDatabase, VectorEntry, VectorMetadata};
 use crate::error::{Result, SdkError};
-use super::{VectorDatabase, VectorEntry, VectorMetadata, SearchQuery, SearchResult};
-use super::super::{LlmClient, ChatCompletionRequest, ChatMessage, ChatMessageContent};
 
 /// Document processing and chunking for RAG pipelines
 #[derive(Debug, Clone)]
@@ -26,10 +26,10 @@ impl DocumentProcessor {
             max_chunk_size: 1000,
             chunk_overlap: 200,
             separators: vec![
-                "\n\n".to_string(),  // Paragraphs
-                "\n".to_string(),    // Lines
-                ". ".to_string(),    // Sentences
-                " ".to_string(),     // Words
+                "\n\n".to_string(), // Paragraphs
+                "\n".to_string(),   // Lines
+                ". ".to_string(),   // Sentences
+                " ".to_string(),    // Words
             ],
         }
     }
@@ -83,7 +83,12 @@ impl DocumentProcessor {
         chunks
     }
 
-    fn try_split_by_separator(&self, text: &str, separator: &str, chunks: &mut Vec<String>) -> bool {
+    fn try_split_by_separator(
+        &self,
+        text: &str,
+        separator: &str,
+        chunks: &mut Vec<String>,
+    ) -> bool {
         let parts: Vec<&str> = text.split(separator).collect();
 
         if parts.len() <= 1 {
@@ -254,7 +259,9 @@ impl RagPipeline {
 
         let question_vector = question_embedding_response
             .first_embedding()
-            .ok_or_else(|| SdkError::Other(anyhow::anyhow!("Failed to generate question embedding")))?;
+            .ok_or_else(|| {
+                SdkError::Other(anyhow::anyhow!("Failed to generate question embedding"))
+            })?;
 
         // 2. Search for relevant documents
         let search_query = SearchQuery::new(question_vector.clone())
@@ -308,19 +315,19 @@ impl RagPipeline {
 
         // 5. Extract response text
         let response_text = match chat_response {
-            super::super::ChatCompletionResponse::NonStream(completion) => {
-                completion
-                    .choices
-                    .first()
-                    .and_then(|choice| choice.message.content.as_ref())
-                    .and_then(|content| match content {
-                        ChatMessageContent::String(text) => Some(text.clone()),
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| "No response generated".to_string())
-            }
+            super::super::ChatCompletionResponse::NonStream(completion) => completion
+                .choices
+                .first()
+                .and_then(|choice| choice.message.content.as_ref())
+                .and_then(|content| match content {
+                    ChatMessageContent::String(text) => Some(text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "No response generated".to_string()),
             super::super::ChatCompletionResponse::Stream(_) => {
-                return Err(SdkError::Other(anyhow::anyhow!("Streaming not supported in RAG pipeline yet")));
+                return Err(SdkError::Other(anyhow::anyhow!(
+                    "Streaming not supported in RAG pipeline yet"
+                )));
             }
         };
 
@@ -334,9 +341,7 @@ impl RagPipeline {
     fn build_context(&self, search_results: &[SearchResult]) -> String {
         let context_parts: Vec<String> = search_results
             .iter()
-            .filter_map(|result| {
-                result.metadata.as_ref()?.text.as_ref()
-            })
+            .filter_map(|result| result.metadata.as_ref()?.text.as_ref())
             .map(|text| text.clone())
             .collect();
 
