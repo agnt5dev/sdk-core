@@ -45,7 +45,7 @@ opentelemetry-appender-tracing = "0.30"
 tracing-opentelemetry = "0.31"
 
 # UUID generation
-uuid = { version = "1.0", features = ["v4"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }
 
 # Random number generation for jitter
 rand = "0.9"
@@ -53,6 +53,40 @@ rand = "0.9"
 # Additional logging and time dependencies
 lazy_static = "1.4"
 chrono = { version = "0.4", features = ["serde"] }
+
+# LLM Provider Dependencies
+# HTTP client with streaming support
+reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest-streams = { version = "0.6", features = ["json"] }
+futures = "0.3"
+
+# AWS SDK for Bedrock - Temporarily disabled due to Rust version requirements
+# aws-sdk-bedrockruntime = "1.50"
+# aws-config = "1.1"
+# aws-credential-types = { version = "1.1", features = ["hardcoded-credentials"] }
+# aws-smithy-runtime = { version = "1.1", features = ["test-util"] }
+# aws-smithy-types = "1.1"
+# aws-types = "1.1"
+
+# Google OAuth for VertexAI
+yup-oauth2 = "8.3"
+
+# OpenTelemetry semantic conventions for LLM operations
+opentelemetry-semantic-conventions = { version = "0.27", features = ["semconv_experimental"] }
+
+# HTTP utilities
+http = "1.1"
+
+# Vector Database Dependencies
+# Qdrant vector database client
+qdrant-client = "1.10"
+
+# Additional JSON utilities for metadata
+serde_yaml = "0.9"
+
+# For text processing and chunking
+regex = "1.0"
+unicode-segmentation = "1.10"
 
 # Build dependencies
 [build-dependencies]
@@ -62,3 +96,15 @@ tonic-prost-build = "0.14"
 [[example]]
 name = "debug_worker"
 path = "examples/debug_worker.rs"
+
+[[example]]
+name = "llm_example"
+path = "examples/llm_example.rs"
+
+[[example]]
+name = "vectordb_rag_example"
+path = "examples/vectordb_rag_example.rs"
+
+[[example]]
+name = "openrouter_example"
+path = "examples/openrouter_example.rs"
