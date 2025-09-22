@@ -66,7 +66,7 @@ impl LlmClient {
 
         match provider.chat_completion(request).await {
             Ok(response) => {
-                span.log_success(&response);
+                span.log_chat_success(&response);
                 Ok(response)
             }
             Err(error) => {
@@ -90,7 +90,7 @@ impl LlmClient {
 
         match provider.completion(request).await {
             Ok(response) => {
-                span.log_success(&response);
+                span.log_completion_success(&response);
                 Ok(response)
             }
             Err(error) => {
@@ -114,7 +114,7 @@ impl LlmClient {
 
         match provider.embeddings(request).await {
             Ok(response) => {
-                span.log_success(&response);
+                span.log_embeddings_success(&response);
                 Ok(response)
             }
             Err(error) => {

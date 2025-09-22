@@ -6,19 +6,74 @@ use super::models::{
 };
 use super::provider::{get_vendor_name, ProviderType};
 use crate::telemetry::{create_function_span, record_span_error, record_span_success};
-use opentelemetry::trace::{Span, SpanKind, Status, Tracer};
+use opentelemetry::metrics::{Counter, Histogram};
+use opentelemetry::trace::Span;
 use opentelemetry::{global, KeyValue};
 use opentelemetry_semantic_conventions::trace::*;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 /// Trait for recording span attributes from LLM requests/responses
 pub trait RecordSpan {
     fn record_span(&self, span: &mut opentelemetry::global::BoxedSpan);
 }
 
+struct LlmMetrics {
+    request_counter: Counter<u64>,
+    latency_histogram: Histogram<f64>,
+    tokens_counter: Counter<u64>,
+}
+
+impl LlmMetrics {
+    fn new() -> Self {
+        let meter = global::meter("agnt5-sdk-core.llm");
+        let request_counter = meter
+            .u64_counter("llm.request.count")
+            .with_description("Count of LLM proxy requests")
+            .build();
+        let latency_histogram = meter
+            .f64_histogram("llm.latency.ms")
+            .with_description("LLM request latency in milliseconds")
+            .build();
+        let tokens_counter = meter
+            .u64_counter("llm.tokens.total")
+            .with_description("Total tokens consumed by LLM proxy")
+            .build();
+        Self {
+            request_counter,
+            latency_histogram,
+            tokens_counter,
+        }
+    }
+
+    fn record(&self, mode: &str, model: &str, status: &str, latency_ms: f64, total_tokens: u64) {
+        let attributes = [
+            KeyValue::new("mode", mode.to_string()),
+            KeyValue::new("model", model.to_string()),
+            KeyValue::new("status", status.to_string()),
+        ];
+        self.request_counter.add(1, &attributes);
+        self.latency_histogram.record(latency_ms, &attributes);
+        if total_tokens > 0 {
+            self.tokens_counter.add(total_tokens, &attributes);
+        }
+    }
+}
+
+fn metrics() -> &'static LlmMetrics {
+    static METRICS: OnceLock<LlmMetrics> = OnceLock::new();
+    METRICS.get_or_init(LlmMetrics::new)
+}
+
 /// LLM-specific span wrapper that integrates with AGNT5's telemetry
 pub struct LlmSpan {
     span: opentelemetry::global::BoxedSpan,
     accumulated_completion: Option<ChatCompletion>,
+    start: Instant,
+    mode: &'static str,
+    model: Option<String>,
+    latest_usage: Option<Usage>,
+    metrics_recorded: bool,
 }
 
 impl LlmSpan {
@@ -33,10 +88,16 @@ impl LlmSpan {
             "llm-worker",
             "llm-invocation",
             None,
+            None,
         );
         let mut llm_span = Self {
             span,
             accumulated_completion: None,
+            start: Instant::now(),
+            mode: "chat",
+            model: Some(request.model.clone()),
+            latest_usage: None,
+            metrics_recorded: false,
         };
 
         // Record request attributes
@@ -54,10 +115,16 @@ impl LlmSpan {
             "llm-worker",
             "llm-invocation",
             None,
+            None,
         );
         let mut llm_span = Self {
             span,
             accumulated_completion: None,
+            start: Instant::now(),
+            mode: "complete",
+            model: Some(request.model.clone()),
+            latest_usage: None,
+            metrics_recorded: false,
         };
 
         llm_span.set_vendor(&provider_type);
@@ -74,10 +141,16 @@ impl LlmSpan {
             "llm-worker",
             "llm-invocation",
             None,
+            None,
         );
         let mut llm_span = Self {
             span,
             accumulated_completion: None,
+            start: Instant::now(),
+            mode: "embeddings",
+            model: Some(request.model.clone()),
+            latest_usage: None,
+            metrics_recorded: false,
         };
 
         llm_span.set_vendor(&provider_type);
@@ -150,19 +223,50 @@ impl LlmSpan {
             // Update usage if present
             if let Some(usage) = &chunk.usage {
                 completion.usage = usage.clone();
+                self.latest_usage = Some(usage.clone());
             }
         }
     }
 
-    /// Log successful completion
-    pub fn log_success<T: RecordSpan>(&mut self, response: &T) {
+    /// Log successful chat completion response
+    pub fn log_chat_success(&mut self, response: &ChatCompletionResponse) {
         response.record_span(&mut self.span);
-        record_span_success(&mut self.span, 0); // TODO: Add actual output size
+        record_span_success(&mut self.span, 0);
+
+        match response {
+            ChatCompletionResponse::NonStream(completion) => {
+                self.model = Some(completion.model.clone());
+                self.latest_usage = Some(completion.usage.clone());
+            }
+            ChatCompletionResponse::Stream(_) => {
+                // usage recorded via streaming chunks
+            }
+        }
+
+        self.record_metrics("success");
+    }
+
+    /// Log successful completion response
+    pub fn log_completion_success(&mut self, response: &CompletionResponse) {
+        response.record_span(&mut self.span);
+        record_span_success(&mut self.span, 0);
+        self.model = Some(response.model.clone());
+        self.latest_usage = Some(response.usage.clone());
+        self.record_metrics("success");
+    }
+
+    /// Log successful embeddings response
+    pub fn log_embeddings_success(&mut self, response: &EmbeddingsResponse) {
+        response.record_span(&mut self.span);
+        record_span_success(&mut self.span, 0);
+        self.model = Some(response.model.clone());
+        self.record_metrics("success");
     }
 
     /// Log error
     pub fn log_error(&mut self, error: &crate::error::SdkError) {
         record_span_error(&mut self.span, &error.to_string());
+        self.record_metrics("error");
     }
 
     /// Finish the span (called automatically on drop)
@@ -170,8 +274,24 @@ impl LlmSpan {
         // If we have accumulated completion from streaming, record it
         if let Some(completion) = &self.accumulated_completion {
             completion.record_span(&mut self.span);
+            self.latest_usage = Some(completion.usage.clone());
         }
-        // Span will be finished when dropped
+        self.record_metrics("success");
+    }
+
+    fn record_metrics(&mut self, status: &str) {
+        if self.metrics_recorded {
+            return;
+        }
+        let latency_ms = self.start.elapsed().as_secs_f64() * 1000.0;
+        let model = self.model.clone().unwrap_or_else(|| "unknown".to_string());
+        let total_tokens = self
+            .latest_usage
+            .as_ref()
+            .map(|usage| usage.prompt_tokens as u64 + usage.completion_tokens as u64)
+            .unwrap_or(0);
+        metrics().record(self.mode, &model, status, latency_ms, total_tokens);
+        self.metrics_recorded = true;
     }
 }
 
@@ -180,7 +300,9 @@ impl Drop for LlmSpan {
         // Record accumulated completion if we have one
         if let Some(completion) = &self.accumulated_completion {
             completion.record_span(&mut self.span);
+            self.latest_usage = Some(completion.usage.clone());
         }
+        self.record_metrics("success");
     }
 }
 

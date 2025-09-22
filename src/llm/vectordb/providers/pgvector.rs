@@ -8,11 +8,12 @@ use super::super::{
 use crate::error::{Result, SdkError};
 
 pub struct PgVectorProvider {
+    #[allow(dead_code)]
     database_url: String,
 }
 
 impl PgVectorProvider {
-    pub async fn new(database_url: &str) -> Result<Self> {
+    pub async fn new(_database_url: &str) -> Result<Self> {
         // PgVector provider requires additional dependencies:
         // - tokio-postgres or sqlx for async PostgreSQL connection
         // - pgvector-sqlx or pgvector extension support

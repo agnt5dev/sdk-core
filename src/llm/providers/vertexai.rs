@@ -80,6 +80,7 @@ impl VertexAIProvider {
         }
     }
 
+    #[allow(dead_code)]
     fn project_id(&self) -> Result<String> {
         self.config
             .get_param("project_id")
@@ -89,6 +90,7 @@ impl VertexAIProvider {
             .map(|s| s.clone())
     }
 
+    #[allow(dead_code)]
     fn location(&self) -> String {
         self.config
             .get_param("location")

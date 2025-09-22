@@ -51,7 +51,7 @@ impl AzureProvider {
             .get_param("endpoint")
             .ok_or_else(|| SdkError::Other(anyhow::anyhow!("Azure endpoint not configured")))?;
 
-        let api_version = self
+        let _api_version = self
             .config
             .get_param("api_version")
             .unwrap_or(&"2024-02-01".to_string());

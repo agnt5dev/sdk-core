@@ -2,15 +2,12 @@
 use async_trait::async_trait;
 use qdrant_client::{
     qdrant::{
-        CollectionInfo as QdrantCollectionInfo, CollectionOperationResponse, Condition,
-        CreateCollection, DeletePoints, Distance, Filter, GetPoints, NamedVectors, PointId,
-        PointStruct, PointsIdsList, PointsOperationResponse, PointsSelector, ScoredPoint,
-        SearchParams, SearchPoints, UpsertPoints, Value as QdrantValue, VectorParams, Vectors,
-        WithPayloadSelector, WithVectorsSelector,
+        Condition, CreateCollection, DeletePoints, Distance, Filter, GetPoints, PointId,
+        PointStruct, PointsIdsList, PointsSelector, SearchPoints, UpsertPoints,
+        Value as QdrantValue, VectorParams, WithPayloadSelector, WithVectorsSelector,
     },
     Qdrant,
 };
-use serde_json::Value;
 use std::collections::HashMap;
 
 use super::super::types::{FilterCondition, FilterOperation};
@@ -22,11 +19,12 @@ use crate::error::{Result, SdkError};
 
 pub struct QdrantProvider {
     client: Qdrant,
+    #[allow(dead_code)]
     url: String,
 }
 
 impl QdrantProvider {
-    pub async fn new(url: &str, api_key: Option<String>) -> Result<Self> {
+    pub async fn new(url: &str, _api_key: Option<String>) -> Result<Self> {
         let client = Qdrant::from_url(url).build().map_err(|e| {
             SdkError::Other(anyhow::anyhow!("Failed to create Qdrant client: {}", e))
         })?;

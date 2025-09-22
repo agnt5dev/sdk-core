@@ -19,6 +19,7 @@ impl BedrockProvider {
         }
     }
 
+    #[allow(dead_code)]
     fn region(&self) -> String {
         self.config
             .get_param("region")

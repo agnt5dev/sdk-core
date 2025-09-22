@@ -14,7 +14,6 @@ pub use types::{
 
 use crate::error::Result;
 use async_trait::async_trait;
-use serde_json::Value;
 
 /// Core trait that all vector database providers must implement
 #[async_trait]

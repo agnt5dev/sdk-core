@@ -1,5 +1,4 @@
 // RAG (Retrieval-Augmented Generation) pipeline components
-use regex::Regex;
 use std::sync::Arc;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -66,7 +65,6 @@ impl DocumentProcessor {
         }
 
         let mut chunks = Vec::new();
-        let mut current_chunk = String::new();
 
         // Try each separator in order
         for separator in &self.separators {

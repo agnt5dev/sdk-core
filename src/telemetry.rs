@@ -11,6 +11,7 @@ use opentelemetry_sdk::{
     trace::SdkTracerProvider,
     Resource,
 };
+use opentelemetry::propagation::TextMapCompositePropagator;
 use std::collections::HashMap;
 use tracing_subscriber::{fmt::format::Writer, layer::SubscriberExt, EnvFilter, Registry};
 
@@ -136,12 +137,16 @@ pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), S
     global::set_tracer_provider(trace_provider);
 
     // Set up composite propagation for both trace context and baggage
-    // Using a simple approach: set up both propagators sequentially
     let trace_propagator = TraceContextPropagator::new();
     let baggage_propagator = BaggagePropagator::new();
 
-    // For now, just use trace propagator - baggage will be handled in extract function
-    global::set_text_map_propagator(trace_propagator);
+    // Create composite propagator that handles both trace context and baggage
+    let composite_propagator = TextMapCompositePropagator::new(vec![
+        Box::new(trace_propagator) as Box<dyn TextMapPropagator + Send + Sync>,
+        Box::new(baggage_propagator) as Box<dyn TextMapPropagator + Send + Sync>,
+    ]);
+
+    global::set_text_map_propagator(composite_propagator);
 
     // Set up tracing subscriber with OpenTelemetry layers
     let telemetry_layer = tracing_opentelemetry::layer().with_tracer(tracer);
@@ -211,6 +216,7 @@ pub fn create_function_span(
     worker_id: &str,
     invocation_id: &str,
     parent_context: Option<Context>,
+    metadata: Option<&HashMap<String, String>>,
 ) -> BoxedSpan {
     let tracer = global::tracer("agnt5-sdk-core");
 
@@ -239,6 +245,36 @@ pub fn create_function_span(
         }
     } else {
         tracing::debug!("No parent context provided for baggage extraction");
+    }
+
+    if let Some(meta) = metadata {
+        if let Some(tenant_id) = meta.get("tenant_id") {
+            attributes.push(KeyValue::new("tenant.id", tenant_id.clone()));
+        }
+        if let Some(run_id) = meta.get("run_id") {
+            attributes.push(KeyValue::new("run.id", run_id.clone()));
+        }
+        if let Some(step_name) = meta.get("step_name") {
+            attributes.push(KeyValue::new("function.step_name", step_name.clone()));
+        }
+        if let Some(attempt) = meta
+            .get("attempt")
+            .or_else(|| meta.get("attempt_number"))
+            .or_else(|| meta.get("step_attempt"))
+        {
+            if let Ok(parsed) = attempt.parse::<i64>() {
+                attributes.push(KeyValue::new("function.step_attempt", parsed));
+            }
+        }
+        if let Some(traceparent) = meta.get("traceparent") {
+            attributes.push(KeyValue::new("traceparent", traceparent.clone()));
+        }
+        if let Some(user_id) = meta.get("user_id") {
+            attributes.push(KeyValue::new("user.id", user_id.clone()));
+        }
+        if let Some(request_id) = meta.get("request_id") {
+            attributes.push(KeyValue::new("request.id", request_id.clone()));
+        }
     }
 
     let span_builder = tracer
