@@ -7,9 +7,11 @@
 
 pub mod config;
 pub mod namespaces;
+pub mod registry;
 
 pub use config::ContextConfig;
 pub use namespaces::{
-    CoreContext, FunctionCall, FunctionHandle, FunctionNamespace, LanguageModelNamespace,
-    SignalNamespace, TimerNamespace,
+    CoreContext, FunctionHandle, FunctionNamespace, FunctionResult, FunctionStatus,
+    LanguageModelNamespace, SignalNamespace, TimerNamespace,
 };
+pub use registry::{FunctionCall, FunctionRegistry, InvocationContext};

@@ -20,8 +20,8 @@ pub use adk::{
 };
 pub use client::WorkerCoordinatorClient;
 pub use context::{
-    ContextConfig, CoreContext, FunctionCall, FunctionHandle, FunctionNamespace,
-    LanguageModelNamespace, SignalNamespace, TimerNamespace,
+    ContextConfig, CoreContext, FunctionCall, FunctionHandle, FunctionNamespace, FunctionRegistry,
+    FunctionResult, FunctionStatus, LanguageModelNamespace, SignalNamespace, TimerNamespace,
 };
 pub use error::{Result, SdkError};
 pub use llm::LlmClient;

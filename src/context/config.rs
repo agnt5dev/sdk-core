@@ -1,7 +1,10 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+
+use super::registry::FunctionRegistry;
 
 /// Identifiers and options required to bootstrap a durable Context instance.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct ContextConfig {
     pub tenant_id: String,
     pub session_id: String,
@@ -10,6 +13,7 @@ pub struct ContextConfig {
     pub attempt: u32,
     pub invocation_id: Option<String>,
     pub metadata: HashMap<String, String>,
+    pub function_registry: Arc<FunctionRegistry>,
 }
 
 impl ContextConfig {
@@ -28,6 +32,7 @@ impl ContextConfig {
             attempt,
             invocation_id: None,
             metadata: HashMap::new(),
+            function_registry: Arc::new(FunctionRegistry::new()),
         }
     }
 
@@ -44,6 +49,25 @@ impl ContextConfig {
         self.metadata.insert(key.into(), value.into());
         self
     }
+
+    pub fn with_function_registry(mut self, registry: Arc<FunctionRegistry>) -> Self {
+        self.function_registry = registry;
+        self
+    }
+}
+
+impl std::fmt::Debug for ContextConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContextConfig")
+            .field("tenant_id", &self.tenant_id)
+            .field("session_id", &self.session_id)
+            .field("run_id", &self.run_id)
+            .field("step_id", &self.step_id)
+            .field("attempt", &self.attempt)
+            .field("invocation_id", &self.invocation_id)
+            .field("metadata", &self.metadata)
+            .finish()
+    }
 }
 
 impl Default for ContextConfig {
@@ -56,6 +80,7 @@ impl Default for ContextConfig {
             attempt: 0,
             invocation_id: None,
             metadata: HashMap::new(),
+            function_registry: Arc::new(FunctionRegistry::new()),
         }
     }
 }
