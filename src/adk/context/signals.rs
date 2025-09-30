@@ -78,7 +78,9 @@ impl SignalControls {
                     if result.delivered {
                         Ok(())
                     } else {
-                        Err(SdkError::State("signal wait completed without delivery".into()))
+                        Err(SdkError::State(
+                            "signal wait completed without delivery".into(),
+                        ))
                     }
                 }
                 _ => Err(SdkError::Internal(

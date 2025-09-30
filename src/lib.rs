@@ -2,6 +2,7 @@
 
 pub mod adk;
 pub mod client;
+pub mod context;
 pub mod error;
 pub mod llm;
 pub mod lm;
@@ -18,6 +19,10 @@ pub use adk::{
     ToolDefinition, ToolHandle, ToolRegistry,
 };
 pub use client::WorkerCoordinatorClient;
+pub use context::{
+    ContextConfig, CoreContext, LlmNamespace, SignalNamespace, TaskHandle, TaskNamespace,
+    TaskRequest, TimerNamespace,
+};
 pub use error::{Result, SdkError};
 pub use llm::LlmClient;
 pub use lm::{
