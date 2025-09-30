@@ -38,10 +38,37 @@ impl WorkerConfig {
         let worker_id = std::env::var("AGNT5_WORKER_ID").unwrap_or_else(|_| default_worker_id);
 
         let coordinator_endpoint = std::env::var("AGNT5_COORDINATOR_ENDPOINT")
-            .unwrap_or_else(|_| "http://localhost:9091".to_string());
-        let tenant_id = std::env::var("AGNT5_TENANT_ID").unwrap_or_else(|_| "default".to_string());
-        let deployment_id =
-            std::env::var("AGNT5_DEPLOYMENT_ID").unwrap_or_else(|_| "default".to_string());
+            .unwrap_or_else(|_| "http://localhost:34186".to_string());
+
+        // Check if we're in development mode for better defaults
+        let is_dev_mode = std::env::var("AGNT5_DEV_MODE").unwrap_or_else(|_| "false".to_string())
+            == "true"
+            || std::env::var("AGNT5_ENVIRONMENT").unwrap_or_else(|_| "".to_string())
+                == "development"
+            || std::env::var("AGNT5_JOURNAL_BACKEND").unwrap_or_else(|_| "".to_string())
+                == "embedded"
+            || std::env::var("AGNT5_ORCHESTRATION_BACKEND").unwrap_or_else(|_| "".to_string())
+                == "sqlite";
+
+        let tenant_id = std::env::var("AGNT5_TENANT_ID").unwrap_or_else(|_| {
+            if is_dev_mode {
+                // Check for dev-specific override first
+                std::env::var("AGNT5_DEV_TENANT_ID")
+                    .unwrap_or_else(|_| "00000000-0000-0000-0000-000000000001".to_string())
+            } else {
+                "default".to_string()
+            }
+        });
+
+        let deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").unwrap_or_else(|_| {
+            if is_dev_mode {
+                // Check for dev-specific override first
+                std::env::var("AGNT5_DEV_DEPLOYMENT_ID")
+                    .unwrap_or_else(|_| "00000000-0000-0000-0000-000000000002".to_string())
+            } else {
+                "default".to_string()
+            }
+        });
 
         Self {
             service_name,

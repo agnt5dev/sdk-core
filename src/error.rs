@@ -53,6 +53,12 @@ pub enum SdkError {
 
     #[error("Internal error: {0}")]
     Internal(String),
+
+    #[error("Unavailable: {0}")]
+    Unavailable(String),
+
+    #[error("Invalid argument: {0}")]
+    InvalidArgument(String),
 }
 
 pub type Result<T> = std::result::Result<T, SdkError>;

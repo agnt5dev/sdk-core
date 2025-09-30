@@ -1,6 +1,7 @@
 // OpenTelemetry telemetry module with OTLP exporter for traces and logs
 use crate::error::SdkError;
 use opentelemetry::global::BoxedSpan;
+use opentelemetry::propagation::TextMapCompositePropagator;
 use opentelemetry::propagation::TextMapPropagator;
 use opentelemetry::trace::{Span, SpanKind, Status, Tracer, TracerProvider};
 use opentelemetry::{baggage::BaggageExt, global, Context, KeyValue};
@@ -11,7 +12,6 @@ use opentelemetry_sdk::{
     trace::SdkTracerProvider,
     Resource,
 };
-use opentelemetry::propagation::TextMapCompositePropagator;
 use std::collections::HashMap;
 use tracing_subscriber::{fmt::format::Writer, layer::SubscriberExt, EnvFilter, Registry};
 

@@ -87,6 +87,9 @@ serde_yaml = "0.9"
 # For text processing and chunking
 regex = "1.0"
 unicode-segmentation = "1.10"
+hex = "0.4"
+hmac = "0.12"
+sha2 = "0.10"
 
 # Build dependencies
 [build-dependencies]
@@ -109,3 +112,7 @@ path = "examples/vectordb_rag_example.rs"
 [[example]]
 name = "openrouter_example"
 path = "examples/openrouter_example.rs"
+
+[[example]]
+name = "language_model_example"
+path = "examples/language_model_example.rs"
