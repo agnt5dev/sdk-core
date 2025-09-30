@@ -6,6 +6,7 @@ pub struct ContextConfig {
     pub tenant_id: String,
     pub session_id: String,
     pub run_id: String,
+    pub step_id: String,
     pub attempt: u32,
     pub invocation_id: Option<String>,
     pub metadata: HashMap<String, String>,
@@ -16,12 +17,14 @@ impl ContextConfig {
         tenant_id: impl Into<String>,
         session_id: impl Into<String>,
         run_id: impl Into<String>,
+        step_id: impl Into<String>,
         attempt: u32,
     ) -> Self {
         Self {
             tenant_id: tenant_id.into(),
             session_id: session_id.into(),
             run_id: run_id.into(),
+            step_id: step_id.into(),
             attempt,
             invocation_id: None,
             metadata: HashMap::new(),
@@ -49,6 +52,7 @@ impl Default for ContextConfig {
             tenant_id: String::new(),
             session_id: String::new(),
             run_id: String::new(),
+            step_id: String::new(),
             attempt: 0,
             invocation_id: None,
             metadata: HashMap::new(),
@@ -62,13 +66,14 @@ mod tests {
 
     #[test]
     fn builder_style_helpers_set_fields() {
-        let cfg = ContextConfig::new("tenant", "session", "run", 1)
+        let cfg = ContextConfig::new("tenant", "session", "run", "step", 1)
             .with_invocation_id("invoke")
             .with_metadata("region", "us-west");
 
         assert_eq!(cfg.tenant_id, "tenant");
         assert_eq!(cfg.session_id, "session");
         assert_eq!(cfg.run_id, "run");
+        assert_eq!(cfg.step_id, "step");
         assert_eq!(cfg.attempt, 1);
         assert_eq!(cfg.invocation_id.as_deref(), Some("invoke"));
         assert_eq!(

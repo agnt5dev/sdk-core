@@ -1,4 +1,4 @@
-//! Next-generation durable Context implementation scaffolding.
+//! Durable Context for AGNT5 SDK
 //!
 //! This module currently exposes placeholders that will be wired to the
 //! runtime service and FFI bridge in subsequent iterations. The initial
@@ -10,6 +10,6 @@ pub mod namespaces;
 
 pub use config::ContextConfig;
 pub use namespaces::{
-    CoreContext, LlmNamespace, SignalNamespace, TaskHandle, TaskNamespace, TaskRequest,
-    TimerNamespace,
+    CoreContext, FunctionCall, FunctionHandle, FunctionNamespace, LanguageModelNamespace,
+    SignalNamespace, TimerNamespace,
 };
