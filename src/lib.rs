@@ -43,6 +43,9 @@ pub use telemetry::{
 };
 pub use worker::Worker;
 
+// Re-export flume for language bindings
+pub use flume;
+
 // Generated protobuf modules
 pub mod pb {
     tonic::include_proto!("api.v1");

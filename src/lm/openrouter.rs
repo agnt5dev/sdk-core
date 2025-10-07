@@ -80,9 +80,12 @@ pub struct OpenRouterProvider {
 
 impl OpenRouterProvider {
     pub fn new(config: OpenRouterConfig) -> SdkResult<Self> {
+        // OpenRouter is a gateway that accepts models with their own provider prefixes
+        // (e.g., anthropic/claude-3.5-haiku, openai/gpt-4o)
+        // We explicitly set model_prefix to None so models are passed as-is
         let mut inner_config = OpenAiConfig::new(config.api_key)
             .with_base_url(config.base_url)
-            .with_model_prefix(Some(MODEL_PREFIX));
+            .with_model_prefix(None::<String>);  // Explicitly remove the default "openai" prefix
 
         if let Some(referer) = config.referer {
             inner_config = inner_config.with_header("HTTP-Referer", referer);

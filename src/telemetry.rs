@@ -13,7 +13,7 @@ use opentelemetry_sdk::{
     Resource,
 };
 use std::collections::HashMap;
-use tracing_subscriber::{fmt::format::Writer, layer::SubscriberExt, EnvFilter, Registry};
+use tracing_subscriber::{fmt::format::Writer, layer::SubscriberExt, Layer as _, EnvFilter, Registry};
 
 /// Custom field formatter that prioritizes invocation.id in log output
 struct InvocationFieldFormatter;
@@ -83,6 +83,12 @@ impl<'writer> tracing_subscriber::fmt::format::FormatFields<'writer> for Invocat
 pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), SdkError> {
     let otel_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
         .unwrap_or_else(|_| "http://localhost:4317".to_string());
+
+    // Print to stderr immediately so it's visible even if tracing setup fails
+    eprintln!("🔭 AGNT5 OpenTelemetry Configuration:");
+    eprintln!("   Endpoint: {}", otel_endpoint);
+    eprintln!("   Service:  {}", service_name);
+    eprintln!("   Version:  {}", service_version);
 
     tracing::info!(
         "Initializing OpenTelemetry with OTLP endpoint: {}",
@@ -162,23 +168,31 @@ pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), S
     });
 
     // Create custom fmt layer that includes invocation.id in log output
+    // Apply filter ONLY to fmt layer for console, let all logs through to OpenTelemetry
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
         .with_thread_ids(false)
         .with_thread_names(false)
         .with_file(true)
         .with_line_number(true)
-        .fmt_fields(InvocationFieldFormatter);
+        .fmt_fields(InvocationFieldFormatter)
+        .with_filter(env_filter);  // Filter only console output, not OpenTelemetry!
 
     let subscriber = Registry::default()
         .with(telemetry_layer)
-        .with(log_appender)
-        .with(fmt_layer)
-        .with(env_filter);
+        .with(log_appender)  // Receives ALL logs, no filtering
+        .with(fmt_layer);  // Filtered console output
 
     // Set as global default subscriber
     tracing::subscriber::set_global_default(subscriber)
         .map_err(|e| SdkError::Other(anyhow::anyhow!("Failed to set tracing subscriber: {}", e)))?;
+
+    // Initialize LogTracer to bridge log crate to tracing
+    // This allows log::info!() calls to be forwarded to tracing (and thus OpenTelemetry)
+    if let Err(e) = tracing_log::LogTracer::init() {
+        eprintln!("⚠️  Warning: Failed to initialize LogTracer (log → tracing bridge): {}", e);
+        eprintln!("   Some logs using log::info!() may not appear in OpenTelemetry");
+    }
 
     tracing::info!(
         "OpenTelemetry with tracing integration initialized successfully for service: {}",

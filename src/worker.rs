@@ -138,7 +138,7 @@ impl Worker {
     /// Run the worker with a message handler
     pub async fn run<F, Fut>(&self, mut message_handler: F) -> Result<()>
     where
-        F: FnMut(RuntimeMessage) -> Fut + Send,
+        F: FnMut(RuntimeMessage, flume::Sender<ServiceMessage>) -> Fut + Send,
         Fut: std::future::Future<Output = Result<Option<ServiceMessage>>> + Send,
     {
         info!("Starting worker {}", self.config.worker_id);
@@ -252,7 +252,7 @@ impl Worker {
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     ) -> Result<()>
     where
-        F: FnMut(RuntimeMessage) -> Fut + Send,
+        F: FnMut(RuntimeMessage, flume::Sender<ServiceMessage>) -> Fut + Send,
         Fut: std::future::Future<Output = Result<Option<ServiceMessage>>> + Send,
     {
         let mut client =
@@ -292,7 +292,10 @@ impl Worker {
                         Ok(runtime_message) => {
                             debug!("Received message for worker {}", self.config.worker_id);
 
-                            let response = message_handler(runtime_message).await;
+                            // Clone tx for potential streaming responses
+                            // Handler can use this to send multiple responses for streaming
+                            let tx_clone = tx.clone();
+                            let response = message_handler(runtime_message, tx_clone).await;
 
                             match response {
                                 Ok(Some(response)) => {
