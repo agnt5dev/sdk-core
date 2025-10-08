@@ -140,9 +140,19 @@ impl LanguageModel for AnthropicProvider {
         // Set request configuration attributes
         telemetry::set_request_attributes(&mut span, &request);
 
-        // Optional content capture
+        // Optional content capture (enabled by default)
         let capture_content = telemetry::should_capture_content();
         if capture_content {
+            // Capture system instructions separately per OpenTelemetry spec
+            if let Some(system_prompt) = &request.system_prompt {
+                let system_instructions = telemetry::serialize_system_instructions(system_prompt);
+                span.set_attribute(opentelemetry::KeyValue::new(
+                    telemetry::attributes::SYSTEM_INSTRUCTIONS,
+                    system_instructions.to_string(),
+                ));
+            }
+
+            // Capture conversation messages (without system instructions)
             let input_messages = telemetry::serialize_input_messages(&request);
             span.set_attribute(opentelemetry::KeyValue::new(
                 telemetry::attributes::INPUT_MESSAGES,
@@ -197,8 +207,19 @@ impl LanguageModel for AnthropicProvider {
         telemetry::set_request_attributes(&mut span, &request);
         span.set_attribute(opentelemetry::KeyValue::new("llm.streaming", true));
 
+        // Optional content capture (enabled by default)
         let capture_content = telemetry::should_capture_content();
         if capture_content {
+            // Capture system instructions separately per OpenTelemetry spec
+            if let Some(system_prompt) = &request.system_prompt {
+                let system_instructions = telemetry::serialize_system_instructions(system_prompt);
+                span.set_attribute(opentelemetry::KeyValue::new(
+                    telemetry::attributes::SYSTEM_INSTRUCTIONS,
+                    system_instructions.to_string(),
+                ));
+            }
+
+            // Capture conversation messages (without system instructions)
             let input_messages = telemetry::serialize_input_messages(&request);
             span.set_attribute(opentelemetry::KeyValue::new(
                 telemetry::attributes::INPUT_MESSAGES,

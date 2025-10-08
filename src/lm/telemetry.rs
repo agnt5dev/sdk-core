@@ -99,32 +99,22 @@ pub fn set_request_attributes(span: &mut impl Span, request: &GenerateRequest) {
 /// ```json
 /// [
 ///   {
-///     "role": "system",
-///     "parts": [{"type": "text", "content": "You are helpful"}]
-///   },
-///   {
 ///     "role": "user",
 ///     "parts": [{"type": "text", "content": "Hello"}]
+///   },
+///   {
+///     "role": "assistant",
+///     "parts": [{"type": "text", "content": "Hi there!"}]
 ///   }
 /// ]
 /// ```
+///
+/// NOTE: System instructions are NOT included here - they should be captured
+/// separately via `serialize_system_instructions()` in the `gen_ai.system_instructions` attribute.
 pub fn serialize_input_messages(request: &GenerateRequest) -> Value {
     let mut messages_array = Vec::new();
 
-    // Add system message if present
-    if let Some(system_prompt) = &request.system_prompt {
-        messages_array.push(json!({
-            "role": "system",
-            "parts": [
-                {
-                    "type": "text",
-                    "content": truncate_content(system_prompt, 10_000)
-                }
-            ]
-        }));
-    }
-
-    // Add conversation messages
+    // Add conversation messages only (system instructions are separate)
     for msg in &request.messages {
         messages_array.push(json!({
             "role": role_to_string(&msg.role),
@@ -138,6 +128,29 @@ pub fn serialize_input_messages(request: &GenerateRequest) -> Value {
     }
 
     json!(messages_array)
+}
+
+/// Serialize system instructions to OpenTelemetry Gen AI format
+///
+/// Format per spec:
+/// ```json
+/// [
+///   {
+///     "type": "text",
+///     "content": "You are a helpful assistant."
+///   }
+/// ]
+/// ```
+///
+/// System instructions are provided to the model separately from the chat history
+/// and should be captured in the `gen_ai.system_instructions` attribute.
+pub fn serialize_system_instructions(system_prompt: &str) -> Value {
+    json!([
+        {
+            "type": "text",
+            "content": truncate_content(system_prompt, 10_000)
+        }
+    ])
 }
 
 /// Serialize output messages to OpenTelemetry Gen AI format
