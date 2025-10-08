@@ -37,12 +37,12 @@ pub mod attributes {
 
 /// Check if content capture is enabled via environment variable
 ///
-/// Per OpenTelemetry spec, content capture should be OPT-IN for privacy/security.
-/// Set AGNT5_LLM_CAPTURE_CONTENT=true to enable full input/output recording.
+/// Content capture is ENABLED by default to provide full visibility into LLM interactions.
+/// Set AGNT5_LLM_CAPTURE_CONTENT=false to disable full input/output recording.
 pub fn should_capture_content() -> bool {
     std::env::var("AGNT5_LLM_CAPTURE_CONTENT")
-        .map(|v| v.to_lowercase() == "true" || v == "1")
-        .unwrap_or(false)
+        .map(|v| v.to_lowercase() != "false" && v != "0")
+        .unwrap_or(true)
 }
 
 /// Create a Gen AI span with proper naming and attributes
