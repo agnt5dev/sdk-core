@@ -225,6 +225,10 @@ impl LanguageModel for OpenAiProvider {
 
         // Optional content capture (enabled by default)
         let capture_content = telemetry::should_capture_content();
+
+        // Capture tool definitions and tool choice
+        telemetry::set_tool_request_attributes(&mut span, &request, capture_content);
+
         if capture_content {
             // Capture system instructions separately per OpenTelemetry spec
             if let Some(system_prompt) = &request.system_prompt {
@@ -301,6 +305,10 @@ impl LanguageModel for OpenAiProvider {
 
         // Optional content capture (enabled by default)
         let capture_content = telemetry::should_capture_content();
+
+        // Capture tool definitions and tool choice
+        telemetry::set_tool_request_attributes(&mut span, &request, capture_content);
+
         if capture_content {
             // Capture system instructions separately per OpenTelemetry spec
             if let Some(system_prompt) = &request.system_prompt {

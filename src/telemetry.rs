@@ -323,6 +323,85 @@ pub fn record_span_error(span: &mut BoxedSpan, error_msg: &str) {
     span.set_status(Status::error(error_msg.to_string()));
 }
 
+/// Create a span for tool execution following OpenTelemetry Gen AI semantic conventions
+///
+/// Per the spec, tool execution spans should use:
+/// - Span name: `execute_tool {tool_name}`
+/// - gen_ai.operation.name: "execute_tool"
+/// - gen_ai.tool.name: The tool name
+/// - gen_ai.tool.call.id: Unique identifier for this tool call (optional)
+/// - gen_ai.tool.description: Tool description (optional)
+pub fn create_tool_execution_span(
+    tool_name: &str,
+    tool_call_id: Option<&str>,
+    tool_description: Option<&str>,
+    arguments: Option<&str>,
+) -> BoxedSpan {
+    let tracer = global::tracer("agnt5-sdk-core");
+
+    // Span name format: "execute_tool {tool_name}" per OpenTelemetry spec
+    let span_name = format!("execute_tool {}", tool_name);
+
+    let mut attributes = vec![
+        // Required attributes per OpenTelemetry Gen AI conventions
+        KeyValue::new("gen_ai.operation.name", "execute_tool"),
+        KeyValue::new("gen_ai.tool.name", tool_name.to_string()),
+    ];
+
+    // Optional attributes
+    if let Some(call_id) = tool_call_id {
+        attributes.push(KeyValue::new("gen_ai.tool.call.id", call_id.to_string()));
+    }
+
+    if let Some(description) = tool_description {
+        attributes.push(KeyValue::new("gen_ai.tool.description", description.to_string()));
+    }
+
+    // Capture tool arguments if provided (typically JSON string)
+    if let Some(args) = arguments {
+        // Truncate to prevent huge span attributes
+        let truncated = if args.len() > 2000 {
+            format!("{}... [truncated {} bytes]", &args[..2000], args.len() - 2000)
+        } else {
+            args.to_string()
+        };
+        attributes.push(KeyValue::new("gen_ai.tool.arguments", truncated));
+    }
+
+    // Tool execution is INTERNAL span kind (not CLIENT)
+    let span = tracer
+        .span_builder(span_name)
+        .with_kind(SpanKind::Internal)
+        .with_attributes(attributes)
+        .start(&tracer);
+
+    span
+}
+
+/// Record tool execution success with result
+pub fn record_tool_success(span: &mut BoxedSpan, result: Option<&str>) {
+    span.set_attribute(KeyValue::new("gen_ai.tool.status", "success"));
+
+    if let Some(res) = result {
+        // Truncate result to prevent huge span attributes
+        let truncated = if res.len() > 5000 {
+            format!("{}... [truncated {} bytes]", &res[..5000], res.len() - 5000)
+        } else {
+            res.to_string()
+        };
+        span.set_attribute(KeyValue::new("gen_ai.tool.result", truncated));
+    }
+
+    span.set_status(Status::Ok);
+}
+
+/// Record tool execution error
+pub fn record_tool_error(span: &mut BoxedSpan, error_msg: &str) {
+    span.set_attribute(KeyValue::new("gen_ai.tool.status", "error"));
+    span.set_attribute(KeyValue::new("gen_ai.tool.error", error_msg.to_string()));
+    span.set_status(Status::error(error_msg.to_string()));
+}
+
 /// End a span (helper function since Span trait may not be accessible)
 pub fn end_span(mut span: BoxedSpan) {
     span.end();

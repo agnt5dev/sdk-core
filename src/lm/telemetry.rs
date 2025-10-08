@@ -15,7 +15,7 @@ use opentelemetry::trace::{Span, SpanKind, Status, Tracer};
 use opentelemetry::{global, KeyValue};
 use serde_json::{json, Value};
 
-use super::interface::{GenerateRequest, GenerateResponse, MessageRole, TokenUsage};
+use super::interface::{GenerateRequest, GenerateResponse, MessageRole, TokenUsage, ToolDefinition};
 
 /// Semantic convention attribute names for Gen AI operations
 pub mod attributes {
@@ -257,6 +257,76 @@ fn role_to_string(role: &MessageRole) -> &'static str {
         MessageRole::System => "system",
         MessageRole::User => "user",
         MessageRole::Assistant => "assistant",
+    }
+}
+
+/// Serialize tool definitions to OpenTelemetry format
+///
+/// Format per spec (array of tool definitions):
+/// ```json
+/// [
+///   {
+///     "name": "search_web",
+///     "description": "Search the web for information",
+///     "parameters": {"type": "object", "properties": {...}}
+///   }
+/// ]
+/// ```
+pub fn serialize_tool_definitions(tools: &[ToolDefinition]) -> Value {
+    let tools_array: Vec<Value> = tools
+        .iter()
+        .map(|tool| {
+            let mut tool_obj = json!({
+                "name": &tool.name,
+            });
+
+            if let Some(description) = &tool.description {
+                tool_obj["description"] = json!(truncate_content(description, 500));
+            }
+
+            if let Some(parameters) = &tool.parameters {
+                // Truncate parameter schema to prevent huge attributes
+                let params_str = parameters.to_string();
+                tool_obj["parameters"] = if params_str.len() > 2000 {
+                    json!(format!("{}... [truncated]", &params_str[..2000]))
+                } else {
+                    parameters.clone()
+                };
+            }
+
+            tool_obj
+        })
+        .collect();
+
+    json!(tools_array)
+}
+
+/// Set tool-related request attributes on the span
+pub fn set_tool_request_attributes(span: &mut impl Span, request: &GenerateRequest, capture_content: bool) {
+    if !request.tools.is_empty() {
+        // Always capture tool count
+        span.set_attribute(KeyValue::new(
+            "gen_ai.request.tools_count",
+            request.tools.len() as i64,
+        ));
+
+        // Capture full tool definitions if content capture is enabled
+        if capture_content {
+            let tools_json = serialize_tool_definitions(&request.tools);
+            span.set_attribute(KeyValue::new(
+                "gen_ai.request.tools",
+                tools_json.to_string(),
+            ));
+        }
+    }
+
+    // Capture tool choice if specified
+    if let Some(tool_choice) = &request.tool_choice {
+        let choice_str = format!("{:?}", tool_choice);
+        span.set_attribute(KeyValue::new(
+            "gen_ai.request.tool_choice",
+            choice_str,
+        ));
     }
 }
 
