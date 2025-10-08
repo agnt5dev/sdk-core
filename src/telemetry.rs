@@ -161,14 +161,17 @@ pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), S
     let log_appender =
         opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&log_provider);
 
-    // Create subscriber with filtered console output and OpenTelemetry
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+    // Create filters for both console and OpenTelemetry (need separate instances)
+    let filter_directive = std::env::var("RUST_LOG").unwrap_or_else(|_| {
         // Default filter: info level for our code, warn for dependencies
-        EnvFilter::new("agnt5=info,h2=warn,hyper=warn,tonic=warn,tower=warn,info")
+        // Filter out noisy gRPC/HTTP2 logs from h2, hyper, tonic, tower
+        "agnt5=info,h2=warn,hyper=warn,tonic=warn,tower=warn,info".to_string()
     });
 
+    let console_filter = EnvFilter::new(&filter_directive);
+    let otel_filter = EnvFilter::new(&filter_directive);
+
     // Create custom fmt layer that includes invocation.id in log output
-    // Apply filter ONLY to fmt layer for console, let all logs through to OpenTelemetry
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
         .with_thread_ids(false)
@@ -176,11 +179,11 @@ pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), S
         .with_file(true)
         .with_line_number(true)
         .fmt_fields(InvocationFieldFormatter)
-        .with_filter(env_filter);  // Filter only console output, not OpenTelemetry!
+        .with_filter(console_filter);  // Filter console output
 
     let subscriber = Registry::default()
         .with(telemetry_layer)
-        .with(log_appender)  // Receives ALL logs, no filtering
+        .with(log_appender.with_filter(otel_filter))  // Filter OTLP logs too!
         .with(fmt_layer);  // Filtered console output
 
     // Set as global default subscriber
