@@ -10,7 +10,6 @@ use super::interface::{
 use super::openai::{OpenAiConfig, OpenAiProvider};
 
 const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
-const MODEL_PREFIX: &str = "openrouter";
 
 #[derive(Clone, Debug)]
 pub struct OpenRouterConfig {
