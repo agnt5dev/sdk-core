@@ -6,6 +6,7 @@ use anyhow::anyhow;
 use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::StreamExt;
+use opentelemetry::trace::Span;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{self, json, Value as JsonValue};
@@ -17,6 +18,7 @@ use super::interface::{
     GenerationConfig, LanguageModel, Message, MessageRole, ResponseFormat, StreamChunk,
     StreamHandle, StreamRequest, TokenUsage, ToolChoice, ToolDefinition,
 };
+use super::telemetry;
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const DEFAULT_VERSION: &str = "2023-06-01";
@@ -132,40 +134,113 @@ impl AnthropicProvider {
 #[async_trait]
 impl LanguageModel for AnthropicProvider {
     async fn generate(&self, request: GenerateRequest) -> SdkResult<GenerateResponse> {
-        validate_request(&request)?;
-        let payload = MessagesPayload::from_request(&request, false)?;
-        let response = self
-            .request()
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|err| SdkError::Other(anyhow!("Anthropic request failed: {err}")))?;
+        // Create OpenTelemetry span for this LLM call
+        let mut span = telemetry::create_gen_ai_span("anthropic", &request.model);
 
-        let response = ensure_success(response).await?;
+        // Set request configuration attributes
+        telemetry::set_request_attributes(&mut span, &request);
 
-        let parsed: MessagesResponse = response
-            .json()
-            .await
-            .map_err(|err| SdkError::Other(anyhow!("failed to parse Anthropic response: {err}")))?;
+        // Optional content capture
+        let capture_content = telemetry::should_capture_content();
+        if capture_content {
+            let input_messages = telemetry::serialize_input_messages(&request);
+            span.set_attribute(opentelemetry::KeyValue::new(
+                telemetry::attributes::INPUT_MESSAGES,
+                input_messages.to_string(),
+            ));
+        }
 
-        parsed.into_generate_response(request.config.response_format.clone())
+        let start = std::time::Instant::now();
+
+        let result = async {
+            validate_request(&request)?;
+            let payload = MessagesPayload::from_request(&request, false)?;
+            let response = self
+                .request()
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|err| SdkError::Other(anyhow!("Anthropic request failed: {err}")))?;
+
+            let response = ensure_success(response).await?;
+
+            let parsed: MessagesResponse = response
+                .json()
+                .await
+                .map_err(|err| SdkError::Other(anyhow!("failed to parse Anthropic response: {err}")))?;
+
+            parsed.into_generate_response(request.config.response_format.clone())
+        }
+        .await;
+
+        let duration_ms = start.elapsed().as_millis();
+        telemetry::set_duration(&mut span, duration_ms);
+
+        match result {
+            Ok(response) => {
+                telemetry::set_response_attributes(&mut span, &response, capture_content);
+                span.end();
+                Ok(response)
+            }
+            Err(err) => {
+                telemetry::set_error_status(&mut span, &err.to_string());
+                span.end();
+                Err(err)
+            }
+        }
     }
 
     async fn stream(&self, request: StreamRequest) -> SdkResult<StreamHandle> {
-        validate_request(&request)?;
-        let payload = MessagesPayload::from_request(&request, true)?;
-        let response = self
-            .request()
-            .header("accept", "text/event-stream")
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|err| SdkError::Other(anyhow!("Anthropic streaming request failed: {err}")))?;
+        // Create OpenTelemetry span for streaming
+        let mut span = telemetry::create_gen_ai_span("anthropic", &request.model);
 
-        let response = ensure_success(response).await?;
+        telemetry::set_request_attributes(&mut span, &request);
+        span.set_attribute(opentelemetry::KeyValue::new("llm.streaming", true));
 
-        let stream = build_stream(response, request.config.response_format.clone());
-        Ok(StreamHandle::new(stream))
+        let capture_content = telemetry::should_capture_content();
+        if capture_content {
+            let input_messages = telemetry::serialize_input_messages(&request);
+            span.set_attribute(opentelemetry::KeyValue::new(
+                telemetry::attributes::INPUT_MESSAGES,
+                input_messages.to_string(),
+            ));
+        }
+
+        let start = std::time::Instant::now();
+
+        let result: SdkResult<StreamHandle> = async {
+            validate_request(&request)?;
+            let payload = MessagesPayload::from_request(&request, true)?;
+            let response = self
+                .request()
+                .header("accept", "text/event-stream")
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|err| SdkError::Other(anyhow!("Anthropic streaming request failed: {err}")))?;
+
+            let response = ensure_success(response).await?;
+
+            let stream = build_stream(response, request.config.response_format.clone());
+            Ok(StreamHandle::new(stream))
+        }
+        .await;
+
+        let duration_ms = start.elapsed().as_millis();
+        telemetry::set_duration(&mut span, duration_ms);
+
+        match result {
+            Ok(stream_handle) => {
+                span.set_status(opentelemetry::trace::Status::Ok);
+                span.end();
+                Ok(stream_handle)
+            }
+            Err(err) => {
+                telemetry::set_error_status(&mut span, &err.to_string());
+                span.end();
+                Err(err)
+            }
+        }
     }
 }
 
