@@ -6,6 +6,7 @@ mod interface;
 mod openai;
 mod openai_common;
 mod openrouter;
+mod telemetry;
 
 pub use anthropic::{AnthropicConfig, AnthropicProvider};
 pub use azure::{AzureOpenAiConfig, AzureOpenAiProvider};

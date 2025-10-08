@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use anyhow::anyhow;
 use async_trait::async_trait;
+use opentelemetry::trace::Span;
 use reqwest::Client;
 
 use crate::error::{Result as SdkResult, SdkError};
@@ -14,6 +15,7 @@ use super::interface::{
 use super::openai_common::{
     parse_error, stream_handle_from_response, ChatCompletionPayload, ChatCompletionResponse,
 };
+use super::telemetry;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_CHAT_PATH: &str = "chat/completions";
@@ -215,42 +217,129 @@ impl OpenAiProvider {
 #[async_trait]
 impl LanguageModel for OpenAiProvider {
     async fn generate(&self, request: GenerateRequest) -> SdkResult<GenerateResponse> {
-        validate_request(&request)?;
-        let model = self.normalize_model(&request.model)?;
-        let payload = ChatCompletionPayload::from_request(&request, model, false);
+        // Create OpenTelemetry span for this LLM call
+        let mut span = telemetry::create_gen_ai_span("openai", &request.model);
 
-        let response = self
-            .request()
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|err| SdkError::Other(anyhow!("OpenAI request failed: {err}")))?;
+        // Set request configuration attributes
+        telemetry::set_request_attributes(&mut span, &request);
 
-        let response = ensure_success(response).await?;
+        // Optional content capture (opt-in via environment variable)
+        let capture_content = telemetry::should_capture_content();
+        if capture_content {
+            let input_messages = telemetry::serialize_input_messages(&request);
+            span.set_attribute(opentelemetry::KeyValue::new(
+                telemetry::attributes::INPUT_MESSAGES,
+                input_messages.to_string(),
+            ));
+        }
 
-        let parsed: ChatCompletionResponse = response
-            .json()
-            .await
-            .map_err(|err| SdkError::Other(anyhow!("failed to parse OpenAI response: {err}")))?;
+        // Track request start time for latency measurement
+        let start = std::time::Instant::now();
 
-        parsed.into_generate_response(request.config.response_format.clone())
+        // Execute the actual API call
+        let result = async {
+            validate_request(&request)?;
+            let model = self.normalize_model(&request.model)?;
+            let payload = ChatCompletionPayload::from_request(&request, model, false);
+
+            let response = self
+                .request()
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|err| SdkError::Other(anyhow!("OpenAI request failed: {err}")))?;
+
+            let response = ensure_success(response).await?;
+
+            let parsed: ChatCompletionResponse = response
+                .json()
+                .await
+                .map_err(|err| SdkError::Other(anyhow!("failed to parse OpenAI response: {err}")))?;
+
+            parsed.into_generate_response(request.config.response_format.clone())
+        }
+        .await;
+
+        // Record latency
+        let duration_ms = start.elapsed().as_millis();
+        telemetry::set_duration(&mut span, duration_ms);
+
+        // Handle result and set span attributes
+        match result {
+            Ok(response) => {
+                telemetry::set_response_attributes(&mut span, &response, capture_content);
+                span.end();
+                Ok(response)
+            }
+            Err(err) => {
+                telemetry::set_error_status(&mut span, &err.to_string());
+                span.end();
+                Err(err)
+            }
+        }
     }
 
     async fn stream(&self, request: StreamRequest) -> SdkResult<StreamHandle> {
-        validate_request(&request)?;
-        let model = self.normalize_model(&request.model)?;
-        let payload = ChatCompletionPayload::from_request(&request, model, true);
+        // Create OpenTelemetry span for this streaming LLM call
+        let mut span = telemetry::create_gen_ai_span("openai", &request.model);
 
-        let response = self
-            .request()
-            .header("Accept", "text/event-stream")
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|err| SdkError::Other(anyhow!("OpenAI streaming request failed: {err}")))?;
+        // Set request configuration attributes
+        telemetry::set_request_attributes(&mut span, &request);
 
-        let response = ensure_success(response).await?;
-        stream_handle_from_response(response, request.config.response_format.clone())
+        // Mark as streaming
+        span.set_attribute(opentelemetry::KeyValue::new("llm.streaming", true));
+
+        // Optional content capture
+        let capture_content = telemetry::should_capture_content();
+        if capture_content {
+            let input_messages = telemetry::serialize_input_messages(&request);
+            span.set_attribute(opentelemetry::KeyValue::new(
+                telemetry::attributes::INPUT_MESSAGES,
+                input_messages.to_string(),
+            ));
+        }
+
+        // Track request start time
+        let start = std::time::Instant::now();
+
+        // Execute the actual streaming API call
+        let result = async {
+            validate_request(&request)?;
+            let model = self.normalize_model(&request.model)?;
+            let payload = ChatCompletionPayload::from_request(&request, model, true);
+
+            let response = self
+                .request()
+                .header("Accept", "text/event-stream")
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|err| SdkError::Other(anyhow!("OpenAI streaming request failed: {err}")))?;
+
+            let response = ensure_success(response).await?;
+            stream_handle_from_response(response, request.config.response_format.clone())
+        }
+        .await;
+
+        // Record latency for stream initialization
+        let duration_ms = start.elapsed().as_millis();
+        telemetry::set_duration(&mut span, duration_ms);
+
+        // Handle result
+        // Note: For streaming, we end the span immediately after stream starts
+        // Individual chunks are not traced separately in this implementation
+        match result {
+            Ok(stream_handle) => {
+                span.set_status(opentelemetry::trace::Status::Ok);
+                span.end();
+                Ok(stream_handle)
+            }
+            Err(err) => {
+                telemetry::set_error_status(&mut span, &err.to_string());
+                span.end();
+                Err(err)
+            }
+        }
     }
 }
 
