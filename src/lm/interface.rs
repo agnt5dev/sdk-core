@@ -37,6 +37,10 @@ pub struct GenerateRequest {
     pub tool_choice: Option<ToolChoice>,
     pub user_id: Option<String>,
     pub config: GenerationConfig,
+    /// OpenTelemetry context for trace propagation across async boundaries
+    /// This is used internally to ensure LM spans are children of the calling function span
+    #[doc(hidden)]
+    pub otel_context: Option<opentelemetry::Context>,
 }
 
 impl GenerateRequest {
@@ -49,6 +53,7 @@ impl GenerateRequest {
             tool_choice: None,
             user_id: None,
             config: GenerationConfig::default(),
+            otel_context: None,
         }
     }
 

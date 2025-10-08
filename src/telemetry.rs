@@ -1,8 +1,7 @@
 // OpenTelemetry telemetry module with OTLP exporter for traces and logs
 use crate::error::SdkError;
 use opentelemetry::global::BoxedSpan;
-use opentelemetry::propagation::TextMapCompositePropagator;
-use opentelemetry::propagation::TextMapPropagator;
+use opentelemetry::propagation::{Extractor, TextMapCompositePropagator, TextMapPropagator};
 use opentelemetry::trace::{Span, SpanKind, Status, Tracer, TracerProvider};
 use opentelemetry::{baggage::BaggageExt, global, Context, KeyValue};
 use opentelemetry_otlp::{LogExporter, SpanExporter, WithExportConfig};
@@ -14,6 +13,23 @@ use opentelemetry_sdk::{
 };
 use std::collections::HashMap;
 use tracing_subscriber::{fmt::format::Writer, layer::SubscriberExt, Layer as _, EnvFilter, Registry};
+
+// Newtype wrapper to implement Extractor trait for HashMap (avoids orphan rule)
+struct HashMapExtractor<'a>(&'a HashMap<String, String>);
+
+impl<'a> Extractor for HashMapExtractor<'a> {
+    fn get(&self, key: &str) -> Option<&str> {
+        let value = self.0.get(key).map(|v| v.as_str());
+        tracing::debug!("Extractor::get({:?}) -> {:?}", key, value);
+        value
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        let keys: Vec<&str> = self.0.keys().map(|s| s.as_str()).collect();
+        tracing::debug!("Extractor::keys() -> {:?}", keys);
+        keys
+    }
+}
 
 /// Custom field formatter that prioritizes invocation.id in log output
 struct InvocationFieldFormatter;
@@ -163,9 +179,10 @@ pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), S
 
     // Create filters for both console and OpenTelemetry (need separate instances)
     let filter_directive = std::env::var("RUST_LOG").unwrap_or_else(|_| {
-        // Default filter: info level for our code, warn for dependencies
-        // Filter out noisy gRPC/HTTP2 logs from h2, hyper, tonic, tower
-        "agnt5=info,h2=warn,hyper=warn,tonic=warn,tower=warn,info".to_string()
+        // Default filter: debug level for AGNT5 and Python SDK, error for noisy dependencies
+        // Filter out noisy gRPC/HTTP2 traces from h2, hyper, tonic, tower
+        // Include python_log for Python SDK ctx.logger logs
+        "agnt5=debug,python_log=debug,h2=error,hyper=error,tonic=warn,tower=warn".to_string()
     });
 
     let console_filter = EnvFilter::new(&filter_directive);
@@ -208,13 +225,30 @@ pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), S
 pub fn extract_context_from_runtime_message(metadata: &HashMap<String, String>) -> Context {
     tracing::debug!("Extracting context from metadata: {:?}", metadata);
 
+    // Wrap HashMap in our Extractor implementation
+    let extractor = HashMapExtractor(metadata);
+
     // Extract trace context first
     let trace_propagator = TraceContextPropagator::new();
-    let ctx = trace_propagator.extract(metadata);
+    let ctx = trace_propagator.extract(&extractor);
+
+    // Debug: Check if we extracted valid trace context
+    use opentelemetry::trace::TraceContextExt;
+    let span = ctx.span();
+    let span_context = span.span_context();
+    if span_context.is_valid() {
+        tracing::debug!(
+            "✅ Extracted valid trace context - trace_id: {:?}, span_id: {:?}",
+            span_context.trace_id(),
+            span_context.span_id()
+        );
+    } else {
+        tracing::warn!("⚠️  Failed to extract valid trace context from metadata - will create new root trace");
+    }
 
     // Then extract baggage using the trace context
     let baggage_propagator = BaggagePropagator::new();
-    let final_ctx = baggage_propagator.extract_with_context(&ctx, metadata);
+    let final_ctx = baggage_propagator.extract_with_context(&ctx, &extractor);
 
     // Debug log baggage contents
     let baggage = final_ctx.baggage();

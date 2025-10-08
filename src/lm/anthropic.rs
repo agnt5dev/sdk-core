@@ -134,8 +134,8 @@ impl AnthropicProvider {
 #[async_trait]
 impl LanguageModel for AnthropicProvider {
     async fn generate(&self, request: GenerateRequest) -> SdkResult<GenerateResponse> {
-        // Create OpenTelemetry span for this LLM call
-        let mut span = telemetry::create_gen_ai_span("anthropic", &request.model);
+        // Create OpenTelemetry span for this LLM call (as child of provided or current context)
+        let mut span = telemetry::create_gen_ai_span("anthropic", &request.model, request.otel_context.clone());
 
         // Set request configuration attributes
         telemetry::set_request_attributes(&mut span, &request);
@@ -205,8 +205,8 @@ impl LanguageModel for AnthropicProvider {
     }
 
     async fn stream(&self, request: StreamRequest) -> SdkResult<StreamHandle> {
-        // Create OpenTelemetry span for streaming
-        let mut span = telemetry::create_gen_ai_span("anthropic", &request.model);
+        // Create OpenTelemetry span for streaming (as child of provided or current context)
+        let mut span = telemetry::create_gen_ai_span("anthropic", &request.model, request.otel_context.clone());
 
         telemetry::set_request_attributes(&mut span, &request);
         span.set_attribute(opentelemetry::KeyValue::new("llm.streaming", true));

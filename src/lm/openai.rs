@@ -217,8 +217,8 @@ impl OpenAiProvider {
 #[async_trait]
 impl LanguageModel for OpenAiProvider {
     async fn generate(&self, request: GenerateRequest) -> SdkResult<GenerateResponse> {
-        // Create OpenTelemetry span for this LLM call
-        let mut span = telemetry::create_gen_ai_span("openai", &request.model);
+        // Create OpenTelemetry span for this LLM call (as child of provided or current context)
+        let mut span = telemetry::create_gen_ai_span("openai", &request.model, request.otel_context.clone());
 
         // Set request configuration attributes
         telemetry::set_request_attributes(&mut span, &request);
@@ -250,7 +250,7 @@ impl LanguageModel for OpenAiProvider {
         // Track request start time for latency measurement
         let start = std::time::Instant::now();
 
-        // Execute the actual API call
+        // Execute the actual API call (span is already linked to parent via create_gen_ai_span)
         let result = async {
             validate_request(&request)?;
             let model = self.normalize_model(&request.model)?;
@@ -274,7 +274,7 @@ impl LanguageModel for OpenAiProvider {
         }
         .await;
 
-        // Record latency
+        // Record latency on the span
         let duration_ms = start.elapsed().as_millis();
         telemetry::set_duration(&mut span, duration_ms);
 
@@ -294,8 +294,8 @@ impl LanguageModel for OpenAiProvider {
     }
 
     async fn stream(&self, request: StreamRequest) -> SdkResult<StreamHandle> {
-        // Create OpenTelemetry span for this streaming LLM call
-        let mut span = telemetry::create_gen_ai_span("openai", &request.model);
+        // Create OpenTelemetry span for this streaming LLM call (as child of provided or current context)
+        let mut span = telemetry::create_gen_ai_span("openai", &request.model, request.otel_context.clone());
 
         // Set request configuration attributes
         telemetry::set_request_attributes(&mut span, &request);
@@ -330,7 +330,7 @@ impl LanguageModel for OpenAiProvider {
         // Track request start time
         let start = std::time::Instant::now();
 
-        // Execute the actual streaming API call
+        // Execute the actual streaming API call (span is already linked to parent via create_gen_ai_span)
         let result = async {
             validate_request(&request)?;
             let model = self.normalize_model(&request.model)?;
@@ -349,7 +349,7 @@ impl LanguageModel for OpenAiProvider {
         }
         .await;
 
-        // Record latency for stream initialization
+        // Record latency for stream initialization on the span
         let duration_ms = start.elapsed().as_millis();
         telemetry::set_duration(&mut span, duration_ms);
 

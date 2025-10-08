@@ -290,8 +290,6 @@ impl Worker {
                 result = rx.recv_async() => {
                     match result {
                         Ok(runtime_message) => {
-                            debug!("Received message for worker {}", self.config.worker_id);
-
                             // Clone tx for potential streaming responses
                             // Handler can use this to send multiple responses for streaming
                             let tx_clone = tx.clone();

@@ -49,16 +49,32 @@ pub fn should_capture_content() -> bool {
 ///
 /// Creates a span named `chat {model}` with SpanKind::Client per OpenTelemetry spec.
 /// Sets required attributes: operation.name, provider.name, request.model
-pub fn create_gen_ai_span(provider: &str, model: &str) -> impl Span {
+///
+/// The span will be created as a child of the provided parent context, or the current
+/// context if none is provided, ensuring LLM calls appear in the same distributed trace
+/// as the calling function.
+///
+/// # Arguments
+/// * `provider` - The LLM provider name (e.g., "openai", "anthropic")
+/// * `model` - The model name (e.g., "gpt-4", "claude-3-opus")
+/// * `parent_context` - Optional parent context for trace propagation across async boundaries
+pub fn create_gen_ai_span(
+    provider: &str,
+    model: &str,
+    parent_context: Option<opentelemetry::Context>,
+) -> impl Span {
     let tracer = global::tracer("agnt5-sdk-core");
 
     // Span name format: "{operation_name} {model_name}" per spec
     let span_name = format!("chat {}", model);
 
+    // Use provided context or get current context to make this span a child of the calling function
+    let ctx = parent_context.unwrap_or_else(opentelemetry::Context::current);
+
     let mut span = tracer
         .span_builder(span_name)
         .with_kind(SpanKind::Client)
-        .start(&tracer);
+        .start_with_context(&tracer, &ctx);
 
     // Required attributes per OpenTelemetry Gen AI conventions
     span.set_attribute(KeyValue::new(attributes::OPERATION_NAME, "chat"));
