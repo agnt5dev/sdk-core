@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::anyhow;
 use async_trait::async_trait;
-use opentelemetry::trace::Span;
+use opentelemetry::trace::{Span, TraceContextExt};
 use reqwest::Client;
 
 use crate::error::{Result as SdkResult, SdkError};
@@ -220,6 +220,29 @@ impl LanguageModel for OpenAiProvider {
         // Create OpenTelemetry span for this LLM call (as child of provided or current context)
         let mut span = telemetry::create_gen_ai_span("openai", &request.model, request.otel_context.clone());
 
+        if let Some(ref ctx) = request.otel_context {
+            let span_ref = ctx.span();
+            let span_ctx = span_ref.span_context();
+            tracing::info!(
+                "Trace propagation: REQUEST context trace_id={}, span_id={}, valid={}",
+                span_ctx.trace_id().to_string(),
+                span_ctx.span_id().to_string(),
+                span_ctx.is_valid()
+            );
+        } else {
+            tracing::warn!("Trace propagation: REQUEST context missing for LLM call");
+        }
+
+        {
+            let span_ctx = span.span_context();
+            tracing::info!(
+                "Trace propagation: LLM span trace_id={}, span_id={}, valid={}",
+                span_ctx.trace_id().to_string(),
+                span_ctx.span_id().to_string(),
+                span_ctx.is_valid()
+            );
+        }
+
         // Set request configuration attributes
         telemetry::set_request_attributes(&mut span, &request);
 
@@ -296,6 +319,29 @@ impl LanguageModel for OpenAiProvider {
     async fn stream(&self, request: StreamRequest) -> SdkResult<StreamHandle> {
         // Create OpenTelemetry span for this streaming LLM call (as child of provided or current context)
         let mut span = telemetry::create_gen_ai_span("openai", &request.model, request.otel_context.clone());
+
+        if let Some(ref ctx) = request.otel_context {
+            let span_ref = ctx.span();
+            let span_ctx = span_ref.span_context();
+            tracing::info!(
+                "Trace propagation: STREAM REQUEST context trace_id={}, span_id={}, valid={}",
+                span_ctx.trace_id().to_string(),
+                span_ctx.span_id().to_string(),
+                span_ctx.is_valid()
+            );
+        } else {
+            tracing::warn!("Trace propagation: STREAM REQUEST context missing for LLM call");
+        }
+
+        {
+            let span_ctx = span.span_context();
+            tracing::info!(
+                "Trace propagation: STREAM LLM span trace_id={}, span_id={}, valid={}",
+                span_ctx.trace_id().to_string(),
+                span_ctx.span_id().to_string(),
+                span_ctx.is_valid()
+            );
+        }
 
         // Set request configuration attributes
         telemetry::set_request_attributes(&mut span, &request);

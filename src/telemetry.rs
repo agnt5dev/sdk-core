@@ -31,10 +31,10 @@ impl<'a> Extractor for HashMapExtractor<'a> {
     }
 }
 
-/// Custom field formatter that prioritizes invocation.id in log output
-struct InvocationFieldFormatter;
+/// Custom field formatter that prioritizes run.id in log output
+struct RunFieldFormatter;
 
-impl<'writer> tracing_subscriber::fmt::format::FormatFields<'writer> for InvocationFieldFormatter {
+impl<'writer> tracing_subscriber::fmt::format::FormatFields<'writer> for RunFieldFormatter {
     fn format_fields<R: tracing_subscriber::field::RecordFields>(
         &self,
         writer: Writer<'writer>,
@@ -45,14 +45,14 @@ impl<'writer> tracing_subscriber::fmt::format::FormatFields<'writer> for Invocat
         struct FieldVisitor<'a> {
             writer: Writer<'a>,
             result: std::fmt::Result,
-            invocation_id: Option<String>,
+            run_id: Option<String>,
             other_fields: Vec<(String, String)>,
         }
 
         impl<'a> Visit for FieldVisitor<'a> {
             fn record_str(&mut self, field: &Field, value: &str) {
-                if field.name() == "invocation.id" {
-                    self.invocation_id = Some(value.to_string());
+                if field.name() == "run.id" {
+                    self.run_id = Some(value.to_string());
                 } else {
                     self.other_fields
                         .push((field.name().to_string(), value.to_string()));
@@ -61,8 +61,8 @@ impl<'writer> tracing_subscriber::fmt::format::FormatFields<'writer> for Invocat
 
             fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
                 let formatted = format!("{:?}", value);
-                if field.name() == "invocation.id" {
-                    self.invocation_id = Some(formatted);
+                if field.name() == "run.id" {
+                    self.run_id = Some(formatted);
                 } else {
                     self.other_fields
                         .push((field.name().to_string(), formatted));
@@ -73,15 +73,15 @@ impl<'writer> tracing_subscriber::fmt::format::FormatFields<'writer> for Invocat
         let mut visitor = FieldVisitor {
             writer,
             result: Ok(()),
-            invocation_id: None,
+            run_id: None,
             other_fields: Vec::new(),
         };
 
         fields.record(&mut visitor);
 
-        // Write invocation.id first if present
-        if let Some(inv_id) = visitor.invocation_id {
-            write!(visitor.writer, "invocation.id={} ", inv_id)?;
+        // Write run.id first if present
+        if let Some(run_id) = visitor.run_id {
+            write!(visitor.writer, "run.id={} ", run_id)?;
         }
 
         // Write other fields
@@ -188,14 +188,14 @@ pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), S
     let console_filter = EnvFilter::new(&filter_directive);
     let otel_filter = EnvFilter::new(&filter_directive);
 
-    // Create custom fmt layer that includes invocation.id in log output
+    // Create custom fmt layer that includes run.id in log output
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
         .with_thread_ids(false)
         .with_thread_names(false)
         .with_file(true)
         .with_line_number(true)
-        .fmt_fields(InvocationFieldFormatter)
+        .fmt_fields(RunFieldFormatter)
         .with_filter(console_filter);  // Filter console output
 
     let subscriber = Registry::default()
@@ -265,17 +265,40 @@ pub fn create_function_span(
     function_name: &str,
     service_name: &str,
     worker_id: &str,
-    invocation_id: &str,
+    run_id: &str,
+    parent_context: Option<Context>,
+    metadata: Option<&HashMap<String, String>>,
+) -> BoxedSpan {
+    // Default to "function" for backwards compatibility
+    create_component_span(
+        function_name,
+        "function",
+        service_name,
+        worker_id,
+        run_id,
+        parent_context,
+        metadata,
+    )
+}
+
+/// Create a span for any component type (function, workflow, agent, tool, entity)
+pub fn create_component_span(
+    component_name: &str,
+    component_type: &str,
+    service_name: &str,
+    worker_id: &str,
+    run_id: &str,
     parent_context: Option<Context>,
     metadata: Option<&HashMap<String, String>>,
 ) -> BoxedSpan {
     let tracer = global::tracer("agnt5-sdk-core");
 
     let mut attributes = vec![
-        KeyValue::new("function.name", function_name.to_string()),
+        KeyValue::new("component.name", component_name.to_string()),
+        KeyValue::new("component.type", component_type.to_string()),
         KeyValue::new("service.name", service_name.to_string()),
         KeyValue::new("worker.id", worker_id.to_string()),
-        KeyValue::new("invocation.id", invocation_id.to_string()),
+        KeyValue::new("run.id", run_id.to_string()),
     ];
 
     // Extract baggage items as span attributes if parent context exists
@@ -329,7 +352,7 @@ pub fn create_function_span(
     }
 
     let span_builder = tracer
-        .span_builder(format!("function.{}", function_name))
+        .span_builder(format!("{}.{}", component_type, component_name))
         .with_kind(SpanKind::Server)
         .with_attributes(attributes);
 

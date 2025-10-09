@@ -38,8 +38,8 @@ pub use runtime_adapter::{
     RuntimeContext, StateManager,
 };
 pub use telemetry::{
-    create_function_span, end_span, extract_context_from_runtime_message, init_telemetry,
-    record_span_error, record_span_success, shutdown_telemetry,
+    create_component_span, create_function_span, end_span, extract_context_from_runtime_message,
+    init_telemetry, record_span_error, record_span_success, shutdown_telemetry,
 };
 pub use worker::Worker;
 

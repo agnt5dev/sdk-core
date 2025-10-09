@@ -1,10 +1,12 @@
 use crate::error::Result;
+use opentelemetry::trace::TraceContextExt;
+use opentelemetry::Context;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct InvocationRequest {
-    pub invocation_id: String,
+    pub run_id: String,
     pub service_name: String,
     pub handler_name: String,
     pub input_data: Vec<u8>,
@@ -13,7 +15,7 @@ pub struct InvocationRequest {
 
 #[derive(Debug, Clone)]
 pub struct InvocationResponse {
-    pub invocation_id: String,
+    pub run_id: String,
     pub output_data: Vec<u8>,
     pub success: bool,
     pub error_message: Option<String>,
@@ -32,13 +34,89 @@ pub trait StateManager: Send + Sync {
 }
 
 pub struct RuntimeContext {
-    pub invocation_id: String,
+    pub run_id: String,
     pub service_name: String,
     pub component_name: String,
     pub tenant_id: String,
     pub deployment_id: String,
     pub metadata: HashMap<String, String>,
     pub state_manager: Arc<dyn StateManager>,
+
+    // OpenTelemetry context for trace propagation
+    pub otel_context: Option<Context>,
+
+    // Pre-extracted correlation IDs for easy access in logging
+    pub trace_id: Option<String>,
+    pub span_id: Option<String>,
+}
+
+impl RuntimeContext {
+    /// Create a new RuntimeContext with OpenTelemetry trace context
+    pub fn with_trace_context(
+        run_id: String,
+        service_name: String,
+        component_name: String,
+        tenant_id: String,
+        deployment_id: String,
+        metadata: HashMap<String, String>,
+        otel_context: Context,
+        state_manager: Arc<dyn StateManager>,
+    ) -> Self {
+        // Extract trace_id and span_id for logging correlation
+        let (trace_id, span_id) = extract_trace_ids(&otel_context);
+
+        Self {
+            run_id,
+            service_name,
+            component_name,
+            tenant_id,
+            deployment_id,
+            metadata,
+            state_manager,
+            otel_context: Some(otel_context),
+            trace_id,
+            span_id,
+        }
+    }
+
+    /// Create a basic RuntimeContext without OpenTelemetry context
+    pub fn new(
+        run_id: String,
+        service_name: String,
+        component_name: String,
+        tenant_id: String,
+        deployment_id: String,
+        metadata: HashMap<String, String>,
+        state_manager: Arc<dyn StateManager>,
+    ) -> Self {
+        Self {
+            run_id,
+            service_name,
+            component_name,
+            tenant_id,
+            deployment_id,
+            metadata,
+            state_manager,
+            otel_context: None,
+            trace_id: None,
+            span_id: None,
+        }
+    }
+}
+
+/// Extract trace_id and span_id from OpenTelemetry context for logging
+fn extract_trace_ids(ctx: &Context) -> (Option<String>, Option<String>) {
+    let span = ctx.span();
+    let span_ctx = span.span_context();
+
+    if span_ctx.is_valid() {
+        (
+            Some(span_ctx.trace_id().to_string()),
+            Some(span_ctx.span_id().to_string()),
+        )
+    } else {
+        (None, None)
+    }
 }
 
 pub struct RuntimeCapabilities {
