@@ -4,19 +4,17 @@ pub mod adk;
 pub mod client;
 pub mod context;
 pub mod error;
-pub mod llm;
 pub mod lm;
 pub mod logging;
 pub mod runtime_adapter;
 pub mod telemetry;
+pub mod vectordb;
 pub mod worker;
 
 // Re-export main types
 pub use adk::{
-    AgentHandle, ContextHandle, DeterministicUtils, InMemoryMemoryBackend, InMemorySessionBackend,
-    MemoryHandle, MemoryItem, RuntimeControls, RuntimeServiceClient, SessionEvent, SessionHandle,
-    SessionStateHandle, SessionStateScope, SignalControls, TaskControls, TimerControls,
-    ToolDefinition, ToolHandle, ToolRegistry,
+    AgentHandle, ContextHandle, DeterministicUtils, RuntimeControls, RuntimeServiceClient,
+    SignalControls, TaskControls, TimerControls, ToolDefinition, ToolHandle, ToolRegistry,
 };
 pub use client::WorkerCoordinatorClient;
 pub use context::{
@@ -24,7 +22,6 @@ pub use context::{
     FunctionResult, FunctionStatus, LanguageModelNamespace, SignalNamespace, TimerNamespace,
 };
 pub use error::{Result, SdkError};
-pub use llm::LlmClient;
 pub use lm::{
     generate, stream, AnthropicConfig, AnthropicProvider, AzureOpenAiConfig, AzureOpenAiProvider,
     BedrockConfig, BedrockProvider, GenerateRequest, GenerateResponse, GenerationConfig,
@@ -34,12 +31,17 @@ pub use lm::{
 };
 pub use logging::{clear_error_buffer, get_error_buffer, init_logging};
 pub use runtime_adapter::{
-    DummyStateManager, InvocationRequest, InvocationResponse, RuntimeAdapter, RuntimeCapabilities,
-    RuntimeContext, StateManager,
+    DummyStateManager, EntityStateLoadResult, EntityStateManager, EntityStateSaveResult,
+    InvocationRequest, InvocationResponse, RuntimeAdapter, RuntimeCapabilities, RuntimeContext,
+    StateManager,
 };
 pub use telemetry::{
     create_component_span, create_function_span, end_span, extract_context_from_runtime_message,
     init_telemetry, record_span_error, record_span_success, shutdown_telemetry,
+};
+pub use vectordb::{
+    Collection, DistanceMetric, PgVectorProvider, QdrantProvider, SearchQuery, SearchResult,
+    VectorDatabase, VectorDbRegistry, VectorEntry, VectorFilter, VectorMetadata,
 };
 pub use worker::Worker;
 

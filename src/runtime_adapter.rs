@@ -3,6 +3,7 @@ use opentelemetry::trace::TraceContextExt;
 use opentelemetry::Context;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::{oneshot, Mutex};
 
 #[derive(Debug, Clone)]
 pub struct InvocationRequest {
@@ -163,5 +164,197 @@ impl StateManager for DummyStateManager {
         Err(crate::error::SdkError::Other(anyhow::anyhow!(
             "State management not implemented"
         )))
+    }
+}
+
+/// Entity state load result
+#[derive(Debug, Clone)]
+pub struct EntityStateLoadResult {
+    pub found: bool,
+    pub state_json: Vec<u8>,
+    pub version: i64,
+}
+
+/// Entity state save result
+#[derive(Debug, Clone)]
+pub struct EntityStateSaveResult {
+    pub new_version: i64,
+}
+
+/// Entity state manager that communicates with Worker Coordinator via gRPC
+/// Implements bulk load/save pattern for entity state operations
+pub struct EntityStateManager {
+    stream_sender: flume::Sender<crate::pb::ServiceMessage>,
+    pending_requests: Arc<Mutex<HashMap<String, oneshot::Sender<crate::pb::RuntimeServiceResponse>>>>,
+    tenant_id: String,
+    session_id: String,
+}
+
+impl EntityStateManager {
+    /// Create a new EntityStateManager with stream access
+    pub fn new(
+        stream_sender: flume::Sender<crate::pb::ServiceMessage>,
+        tenant_id: String,
+        session_id: String,
+    ) -> Self {
+        Self {
+            stream_sender,
+            pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            tenant_id,
+            session_id,
+        }
+    }
+
+    /// Handle RuntimeServiceResponse from the worker stream
+    /// This should be called by the worker when it receives a RuntimeServiceResponse
+    pub async fn handle_response(&self, response: crate::pb::RuntimeServiceResponse) {
+        let request_id = response.request_id.clone();
+
+        let mut pending = self.pending_requests.lock().await;
+        if let Some(sender) = pending.remove(&request_id) {
+            let _ = sender.send(response);
+        }
+    }
+
+    /// Load entire entity state from platform
+    pub async fn load_state(
+        &self,
+        entity_type: String,
+        entity_key: String,
+    ) -> Result<EntityStateLoadResult> {
+        use crate::pb::{runtime_service_request, EntityStateLoadRequest, RuntimeServiceRequest, ServiceMessage};
+
+        // Generate unique request ID
+        let request_id = uuid::Uuid::new_v4().to_string();
+
+        // Create oneshot channel for response
+        let (response_tx, response_rx) = oneshot::channel();
+
+        // Store in pending requests
+        self.pending_requests.lock().await.insert(request_id.clone(), response_tx);
+
+        // Create RuntimeServiceRequest
+        let request = RuntimeServiceRequest {
+            request_id: request_id.clone(),
+            tenant_id: self.tenant_id.clone(),
+            session_id: self.session_id.clone(),
+            operation: Some(runtime_service_request::Operation::EntityStateLoad(
+                EntityStateLoadRequest {
+                    entity_type,
+                    entity_key,
+                }
+            )),
+        };
+
+        // Send via worker stream
+        let message = ServiceMessage {
+            worker_id: String::new(), // Will be filled by worker
+            message_type: Some(crate::pb::service_message::MessageType::RuntimeService(request)),
+        };
+
+        self.stream_sender.send_async(message).await
+            .map_err(|e| crate::error::SdkError::Connection(format!("Failed to send load request: {}", e)))?;
+
+        // Wait for response with timeout
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            response_rx
+        ).await
+            .map_err(|_| crate::error::SdkError::Other(anyhow::anyhow!("Entity state load timeout")))?
+            .map_err(|_| crate::error::SdkError::Other(anyhow::anyhow!("Response channel closed")))?;
+
+        // Check if request succeeded
+        if !response.success {
+            return Err(crate::error::SdkError::Other(anyhow::anyhow!(
+                "Entity state load failed: {}",
+                response.error_message
+            )));
+        }
+
+        // Extract result
+        match response.result {
+            Some(crate::pb::runtime_service_response::Result::EntityStateLoad(result)) => {
+                Ok(EntityStateLoadResult {
+                    found: result.found,
+                    state_json: result.state_json,
+                    version: result.version,
+                })
+            }
+            _ => Err(crate::error::SdkError::Other(anyhow::anyhow!(
+                "Unexpected response type for entity state load"
+            ))),
+        }
+    }
+
+    /// Save entire entity state to platform with optimistic locking
+    pub async fn save_state(
+        &self,
+        entity_type: String,
+        entity_key: String,
+        state_json: Vec<u8>,
+        expected_version: i64,
+    ) -> Result<EntityStateSaveResult> {
+        use crate::pb::{runtime_service_request, EntityStateSaveRequest, RuntimeServiceRequest, ServiceMessage};
+
+        // Generate unique request ID
+        let request_id = uuid::Uuid::new_v4().to_string();
+
+        // Create oneshot channel for response
+        let (response_tx, response_rx) = oneshot::channel();
+
+        // Store in pending requests
+        self.pending_requests.lock().await.insert(request_id.clone(), response_tx);
+
+        // Create RuntimeServiceRequest
+        let request = RuntimeServiceRequest {
+            request_id: request_id.clone(),
+            tenant_id: self.tenant_id.clone(),
+            session_id: self.session_id.clone(),
+            operation: Some(runtime_service_request::Operation::EntityStateSave(
+                EntityStateSaveRequest {
+                    entity_type,
+                    entity_key,
+                    state_json,
+                    expected_version,
+                }
+            )),
+        };
+
+        // Send via worker stream
+        let message = ServiceMessage {
+            worker_id: String::new(), // Will be filled by worker
+            message_type: Some(crate::pb::service_message::MessageType::RuntimeService(request)),
+        };
+
+        self.stream_sender.send_async(message).await
+            .map_err(|e| crate::error::SdkError::Connection(format!("Failed to send save request: {}", e)))?;
+
+        // Wait for response with timeout
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            response_rx
+        ).await
+            .map_err(|_| crate::error::SdkError::Other(anyhow::anyhow!("Entity state save timeout")))?
+            .map_err(|_| crate::error::SdkError::Other(anyhow::anyhow!("Response channel closed")))?;
+
+        // Check if request succeeded
+        if !response.success {
+            return Err(crate::error::SdkError::Other(anyhow::anyhow!(
+                "Entity state save failed: {}",
+                response.error_message
+            )));
+        }
+
+        // Extract result
+        match response.result {
+            Some(crate::pb::runtime_service_response::Result::EntityStateSave(result)) => {
+                Ok(EntityStateSaveResult {
+                    new_version: result.new_version,
+                })
+            }
+            _ => Err(crate::error::SdkError::Other(anyhow::anyhow!(
+                "Unexpected response type for entity state save"
+            ))),
+        }
     }
 }

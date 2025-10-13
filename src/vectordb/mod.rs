@@ -2,7 +2,6 @@
 // Provides unified interface for vector storage and retrieval operations
 
 pub mod providers;
-pub mod rag;
 pub mod types;
 
 // Re-export core types
