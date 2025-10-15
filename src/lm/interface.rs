@@ -281,8 +281,16 @@ pub struct GenerateResponse {
     pub text: String,
     pub usage: Option<TokenUsage>,
     pub finish_reason: Option<String>,
+    pub tool_calls: Option<Vec<ToolCall>>,
     pub object: Option<Value>,
     pub raw: Option<Value>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
 }
 
 #[derive(Clone, Debug)]

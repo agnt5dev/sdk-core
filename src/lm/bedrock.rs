@@ -402,6 +402,7 @@ impl BedrockAnthropicResponse {
             finish_reason: self.stop_reason,
             usage: self.usage.and_then(|usage| usage.into_token_usage()),
             text,
+            tool_calls: None,  // Bedrock tool calls not yet supported
             object,
             raw: None,
         })

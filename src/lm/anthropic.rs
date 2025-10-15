@@ -554,6 +554,7 @@ impl MessagesResponse {
             text,
             usage: usage_from_api(usage),
             finish_reason: stop_reason,
+            tool_calls: None,  // Anthropic tool calls handled separately
             object,
             raw: Some(raw),
         })
@@ -815,6 +816,7 @@ impl PartialResponse {
             text,
             usage,
             finish_reason: self.stop_reason,
+            tool_calls: None,  // Anthropic streaming tool calls handled separately
             object,
             raw: None,
         })

@@ -167,6 +167,8 @@ impl ChatCompletionResponse {
         self,
         response_format: ResponseFormat,
     ) -> SdkResult<GenerateResponse> {
+        use super::interface::ToolCall;
+
         let raw = serde_json::to_value(&self).unwrap_or(JsonValue::Null);
         let ChatCompletionResponse {
             id,
@@ -186,6 +188,22 @@ impl ChatCompletionResponse {
             .first()
             .and_then(|choice| choice.finish_reason.clone());
 
+        // Extract tool_calls from the response
+        let tool_calls = choices
+            .first()
+            .and_then(|choice| choice.message.as_ref())
+            .and_then(|message| message.tool_calls.as_ref())
+            .map(|api_tool_calls| {
+                api_tool_calls
+                    .iter()
+                    .map(|api_tc| ToolCall {
+                        id: api_tc.id.clone(),
+                        name: api_tc.function.name.clone(),
+                        arguments: api_tc.function.arguments.clone(),
+                    })
+                    .collect()
+            });
+
         let object = match response_format {
             ResponseFormat::Text => None,
             ResponseFormat::Json => Some(parse_json_value(&text)?),
@@ -199,6 +217,7 @@ impl ChatCompletionResponse {
             text,
             usage: usage_from_api(usage),
             finish_reason,
+            tool_calls,
             object,
             raw: Some(raw),
         })
@@ -218,6 +237,22 @@ pub(crate) struct ChoiceMessage {
     #[allow(unused)]
     role: Option<String>,
     content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ApiToolCall>>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+pub(crate) struct ApiToolCall {
+    pub(crate) id: String,
+    #[serde(rename = "type")]
+    pub(crate) tool_type: String,
+    pub(crate) function: ApiToolCallFunction,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+pub(crate) struct ApiToolCallFunction {
+    pub(crate) name: String,
+    pub(crate) arguments: String,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -353,6 +388,7 @@ impl PartialResponse {
             finish_reason: self.finish_reason,
             usage: usage_from_api(self.usage),
             text,
+            tool_calls: None,  // Streaming doesn't support tool calls yet
             object,
             raw: None,
         })
