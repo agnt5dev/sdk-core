@@ -136,10 +136,13 @@ impl Worker {
     }
 
     /// Run the worker with a message handler
-    pub async fn run<F, Fut>(&self, mut message_handler: F) -> Result<()>
+    ///
+    /// The handler is now `Fn + Clone` instead of `FnMut` to enable concurrent execution.
+    /// Multiple worker tasks can invoke the handler in parallel.
+    pub async fn run<F, Fut>(&self, message_handler: F) -> Result<()>
     where
-        F: FnMut(RuntimeMessage, flume::Sender<ServiceMessage>) -> Fut + Send,
-        Fut: std::future::Future<Output = Result<Option<ServiceMessage>>> + Send,
+        F: Fn(RuntimeMessage, flume::Sender<ServiceMessage>) -> Fut + Send + Clone + 'static,
+        Fut: std::future::Future<Output = Result<Option<ServiceMessage>>> + Send + 'static,
     {
         info!("Starting worker {}", self.config.worker_id);
 
@@ -209,7 +212,7 @@ impl Worker {
             let shutdown_rx_inner = shutdown_tx.subscribe();
 
             match self
-                .try_connect_and_run(&mut message_handler, shutdown_rx_inner)
+                .try_connect_and_run(message_handler.clone(), shutdown_rx_inner)
                 .await
             {
                 Ok(()) => {
@@ -248,12 +251,12 @@ impl Worker {
     /// Internal method to connect and run until disconnection
     async fn try_connect_and_run<F, Fut>(
         &self,
-        message_handler: &mut F,
+        message_handler: F,
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     ) -> Result<()>
     where
-        F: FnMut(RuntimeMessage, flume::Sender<ServiceMessage>) -> Fut + Send,
-        Fut: std::future::Future<Output = Result<Option<ServiceMessage>>> + Send,
+        F: Fn(RuntimeMessage, flume::Sender<ServiceMessage>) -> Fut + Send + Clone + 'static,
+        Fut: std::future::Future<Output = Result<Option<ServiceMessage>>> + Send + 'static,
     {
         let mut client =
             WorkerCoordinatorClient::connect(self.config.coordinator_endpoint.clone()).await?;
@@ -283,58 +286,128 @@ impl Worker {
         // Start heartbeat task
         let heartbeat_task = self.spawn_heartbeat_task(tx.clone());
 
-        // Continue with normal message handling using tokio::select!
-        loop {
+        // Get concurrency configuration
+        let max_concurrency = std::env::var("AGNT5_MAX_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100);
+
+        info!(
+            "Worker {} starting with concurrency limit: {}",
+            self.config.worker_id, max_concurrency
+        );
+
+        // Create task pool channels
+        // Task dispatch channel (bounded for backpressure)
+        let (task_tx, task_rx) = flume::bounded::<RuntimeMessage>(max_concurrency * 2);
+        // Response collection channel (unbounded - responses must flow)
+        let (response_tx, response_rx) = flume::unbounded::<ServiceMessage>();
+
+        // Spawn worker pool
+        let mut worker_handles = Vec::new();
+        for worker_id in 0..max_concurrency {
+            let task_rx = task_rx.clone();
+            let response_tx = response_tx.clone();
+            let handler = message_handler.clone();
+            let worker_name = format!("{}-{}", self.config.worker_id, worker_id);
+
+            let handle = tokio::spawn(async move {
+                debug!("Worker task {} started", worker_name);
+
+                while let Ok(runtime_message) = task_rx.recv_async().await {
+                    debug!("Worker {} processing message", worker_name);
+
+                    let tx_clone = response_tx.clone();
+                    match handler(runtime_message, tx_clone).await {
+                        Ok(Some(response)) => {
+                            if let Err(e) = response_tx.send_async(response).await {
+                                error!("Worker {} failed to send response: {}", worker_name, e);
+                                break;
+                            }
+                        }
+                        Ok(None) => {
+                            // No response needed
+                        }
+                        Err(e) => {
+                            error!("Worker {} handler error: {}", worker_name, e);
+                        }
+                    }
+                }
+
+                debug!("Worker task {} exiting", worker_name);
+            });
+
+            worker_handles.push(handle);
+        }
+
+        // Main dispatch loop
+        let dispatch_result = loop {
             tokio::select! {
-                // Wait for incoming message
+                // Dispatch incoming messages to worker pool
                 result = rx.recv_async() => {
                     match result {
                         Ok(runtime_message) => {
-                            // Clone tx for potential streaming responses
-                            // Handler can use this to send multiple responses for streaming
-                            let tx_clone = tx.clone();
-                            let response = message_handler(runtime_message, tx_clone).await;
-
-                            match response {
-                                Ok(Some(response)) => {
-                                    // Send response back to coordinator
-                                    debug!("Sending response back to coordinator");
-                                    if let Err(e) = tx.send_async(response).await {
-                                        error!("Failed to send response for worker {}: {}", self.config.worker_id, e);
-                                        // Connection lost, return error to trigger reconnection
-                                        heartbeat_task.abort();
-                                        return Err(crate::error::SdkError::Connection(format!("Send failed: {}", e)));
-                                    }
-                                }
-                                Ok(None) => {
-                                    // No response needed
-                                }
-                                Err(e) => {
-                                    error!("Message handler error in worker {}: {}", self.config.worker_id, e);
-                                }
+                            // Send to worker pool (bounded channel provides backpressure)
+                            if let Err(e) = task_tx.send_async(runtime_message).await {
+                                error!("Failed to dispatch message to worker pool: {}", e);
+                                break Err(crate::error::SdkError::Connection(
+                                    format!("Task dispatch failed: {}", e)
+                                ));
                             }
                         }
                         Err(e) => {
                             error!("Channel error for worker {}, will reconnect: {}", self.config.worker_id, e);
-
-                            // Try to send graceful shutdown message
-                            let _ = self.send_shutdown_message(&tx).await;
-                            heartbeat_task.abort();
-
-                            // Return error to trigger reconnection
-                            return Err(crate::error::SdkError::Connection(format!("Receive failed: {}", e)));
+                            break Err(crate::error::SdkError::Connection(
+                                format!("Receive failed: {}", e)
+                            ));
                         }
                     }
                 }
-                // Wait for shutdown signal - immediate response!
+
+                // Forward responses from worker pool to coordinator
+                response = response_rx.recv_async() => {
+                    match response {
+                        Ok(service_message) => {
+                            if let Err(e) = tx.send_async(service_message).await {
+                                error!("Failed to send response to coordinator: {}", e);
+                                break Err(crate::error::SdkError::Connection(
+                                    format!("Send failed: {}", e)
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            error!("Response channel error: {}", e);
+                            break Err(crate::error::SdkError::Connection(
+                                format!("Response receive failed: {}", e)
+                            ));
+                        }
+                    }
+                }
+
+                // Wait for shutdown signal
                 _ = shutdown_rx.recv() => {
                     info!("Worker {} received shutdown signal, stopping gracefully", self.config.worker_id);
-                    let _ = self.send_shutdown_message(&tx).await;
-                    heartbeat_task.abort();
-                    return Ok(());
+                    break Ok(());
                 }
             }
+        };
+
+        // Cleanup: close channels and wait for workers
+        info!("Worker {} shutting down task pool", self.config.worker_id);
+        drop(task_tx); // Signal workers to exit
+        drop(task_rx); // Close receiver
+        drop(response_tx); // Close response sender
+
+        // Wait for all worker tasks to complete
+        for handle in worker_handles {
+            let _ = handle.await;
         }
+
+        // Send shutdown message and stop heartbeat
+        let _ = self.send_shutdown_message(&tx).await;
+        heartbeat_task.abort();
+
+        dispatch_result
     }
 
     /// Spawn a simple heartbeat task that sends periodic health checks
