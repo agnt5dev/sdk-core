@@ -312,11 +312,8 @@ impl Worker {
             let worker_name = format!("{}-{}", self.config.worker_id, worker_id);
 
             let handle = tokio::spawn(async move {
-                debug!("Worker task {} started", worker_name);
 
                 while let Ok(runtime_message) = task_rx.recv_async().await {
-                    debug!("Worker {} processing message", worker_name);
-
                     let tx_clone = response_tx.clone();
                     match handler(runtime_message, tx_clone).await {
                         Ok(Some(response)) => {
@@ -333,8 +330,6 @@ impl Worker {
                         }
                     }
                 }
-
-                debug!("Worker task {} exiting", worker_name);
             });
 
             worker_handles.push(handle);
