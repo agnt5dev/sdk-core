@@ -7,7 +7,7 @@ use crate::pb::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 /// Connection states for tracking worker status
@@ -412,8 +412,6 @@ impl Worker {
     ) -> tokio::task::JoinHandle<()> {
         let worker_id = self.config.worker_id.clone();
 
-        debug!("Starting heartbeat task (interval: 30s)");
-
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
 
@@ -441,14 +439,11 @@ impl Worker {
 
                 // Send heartbeat - if it fails, the channel is closed so we exit
                 if tx.send_async(service_message).await.is_err() {
-                    debug!("Heartbeat channel closed for worker {}", worker_id);
                     break;
                 }
 
                 // Heartbeat sent successfully
             }
-
-            debug!("Heartbeat task ended");
         })
     }
 
