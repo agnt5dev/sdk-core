@@ -5,7 +5,7 @@ use crate::pb::{
 };
 use std::time::Duration;
 use tonic::transport::Channel;
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 /// Simple client for communicating with the Worker Coordinator service
 #[derive(Debug, Clone)]
@@ -126,7 +126,6 @@ impl WorkerCoordinatorClient {
                 match message_result {
                     Ok(runtime_message) => {
                         if runtime_msg_tx.send_async(runtime_message).await.is_err() {
-                            debug!("📪 Runtime message channel closed, stopping forwarder");
                             break;
                         }
                     }
