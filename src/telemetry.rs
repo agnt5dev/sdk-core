@@ -19,15 +19,11 @@ struct HashMapExtractor<'a>(&'a HashMap<String, String>);
 
 impl<'a> Extractor for HashMapExtractor<'a> {
     fn get(&self, key: &str) -> Option<&str> {
-        let value = self.0.get(key).map(|v| v.as_str());
-        tracing::debug!("Extractor::get({:?}) -> {:?}", key, value);
-        value
+        self.0.get(key).map(|v| v.as_str())
     }
 
     fn keys(&self) -> Vec<&str> {
-        let keys: Vec<&str> = self.0.keys().map(|s| s.as_str()).collect();
-        tracing::debug!("Extractor::keys() -> {:?}", keys);
-        keys
+        self.0.keys().map(|s| s.as_str()).collect()
     }
 }
 
@@ -223,8 +219,6 @@ pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), S
 
 /// Extract trace context and baggage from runtime message metadata
 pub fn extract_context_from_runtime_message(metadata: &HashMap<String, String>) -> Context {
-    tracing::debug!("Extracting context from metadata: {:?}", metadata);
-
     // Wrap HashMap in our Extractor implementation
     let extractor = HashMapExtractor(metadata);
 
@@ -232,30 +226,17 @@ pub fn extract_context_from_runtime_message(metadata: &HashMap<String, String>) 
     let trace_propagator = TraceContextPropagator::new();
     let ctx = trace_propagator.extract(&extractor);
 
-    // Debug: Check if we extracted valid trace context
+    // Check if we extracted valid trace context and log warning if not
     use opentelemetry::trace::TraceContextExt;
     let span = ctx.span();
     let span_context = span.span_context();
-    if span_context.is_valid() {
-        tracing::debug!(
-            "✅ Extracted valid trace context - trace_id: {:?}, span_id: {:?}",
-            span_context.trace_id(),
-            span_context.span_id()
-        );
-    } else {
+    if !span_context.is_valid() {
         tracing::warn!("⚠️  Failed to extract valid trace context from metadata - will create new root trace");
     }
 
     // Then extract baggage using the trace context
     let baggage_propagator = BaggagePropagator::new();
     let final_ctx = baggage_propagator.extract_with_context(&ctx, &extractor);
-
-    // Debug log baggage contents
-    let baggage = final_ctx.baggage();
-    tracing::debug!(
-        "Extracted baggage items: {:?}",
-        baggage.iter().collect::<Vec<_>>()
-    );
 
     final_ctx
 }
@@ -304,21 +285,11 @@ pub fn create_component_span(
     // Extract baggage items as span attributes if parent context exists
     if let Some(ref ctx) = parent_context {
         let baggage = ctx.baggage();
-        let baggage_items: Vec<_> = baggage.iter().collect();
-        tracing::debug!(
-            "Adding {} baggage items as span attributes: {:?}",
-            baggage_items.len(),
-            baggage_items
-        );
-
         for (key, (value, _metadata)) in baggage.iter() {
             // Add baggage items with "baggage." prefix to distinguish them
             let attr_key = format!("baggage.{}", key);
             attributes.push(KeyValue::new(attr_key.clone(), value.to_string()));
-            tracing::debug!("Added baggage attribute: {} = {}", attr_key, value);
         }
-    } else {
-        tracing::debug!("No parent context provided for baggage extraction");
     }
 
     if let Some(meta) = metadata {
@@ -469,8 +440,6 @@ pub fn end_span(mut span: BoxedSpan) {
 /// This should be called before worker shutdown to ensure batched spans are exported.
 /// The batch span processor buffers spans with a 5-second timeout by default.
 pub fn flush_telemetry() -> Result<(), SdkError> {
-    tracing::debug!("Flushing telemetry data...");
-
     // The global tracer provider doesn't expose force_flush directly
     // We need to access it through the TracerProvider trait
     // For now, use a simple timeout to allow batch processor to flush
@@ -478,7 +447,6 @@ pub fn flush_telemetry() -> Result<(), SdkError> {
     use std::time::Duration;
     std::thread::sleep(Duration::from_secs(2));
 
-    tracing::debug!("Telemetry flush completed (waited for batch export)");
     Ok(())
 }
 
