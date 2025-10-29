@@ -7,6 +7,7 @@ pub mod error;
 pub mod lm;
 pub mod logging;
 pub mod runtime_adapter;
+pub mod span_filter;
 pub mod telemetry;
 pub mod vectordb;
 pub mod worker;

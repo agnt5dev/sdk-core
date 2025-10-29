@@ -136,10 +136,13 @@ pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), S
             SdkError::Other(anyhow::anyhow!("Failed to create OTLP log exporter: {}", e))
         })?;
 
-    // Create tracer provider with batch exporter
+    // Wrap trace exporter with filtering to remove h2 spans
+    let filtering_exporter = crate::span_filter::FilteringSpanExporter::new(trace_exporter);
+
+    // Create tracer provider with filtered batch exporter
     let trace_provider = SdkTracerProvider::builder()
         .with_resource(resource.clone())
-        .with_batch_exporter(trace_exporter)
+        .with_batch_exporter(filtering_exporter)
         .build();
 
     // Create logger provider with batch exporter
