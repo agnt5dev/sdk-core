@@ -1,6 +1,7 @@
 // AGNT5 SDK Core - Simple, focused foundation for worker coordination
 
 pub mod adk;
+pub mod checkpoint;
 pub mod client;
 pub mod context;
 pub mod error;
@@ -17,6 +18,7 @@ pub use adk::{
     AgentHandle, ContextHandle, DeterministicUtils, RuntimeControls, RuntimeServiceClient,
     SignalControls, TaskControls, TimerControls, ToolDefinition, ToolHandle, ToolRegistry,
 };
+pub use checkpoint::{CheckpointMessage, CheckpointQueue};
 pub use client::WorkerCoordinatorClient;
 pub use context::{
     ContextConfig, CoreContext, FunctionCall, FunctionHandle, FunctionNamespace, FunctionRegistry,
