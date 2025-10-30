@@ -1,8 +1,9 @@
+use crate::checkpoint::{CheckpointMessage, CheckpointQueue};
 use crate::client::WorkerCoordinatorClient;
 use crate::error::Result;
 use crate::pb::{
     ComponentInfo, HealthCheck, RegisterService, RuntimeMessage, ServiceMessage, UnregisterService,
-    WorkerHealthStatus,
+    WorkerHealthStatus, WorkflowCheckpoint,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -82,12 +83,26 @@ impl WorkerConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Worker {
     config: WorkerConfig,
     components: Vec<ComponentInfo>,
     metadata: HashMap<String, String>,
     connection_state: Arc<std::sync::Mutex<ConnectionState>>,
+    checkpoint_queue: CheckpointQueue,
+}
+
+// Implement Debug manually to avoid requiring Debug on CheckpointQueue's internals
+impl std::fmt::Debug for Worker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Worker")
+            .field("config", &self.config)
+            .field("components", &self.components)
+            .field("metadata", &self.metadata)
+            .field("connection_state", &self.connection_state)
+            .field("checkpoint_queue_size", &self.checkpoint_queue.len())
+            .finish()
+    }
 }
 
 impl Worker {
@@ -97,11 +112,20 @@ impl Worker {
         components: Vec<ComponentInfo>,
         metadata: HashMap<String, String>,
     ) -> Self {
+        // Get checkpoint buffer size from environment or use default
+        let checkpoint_buffer_size = std::env::var("AGNT5_CHECKPOINT_BUFFER_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1000);
+
+        info!("Creating worker with checkpoint buffer size: {}", checkpoint_buffer_size);
+
         Self {
             config,
             components,
             metadata,
             connection_state: Arc::new(std::sync::Mutex::new(ConnectionState::Disconnected)),
+            checkpoint_queue: CheckpointQueue::new(checkpoint_buffer_size),
         }
     }
 
@@ -133,6 +157,77 @@ impl Worker {
             poisoned.into_inner()
         });
         *guard = state;
+    }
+
+    /// Queue a workflow checkpoint for progressive durability
+    ///
+    /// This is called from language SDKs via FFI during workflow execution to send
+    /// checkpoints (state changes, step completions) to the platform in real-time.
+    ///
+    /// Checkpoints are buffered and sent via gRPC when the stream is active.
+    ///
+    /// # Arguments
+    ///
+    /// * `invocation_id` - Workflow run ID
+    /// * `checkpoint_type` - Event type ("workflow.state.changed", "workflow.step.started", etc.)
+    /// * `checkpoint_data` - JSON payload as bytes
+    /// * `sequence_number` - Monotonic sequence for ordering
+    /// * `metadata` - Additional metadata (tenant_id, deployment_id, etc.)
+    pub fn queue_checkpoint(
+        &self,
+        invocation_id: String,
+        checkpoint_type: String,
+        checkpoint_data: Vec<u8>,
+        sequence_number: i64,
+        metadata: HashMap<String, String>,
+    ) -> Result<()> {
+        let checkpoint = CheckpointMessage {
+            invocation_id: invocation_id.clone(),
+            checkpoint_type: checkpoint_type.clone(),
+            checkpoint_data,
+            sequence_number,
+            metadata,
+            queued_at: std::time::Instant::now(),
+        };
+
+        self.checkpoint_queue.push(checkpoint).map_err(|e| {
+            crate::error::SdkError::Internal(format!("Failed to queue checkpoint: {}", e))
+        })?;
+
+        Ok(())
+    }
+
+    /// Get checkpoint queue metrics
+    ///
+    /// Returns (queued, sent, dropped, errors)
+    pub fn checkpoint_metrics(&self) -> (u64, u64, u64, u64) {
+        self.checkpoint_queue.get_metrics()
+    }
+
+    /// Drain all buffered checkpoints for synchronous flushing
+    ///
+    /// This method removes and returns all queued checkpoints.
+    /// Used before sending workflow completion response to ensure
+    /// checkpoints arrive before run.completed event.
+    ///
+    /// # Returns
+    ///
+    /// Vector of (invocation_id, checkpoint_type, checkpoint_data, sequence_number, metadata) tuples
+    pub fn drain_checkpoints(&self) -> Vec<(String, String, Vec<u8>, i64, HashMap<String, String>)> {
+        let checkpoints = self.checkpoint_queue.drain_all();
+
+        checkpoints
+            .into_iter()
+            .map(|cp| {
+                (
+                    cp.invocation_id,
+                    cp.checkpoint_type,
+                    cp.checkpoint_data,
+                    cp.sequence_number,
+                    cp.metadata,
+                )
+            })
+            .collect()
     }
 
     /// Run the worker with a message handler
@@ -286,6 +381,9 @@ impl Worker {
         // Start heartbeat task
         let heartbeat_task = self.spawn_heartbeat_task(tx.clone());
 
+        // Start checkpoint flushing task
+        let checkpoint_task = self.spawn_checkpoint_flush_task(tx.clone());
+
         // Get concurrency configuration
         let max_concurrency = std::env::var("AGNT5_MAX_CONCURRENCY")
             .ok()
@@ -398,9 +496,10 @@ impl Worker {
             let _ = handle.await;
         }
 
-        // Send shutdown message and stop heartbeat
+        // Send shutdown message and stop background tasks
         let _ = self.send_shutdown_message(&tx).await;
         heartbeat_task.abort();
+        checkpoint_task.abort();
 
         dispatch_result
     }
@@ -443,6 +542,83 @@ impl Worker {
                 }
 
                 // Heartbeat sent successfully
+            }
+        })
+    }
+
+    /// Spawn checkpoint flushing task for progressive workflow durability
+    ///
+    /// This task periodically flushes buffered checkpoints to the coordinator via gRPC stream.
+    /// Checkpoints are sent immediately when queued if the queue was previously empty,
+    /// otherwise they're batched and sent periodically.
+    fn spawn_checkpoint_flush_task(
+        &self,
+        tx: flume::Sender<ServiceMessage>,
+    ) -> tokio::task::JoinHandle<()> {
+        let worker_id = self.config.worker_id.clone();
+        let checkpoint_queue = self.checkpoint_queue.clone();
+
+        // Get flush interval from environment or use default (100ms for low latency)
+        let flush_interval_ms = std::env::var("AGNT5_CHECKPOINT_FLUSH_INTERVAL_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100); // Default 100ms for low-latency checkpoint streaming
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(
+                std::time::Duration::from_millis(flush_interval_ms)
+            );
+
+            loop {
+                interval.tick().await;
+
+                // Flush all queued checkpoints
+                let mut sent_count = 0;
+                while let Some(checkpoint) = checkpoint_queue.pop() {
+                    let workflow_checkpoint = WorkflowCheckpoint {
+                        invocation_id: checkpoint.invocation_id.clone(),
+                        checkpoint_type: checkpoint.checkpoint_type.clone(),
+                        checkpoint_data: checkpoint.checkpoint_data.clone(),
+                        sequence_number: checkpoint.sequence_number,
+                        metadata: checkpoint.metadata.clone(),
+                    };
+
+                    let service_message = ServiceMessage {
+                        worker_id: worker_id.clone(),
+                        message_type: Some(
+                            crate::pb::service_message::MessageType::WorkflowCheckpoint(
+                                workflow_checkpoint,
+                            ),
+                        ),
+                    };
+
+                    // Send checkpoint - if it fails, re-queue and exit
+                    if let Err(e) = tx.send_async(service_message).await {
+                        warn!(
+                            "Failed to send checkpoint, re-queuing: type={} seq={} error={}",
+                            checkpoint.checkpoint_type, checkpoint.sequence_number, e
+                        );
+
+                        // Re-queue at front to preserve order
+                        if let Err(e) = checkpoint_queue.push_front(checkpoint) {
+                            error!("Failed to re-queue checkpoint: {}", e);
+                        }
+
+                        checkpoint_queue.record_error();
+                        break; // Channel closed, exit task
+                    }
+
+                    checkpoint_queue.record_sent();
+                    sent_count += 1;
+                }
+
+                if sent_count > 0 {
+                    info!(
+                        "Flushed {} checkpoints to coordinator (queue_size={})",
+                        sent_count,
+                        checkpoint_queue.len()
+                    );
+                }
             }
         })
     }
