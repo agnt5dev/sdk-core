@@ -461,19 +461,14 @@ impl Worker {
                 response = response_rx.recv_async() => {
                     match response {
                         Ok(service_message) => {
-                            eprintln!("🚀 SDK_CORE: Received response from worker pool, sending to coordinator");
-                            eprintln!("🚀 SDK_CORE: ServiceMessage type: {:?}", service_message.message_type.as_ref().map(|_| "FunctionResponse"));
                             if let Err(e) = tx.send_async(service_message).await {
-                                eprintln!("❌ SDK_CORE: Failed to send response to coordinator: {}", e);
                                 error!("Failed to send response to coordinator: {}", e);
                                 break Err(crate::error::SdkError::Connection(
                                     format!("Send failed: {}", e)
                                 ));
                             }
-                            eprintln!("✅ SDK_CORE: Successfully sent response to coordinator");
                         }
                         Err(e) => {
-                            eprintln!("❌ SDK_CORE: Response channel error: {}", e);
                             error!("Response channel error: {}", e);
                             break Err(crate::error::SdkError::Connection(
                                 format!("Response receive failed: {}", e)
