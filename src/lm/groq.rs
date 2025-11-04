@@ -7,7 +7,7 @@ use crate::error::{Result as SdkResult, SdkError};
 use super::interface::{
     GenerateRequest, GenerateResponse, LanguageModel, StreamHandle, StreamRequest,
 };
-use super::openai::{OpenAiConfig, OpenAiProvider};
+use super::openai_chat::{OpenAiChatConfig, OpenAiChatProvider};
 
 const DEFAULT_BASE_URL: &str = "https://api.groq.com/openai/v1";
 const MODEL_PREFIX: &str = "groq";
@@ -49,16 +49,16 @@ impl GroqConfig {
 
 #[derive(Clone)]
 pub struct GroqProvider {
-    inner: OpenAiProvider,
+    inner: OpenAiChatProvider,
 }
 
 impl GroqProvider {
     pub fn new(config: GroqConfig) -> SdkResult<Self> {
-        let inner_config = OpenAiConfig::new(config.api_key)
+        let inner_config = OpenAiChatConfig::new(config.api_key)
             .with_base_url(config.base_url)
             .with_model_prefix(Some(MODEL_PREFIX));
 
-        let inner = OpenAiProvider::new(inner_config)?;
+        let inner = OpenAiChatProvider::new(inner_config)?;
         Ok(Self { inner })
     }
 

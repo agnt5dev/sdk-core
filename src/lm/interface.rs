@@ -129,6 +129,15 @@ pub struct GenerationConfig {
     pub top_p: Option<f32>,
     pub max_output_tokens: Option<u32>,
     pub response_format: ResponseFormat,
+    /// Reasoning effort for o-series models (o1, o3-mini, o3)
+    /// Only supported by OpenAI Responses API
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// Output modalities (text, audio, image)
+    /// Only supported by OpenAI Responses API
+    pub modalities: Option<Vec<Modality>>,
+    /// Built-in tools (web search, code interpreter, file search)
+    /// Only supported by OpenAI Responses API
+    pub built_in_tools: Vec<BuiltInTool>,
 }
 
 impl GenerationConfig {
@@ -149,6 +158,26 @@ impl GenerationConfig {
 
     pub fn response_format(mut self, format: ResponseFormat) -> Self {
         self.response_format = format;
+        self
+    }
+
+    pub fn reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
+        self.reasoning_effort = Some(effort);
+        self
+    }
+
+    pub fn modalities(mut self, modalities: Vec<Modality>) -> Self {
+        self.modalities = Some(modalities);
+        self
+    }
+
+    pub fn add_built_in_tool(mut self, tool: BuiltInTool) -> Self {
+        self.built_in_tools.push(tool);
+        self
+    }
+
+    pub fn built_in_tools(mut self, tools: Vec<BuiltInTool>) -> Self {
+        self.built_in_tools = tools;
         self
     }
 }
@@ -186,6 +215,41 @@ impl JsonSchemaFormat {
         self.strict = strict;
         self
     }
+}
+
+/// Reasoning effort for o-series models (o1, o3-mini, o3).
+/// Controls how much compute the model uses for reasoning.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ReasoningEffort {
+    /// Minimal reasoning effort (fastest)
+    Minimal,
+    /// Medium reasoning effort (balanced)
+    Medium,
+    /// High reasoning effort (most thorough)
+    High,
+}
+
+/// Built-in tools provided by OpenAI Responses API.
+/// These tools are executed server-side by OpenAI.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BuiltInTool {
+    /// Web search tool ($25-$50 per 1000 queries)
+    WebSearch,
+    /// Python code interpreter (included)
+    CodeInterpreter,
+    /// File search over uploaded documents ($2.50 per 1000 queries)
+    FileSearch,
+}
+
+/// Output modalities supported by the model.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Modality {
+    /// Text output
+    Text,
+    /// Audio output
+    Audio,
+    /// Image output
+    Image,
 }
 
 #[derive(Clone, Debug)]

@@ -7,7 +7,7 @@ use crate::error::{Result as SdkResult, SdkError};
 use super::interface::{
     GenerateRequest, GenerateResponse, LanguageModel, StreamHandle, StreamRequest,
 };
-use super::openai::{OpenAiConfig, OpenAiProvider};
+use super::openai_chat::{OpenAiChatConfig, OpenAiChatProvider};
 
 const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
@@ -74,7 +74,7 @@ impl OpenRouterConfig {
 
 #[derive(Clone)]
 pub struct OpenRouterProvider {
-    inner: OpenAiProvider,
+    inner: OpenAiChatProvider,
 }
 
 impl OpenRouterProvider {
@@ -82,7 +82,7 @@ impl OpenRouterProvider {
         // OpenRouter is a gateway that accepts models with their own provider prefixes
         // (e.g., anthropic/claude-3.5-haiku, openai/gpt-4o)
         // We explicitly set model_prefix to None so models are passed as-is
-        let mut inner_config = OpenAiConfig::new(config.api_key)
+        let mut inner_config = OpenAiChatConfig::new(config.api_key)
             .with_base_url(config.base_url)
             .with_model_prefix(None::<String>);  // Explicitly remove the default "openai" prefix
 
@@ -94,7 +94,7 @@ impl OpenRouterProvider {
             inner_config = inner_config.with_header("X-Title", app_id);
         }
 
-        let inner = OpenAiProvider::new(inner_config)?;
+        let inner = OpenAiChatProvider::new(inner_config)?;
         Ok(Self { inner })
     }
 

@@ -443,6 +443,9 @@ impl MessagesPayload {
             top_p,
             max_output_tokens,
             response_format,
+            reasoning_effort: _,
+            modalities: _,
+            built_in_tools: _,
         } = request.config.clone();
 
         let max_tokens = max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS).max(1);
