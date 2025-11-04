@@ -27,9 +27,10 @@ pub use context::{
 pub use error::{Result, SdkError};
 pub use lm::{
     generate, stream, AnthropicConfig, AnthropicProvider, AzureOpenAiConfig, AzureOpenAiProvider,
-    BedrockConfig, BedrockProvider, GenerateRequest, GenerateResponse, GenerationConfig,
-    GroqConfig, GroqProvider, JsonSchemaFormat, LanguageModel, Message, MessageRole, OpenAiConfig,
-    OpenAiProvider, OpenRouterConfig, OpenRouterProvider, ResponseFormat, StreamChunk,
+    BedrockConfig, BedrockProvider, BuiltInTool, GenerateRequest, GenerateResponse,
+    GenerationConfig, GroqConfig, GroqProvider, JsonSchemaFormat, LanguageModel, Message,
+    MessageRole, Modality, OpenAiChatConfig, OpenAiChatProvider, OpenAiConfig, OpenAiProvider,
+    OpenRouterConfig, OpenRouterProvider, ReasoningEffort, ResponseFormat, StreamChunk,
     StreamHandle, StreamRequest, TokenUsage, ToolChoice,
 };
 pub use logging::{clear_error_buffer, get_error_buffer, init_logging};
