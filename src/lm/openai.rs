@@ -455,6 +455,14 @@ pub enum OutputItem {
         role: String,
         content: Vec<ContentItem>,
     },
+    #[serde(rename = "function_call")]
+    FunctionCall {
+        id: String,
+        status: String,
+        arguments: String,
+        call_id: String,
+        name: String,
+    },
     #[serde(rename = "tool_call")]
     ToolCall {
         #[serde(rename = "tool_name")]
@@ -512,6 +520,18 @@ impl ResponsesApiResponse {
                             }
                         }
                     }
+                }
+                OutputItem::FunctionCall {
+                    call_id,
+                    name,
+                    arguments,
+                    ..
+                } => {
+                    tool_calls.push(super::interface::ToolCall {
+                        id: call_id.clone(),
+                        name: name.clone(),
+                        arguments: arguments.clone(),
+                    });
                 }
                 OutputItem::ToolCall {
                     tool_name,
@@ -817,10 +837,17 @@ impl LanguageModel for OpenAiProvider {
 
             let response = ensure_success(response).await?;
 
-            let parsed: ResponsesApiResponse = response
-                .json()
+            // Get response text for debugging
+            let response_text = response
+                .text()
                 .await
+                .map_err(|err| SdkError::Other(anyhow!("failed to read OpenAI Responses response body: {err}")))?;
+
+            tracing::debug!("OpenAI Responses API raw response: {}", response_text);
+
+            let parsed: ResponsesApiResponse = serde_json::from_str(&response_text)
                 .map_err(|err| {
+                    tracing::error!("Failed to parse OpenAI Responses response. Error: {}, Response body: {}", err, response_text);
                     SdkError::Other(anyhow!("failed to parse OpenAI Responses response: {err}"))
                 })?;
 
