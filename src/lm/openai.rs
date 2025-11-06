@@ -256,16 +256,12 @@ pub struct ReasoningConfig {
     pub summary: Option<bool>,
 }
 
-/// API tool definition (user-defined tools, not built-in)
+/// API tool definition for Responses API (user-defined tools, not built-in)
+/// Note: Responses API uses a flat structure, unlike Chat Completions API which nests under "function"
 #[derive(Clone, Debug, Serialize)]
 pub struct ApiTool {
     #[serde(rename = "type")]
     pub tool_type: String, // "function"
-    pub function: ApiFunction,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct ApiFunction {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -327,16 +323,14 @@ impl ResponsesApiRequest {
         // Build tools array (mix of user-defined and built-in)
         let mut tools_array: Vec<Value> = Vec::new();
 
-        // Add user-defined function tools
+        // Add user-defined function tools (flat structure for Responses API)
         for tool in &req.tools {
             let api_tool = ApiTool {
                 tool_type: "function".to_string(),
-                function: ApiFunction {
-                    name: tool.name.clone(),
-                    description: tool.description.clone(),
-                    parameters: tool.parameters.clone().unwrap_or(serde_json::json!({})),
-                    strict: tool.strict,
-                },
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters: tool.parameters.clone().unwrap_or(serde_json::json!({})),
+                strict: tool.strict,
             };
             tools_array.push(serde_json::to_value(api_tool).unwrap());
         }
