@@ -446,16 +446,20 @@ impl Worker {
                             // Send to worker pool (bounded channel provides backpressure)
                             if let Err(e) = task_tx.send_async(runtime_message).await {
                                 error!("Failed to dispatch message to worker pool: {}", e);
-                                break Err(crate::error::SdkError::Connection(
-                                    format!("Task dispatch failed: {}", e)
-                                ));
+                                break Err(crate::error::SdkError::Connection {
+                                    message: format!("Task dispatch failed: {}", e),
+                                    code: crate::error::ErrorCode::ConnectionFailed,
+                                    source: None,
+                                });
                             }
                         }
                         Err(e) => {
                             error!("Channel error for worker {}, will reconnect: {}", self.config.worker_id, e);
-                            break Err(crate::error::SdkError::Connection(
-                                format!("Receive failed: {}", e)
-                            ));
+                            break Err(crate::error::SdkError::Connection {
+                                message: format!("Receive failed: {}", e),
+                                code: crate::error::ErrorCode::ConnectionFailed,
+                                source: None,
+                            });
                         }
                     }
                 }
@@ -466,16 +470,20 @@ impl Worker {
                         Ok(service_message) => {
                             if let Err(e) = tx.send_async(service_message).await {
                                 error!("Failed to send response to coordinator: {}", e);
-                                break Err(crate::error::SdkError::Connection(
-                                    format!("Send failed: {}", e)
-                                ));
+                                break Err(crate::error::SdkError::Connection {
+                                    message: format!("Send failed: {}", e),
+                                    code: crate::error::ErrorCode::ConnectionFailed,
+                                    source: None,
+                                });
                             }
                         }
                         Err(e) => {
                             error!("Response channel error: {}", e);
-                            break Err(crate::error::SdkError::Connection(
-                                format!("Response receive failed: {}", e)
-                            ));
+                            break Err(crate::error::SdkError::Connection {
+                                message: format!("Response receive failed: {}", e),
+                                code: crate::error::ErrorCode::ConnectionFailed,
+                                source: None,
+                            });
                         }
                     }
                 }
@@ -660,10 +668,11 @@ impl Worker {
                     "Failed to send shutdown message for worker {}: {}",
                     self.config.worker_id, e
                 );
-                Err(crate::error::SdkError::Connection(format!(
-                    "Shutdown message failed: {}",
-                    e
-                )))
+                Err(crate::error::SdkError::Connection {
+                    message: format!("Shutdown message failed: {}", e),
+                    code: crate::error::ErrorCode::ConnectionFailed,
+                    source: None,
+                })
             }
         }
     }

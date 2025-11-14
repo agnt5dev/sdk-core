@@ -89,7 +89,10 @@ impl OpenAiChatConfig {
 
     pub fn from_env() -> SdkResult<Self> {
         let api_key = env::var("OPENAI_API_KEY")
-            .map_err(|_| SdkError::Configuration("OPENAI_API_KEY must be set".to_string()))?;
+            .map_err(|_| SdkError::Configuration {
+                message: "OPENAI_API_KEY must be set".to_string(),
+                field: Some("OPENAI_API_KEY".to_string()),
+            })?;
 
         let mut config = OpenAiChatConfig::new(api_key);
 
@@ -181,9 +184,10 @@ impl OpenAiChatProvider {
     fn normalize_model(&self, model: &str) -> SdkResult<String> {
         let trimmed = model.trim();
         if trimmed.is_empty() {
-            return Err(SdkError::Configuration(
-                "model id must not be empty for OpenAI Chat requests".to_string(),
-            ));
+            return Err(SdkError::Configuration {
+                message: "model id must not be empty for OpenAI Chat requests".to_string(),
+                field: Some("model".to_string()),
+            });
         }
 
         match &self.config.model_prefix {
@@ -191,20 +195,23 @@ impl OpenAiChatProvider {
                 if let Some((provider, rest)) = trimmed.split_once('/') {
                     let rest = rest.trim();
                     if provider != prefix {
-                        return Err(SdkError::Configuration(format!(
-                            "expected model prefix `{prefix}/`, got `{provider}`"
-                        )));
+                        return Err(SdkError::Configuration {
+                            message: format!("expected model prefix `{prefix}/`, got `{provider}`"),
+                            field: Some("model".to_string()),
+                        });
                     }
                     if rest.is_empty() {
-                        return Err(SdkError::Configuration(format!(
-                            "model id must follow `{prefix}/` prefix"
-                        )));
+                        return Err(SdkError::Configuration {
+                            message: format!("model id must follow `{prefix}/` prefix"),
+                            field: Some("model".to_string()),
+                        });
                     }
                     Ok(rest.to_string())
                 } else {
-                    Err(SdkError::Configuration(format!(
-                        "model should be prefixed with `{prefix}/`"
-                    )))
+                    Err(SdkError::Configuration {
+                        message: format!("model should be prefixed with `{prefix}/`"),
+                        field: Some("model".to_string()),
+                    })
                 }
             }
             None => Ok(trimmed.to_string()),
@@ -397,9 +404,10 @@ impl LanguageModel for OpenAiChatProvider {
 
 fn validate_request(request: &GenerateRequest) -> SdkResult<()> {
     if request.system_prompt.is_none() && request.messages.is_empty() {
-        return Err(SdkError::Configuration(
-            "at least a system prompt or one message is required for OpenAI Chat requests".to_string(),
-        ));
+        return Err(SdkError::Configuration {
+            message: "at least a system prompt or one message is required for OpenAI Chat requests".to_string(),
+            field: None,
+        });
     }
     Ok(())
 }

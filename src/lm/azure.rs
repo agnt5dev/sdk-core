@@ -49,10 +49,16 @@ impl AzureOpenAiConfig {
 
     pub fn from_env() -> SdkResult<Self> {
         let api_key = env::var("AZURE_OPENAI_API_KEY")
-            .map_err(|_| SdkError::Configuration("AZURE_OPENAI_API_KEY must be set".to_string()))?;
+            .map_err(|_| SdkError::Configuration {
+                message: "AZURE_OPENAI_API_KEY must be set".to_string(),
+                field: Some("AZURE_OPENAI_API_KEY".to_string()),
+            })?;
 
         let endpoint = env::var("AZURE_OPENAI_ENDPOINT").map_err(|_| {
-            SdkError::Configuration("AZURE_OPENAI_ENDPOINT must be set".to_string())
+            SdkError::Configuration {
+                message: "AZURE_OPENAI_ENDPOINT must be set".to_string(),
+                field: Some("AZURE_OPENAI_ENDPOINT".to_string()),
+            }
         })?;
 
         let mut config = AzureOpenAiConfig::new(api_key, endpoint);
@@ -111,21 +117,24 @@ impl AzureOpenAiProvider {
         let trimmed = model.trim();
         if let Some((prefix, rest)) = trimmed.split_once('/') {
             if prefix != MODEL_PREFIX {
-                return Err(SdkError::Configuration(format!(
-                    "Azure provider expects model ids prefixed with `{MODEL_PREFIX}/`; got `{prefix}`"
-                )));
+                return Err(SdkError::Configuration {
+                    message: format!("Azure provider expects model ids prefixed with `{MODEL_PREFIX}/`; got `{prefix}`"),
+                    field: Some("model".to_string()),
+                });
             }
             let deployment = rest.trim();
             if deployment.is_empty() {
-                return Err(SdkError::Configuration(
-                    "Azure model id must include deployment after `azure/` prefix".to_string(),
-                ));
+                return Err(SdkError::Configuration {
+                    message: "Azure model id must include deployment after `azure/` prefix".to_string(),
+                    field: Some("model".to_string()),
+                });
             }
             Ok(deployment.to_string())
         } else {
-            Err(SdkError::Configuration(format!(
-                "Azure model ids must be prefixed with `{MODEL_PREFIX}/`"
-            )))
+            Err(SdkError::Configuration {
+                message: format!("Azure model ids must be prefixed with `{MODEL_PREFIX}/`"),
+                field: Some("model".to_string()),
+            })
         }
     }
 
@@ -183,10 +192,10 @@ impl LanguageModel for AzureOpenAiProvider {
 
 fn validate_request(request: &GenerateRequest) -> SdkResult<()> {
     if request.system_prompt.is_none() && request.messages.is_empty() {
-        return Err(SdkError::Configuration(
-            "at least a system prompt or one message is required for Azure OpenAI requests"
-                .to_string(),
-        ));
+        return Err(SdkError::Configuration {
+            message: "at least a system prompt or one message is required for Azure OpenAI requests".to_string(),
+            field: None,
+        });
     }
     Ok(())
 }

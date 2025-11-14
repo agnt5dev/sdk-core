@@ -41,15 +41,17 @@ pub struct BedrockConfig {
 impl BedrockConfig {
     pub fn from_env() -> SdkResult<Self> {
         let access_key = env::var("AWS_ACCESS_KEY_ID").map_err(|_| {
-            SdkError::Configuration(
-                "AWS_ACCESS_KEY_ID must be set for Bedrock requests".to_string(),
-            )
+            SdkError::Configuration {
+                message: "AWS_ACCESS_KEY_ID must be set for Bedrock requests".to_string(),
+                field: Some("AWS_ACCESS_KEY_ID".to_string()),
+            }
         })?;
 
         let secret_key = env::var("AWS_SECRET_ACCESS_KEY").map_err(|_| {
-            SdkError::Configuration(
-                "AWS_SECRET_ACCESS_KEY must be set for Bedrock requests".to_string(),
-            )
+            SdkError::Configuration {
+                message: "AWS_SECRET_ACCESS_KEY must be set for Bedrock requests".to_string(),
+                field: Some("AWS_SECRET_ACCESS_KEY".to_string()),
+            }
         })?;
 
         let session_token = env::var("AWS_SESSION_TOKEN").ok();
@@ -132,14 +134,16 @@ impl LanguageModel for BedrockProvider {
 
 fn validate_request(request: &GenerateRequest) -> SdkResult<()> {
     if request.messages.is_empty() {
-        return Err(SdkError::Configuration(
-            "at least one message is required for Bedrock requests".to_string(),
-        ));
+        return Err(SdkError::Configuration {
+            message: "at least one message is required for Bedrock requests".to_string(),
+            field: None,
+        });
     }
     if !request.tools.is_empty() || request.tool_choice.is_some() {
-        return Err(SdkError::Configuration(
-            "Bedrock provider does not yet support tool calls in this SDK".to_string(),
-        ));
+        return Err(SdkError::Configuration {
+            message: "Bedrock provider does not yet support tool calls in this SDK".to_string(),
+            field: None,
+        });
     }
     Ok(())
 }
@@ -151,30 +155,34 @@ fn extract_region_and_model<'a>(
     let trimmed = model.trim();
     let rest = if let Some((prefix, rest)) = trimmed.split_once('/') {
         if prefix != MODEL_PREFIX {
-            return Err(SdkError::Configuration(format!(
-                "Bedrock provider expects model ids prefixed with `{MODEL_PREFIX}/`; got `{prefix}`"
-            )));
+            return Err(SdkError::Configuration {
+                message: format!("Bedrock provider expects model ids prefixed with `{MODEL_PREFIX}/`; got `{prefix}`"),
+                field: Some("model".to_string()),
+            });
         }
         rest
     } else {
-        return Err(SdkError::Configuration(format!(
-            "Bedrock model ids must be prefixed with `{MODEL_PREFIX}/`"
-        )));
+        return Err(SdkError::Configuration {
+            message: format!("Bedrock model ids must be prefixed with `{MODEL_PREFIX}/`"),
+            field: Some("model".to_string()),
+        });
     };
 
     if let Some((region, model_id)) = rest.split_once('/') {
         if region.trim().is_empty() || model_id.trim().is_empty() {
-            return Err(SdkError::Configuration(
-                "Bedrock model id must be in the form `bedrock/<region>/<model>`".to_string(),
-            ));
+            return Err(SdkError::Configuration {
+                message: "Bedrock model id must be in the form `bedrock/<region>/<model>`".to_string(),
+                field: Some("model".to_string()),
+            });
         }
         Ok((region.trim(), model_id.trim()))
     } else if let Some(region) = default_region {
         Ok((region, rest.trim()))
     } else {
-        Err(SdkError::Configuration(
-            "Bedrock model id must include a region (bedrock/<region>/<model>)".to_string(),
-        ))
+        Err(SdkError::Configuration {
+            message: "Bedrock model id must include a region (bedrock/<region>/<model>)".to_string(),
+            field: Some("model".to_string()),
+        })
     }
 }
 
@@ -182,9 +190,10 @@ fn build_bedrock_payload(request: &GenerateRequest, model_id: &str) -> SdkResult
     if model_id.starts_with("anthropic.") {
         build_anthropic_payload(request)
     } else {
-        Err(SdkError::Configuration(format!(
-            "Bedrock provider currently supports anthropic models only; got `{model_id}`"
-        )))
+        Err(SdkError::Configuration {
+            message: format!("Bedrock provider currently supports anthropic models only; got `{model_id}`"),
+            field: Some("model".to_string()),
+        })
     }
 }
 
@@ -210,9 +219,10 @@ fn build_anthropic_payload(request: &GenerateRequest) -> SdkResult<Value> {
     }
 
     if messages.is_empty() {
-        return Err(SdkError::Configuration(
-            "Bedrock anthropic requests require at least one user or assistant message".to_string(),
-        ));
+        return Err(SdkError::Configuration {
+            message: "Bedrock anthropic requests require at least one user or assistant message".to_string(),
+            field: None,
+        });
     }
 
     let max_tokens = request
@@ -273,7 +283,10 @@ impl BedrockProvider {
         // Take an owned copy of the host string so it doesn't borrow from `url`.
         let host = url
             .host_str()
-            .ok_or_else(|| SdkError::Configuration("Bedrock URL missing host".to_string()))?
+            .ok_or_else(|| SdkError::Configuration {
+                message: "Bedrock URL missing host".to_string(),
+                field: Some("url".to_string()),
+            })?
             .to_string();
 
         let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();

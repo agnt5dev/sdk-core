@@ -24,16 +24,20 @@ impl TaskControls {
 
     fn state(&self) -> Result<Arc<ContextRuntimeState>> {
         self.state.clone().ok_or_else(|| {
-            SdkError::Unavailable("durable task controls unavailable in this context".into())
+            SdkError::Unavailable {
+                message: "durable task controls unavailable in this context".into(),
+                service: None,
+            }
         })
     }
 
     /// Spawn a durable task/tool invocation.
     pub fn spawn(&self, target: &str) -> Result<()> {
         if target.is_empty() {
-            return Err(SdkError::InvalidArgument(
-                "spawn requires a non-empty task target".into(),
-            ));
+            return Err(SdkError::InvalidArgument {
+                message: "spawn requires a non-empty task target".into(),
+                argument: Some("target".to_string()),
+            });
         }
 
         let state = self.state()?;
@@ -75,10 +79,13 @@ impl TaskControls {
                     if result.status.is_empty() || result.status == "ENQUEUED" {
                         Ok(())
                     } else {
-                        Err(SdkError::State(format!(
-                            "task spawn returned unexpected status '{}': invocation {}",
-                            result.status, result.invocation_id
-                        )))
+                        Err(SdkError::State {
+                            message: format!(
+                                "task spawn returned unexpected status '{}': invocation {}",
+                                result.status, result.invocation_id
+                            ),
+                            code: crate::error::ErrorCode::InvalidState,
+                        })
                     }
                 }
                 _ => Err(SdkError::Internal(

@@ -67,7 +67,10 @@ impl ToolRegistry {
         guard
             .get(name)
             .cloned()
-            .ok_or_else(|| SdkError::Configuration(format!("Tool '{name}' not found")))
+            .ok_or_else(|| SdkError::Configuration {
+                message: format!("Tool '{name}' not found"),
+                field: Some("name".to_string()),
+            })
     }
 
     pub fn list(self: &Arc<Self>) -> Result<Vec<ToolDefinition>> {

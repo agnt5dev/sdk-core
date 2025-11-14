@@ -33,7 +33,10 @@ impl GroqConfig {
 
     pub fn from_env() -> SdkResult<Self> {
         let api_key = env::var("GROQ_API_KEY")
-            .map_err(|_| SdkError::Configuration("GROQ_API_KEY must be set".to_string()))?;
+            .map_err(|_| SdkError::Configuration {
+                message: "GROQ_API_KEY must be set".to_string(),
+                field: Some("GROQ_API_KEY".to_string()),
+            })?;
 
         let mut config = GroqConfig::new(api_key);
 
