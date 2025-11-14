@@ -326,17 +326,20 @@ impl Worker {
 
                     retry_count += 1;
                     if retry_count >= max_retries {
-                        // After max retries, use longer delays but keep trying
-                        info!(
-                            "Worker {} max retries exceeded, using longer delays",
-                            self.config.worker_id
+                        // After max retries, exit instead of infinite loop
+                        error!(
+                            "Worker {} failed to connect after {} attempts, exiting",
+                            self.config.worker_id, max_retries
                         );
-                        let long_delay = std::time::Duration::from_secs(30);
-                        let jitter = rand::random::<f64>() * 0.3 - 0.15; // ±15% jitter
-                        let jitter_ms = (long_delay.as_millis() as f64 * jitter) as u64;
-                        let delay = long_delay + std::time::Duration::from_millis(jitter_ms);
-                        tokio::time::sleep(delay).await;
-                        retry_count = max_retries; // Keep at max to use long delays
+                        self.set_connection_state(ConnectionState::Error(format!(
+                            "Failed to connect after {} attempts",
+                            max_retries
+                        )));
+                        return Err(anyhow::anyhow!(
+                            "Worker {} failed to connect to coordinator after {} attempts",
+                            self.config.worker_id,
+                            max_retries
+                        ).into());
                     }
                 }
             }
