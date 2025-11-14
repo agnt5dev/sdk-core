@@ -88,7 +88,10 @@ impl OpenAiConfig {
 
     pub fn from_env() -> SdkResult<Self> {
         let api_key = env::var("OPENAI_API_KEY")
-            .map_err(|_| SdkError::Configuration("OPENAI_API_KEY must be set".to_string()))?;
+            .map_err(|_| SdkError::Configuration {
+                message: "OPENAI_API_KEY must be set".to_string(),
+                field: Some("OPENAI_API_KEY".to_string()),
+            })?;
 
         let mut config = OpenAiConfig::new(api_key);
 
@@ -174,9 +177,10 @@ impl OpenAiProvider {
     fn normalize_model(&self, model: &str) -> SdkResult<String> {
         let trimmed = model.trim();
         if trimmed.is_empty() {
-            return Err(SdkError::Configuration(
-                "model id must not be empty for OpenAI Responses requests".to_string(),
-            ));
+            return Err(SdkError::Configuration {
+                message: "model id must not be empty for OpenAI Responses requests".to_string(),
+                field: Some("model".to_string()),
+            });
         }
 
         match &self.config.model_prefix {
@@ -184,20 +188,23 @@ impl OpenAiProvider {
                 if let Some((provider, rest)) = trimmed.split_once('/') {
                     let rest = rest.trim();
                     if provider != prefix {
-                        return Err(SdkError::Configuration(format!(
-                            "expected model prefix `{prefix}/`, got `{provider}`"
-                        )));
+                        return Err(SdkError::Configuration {
+                            message: format!("expected model prefix `{prefix}/`, got `{provider}`"),
+                            field: Some("model".to_string()),
+                        });
                     }
                     if rest.is_empty() {
-                        return Err(SdkError::Configuration(format!(
-                            "model id must follow `{prefix}/` prefix"
-                        )));
+                        return Err(SdkError::Configuration {
+                            message: format!("model id must follow `{prefix}/` prefix"),
+                            field: Some("model".to_string()),
+                        });
                     }
                     Ok(rest.to_string())
                 } else {
-                    Err(SdkError::Configuration(format!(
-                        "model should be prefixed with `{prefix}/`"
-                    )))
+                    Err(SdkError::Configuration {
+                        message: format!("model should be prefixed with `{prefix}/`"),
+                        field: Some("model".to_string()),
+                    })
                 }
             }
             None => Ok(trimmed.to_string()),
@@ -450,15 +457,10 @@ pub struct ContentItem {
 pub enum OutputItem {
     #[serde(rename = "message")]
     Message {
-        id: String,
-        status: String,
-        role: String,
         content: Vec<ContentItem>,
     },
     #[serde(rename = "function_call")]
     FunctionCall {
-        id: String,
-        status: String,
         arguments: String,
         call_id: String,
         name: String,
@@ -470,10 +472,7 @@ pub enum OutputItem {
         arguments: Value,
     },
     #[serde(rename = "reasoning")]
-    Reasoning {
-        id: String,
-        summary: Vec<Value>, // Summary can be empty or contain reasoning steps
-    },
+    Reasoning {},
 }
 
 /// Usage statistics from the API
@@ -493,7 +492,6 @@ pub struct ApiUsage {
 #[derive(Clone, Debug, Deserialize)]
 pub struct ResponsesApiResponse {
     pub id: String,
-    pub object: String,
     pub created_at: i64,
     pub model: String,
     pub status: String,
@@ -578,187 +576,15 @@ impl ResponsesApiResponse {
 }
 
 // ============================================================================
-// Streaming Event Types
-// ============================================================================
-
-/// Streaming events from Responses API
-#[derive(Clone, Debug, Deserialize)]
-#[serde(tag = "type")]
-pub enum ResponseEvent {
-    #[serde(rename = "response.created")]
-    ResponseCreated {
-        #[serde(flatten)]
-        data: ResponseCreatedData,
-    },
-    #[serde(rename = "response.output_item.added")]
-    OutputItemAdded {
-        #[serde(flatten)]
-        data: OutputItemAddedData,
-    },
-    #[serde(rename = "response.output_text.delta")]
-    OutputTextDelta {
-        #[serde(flatten)]
-        data: OutputTextDeltaData,
-    },
-    #[serde(rename = "response.output_text.done")]
-    OutputTextDone {
-        #[serde(flatten)]
-        data: OutputTextDoneData,
-    },
-    #[serde(rename = "response.completed")]
-    Completed {
-        #[serde(flatten)]
-        data: ResponseCompletedData,
-    },
-    #[serde(rename = "error")]
-    Error {
-        error: ErrorData,
-    },
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct ResponseCreatedData {
-    pub id: String,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct OutputItemAddedData {
-    pub item: OutputItem,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct OutputTextDeltaData {
-    pub delta: String,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct OutputTextDoneData {
-    pub text: String,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct ResponseCompletedData {
-    pub response: ResponsesApiResponse,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct ErrorData {
-    pub message: String,
-}
-
-/// Accumulator for streaming events
-pub struct EventAccumulator {
-    pub id: Option<String>,
-    pub model: Option<String>,
-    pub status: Option<String>,
-    pub accumulated_text: String,
-    pub output_items: Vec<OutputItem>,
-    pub usage: Option<ApiUsage>,
-}
-
-impl EventAccumulator {
-    pub fn new() -> Self {
-        Self {
-            id: None,
-            model: None,
-            status: None,
-            accumulated_text: String::new(),
-            output_items: Vec::new(),
-            usage: None,
-        }
-    }
-
-    pub fn update(&mut self, event: ResponseEvent) {
-        match event {
-            ResponseEvent::ResponseCreated { data } => {
-                self.id = Some(data.id);
-            }
-            ResponseEvent::OutputItemAdded { data } => {
-                self.output_items.push(data.item);
-            }
-            ResponseEvent::OutputTextDelta { data } => {
-                self.accumulated_text.push_str(&data.delta);
-            }
-            ResponseEvent::OutputTextDone { data } => {
-                self.accumulated_text = data.text;
-            }
-            ResponseEvent::Completed { data } => {
-                self.id = Some(data.response.id);
-                self.model = Some(data.response.model);
-                self.status = Some(data.response.status);
-                self.output_items = data.response.output;
-                self.usage = data.response.usage;
-            }
-            ResponseEvent::Error { .. } => {
-                // Error handling done at a higher level
-            }
-        }
-    }
-
-    pub fn into_generate_response(self) -> SdkResult<GenerateResponse> {
-        let id = self.id.ok_or_else(|| {
-            SdkError::Other(anyhow!("missing response id in streaming response"))
-        })?;
-        let model = self.model.ok_or_else(|| {
-            SdkError::Other(anyhow!("missing model in streaming response"))
-        })?;
-
-        // Extract tool calls
-        let mut tool_calls = Vec::new();
-        for item in &self.output_items {
-            if let OutputItem::ToolCall {
-                tool_name,
-                arguments,
-            } = item
-            {
-                tool_calls.push(super::interface::ToolCall {
-                    id: format!("call_{}", tool_name),
-                    name: tool_name.clone(),
-                    arguments: arguments.to_string(),
-                });
-            }
-        }
-
-        let usage = self.usage.map(|u| super::interface::TokenUsage {
-            prompt_tokens: u.prompt_tokens,
-            completion_tokens: u.completion_tokens,
-            total_tokens: u.total_tokens,
-        });
-
-        Ok(GenerateResponse {
-            id,
-            model,
-            created: None,
-            text: self.accumulated_text,
-            usage,
-            finish_reason: self.status,
-            tool_calls: if tool_calls.is_empty() {
-                None
-            } else {
-                Some(tool_calls)
-            },
-            object: None,
-            raw: None,
-        })
-    }
-}
-
-impl Default for EventAccumulator {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ============================================================================
 // LanguageModel Trait Implementation
 // ============================================================================
 
 fn validate_request(request: &GenerateRequest) -> SdkResult<()> {
     if request.system_prompt.is_none() && request.messages.is_empty() {
-        return Err(SdkError::Configuration(
-            "at least a system prompt or one message is required for OpenAI Responses requests"
-                .to_string(),
-        ));
+        return Err(SdkError::Configuration {
+            message: "at least a system prompt or one message is required for OpenAI Responses requests".to_string(),
+            field: None,
+        });
     }
     Ok(())
 }

@@ -61,7 +61,10 @@ impl AnthropicConfig {
 
     pub fn from_env() -> SdkResult<Self> {
         let api_key = env::var("ANTHROPIC_API_KEY")
-            .map_err(|_| SdkError::Configuration("ANTHROPIC_API_KEY must be set".to_string()))?;
+            .map_err(|_| SdkError::Configuration {
+                message: "ANTHROPIC_API_KEY must be set".to_string(),
+                field: Some("ANTHROPIC_API_KEY".to_string()),
+            })?;
 
         let mut config = AnthropicConfig::new(api_key);
 
@@ -293,9 +296,10 @@ impl LanguageModel for AnthropicProvider {
 
 fn validate_request(request: &GenerateRequest) -> SdkResult<()> {
     if request.model.trim().is_empty() {
-        return Err(SdkError::Configuration(
-            "model must be provided for Anthropic requests".to_string(),
-        ));
+        return Err(SdkError::Configuration {
+            message: "model must be provided for Anthropic requests".to_string(),
+            field: Some("model".to_string()),
+        });
     }
 
     if request
@@ -303,16 +307,17 @@ fn validate_request(request: &GenerateRequest) -> SdkResult<()> {
         .iter()
         .all(|message| message.role == MessageRole::System)
     {
-        return Err(SdkError::Configuration(
-            "at least one non-system message is required for Anthropic requests".to_string(),
-        ));
+        return Err(SdkError::Configuration {
+            message: "at least one non-system message is required for Anthropic requests".to_string(),
+            field: None,
+        });
     }
 
     if request.system_prompt.is_none() && request.messages.is_empty() {
-        return Err(SdkError::Configuration(
-            "at least a system prompt or one message is required for Anthropic requests"
-                .to_string(),
-        ));
+        return Err(SdkError::Configuration {
+            message: "at least a system prompt or one message is required for Anthropic requests".to_string(),
+            field: None,
+        });
     }
 
     Ok(())
@@ -686,22 +691,25 @@ fn convert_tool_choice(choice: Option<&ToolChoice>) -> Option<JsonValue> {
 fn normalize_model(model: &str) -> SdkResult<String> {
     let trimmed = model.trim();
     if trimmed.is_empty() {
-        return Err(SdkError::Configuration(
-            "model id must not be empty for Anthropic requests".to_string(),
-        ));
+        return Err(SdkError::Configuration {
+            message: "model id must not be empty for Anthropic requests".to_string(),
+            field: Some("model".to_string()),
+        });
     }
 
     if let Some((provider, rest)) = trimmed.split_once('/') {
         let rest = rest.trim();
         if provider != "anthropic" {
-            return Err(SdkError::Configuration(format!(
-                "Anthropic provider expects model ids prefixed with `anthropic/`; got `{provider}`"
-            )));
+            return Err(SdkError::Configuration {
+                message: format!("Anthropic provider expects model ids prefixed with `anthropic/`; got `{provider}`"),
+                field: Some("model".to_string()),
+            });
         }
         if rest.is_empty() {
-            return Err(SdkError::Configuration(
-                "model id must be provided after `anthropic/` prefix".to_string(),
-            ));
+            return Err(SdkError::Configuration {
+                message: "model id must be provided after `anthropic/` prefix".to_string(),
+                field: Some("model".to_string()),
+            });
         }
         Ok(rest.to_string())
     } else {

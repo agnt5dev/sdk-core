@@ -115,10 +115,13 @@ impl FunctionRegistry {
         };
 
         let callback = handler.ok_or_else(|| {
-            SdkError::InvalidArgument(format!(
-                "no function registered for {}::{}",
-                call.target_service, call.handler
-            ))
+            SdkError::InvalidArgument {
+                message: format!(
+                    "no function registered for {}::{}",
+                    call.target_service, call.handler
+                ),
+                argument: Some("handler".to_string()),
+            }
         })?;
 
         callback(call, ctx).await

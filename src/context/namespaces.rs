@@ -87,12 +87,12 @@ impl FunctionNamespace {
                 invocation_id,
                 output,
             )),
-            Err(err) => match err {
-                SdkError::InvalidArgument(_) => Err(err),
-                other => Ok(FunctionHandle::failed(
+            Err(err) => match &err {
+                SdkError::InvalidArgument { .. } => Err(err),
+                _ => Ok(FunctionHandle::failed(
                     original_request,
                     invocation_id,
-                    other.to_string(),
+                    err.to_string(),
                 )),
             },
         }
@@ -168,16 +168,18 @@ impl SignalNamespace {
 
     pub async fn wait(&self, name: &str) -> Result<Value> {
         let _ = (&self.state, name);
-        Err(SdkError::Unavailable(
-            "Signal waiting not yet implemented".to_string(),
-        ))
+        Err(SdkError::Unavailable {
+            message: "Signal waiting not yet implemented".to_string(),
+            service: None,
+        })
     }
 
     pub async fn emit(&self, name: &str, payload: Value) -> Result<()> {
         let _ = (&self.state, name, &payload);
-        Err(SdkError::Unavailable(
-            "Signal emission not yet implemented".to_string(),
-        ))
+        Err(SdkError::Unavailable {
+            message: "Signal emission not yet implemented".to_string(),
+            service: None,
+        })
     }
 }
 
@@ -193,9 +195,10 @@ impl TimerNamespace {
 
     pub async fn sleep(&self, duration: Duration) -> Result<()> {
         let _ = (&self.state, duration);
-        Err(SdkError::Unavailable(
-            "Durable sleep not yet implemented".to_string(),
-        ))
+        Err(SdkError::Unavailable {
+            message: "Durable sleep not yet implemented".to_string(),
+            service: None,
+        })
     }
 }
 
@@ -211,9 +214,10 @@ impl LanguageModelNamespace {
 
     pub async fn generate(&self, _request: serde_json::Value) -> Result<Value> {
         let _ = &self.state;
-        Err(SdkError::Unavailable(
-            "Language model generation not yet implemented".to_string(),
-        ))
+        Err(SdkError::Unavailable {
+            message: "Language model generation not yet implemented".to_string(),
+            service: None,
+        })
     }
 }
 

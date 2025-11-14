@@ -24,16 +24,20 @@ impl SignalControls {
 
     fn state(&self) -> Result<Arc<ContextRuntimeState>> {
         self.state.clone().ok_or_else(|| {
-            SdkError::Unavailable("durable signal controls unavailable in this context".into())
+            SdkError::Unavailable {
+                message: "durable signal controls unavailable in this context".into(),
+                service: None,
+            }
         })
     }
 
     /// Register a wait for a named signal.
     pub fn wait(&self, name: &str, correlation: Option<&str>) -> Result<()> {
         if name.is_empty() {
-            return Err(SdkError::InvalidArgument(
-                "signal wait requires a non-empty signal name".into(),
-            ));
+            return Err(SdkError::InvalidArgument {
+                message: "signal wait requires a non-empty signal name".into(),
+                argument: Some("name".to_string()),
+            });
         }
 
         let state = self.state()?;
@@ -78,9 +82,10 @@ impl SignalControls {
                     if result.delivered {
                         Ok(())
                     } else {
-                        Err(SdkError::State(
-                            "signal wait completed without delivery".into(),
-                        ))
+                        Err(SdkError::State {
+                            message: "signal wait completed without delivery".into(),
+                            code: crate::error::ErrorCode::InvalidState,
+                        })
                     }
                 }
                 _ => Err(SdkError::Internal(

@@ -19,7 +19,11 @@ impl WorkerCoordinatorClient {
         info!("Connecting to Worker Coordinator at {}", endpoint);
 
         let channel = Channel::from_shared(endpoint.clone())
-            .map_err(|e| SdkError::Connection(format!("Invalid endpoint {}: {}", endpoint, e)))?
+            .map_err(|e| SdkError::Connection {
+                message: format!("Invalid endpoint {}: {}", endpoint, e),
+                code: crate::error::ErrorCode::ConnectionFailed,
+                source: None,
+            })?
             .connect()
             .await?;
 
@@ -74,7 +78,11 @@ impl WorkerCoordinatorClient {
             .await
             .map_err(|e| {
                 error!("Failed to create gRPC worker stream: {}", e);
-                SdkError::Connection(format!("gRPC stream failed: {}", e))
+                SdkError::Connection {
+                    message: format!("gRPC stream failed: {}", e),
+                    code: crate::error::ErrorCode::ConnectionFailed,
+                    source: None,
+                }
             })?
             .into_inner();
 
@@ -83,13 +91,19 @@ impl WorkerCoordinatorClient {
                 .await
                 .map_err(|_| {
                     error!("Timeout waiting for registration response");
-                    SdkError::Connection(
-                        "Registration timeout - no response from runtime".to_string(),
-                    )
+                    SdkError::Connection {
+                        message: "Registration timeout - no response from runtime".to_string(),
+                        code: crate::error::ErrorCode::ConnectionTimeout,
+                        source: None,
+                    }
                 })?
                 .map_err(|e| {
                     error!("Failed to receive registration response: {}", e);
-                    SdkError::Connection(format!("Stream error: {}", e))
+                    SdkError::Connection {
+                        message: format!("Stream error: {}", e),
+                        code: crate::error::ErrorCode::ConnectionFailed,
+                        source: None,
+                    }
                 })?;
 
         // Process registration response
@@ -98,24 +112,29 @@ impl WorkerCoordinatorClient {
                 Some(crate::pb::runtime_message::MessageData::RegisterServiceResponse(resp)) => {
                     if !resp.ack {
                         error!("Registration failed: {}", resp.error);
-                        return Err(SdkError::Connection(format!(
-                            "Registration failed: {}",
-                            resp.error
-                        )));
+                        return Err(SdkError::Connection {
+                            message: format!("Registration failed: {}", resp.error),
+                            code: crate::error::ErrorCode::ConnectionFailed,
+                            source: None,
+                        });
                     }
                 }
                 _ => {
                     error!("Unexpected response type to registration");
-                    return Err(SdkError::Connection(
-                        "Unexpected response to registration".to_string(),
-                    ));
+                    return Err(SdkError::Connection {
+                        message: "Unexpected response to registration".to_string(),
+                        code: crate::error::ErrorCode::InvalidMessage,
+                        source: None,
+                    });
                 }
             }
         } else {
             error!("No registration response received");
-            return Err(SdkError::Connection(
-                "No registration response received".to_string(),
-            ));
+            return Err(SdkError::Connection {
+                message: "No registration response received".to_string(),
+                code: crate::error::ErrorCode::ConnectionFailed,
+                source: None,
+            });
         }
 
         // Spawn simple task to forward stream messages to runtime channel

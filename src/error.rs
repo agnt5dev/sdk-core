@@ -123,10 +123,10 @@ pub enum SdkError {
         service: String,
     },
 
-    #[error("Telemetry error: {message}")]
+    #[error("Telemetry error: {0}")]
     TelemetryError(String),
 
-    #[error("Internal error: {message}")]
+    #[error("Internal error: {0}")]
     Internal(String),
 
     #[error("Service unavailable: {message}")]

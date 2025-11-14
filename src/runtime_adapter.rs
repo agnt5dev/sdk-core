@@ -253,7 +253,11 @@ impl EntityStateManager {
         };
 
         self.stream_sender.send_async(message).await
-            .map_err(|e| crate::error::SdkError::Connection(format!("Failed to send load request: {}", e)))?;
+            .map_err(|e| crate::error::SdkError::Connection {
+                message: format!("Failed to send load request: {}", e),
+                code: crate::error::ErrorCode::ConnectionFailed,
+                source: None,
+            })?;
 
         // Wait for response with timeout
         let response = tokio::time::timeout(
@@ -327,7 +331,11 @@ impl EntityStateManager {
         };
 
         self.stream_sender.send_async(message).await
-            .map_err(|e| crate::error::SdkError::Connection(format!("Failed to send save request: {}", e)))?;
+            .map_err(|e| crate::error::SdkError::Connection {
+                message: format!("Failed to send save request: {}", e),
+                code: crate::error::ErrorCode::ConnectionFailed,
+                source: None,
+            })?;
 
         // Wait for response with timeout
         let response = tokio::time::timeout(

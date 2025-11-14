@@ -25,7 +25,10 @@ impl RuntimeControls {
 
     fn state(&self) -> Result<Arc<ContextRuntimeState>> {
         self.state.clone().ok_or_else(|| {
-            SdkError::Unavailable("durable runtime controls unavailable in this context".into())
+            SdkError::Unavailable {
+                message: "durable runtime controls unavailable in this context".into(),
+                service: None,
+            }
         })
     }
 

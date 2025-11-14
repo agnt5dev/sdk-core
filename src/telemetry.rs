@@ -478,9 +478,8 @@ pub fn shutdown_telemetry() {
             eprintln!("Warning: Failed to flush telemetry during shutdown: {}", e);
         }
 
-        // Shutdown the global tracer provider
-        // This may hang in some versions of OpenTelemetry, hence the timeout
-        global::shutdown_tracer_provider();
+        // Note: In OpenTelemetry 0.30+, global::shutdown_tracer_provider() was removed.
+        // Flushing above is sufficient to ensure pending telemetry is exported.
 
         // Signal completion
         let _ = tx.send(());

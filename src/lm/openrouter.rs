@@ -46,7 +46,10 @@ impl OpenRouterConfig {
 
     pub fn from_env() -> SdkResult<Self> {
         let api_key = env::var("OPENROUTER_API_KEY")
-            .map_err(|_| SdkError::Configuration("OPENROUTER_API_KEY must be set".to_string()))?;
+            .map_err(|_| SdkError::Configuration {
+                message: "OPENROUTER_API_KEY must be set".to_string(),
+                field: Some("OPENROUTER_API_KEY".to_string()),
+            })?;
 
         let mut config = OpenRouterConfig::new(api_key);
 

@@ -119,7 +119,11 @@ impl RuntimeServiceClient {
                 message_type: Some(service_message::MessageType::RuntimeService(request)),
             })
             .await
-            .map_err(|err| SdkError::Connection(format!("send runtime service: {}", err)))?;
+            .map_err(|err| SdkError::Connection {
+                message: format!("send runtime service: {}", err),
+                code: crate::error::ErrorCode::ConnectionFailed,
+                source: None,
+            })?;
 
         let response = rx.await.map_err(|_| {
             SdkError::Internal("runtime service response channel closed unexpectedly".into())
@@ -133,7 +137,10 @@ impl RuntimeServiceClient {
             } else {
                 response.error_message.clone()
             };
-            Err(SdkError::State(message))
+            Err(SdkError::State {
+                message,
+                code: crate::error::ErrorCode::ExecutionFailed,
+            })
         }
     }
 }
