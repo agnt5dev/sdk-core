@@ -453,12 +453,49 @@ pub fn flush_telemetry() -> Result<(), SdkError> {
     Ok(())
 }
 
-/// Stub shutdown function - implementation pending due to known issues
+/// Shutdown telemetry gracefully with timeout protection
+///
+/// This function:
+/// 1. Flushes any buffered telemetry data (traces and logs)
+/// 2. Shuts down the global tracer provider
+/// 3. Uses a 5-second timeout to prevent hanging forever
+///
+/// Note: Shutdown may take up to 2 seconds due to batch exporter flush intervals
 pub fn shutdown_telemetry() {
-    // For now, just log that shutdown was called
-    tracing::info!("Telemetry shutdown requested");
-    // Note: global::shutdown_tracer_provider() has known hanging issues in v0.30
-    // Will implement proper shutdown in later phase
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    tracing::info!("Shutting down telemetry - flushing buffered data");
+
+    // Create a channel for timeout handling
+    let (tx, rx) = mpsc::channel();
+
+    // Spawn shutdown in a separate thread to enforce timeout
+    thread::spawn(move || {
+        // Flush any pending telemetry first
+        if let Err(e) = flush_telemetry() {
+            eprintln!("Warning: Failed to flush telemetry during shutdown: {}", e);
+        }
+
+        // Shutdown the global tracer provider
+        // This may hang in some versions of OpenTelemetry, hence the timeout
+        global::shutdown_tracer_provider();
+
+        // Signal completion
+        let _ = tx.send(());
+    });
+
+    // Wait for shutdown with timeout
+    match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(_) => {
+            tracing::info!("Telemetry shutdown completed successfully");
+        }
+        Err(_) => {
+            eprintln!("Warning: Telemetry shutdown timed out after 5 seconds");
+            eprintln!("         Some telemetry data may not have been exported");
+        }
+    }
 }
 
 #[cfg(test)]
