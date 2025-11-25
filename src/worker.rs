@@ -28,8 +28,6 @@ pub struct WorkerConfig {
 
     pub worker_id: String,
     pub coordinator_endpoint: String,
-    pub tenant_id: String,
-    pub deployment_id: String,
 }
 
 impl WorkerConfig {
@@ -41,46 +39,48 @@ impl WorkerConfig {
         let coordinator_endpoint = std::env::var("AGNT5_COORDINATOR_ENDPOINT")
             .unwrap_or_else(|_| "http://localhost:34186".to_string());
 
-        // Check if we're in development mode for better defaults
-        let is_dev_mode = std::env::var("AGNT5_DEV_MODE").unwrap_or_else(|_| "false".to_string())
-            == "true"
-            || std::env::var("AGNT5_ENVIRONMENT").unwrap_or_else(|_| "".to_string())
-                == "development"
-            || std::env::var("AGNT5_JOURNAL_BACKEND").unwrap_or_else(|_| "".to_string())
-                == "embedded"
-            || std::env::var("AGNT5_ORCHESTRATION_BACKEND").unwrap_or_else(|_| "".to_string())
-                == "sqlite";
-
-        let tenant_id = std::env::var("AGNT5_TENANT_ID").unwrap_or_else(|_| {
-            if is_dev_mode {
-                // Check for dev-specific override first
-                std::env::var("AGNT5_DEV_TENANT_ID")
-                    .unwrap_or_else(|_| "00000000-0000-0000-0000-000000000001".to_string())
-            } else {
-                "default".to_string()
-            }
-        });
-
-        let deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").unwrap_or_else(|_| {
-            if is_dev_mode {
-                // Check for dev-specific override first
-                std::env::var("AGNT5_DEV_DEPLOYMENT_ID")
-                    .unwrap_or_else(|_| "00000000-0000-0000-0000-000000000002".to_string())
-            } else {
-                "default".to_string()
-            }
-        });
-
         Self {
             service_name,
             service_version,
             service_type,
             worker_id,
             coordinator_endpoint,
-            tenant_id,
-            deployment_id,
         }
     }
+}
+
+/// Blacklist patterns for sensitive environment variables
+/// These patterns are checked (case-insensitive) to prevent leaking credentials
+pub const AGNT5_METADATA_BLACKLIST_PATTERNS: &[&str] = &[
+    "_KEY",
+    "_SECRET",
+    "_TOKEN",
+    "_PASSWORD",
+    "_CREDENTIAL",
+    "_API_KEY",
+    "_AUTH_TOKEN",
+    "_PRIVATE_KEY",
+];
+
+/// Check if an environment variable should be excluded from metadata
+/// Returns true if the variable name matches any blacklist pattern
+pub fn is_sensitive_env_var(key: &str) -> bool {
+    let key_upper = key.to_uppercase();
+    AGNT5_METADATA_BLACKLIST_PATTERNS
+        .iter()
+        .any(|pattern| key_upper.ends_with(pattern))
+}
+
+/// Collect all AGNT5_* environment variables for registration metadata
+/// Excludes sensitive variables based on blacklist patterns
+pub fn collect_agnt5_env_vars() -> HashMap<String, String> {
+    let mut metadata = HashMap::new();
+    for (key, value) in std::env::vars() {
+        if key.starts_with("AGNT5_") && !is_sensitive_env_var(&key) {
+            metadata.insert(key, value);
+        }
+    }
+    metadata
 }
 
 #[derive(Clone)]
@@ -360,14 +360,16 @@ impl Worker {
             WorkerCoordinatorClient::connect(self.config.coordinator_endpoint.clone()).await?;
 
         // Create registration message with components
+        // Merge user-provided metadata with auto-collected AGNT5_* env vars
+        let mut metadata = self.metadata.clone();
+        metadata.extend(collect_agnt5_env_vars());
+
         let registration = RegisterService {
             service_name: self.config.service_name.clone(),
             service_version: self.config.service_version.clone(),
             service_type: self.config.service_type.clone(),
             components: self.components.clone(),
-            tenant_id: self.config.tenant_id.clone(),
-            deployment_id: self.config.deployment_id.clone(),
-            metadata: self.metadata.clone(),
+            metadata,
         };
 
         // Use the working pattern - create stream with immediate registration
@@ -542,6 +544,7 @@ impl Worker {
 
                 let service_message = ServiceMessage {
                     worker_id: worker_id.clone(),
+                    metadata: std::collections::HashMap::new(),
                     message_type: Some(crate::pb::service_message::MessageType::HealthCheck(
                         health_check,
                     )),
@@ -596,6 +599,7 @@ impl Worker {
 
                     let service_message = ServiceMessage {
                         worker_id: worker_id.clone(),
+                        metadata: std::collections::HashMap::new(),
                         message_type: Some(
                             crate::pb::service_message::MessageType::WorkflowCheckpoint(
                                 workflow_checkpoint,
@@ -648,6 +652,7 @@ impl Worker {
 
         let service_message = ServiceMessage {
             worker_id: self.config.worker_id.clone(),
+            metadata: std::collections::HashMap::new(),
             message_type: Some(crate::pb::service_message::MessageType::UnregisterService(
                 unregister,
             )),
