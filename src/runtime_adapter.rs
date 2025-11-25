@@ -236,7 +236,6 @@ impl EntityStateManager {
         // Create RuntimeServiceRequest
         let request = RuntimeServiceRequest {
             request_id: request_id.clone(),
-            tenant_id: self.tenant_id.clone(),
             session_id: self.session_id.clone(),
             operation: Some(runtime_service_request::Operation::EntityStateLoad(
                 EntityStateLoadRequest {
@@ -249,6 +248,7 @@ impl EntityStateManager {
         // Send via worker stream
         let message = ServiceMessage {
             worker_id: String::new(), // Will be filled by worker
+            metadata: HashMap::new(),
             message_type: Some(crate::pb::service_message::MessageType::RuntimeService(request)),
         };
 
@@ -312,7 +312,6 @@ impl EntityStateManager {
         // Create RuntimeServiceRequest
         let request = RuntimeServiceRequest {
             request_id: request_id.clone(),
-            tenant_id: self.tenant_id.clone(),
             session_id: self.session_id.clone(),
             operation: Some(runtime_service_request::Operation::EntityStateSave(
                 EntityStateSaveRequest {
@@ -327,6 +326,7 @@ impl EntityStateManager {
         // Send via worker stream
         let message = ServiceMessage {
             worker_id: String::new(), // Will be filled by worker
+            metadata: HashMap::new(),
             message_type: Some(crate::pb::service_message::MessageType::RuntimeService(request)),
         };
 

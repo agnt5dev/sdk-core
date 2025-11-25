@@ -49,14 +49,12 @@ impl TimerControls {
         let dedupe_id = format!("{}:{}:{}", state.run_id, state.step_id, timer_key);
 
         let client = Arc::clone(&state.client);
-        let tenant_id = state.tenant_id.clone();
         let session_id = state.session_id.clone();
         let run_id = state.run_id.clone();
         let step_id = state.step_id.clone();
 
         let request = RuntimeServiceRequest {
             request_id: String::new(),
-            tenant_id,
             session_id,
             operation: Some(RuntimeOperation::TimerSleep(TimerSleepRequest {
                 run_id,
