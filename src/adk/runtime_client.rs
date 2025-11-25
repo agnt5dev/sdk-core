@@ -4,7 +4,7 @@ use crate::pb::{
     runtime_message, service_message, RuntimeMessage, RuntimeServiceRequest,
     RuntimeServiceResponse, ServiceMessage,
 };
-use crate::worker::WorkerConfig;
+use crate::worker::{collect_agnt5_env_vars, WorkerConfig};
 use flume::{Receiver, Sender};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -39,14 +39,15 @@ impl RuntimeServiceClient {
         let mut client =
             WorkerCoordinatorClient::connect(config.coordinator_endpoint.clone()).await?;
 
+        // Collect AGNT5_* environment variables for metadata
+        let metadata = collect_agnt5_env_vars();
+
         let register = crate::pb::RegisterService {
             service_name: config.service_name.clone(),
             service_version: config.service_version.clone(),
             service_type: config.service_type.clone(),
-            tenant_id: config.tenant_id.clone(),
-            deployment_id: config.deployment_id.clone(),
             components: vec![],
-            metadata: HashMap::new(),
+            metadata,
         };
 
         let (sender, receiver) = client
@@ -116,6 +117,7 @@ impl RuntimeServiceClient {
         self.sender
             .send_async(ServiceMessage {
                 worker_id: self.worker_id.clone(),
+                metadata: HashMap::new(),
                 message_type: Some(service_message::MessageType::RuntimeService(request)),
             })
             .await

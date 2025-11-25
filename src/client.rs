@@ -3,6 +3,7 @@ use crate::pb::{
     worker_coordinator_service_client::WorkerCoordinatorServiceClient, RegisterService,
     RuntimeMessage, ServiceMessage,
 };
+use std::collections::HashMap;
 use std::time::Duration;
 use tonic::transport::Channel;
 use tracing::{error, info};
@@ -44,6 +45,7 @@ impl WorkerCoordinatorClient {
         // Create the registration message first
         let registration_message = ServiceMessage {
             worker_id: worker_id.clone(),
+            metadata: HashMap::new(),
             message_type: Some(crate::pb::service_message::MessageType::RegisterService(
                 registration,
             )),

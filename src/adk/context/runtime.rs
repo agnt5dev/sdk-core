@@ -46,7 +46,6 @@ impl RuntimeControls {
         }
 
         let client = Arc::clone(&state.client);
-        let tenant_id = state.tenant_id.clone();
         let session_id = state.session_id.clone();
         let run_id = state.run_id.clone();
         let step_id = state.step_id.clone();
@@ -54,7 +53,6 @@ impl RuntimeControls {
 
         let request = RuntimeServiceRequest {
             request_id: String::new(),
-            tenant_id,
             session_id,
             operation: Some(RuntimeOperation::RunCheckpoint(RunCheckpointRequest {
                 run_id,
@@ -89,14 +87,12 @@ impl RuntimeControls {
         }
 
         let client = Arc::clone(&state.client);
-        let tenant_id = state.tenant_id.clone();
         let session_id = state.session_id.clone();
         let run_id = state.run_id.clone();
         let step_id = state.step_id.clone();
 
         let request = RuntimeServiceRequest {
             request_id: String::new(),
-            tenant_id,
             session_id,
             operation: Some(RuntimeOperation::RunFail(RunFailRequest {
                 run_id,
