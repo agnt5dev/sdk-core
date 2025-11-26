@@ -1,12 +1,13 @@
 use crate::error::{Result, SdkError};
 use crate::pb::{
-    worker_coordinator_service_client::WorkerCoordinatorServiceClient, RegisterService,
+    worker_coordinator_service_client::WorkerCoordinatorServiceClient, CheckpointRequest,
+    CheckpointType, DurableStepCheckpoint, GetMemoizedStepRequest, RegisterService,
     RuntimeMessage, ServiceMessage,
 };
 use std::collections::HashMap;
 use std::time::Duration;
 use tonic::transport::Channel;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 /// Simple client for communicating with the Worker Coordinator service
 #[derive(Debug, Clone)]
@@ -160,4 +161,150 @@ impl WorkerCoordinatorClient {
 
         Ok((outgoing_tx, runtime_msg_rx))
     }
+
+    /// Send a step checkpoint and check for memoized result
+    ///
+    /// This method sends a checkpoint for a workflow step and checks if the step
+    /// result is already memoized. If memoized, returns the cached output.
+    ///
+    /// # Arguments
+    ///
+    /// * `run_id` - The workflow run ID
+    /// * `step_key` - Unique key for this step (e.g., "step:greet:0")
+    /// * `step_name` - Human-readable step name
+    /// * `step_type` - Type of step (e.g., "function", "activity", "llm_call")
+    /// * `checkpoint_type` - Type of checkpoint (started, completed, failed)
+    /// * `payload` - Checkpoint payload (input for started, output for completed)
+    /// * `error_message` - Error message (for failed checkpoints)
+    /// * `error_type` - Error type (for failed checkpoints)
+    /// * `latency_ms` - Step execution latency in milliseconds
+    ///
+    /// # Returns
+    ///
+    /// `CheckpointResult` containing memoization status and cached output if available
+    pub async fn checkpoint(
+        &mut self,
+        run_id: String,
+        step_key: String,
+        step_name: String,
+        step_type: String,
+        checkpoint_type: CheckpointType,
+        payload: Option<Vec<u8>>,
+        error_message: Option<String>,
+        error_type: Option<String>,
+        latency_ms: Option<i64>,
+    ) -> Result<CheckpointResult> {
+        debug!(
+            "Sending checkpoint: run_id={}, step_key={}, type={:?}",
+            run_id, step_key, checkpoint_type
+        );
+
+        let checkpoint = DurableStepCheckpoint {
+            run_id,
+            step_key,
+            step_name,
+            step_type,
+            r#type: checkpoint_type.into(),
+            payload: payload.unwrap_or_default(),
+            error_message: error_message.unwrap_or_default(),
+            error_type: error_type.unwrap_or_default(),
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: 0.0,
+            latency_ms: latency_ms.unwrap_or(0),
+            model_provider: String::new(),
+            model_version: String::new(),
+        };
+
+        let request = CheckpointRequest {
+            checkpoint: Some(checkpoint),
+        };
+
+        let response = self
+            .client
+            .checkpoint(request)
+            .await
+            .map_err(|e| {
+                error!("Checkpoint RPC failed: {}", e);
+                SdkError::Connection {
+                    message: format!("Checkpoint failed: {}", e),
+                    code: crate::error::ErrorCode::ConnectionFailed,
+                    source: None,
+                }
+            })?
+            .into_inner();
+
+        Ok(CheckpointResult {
+            success: response.success,
+            error_message: if response.error_message.is_empty() {
+                None
+            } else {
+                Some(response.error_message)
+            },
+            memoized: response.memoized,
+            cached_output: if response.cached_output.is_empty() {
+                None
+            } else {
+                Some(response.cached_output)
+            },
+        })
+    }
+
+    /// Check if a step result is memoized without sending a full checkpoint
+    ///
+    /// Use this for quick memoization lookups before executing expensive steps.
+    ///
+    /// # Arguments
+    ///
+    /// * `run_id` - The workflow run ID
+    /// * `step_key` - Unique key for this step
+    ///
+    /// # Returns
+    ///
+    /// `Some(output)` if the step is memoized, `None` otherwise
+    pub async fn get_memoized_step(
+        &mut self,
+        run_id: String,
+        step_key: String,
+    ) -> Result<Option<Vec<u8>>> {
+        debug!(
+            "Checking memoization: run_id={}, step_key={}",
+            run_id, step_key
+        );
+
+        let request = GetMemoizedStepRequest { run_id, step_key };
+
+        let response = self
+            .client
+            .get_memoized_step(request)
+            .await
+            .map_err(|e| {
+                error!("GetMemoizedStep RPC failed: {}", e);
+                SdkError::Connection {
+                    message: format!("GetMemoizedStep failed: {}", e),
+                    code: crate::error::ErrorCode::ConnectionFailed,
+                    source: None,
+                }
+            })?
+            .into_inner();
+
+        if response.found && !response.output.is_empty() {
+            Ok(Some(response.output))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// Result of a checkpoint operation
+#[derive(Debug, Clone)]
+pub struct CheckpointResult {
+    /// Whether the checkpoint was processed successfully
+    pub success: bool,
+    /// Error message if the checkpoint failed
+    pub error_message: Option<String>,
+    /// Whether the step was already memoized (for STEP_STARTED checkpoints)
+    pub memoized: bool,
+    /// Cached output if memoized
+    pub cached_output: Option<Vec<u8>>,
 }
