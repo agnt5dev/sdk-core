@@ -19,7 +19,7 @@ pub use adk::{
     SignalControls, TaskControls, TimerControls, ToolDefinition, ToolHandle, ToolRegistry,
 };
 pub use checkpoint::{CheckpointMessage, CheckpointQueue};
-pub use client::WorkerCoordinatorClient;
+pub use client::{CheckpointResult, WorkerCoordinatorClient};
 pub use context::{
     ContextConfig, CoreContext, FunctionCall, FunctionHandle, FunctionNamespace, FunctionRegistry,
     FunctionResult, FunctionStatus, LanguageModelNamespace, SignalNamespace, TimerNamespace,
@@ -56,6 +56,9 @@ pub use flume;
 pub mod pb {
     tonic::include_proto!("api.v1");
 }
+
+// Re-export checkpoint types for language bindings
+pub use pb::CheckpointType;
 
 #[cfg(test)]
 mod tests {
