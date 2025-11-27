@@ -5,7 +5,7 @@
 // This enables real-time SSE streaming for interactive scenarios like watching
 // agent execution live in the UI.
 
-use crate::error::{Result, SdkError};
+// Note: Result and SdkError are available if needed for future extensions
 use crate::pb::{
     worker_coordinator_service_client::WorkerCoordinatorServiceClient,
     WriteJournalEventRequest, WriteJournalEventsBatchRequest,
@@ -107,25 +107,6 @@ impl JournalSpanExporter {
         *guard = tenant_id;
     }
 
-    /// Ensure the gRPC client is connected.
-    async fn ensure_connected(&self) -> Result<()> {
-        let mut client_guard = self.client.lock().await;
-        if client_guard.is_none() {
-            debug!("Connecting journal exporter to {}", self.endpoint);
-            let channel = Channel::from_shared(self.endpoint.clone())
-                .map_err(|e| SdkError::Connection {
-                    message: format!("Invalid endpoint {}: {}", self.endpoint, e),
-                    code: crate::error::ErrorCode::ConnectionFailed,
-                    source: None,
-                })?
-                .connect()
-                .await?;
-
-            *client_guard = Some(WorkerCoordinatorServiceClient::new(channel));
-        }
-        Ok(())
-    }
-
     /// Convert OpenTelemetry SpanData to journal format.
     fn convert_span_data(span: &SpanData) -> JournalSpanData {
         use opentelemetry::trace::Status;
@@ -185,9 +166,11 @@ impl JournalSpanExporter {
                                         .map(|v| serde_json::Value::String(v.to_string()))
                                         .collect()
                                 }
+                                _ => vec![serde_json::Value::String("unknown".to_string())],
                             };
                             serde_json::Value::Array(arr_values)
                         }
+                        _ => serde_json::Value::String(format!("{:?}", kv.value)),
                     };
                     (kv.key.to_string(), value)
                 })
@@ -299,6 +282,16 @@ impl JournalSpanExporter {
                 _ => format!("{:?}", kv.value),
             })
     }
+
+    /// Check if span has is_streaming=true attribute.
+    /// Only spans with this attribute should be exported to the journal for real-time SSE.
+    fn is_streaming_span(span: &SpanData) -> bool {
+        span.attributes
+            .iter()
+            .any(|kv| {
+                kv.key.as_str() == "agnt5.is_streaming" && matches!(&kv.value, opentelemetry::Value::Bool(true))
+            })
+    }
 }
 
 impl SpanExporter for JournalSpanExporter {
@@ -349,6 +342,13 @@ impl SpanExporter for JournalSpanExporter {
             let requests: Vec<WriteJournalEventRequest> = batch
                 .iter()
                 .filter_map(|span| {
+                    // Only export spans that have is_streaming=true attribute
+                    // This ensures journal export only happens for streaming calls
+                    if !Self::is_streaming_span(span) {
+                        debug!("Skipping span {} - not a streaming span", span.name);
+                        return None;
+                    }
+
                     // Try to get run_id from span attributes, fall back to default
                     let run_id = Self::extract_run_id(span).or_else(|| default_run.clone());
 
@@ -442,7 +442,7 @@ impl Default for JournalExporterConfig {
     }
 }
 
-/// Create a journal span exporter if enabled.
+/// Create a journal span exporter if enabled by environment variable.
 ///
 /// Returns None if journal streaming is disabled (AGNT5_JOURNAL_STREAMING != "true").
 pub fn create_journal_exporter() -> Option<JournalSpanExporter> {
@@ -452,6 +452,16 @@ pub fn create_journal_exporter() -> Option<JournalSpanExporter> {
     } else {
         None
     }
+}
+
+/// Create a journal span exporter unconditionally.
+///
+/// This is used when span filtering is done at export time based on agnt5.is_streaming attribute.
+/// Always returns Some() unless the endpoint cannot be determined.
+pub fn create_journal_exporter_always() -> Option<JournalSpanExporter> {
+    let endpoint = std::env::var("AGNT5_COORDINATOR_ENDPOINT")
+        .unwrap_or_else(|_| "http://localhost:34186".to_string());
+    Some(JournalSpanExporter::new(endpoint))
 }
 
 #[cfg(test)]
