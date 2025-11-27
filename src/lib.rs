@@ -5,6 +5,7 @@ pub mod checkpoint;
 pub mod client;
 pub mod context;
 pub mod error;
+pub mod journal_exporter;
 pub mod lm;
 pub mod logging;
 pub mod runtime_adapter;
@@ -42,6 +43,9 @@ pub use runtime_adapter::{
 pub use telemetry::{
     create_component_span, create_function_span, end_span, extract_context_from_runtime_message,
     init_telemetry, record_span_error, record_span_success, shutdown_telemetry,
+};
+pub use journal_exporter::{
+    create_journal_exporter, JournalExporterConfig, JournalSpanExporter,
 };
 pub use vectordb::{
     Collection, DistanceMetric, PgVectorProvider, QdrantProvider, SearchQuery, SearchResult,
