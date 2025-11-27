@@ -101,6 +101,7 @@ pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), S
     eprintln!("   Endpoint: {}", otel_endpoint);
     eprintln!("   Service:  {}", service_name);
     eprintln!("   Version:  {}", service_version);
+    eprintln!("   Journal:  enabled (filtered by is_streaming attribute)");
 
     tracing::info!(
         "Initializing OpenTelemetry with OTLP endpoint: {}",
@@ -139,11 +140,22 @@ pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), S
     // Wrap trace exporter with filtering to remove h2 spans
     let filtering_exporter = crate::span_filter::FilteringSpanExporter::new(trace_exporter);
 
-    // Create tracer provider with filtered batch exporter
-    let trace_provider = SdkTracerProvider::builder()
+    // Create tracer provider builder
+    let mut trace_provider_builder = SdkTracerProvider::builder()
         .with_resource(resource.clone())
-        .with_batch_exporter(filtering_exporter)
-        .build();
+        .with_batch_exporter(filtering_exporter);
+
+    // Add journal exporter for real-time SSE streaming
+    // The exporter filters spans based on agnt5.is_streaming attribute
+    // Only spans from streaming calls will be exported to the journal
+    if let Some(journal_exporter) = crate::journal_exporter::create_journal_exporter_always() {
+        tracing::info!("Adding journal exporter for real-time SSE streaming (attribute-filtered)");
+        // Use simple exporter (not batch) for immediate delivery
+        trace_provider_builder = trace_provider_builder.with_simple_exporter(journal_exporter);
+    }
+
+    // Build tracer provider
+    let trace_provider = trace_provider_builder.build();
 
     // Create logger provider with batch exporter
     let log_provider = SdkLoggerProvider::builder()
