@@ -150,8 +150,9 @@ pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), S
     // Only spans from streaming calls will be exported to the journal
     if let Some(journal_exporter) = crate::journal_exporter::create_journal_exporter_always() {
         tracing::info!("Adding journal exporter for real-time SSE streaming (attribute-filtered)");
-        // Use simple exporter (not batch) for immediate delivery
-        trace_provider_builder = trace_provider_builder.with_simple_exporter(journal_exporter);
+        // Use batch exporter to avoid blocking the worker connection during startup
+        // The simple exporter causes a deadlock when spans are created during gRPC connection
+        trace_provider_builder = trace_provider_builder.with_batch_exporter(journal_exporter);
     }
 
     // Build tracer provider
