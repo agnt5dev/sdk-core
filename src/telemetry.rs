@@ -1,16 +1,19 @@
-// OpenTelemetry telemetry module with OTLP exporter for traces and logs
+// OpenTelemetry telemetry module with OTLP exporter for traces, logs, and metrics
 use crate::error::SdkError;
 use opentelemetry::global::BoxedSpan;
+use opentelemetry::metrics::Counter;
 use opentelemetry::propagation::{Extractor, TextMapCompositePropagator, TextMapPropagator};
 use opentelemetry::trace::{Span, SpanKind, Status, Tracer, TracerProvider};
 use opentelemetry::{baggage::BaggageExt, global, Context, KeyValue};
-use opentelemetry_otlp::{LogExporter, SpanExporter, WithExportConfig};
+use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::{
     logs::SdkLoggerProvider,
+    metrics::SdkMeterProvider,
     propagation::{BaggagePropagator, TraceContextPropagator},
     trace::SdkTracerProvider,
     Resource,
 };
+use std::sync::OnceLock;
 use std::collections::HashMap;
 use tracing_subscriber::{fmt::format::Writer, layer::SubscriberExt, Layer as _, EnvFilter, Registry};
 
@@ -108,13 +111,30 @@ pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), S
         otel_endpoint
     );
 
-    // Create resource with service information
+    // Extract deployment_id and tenant_id from environment variables
+    // These are set by the control plane when deploying workers
+    let deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").ok();
+    let tenant_id = std::env::var("AGNT5_TENANT_ID").ok();
+
+    // Create resource attributes
+    let mut resource_attributes = vec![
+        KeyValue::new("service.version", service_version.to_string()),
+    ];
+
+    if let Some(ref deployment_id) = deployment_id {
+        resource_attributes.push(KeyValue::new("deployment.id", deployment_id.clone()));
+        eprintln!("   Deployment ID: {}", deployment_id);
+    }
+
+    if let Some(ref tenant_id) = tenant_id {
+        resource_attributes.push(KeyValue::new("tenant.id", tenant_id.clone()));
+        eprintln!("   Tenant ID: {}", tenant_id);
+    }
+
+    // Create resource with service information and deployment/tenant IDs
     let resource = Resource::builder()
         .with_service_name(service_name.to_string())
-        .with_attributes(vec![KeyValue::new(
-            "service.version",
-            service_version.to_string(),
-        )])
+        .with_attributes(resource_attributes)
         .build();
 
     // Build OTLP exporters for traces and logs
@@ -131,7 +151,7 @@ pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), S
 
     let log_exporter = LogExporter::builder()
         .with_tonic()
-        .with_endpoint(otel_endpoint)
+        .with_endpoint(otel_endpoint.clone())
         .build()
         .map_err(|e| {
             SdkError::Other(anyhow::anyhow!("Failed to create OTLP log exporter: {}", e))
@@ -145,24 +165,38 @@ pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), S
         .with_resource(resource.clone())
         .with_batch_exporter(filtering_exporter);
 
-    // Add journal exporter for real-time SSE streaming
-    // The exporter filters spans based on agnt5.is_streaming attribute
-    // Only spans from streaming calls will be exported to the journal
-    if let Some(journal_exporter) = crate::journal_exporter::create_journal_exporter_always() {
-        tracing::info!("Adding journal exporter for real-time SSE streaming (attribute-filtered)");
-        // Use batch exporter to avoid blocking the worker connection during startup
-        // The simple exporter causes a deadlock when spans are created during gRPC connection
-        trace_provider_builder = trace_provider_builder.with_batch_exporter(journal_exporter);
-    }
+    // NOTE: Journal export for real-time SSE streaming is NOT done via the tracer provider.
+    // Instead, the worker code directly calls export_span_to_journal() after streaming spans end.
+    // This avoids BatchSpanProcessor delays and Tokio runtime issues, providing true real-time delivery.
 
     // Build tracer provider
     let trace_provider = trace_provider_builder.build();
 
     // Create logger provider with batch exporter
     let log_provider = SdkLoggerProvider::builder()
-        .with_resource(resource)
+        .with_resource(resource.clone())
         .with_batch_exporter(log_exporter)
         .build();
+
+    // Create metrics exporter and meter provider
+    let metric_exporter = MetricExporter::builder()
+        .with_tonic()
+        .with_endpoint(otel_endpoint.clone())
+        .build()
+        .map_err(|e| {
+            SdkError::Other(anyhow::anyhow!(
+                "Failed to create OTLP metric exporter: {}",
+                e
+            ))
+        })?;
+
+    let meter_provider = SdkMeterProvider::builder()
+        .with_resource(resource)
+        .with_periodic_exporter(metric_exporter)
+        .build();
+
+    // Set as global meter provider
+    global::set_meter_provider(meter_provider);
 
     // Get tracer from provider before setting as global
     let tracer = trace_provider.tracer("agnt5-sdk-core");
@@ -508,6 +542,56 @@ pub fn shutdown_telemetry() {
             eprintln!("         Some telemetry data may not have been exported");
         }
     }
+}
+
+// =============================================================================
+// Metrics
+// =============================================================================
+
+/// Static counter for execution requests received by the worker
+static EXECUTION_REQUESTS_COUNTER: OnceLock<Counter<u64>> = OnceLock::new();
+
+/// Initialize the execution requests counter
+/// This should be called after init_telemetry()
+fn get_execution_requests_counter() -> &'static Counter<u64> {
+    EXECUTION_REQUESTS_COUNTER.get_or_init(|| {
+        let meter = global::meter("agnt5-sdk-core");
+        meter
+            .u64_counter("agnt5.worker.execution_requests")
+            .with_description("Number of execution requests received by the worker")
+            .with_unit("requests")
+            .build()
+    })
+}
+
+/// Record an execution request received by the worker
+///
+/// This increments the execution_requests counter with the given attributes.
+/// Call this when a worker receives a new execution request (function, workflow, agent, etc.)
+pub fn record_execution_request(component_name: &str, component_type: &str) {
+    let counter = get_execution_requests_counter();
+    counter.add(
+        1,
+        &[
+            KeyValue::new("component.name", component_name.to_string()),
+            KeyValue::new("component.type", component_type.to_string()),
+        ],
+    );
+}
+
+/// Record an execution request with additional attributes
+pub fn record_execution_request_with_attrs(
+    component_name: &str,
+    component_type: &str,
+    additional_attrs: &[KeyValue],
+) {
+    let counter = get_execution_requests_counter();
+    let mut attrs = vec![
+        KeyValue::new("component.name", component_name.to_string()),
+        KeyValue::new("component.type", component_type.to_string()),
+    ];
+    attrs.extend_from_slice(additional_attrs);
+    counter.add(1, &attrs);
 }
 
 #[cfg(test)]
