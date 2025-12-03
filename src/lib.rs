@@ -42,10 +42,13 @@ pub use runtime_adapter::{
 };
 pub use telemetry::{
     create_component_span, create_function_span, end_span, extract_context_from_runtime_message,
-    init_telemetry, record_span_error, record_span_success, shutdown_telemetry,
+    init_telemetry, record_execution_request, record_execution_request_with_attrs,
+    record_span_error, record_span_success, shutdown_telemetry,
 };
 pub use journal_exporter::{
-    create_journal_exporter, JournalExporterConfig, JournalSpanExporter,
+    create_journal_log_data, create_journal_span_data, export_log_to_journal,
+    export_span_to_journal, get_journal_client, JournalClient, JournalExporterConfig,
+    JournalLogData, JournalSpanData, JournalSpanStatus,
 };
 pub use vectordb::{
     Collection, DistanceMetric, PgVectorProvider, QdrantProvider, SearchQuery, SearchResult,
