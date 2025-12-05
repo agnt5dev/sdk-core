@@ -1,14 +1,19 @@
 use crate::checkpoint::{CheckpointMessage, CheckpointQueue};
 use crate::client::WorkerCoordinatorClient;
 use crate::error::Result;
+use crate::journal_exporter::{
+    create_journal_log_data, create_journal_span_data, export_log_to_journal,
+    export_span_to_journal,
+};
 use crate::pb::{
     ComponentInfo, HealthCheck, RegisterService, RuntimeMessage, ServiceMessage, UnregisterService,
     WorkerHealthStatus, WorkflowCheckpoint,
 };
+use crate::span_export_queue::{LogExportQueue, SpanExportQueue};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{error, info, warn};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// Connection states for tracking worker status
@@ -90,6 +95,8 @@ pub struct Worker {
     metadata: HashMap<String, String>,
     connection_state: Arc<std::sync::Mutex<ConnectionState>>,
     checkpoint_queue: CheckpointQueue,
+    span_export_queue: SpanExportQueue,
+    log_export_queue: LogExportQueue,
 }
 
 // Implement Debug manually to avoid requiring Debug on CheckpointQueue's internals
@@ -101,6 +108,8 @@ impl std::fmt::Debug for Worker {
             .field("metadata", &self.metadata)
             .field("connection_state", &self.connection_state)
             .field("checkpoint_queue_size", &self.checkpoint_queue.len())
+            .field("span_export_queue_size", &self.span_export_queue.len())
+            .field("log_export_queue_size", &self.log_export_queue.len())
             .finish()
     }
 }
@@ -118,7 +127,21 @@ impl Worker {
             .and_then(|s| s.parse().ok())
             .unwrap_or(1000);
 
-        info!("Creating worker with checkpoint buffer size: {}", checkpoint_buffer_size);
+        // Get span/log export buffer sizes from environment or use defaults
+        let span_export_buffer_size = std::env::var("AGNT5_SPAN_EXPORT_BUFFER_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1000);
+
+        let log_export_buffer_size = std::env::var("AGNT5_LOG_EXPORT_BUFFER_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5000);
+
+        info!(
+            "Creating worker with buffer sizes: checkpoints={}, spans={}, logs={}",
+            checkpoint_buffer_size, span_export_buffer_size, log_export_buffer_size
+        );
 
         Self {
             config,
@@ -126,7 +149,19 @@ impl Worker {
             metadata,
             connection_state: Arc::new(std::sync::Mutex::new(ConnectionState::Disconnected)),
             checkpoint_queue: CheckpointQueue::new(checkpoint_buffer_size),
+            span_export_queue: SpanExportQueue::new(span_export_buffer_size),
+            log_export_queue: LogExportQueue::new(log_export_buffer_size),
         }
+    }
+
+    /// Get a clone of the span export queue for use by language SDKs
+    pub fn span_export_queue(&self) -> SpanExportQueue {
+        self.span_export_queue.clone()
+    }
+
+    /// Get a clone of the log export queue for use by language SDKs
+    pub fn log_export_queue(&self) -> LogExportQueue {
+        self.log_export_queue.clone()
     }
 
     /// Set components for the worker
@@ -389,6 +424,10 @@ impl Worker {
         // Start checkpoint flushing task
         let checkpoint_task = self.spawn_checkpoint_flush_task(tx.clone());
 
+        // Start span and log export flush tasks for real-time SSE streaming
+        let span_export_task = self.spawn_span_export_flush_task();
+        let log_export_task = self.spawn_log_export_flush_task();
+
         // Get concurrency configuration
         let max_concurrency = std::env::var("AGNT5_MAX_CONCURRENCY")
             .ok()
@@ -513,6 +552,8 @@ impl Worker {
         let _ = self.send_shutdown_message(&tx).await;
         heartbeat_task.abort();
         checkpoint_task.abort();
+        span_export_task.abort();
+        log_export_task.abort();
 
         dispatch_result
     }
@@ -632,6 +673,154 @@ impl Worker {
                         "Flushed {} checkpoints to coordinator (queue_size={})",
                         sent_count,
                         checkpoint_queue.len()
+                    );
+                }
+            }
+        })
+    }
+
+    /// Spawn span export flush task for real-time SSE streaming
+    ///
+    /// This task periodically flushes buffered span export requests to the journal via gRPC.
+    /// Spans are exported directly to enable real-time visibility in SSE streams.
+    fn spawn_span_export_flush_task(&self) -> tokio::task::JoinHandle<()> {
+        let span_queue = self.span_export_queue.clone();
+
+        // Get flush interval from environment or use default (50ms for low latency)
+        let flush_interval_ms = std::env::var("AGNT5_SPAN_EXPORT_FLUSH_INTERVAL_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50); // Default 50ms for low-latency span streaming
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(flush_interval_ms));
+
+            loop {
+                interval.tick().await;
+
+                // Flush all queued span exports
+                let mut sent_count = 0;
+                while let Some(request) = span_queue.pop() {
+                    // Convert attributes from HashMap to serde_json::Value
+                    let attributes_json = request.attributes.map(|attrs| {
+                        serde_json::Value::Object(
+                            attrs
+                                .into_iter()
+                                .map(|(k, v)| (k, serde_json::Value::String(v)))
+                                .collect(),
+                        )
+                    });
+
+                    // Convert request to JournalSpanData
+                    let span_data = create_journal_span_data(
+                        &request.trace_id,
+                        &request.span_id,
+                        request.parent_span_id.as_deref(),
+                        &request.name,
+                        &request.kind,
+                        request.start_time_ns,
+                        request.end_time_ns,
+                        &request.status_code,
+                        request.status_description.as_deref(),
+                        attributes_json,
+                    );
+
+                    // Export to journal
+                    if let Err(e) = export_span_to_journal(
+                        &request.run_id,
+                        &span_data,
+                        request.tenant_id.as_deref(),
+                    )
+                    .await
+                    {
+                        warn!(
+                            "Failed to export span to journal: {} (run_id={}, span={})",
+                            e, request.run_id, request.name
+                        );
+                        span_queue.record_error();
+                    } else {
+                        span_queue.record_sent();
+                        sent_count += 1;
+                    }
+                }
+
+                if sent_count > 0 {
+                    debug!(
+                        "Flushed {} spans to journal (queue_size={})",
+                        sent_count,
+                        span_queue.len()
+                    );
+                }
+            }
+        })
+    }
+
+    /// Spawn log export flush task for real-time SSE streaming
+    ///
+    /// This task periodically flushes buffered log export requests to the journal via gRPC.
+    /// Logs are exported directly to enable real-time visibility in SSE streams.
+    fn spawn_log_export_flush_task(&self) -> tokio::task::JoinHandle<()> {
+        let log_queue = self.log_export_queue.clone();
+
+        // Get flush interval from environment or use default (50ms for low latency)
+        let flush_interval_ms = std::env::var("AGNT5_LOG_EXPORT_FLUSH_INTERVAL_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50); // Default 50ms for low-latency log streaming
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(flush_interval_ms));
+
+            loop {
+                interval.tick().await;
+
+                // Flush all queued log exports
+                let mut sent_count = 0;
+                while let Some(request) = log_queue.pop() {
+                    // Convert attributes from HashMap to serde_json::Value
+                    let attributes_json = request.attributes.map(|attrs| {
+                        serde_json::Value::Object(
+                            attrs
+                                .into_iter()
+                                .map(|(k, v)| (k, serde_json::Value::String(v)))
+                                .collect(),
+                        )
+                    });
+
+                    // Convert request to JournalLogData
+                    let log_data = create_journal_log_data(
+                        request.timestamp_ns,
+                        &request.severity,
+                        &request.body,
+                        &request.trace_id,
+                        &request.span_id,
+                        attributes_json,
+                    );
+
+                    // Export to journal
+                    if let Err(e) = export_log_to_journal(
+                        &request.run_id,
+                        &log_data,
+                        request.tenant_id.as_deref(),
+                    )
+                    .await
+                    {
+                        warn!(
+                            "Failed to export log to journal: {} (run_id={}, severity={})",
+                            e, request.run_id, request.severity
+                        );
+                        log_queue.record_error();
+                    } else {
+                        log_queue.record_sent();
+                        sent_count += 1;
+                    }
+                }
+
+                if sent_count > 0 {
+                    debug!(
+                        "Flushed {} logs to journal (queue_size={})",
+                        sent_count,
+                        log_queue.len()
                     );
                 }
             }

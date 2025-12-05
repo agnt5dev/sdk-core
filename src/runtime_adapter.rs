@@ -49,6 +49,9 @@ pub struct RuntimeContext {
     // Pre-extracted correlation IDs for easy access in logging
     pub trace_id: Option<String>,
     pub span_id: Option<String>,
+
+    // Whether this is a streaming request (for real-time SSE journal export)
+    pub is_streaming: bool,
 }
 
 impl RuntimeContext {
@@ -62,6 +65,7 @@ impl RuntimeContext {
         metadata: HashMap<String, String>,
         otel_context: Context,
         state_manager: Arc<dyn StateManager>,
+        is_streaming: bool,
     ) -> Self {
         // Extract trace_id and span_id for logging correlation
         let (trace_id, span_id) = extract_trace_ids(&otel_context);
@@ -77,6 +81,7 @@ impl RuntimeContext {
             otel_context: Some(otel_context),
             trace_id,
             span_id,
+            is_streaming,
         }
     }
 
@@ -101,6 +106,7 @@ impl RuntimeContext {
             otel_context: None,
             trace_id: None,
             span_id: None,
+            is_streaming: false,
         }
     }
 }
