@@ -3,6 +3,7 @@
 pub mod adk;
 pub mod checkpoint;
 pub mod client;
+pub mod span_export_queue;
 pub mod context;
 pub mod error;
 pub mod journal_exporter;
@@ -20,6 +21,7 @@ pub use adk::{
     SignalControls, TaskControls, TimerControls, ToolDefinition, ToolHandle, ToolRegistry,
 };
 pub use checkpoint::{CheckpointMessage, CheckpointQueue};
+pub use span_export_queue::{LogExportQueue, LogExportRequest, SpanExportQueue, SpanExportRequest};
 pub use client::{CheckpointResult, WorkerCoordinatorClient};
 pub use context::{
     ContextConfig, CoreContext, FunctionCall, FunctionHandle, FunctionNamespace, FunctionRegistry,
