@@ -161,7 +161,7 @@ pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), S
     let filtering_exporter = crate::span_filter::FilteringSpanExporter::new(trace_exporter);
 
     // Create tracer provider builder
-    let mut trace_provider_builder = SdkTracerProvider::builder()
+    let trace_provider_builder = SdkTracerProvider::builder()
         .with_resource(resource.clone())
         .with_batch_exporter(filtering_exporter);
 
