@@ -192,7 +192,7 @@ pub struct EntityStateSaveResult {
 pub struct EntityStateManager {
     stream_sender: flume::Sender<crate::pb::ServiceMessage>,
     pending_requests: Arc<Mutex<HashMap<String, oneshot::Sender<crate::pb::RuntimeServiceResponse>>>>,
-    tenant_id: String,
+    _tenant_id: String,
     session_id: String,
 }
 
@@ -206,7 +206,7 @@ impl EntityStateManager {
         Self {
             stream_sender,
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
-            tenant_id,
+            _tenant_id: tenant_id,
             session_id,
         }
     }

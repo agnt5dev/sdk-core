@@ -53,7 +53,7 @@ impl ContextRuntimeConfig {
 #[derive(Debug)]
 pub(crate) struct ContextRuntimeState {
     pub client: Arc<RuntimeServiceClient>,
-    pub tenant_id: String,
+    pub _tenant_id: String,
     pub session_id: String,
     pub run_id: String,
     pub step_id: String,
@@ -65,7 +65,7 @@ impl ContextRuntimeState {
     fn new(config: ContextRuntimeConfig) -> Arc<Self> {
         Arc::new(Self {
             client: config.client,
-            tenant_id: config.tenant_id,
+            _tenant_id: config.tenant_id,
             session_id: config.session_id,
             run_id: config.run_id,
             step_id: config.step_id,
