@@ -1,6 +1,7 @@
 mod anthropic;
 mod azure;
 mod bedrock;
+mod embedder;
 mod groq;
 mod interface;
 mod openai;
@@ -12,6 +13,9 @@ mod telemetry;
 pub use anthropic::{AnthropicConfig, AnthropicProvider};
 pub use azure::{AzureOpenAiConfig, AzureOpenAiProvider};
 pub use bedrock::{BedrockConfig, BedrockProvider};
+pub use embedder::{
+    Embedder, EmbedderRegistry, OpenAiEmbedder, OpenAiEmbedderConfig, OpenAiEmbeddingModel,
+};
 pub use groq::{GroqConfig, GroqProvider};
 pub use interface::{
     generate, stream, BuiltInTool, GenerateRequest, GenerateResponse, GenerationConfig,

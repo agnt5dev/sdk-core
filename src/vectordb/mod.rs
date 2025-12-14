@@ -5,7 +5,11 @@ pub mod providers;
 pub mod types;
 
 // Re-export core types
-pub use providers::{pgvector::PgVectorProvider, qdrant::QdrantProvider};
+pub use providers::{
+    agnt5::{Agnt5Provider, Agnt5ProviderConfig},
+    pgvector::PgVectorProvider,
+    qdrant::QdrantProvider,
+};
 pub use types::{
     Collection, DistanceMetric, SearchQuery, SearchResult, VectorEntry, VectorFilter,
     VectorMetadata,
@@ -127,44 +131,89 @@ impl VectorDbRegistry {
     }
 
     /// Load providers from environment variables
+    /// Detection order:
+    /// 1. AGNT5 Platform (default) - uses platform's backend (SQLite/PostgreSQL/CockroachDB+Qdrant)
+    /// 2. QDRANT_URL - direct connection to user's Qdrant
+    /// 3. POSTGRES_URL - direct connection to user's PostgreSQL with pgvector
     pub async fn load_from_environment(&mut self) -> Result<()> {
         let mut loaded_count = 0;
 
-        // Qdrant
-        if let Ok(url) = std::env::var("QDRANT_URL") {
-            let provider = QdrantProvider::new(&url, None).await?;
-            self.register_provider("qdrant".to_string(), std::sync::Arc::new(provider));
-            loaded_count += 1;
+        // AGNT5 Platform (default provider)
+        // Always available - uses platform gateway for vector operations
+        match Agnt5Provider::from_env() {
+            Ok(provider) => {
+                self.register_provider("agnt5".to_string(), std::sync::Arc::new(provider));
+                loaded_count += 1;
 
-            if self.default_provider.is_none() {
-                self.default_provider = Some("qdrant".to_string());
+                // AGNT5 is the default provider
+                self.default_provider = Some("agnt5".to_string());
+            }
+            Err(e) => {
+                tracing::debug!("AGNT5 provider not available: {}", e);
             }
         }
 
-        // pgvector (PostgreSQL)
+        // Qdrant (user's own instance)
+        if let Ok(url) = std::env::var("QDRANT_URL") {
+            match QdrantProvider::new(&url, None).await {
+                Ok(provider) => {
+                    self.register_provider("qdrant".to_string(), std::sync::Arc::new(provider));
+                    loaded_count += 1;
+
+                    // If no default yet, use Qdrant
+                    if self.default_provider.is_none() {
+                        self.default_provider = Some("qdrant".to_string());
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to connect to Qdrant at {}: {}", url, e);
+                }
+            }
+        }
+
+        // pgvector (user's own PostgreSQL)
         if let Ok(database_url) =
             std::env::var("POSTGRES_URL").or_else(|_| std::env::var("DATABASE_URL"))
         {
-            let provider = PgVectorProvider::new(&database_url).await?;
-            self.register_provider("pgvector".to_string(), std::sync::Arc::new(provider));
-            loaded_count += 1;
+            match PgVectorProvider::new(&database_url).await {
+                Ok(provider) => {
+                    self.register_provider("pgvector".to_string(), std::sync::Arc::new(provider));
+                    loaded_count += 1;
 
-            if self.default_provider.is_none() {
-                self.default_provider = Some("pgvector".to_string());
+                    if self.default_provider.is_none() {
+                        self.default_provider = Some("pgvector".to_string());
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("pgvector provider not available: {}", e);
+                }
             }
         }
 
         if loaded_count == 0 {
-            tracing::warn!("No vector database providers loaded from environment. Set QDRANT_URL or POSTGRES_URL.");
+            tracing::warn!(
+                "No vector database providers loaded. AGNT5 platform provider will be used by default."
+            );
+            // Try to create AGNT5 provider with defaults even if from_env failed
+            let config = Agnt5ProviderConfig::new("http://localhost:34183");
+            if let Ok(provider) = Agnt5Provider::new(config) {
+                self.register_provider("agnt5".to_string(), std::sync::Arc::new(provider));
+                self.default_provider = Some("agnt5".to_string());
+                loaded_count = 1;
+            }
+        }
+
+        if loaded_count == 0 {
             return Err(crate::error::SdkError::Other(anyhow::anyhow!(
                 "No vector database providers available"
             )));
-        } else {
-            tracing::info!(
-                "Loaded {} vector database providers from environment",
-                loaded_count
-            );
         }
+
+        tracing::info!(
+            "Loaded {} vector database providers from environment (default: {:?})",
+            loaded_count,
+            self.default_provider
+        );
 
         Ok(())
     }
