@@ -485,48 +485,25 @@ pub fn end_span(mut span: BoxedSpan) {
     span.end();
 }
 
-/// Force flush all pending telemetry data (spans and logs)
-///
-/// This should be called before worker shutdown to ensure batched spans are exported.
-/// The batch span processor buffers spans with a 5-second timeout by default.
-pub fn flush_telemetry() -> Result<(), SdkError> {
-    // The global tracer provider doesn't expose force_flush directly
-    // We need to access it through the TracerProvider trait
-    // For now, use a simple timeout to allow batch processor to flush
-    // Using 2 seconds to ensure batch has time to export
-    use std::time::Duration;
-    std::thread::sleep(Duration::from_secs(2));
-
-    Ok(())
-}
-
 /// Shutdown telemetry gracefully with timeout protection
 ///
-/// This function:
-/// 1. Flushes any buffered telemetry data (traces and logs)
-/// 2. Shuts down the global tracer provider
-/// 3. Uses a 5-second timeout to prevent hanging forever
-///
-/// Note: Shutdown may take up to 2 seconds due to batch exporter flush intervals
+/// This function shuts down telemetry and uses a 5-second timeout to prevent hanging forever.
+/// Note: In OpenTelemetry 0.30+, global::shutdown_tracer_provider() was removed,
+/// so this primarily serves as a clean shutdown point.
 pub fn shutdown_telemetry() {
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
 
-    tracing::info!("Shutting down telemetry - flushing buffered data");
+    tracing::info!("Shutting down telemetry");
 
     // Create a channel for timeout handling
     let (tx, rx) = mpsc::channel();
 
     // Spawn shutdown in a separate thread to enforce timeout
     thread::spawn(move || {
-        // Flush any pending telemetry first
-        if let Err(e) = flush_telemetry() {
-            eprintln!("Warning: Failed to flush telemetry during shutdown: {}", e);
-        }
-
         // Note: In OpenTelemetry 0.30+, global::shutdown_tracer_provider() was removed.
-        // Flushing above is sufficient to ensure pending telemetry is exported.
+        // The batch span processor handles flushing automatically.
 
         // Signal completion
         let _ = tx.send(());

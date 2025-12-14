@@ -52,6 +52,10 @@ pub struct CheckpointMessage {
     /// Metadata including tenant_id, deployment_id, etc.
     pub metadata: HashMap<String, String>,
 
+    /// Source timestamp in nanoseconds since Unix epoch
+    /// Generated at the source (SDK) for correct logical ordering regardless of write time
+    pub source_timestamp_ns: i64,
+
     /// When checkpoint was queued (for metrics)
     pub queued_at: Instant,
 }
@@ -131,6 +135,7 @@ impl CheckpointQueue {
     ///     checkpoint_data: b"{}".to_vec(),
     ///     sequence_number: 1,
     ///     metadata: HashMap::new(),
+    ///     source_timestamp_ns: 1234567890000000000,
     ///     queued_at: Instant::now(),
     /// })?;
     /// ```
@@ -333,6 +338,7 @@ mod tests {
             checkpoint_data: format!("{{\"seq\": {}}}", seq).into_bytes(),
             sequence_number: seq,
             metadata: HashMap::new(),
+            source_timestamp_ns: 1234567890000000000 + seq * 1000000,
             queued_at: Instant::now(),
         }
     }

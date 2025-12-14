@@ -149,7 +149,8 @@ impl JournalClient {
         let data = serde_json::to_vec(span_data)
             .map_err(|e| format!("Failed to serialize span: {}", e))?;
 
-        // Build request
+        // Build request with source timestamp for correct ordering
+        // Use end_time_unix_nano as the source timestamp since that's when the span completed
         let request = WriteJournalEventRequest {
             run_id: run_id.to_string(),
             event_type: "span".to_string(),
@@ -157,6 +158,7 @@ impl JournalClient {
             trace_id: span_data.trace_id.clone(),
             span_id: span_data.span_id.clone(),
             tenant_id: tenant_id.unwrap_or_default().to_string(),
+            source_timestamp_ns: span_data.end_time_unix_nano,
         };
 
         // Send via gRPC
@@ -261,7 +263,8 @@ pub async fn export_log_to_journal(
     let data = serde_json::to_vec(log_data)
         .map_err(|e| format!("Failed to serialize log: {}", e))?;
 
-    // Build request
+    // Build request with source timestamp for correct ordering
+    // Use timestamp_unix_nano as the source timestamp since that's when the log was generated
     let request = WriteJournalEventRequest {
         run_id: run_id.to_string(),
         event_type: "log".to_string(),
@@ -269,6 +272,7 @@ pub async fn export_log_to_journal(
         trace_id: log_data.trace_id.clone(),
         span_id: log_data.span_id.clone(),
         tenant_id: tenant_id.unwrap_or_default().to_string(),
+        source_timestamp_ns: log_data.timestamp_unix_nano,
     };
 
     // Send via gRPC

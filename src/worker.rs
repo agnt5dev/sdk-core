@@ -208,6 +208,7 @@ impl Worker {
     /// * `checkpoint_data` - JSON payload as bytes
     /// * `sequence_number` - Monotonic sequence for ordering
     /// * `metadata` - Additional metadata (tenant_id, deployment_id, etc.)
+    /// * `source_timestamp_ns` - Nanosecond timestamp when event was created (for correct logical ordering)
     pub fn queue_checkpoint(
         &self,
         invocation_id: String,
@@ -215,6 +216,7 @@ impl Worker {
         checkpoint_data: Vec<u8>,
         sequence_number: i64,
         metadata: HashMap<String, String>,
+        source_timestamp_ns: i64,
     ) -> Result<()> {
         let checkpoint = CheckpointMessage {
             invocation_id: invocation_id.clone(),
@@ -222,6 +224,7 @@ impl Worker {
             checkpoint_data,
             sequence_number,
             metadata,
+            source_timestamp_ns,
             queued_at: std::time::Instant::now(),
         };
 
@@ -636,6 +639,7 @@ impl Worker {
                         checkpoint_data: checkpoint.checkpoint_data.clone(),
                         sequence_number: checkpoint.sequence_number,
                         metadata: checkpoint.metadata.clone(),
+                        source_timestamp_ns: checkpoint.source_timestamp_ns,
                     };
 
                     let service_message = ServiceMessage {

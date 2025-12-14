@@ -30,11 +30,12 @@ pub use context::{
 pub use error::{Result, SdkError};
 pub use lm::{
     generate, stream, AnthropicConfig, AnthropicProvider, AzureOpenAiConfig, AzureOpenAiProvider,
-    BedrockConfig, BedrockProvider, BuiltInTool, GenerateRequest, GenerateResponse,
-    GenerationConfig, GroqConfig, GroqProvider, JsonSchemaFormat, LanguageModel, Message,
-    MessageRole, Modality, OpenAiChatConfig, OpenAiChatProvider, OpenAiConfig, OpenAiProvider,
-    OpenRouterConfig, OpenRouterProvider, ReasoningEffort, ResponseFormat, StreamChunk,
-    StreamHandle, StreamRequest, TokenUsage, ToolChoice,
+    BedrockConfig, BedrockProvider, BuiltInTool, Embedder, EmbedderRegistry, GenerateRequest,
+    GenerateResponse, GenerationConfig, GroqConfig, GroqProvider, JsonSchemaFormat, LanguageModel,
+    Message, MessageRole, Modality, OpenAiChatConfig, OpenAiChatProvider, OpenAiConfig,
+    OpenAiEmbedder, OpenAiEmbedderConfig, OpenAiEmbeddingModel, OpenAiProvider, OpenRouterConfig,
+    OpenRouterProvider, ReasoningEffort, ResponseFormat, StreamChunk, StreamHandle, StreamRequest,
+    TokenUsage, ToolChoice,
 };
 pub use logging::{clear_error_buffer, get_error_buffer, init_logging};
 pub use runtime_adapter::{
@@ -53,8 +54,9 @@ pub use journal_exporter::{
     JournalLogData, JournalSpanData, JournalSpanStatus,
 };
 pub use vectordb::{
-    Collection, DistanceMetric, PgVectorProvider, QdrantProvider, SearchQuery, SearchResult,
-    VectorDatabase, VectorDbRegistry, VectorEntry, VectorFilter, VectorMetadata,
+    Agnt5Provider, Agnt5ProviderConfig, Collection, DistanceMetric, PgVectorProvider,
+    QdrantProvider, SearchQuery, SearchResult, VectorDatabase, VectorDbRegistry, VectorEntry,
+    VectorFilter, VectorMetadata,
 };
 pub use worker::Worker;
 

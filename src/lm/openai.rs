@@ -296,6 +296,8 @@ pub struct ResponsesApiRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub store: Option<bool>, // Default: false (stateless)
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>, // Enable streaming responses
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
@@ -426,6 +428,7 @@ impl ResponsesApiRequest {
             instructions,
             previous_response_id: None,
             store: Some(false), // Stateless by default
+            stream: None,       // Set to Some(true) for streaming
             temperature: if is_reasoning_model { None } else { req.config.temperature },
             top_p: if is_reasoning_model { None } else { req.config.top_p },
             max_output_tokens: req.config.max_output_tokens,
@@ -757,22 +760,43 @@ impl LanguageModel for OpenAiProvider {
         let start = std::time::Instant::now();
 
         // Execute the actual streaming API call
+        // NOTE: For streaming, we use the Chat Completions API (/chat/completions) instead of
+        // the Responses API (/responses) because the Responses API has a different SSE format
+        // that's not yet supported. The Chat Completions streaming format is well-tested.
         let result = async {
             validate_request(&request)?;
             let model = self.normalize_model(&request.model)?;
-            let mut payload = ResponsesApiRequest::from_request(&request, model);
 
-            // Enable streaming
-            payload.store = Some(false); // Stateless streaming
+            // Use Chat Completions format for streaming (different from non-streaming Responses API)
+            let payload = super::openai_common::ChatCompletionPayload::from_request(&request, model, true);
 
-            let response = self
-                .request()
-                .header("Accept", "text/event-stream")
+            // Build Chat Completions URL
+            let base = self.config.base_url.trim_end_matches('/');
+            let url = format!("{base}/chat/completions");
+
+            let mut req_builder = self
+                .http
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", self.config.api_key))
+                .header("Accept", "text/event-stream");
+
+            // Add optional headers
+            if let Some(org) = &self.config.organization {
+                req_builder = req_builder.header("OpenAI-Organization", org);
+            }
+            if let Some(project) = &self.config.project {
+                req_builder = req_builder.header("OpenAI-Project", project);
+            }
+            for (key, value) in &self.config.extra_headers {
+                req_builder = req_builder.header(key, value);
+            }
+
+            let response = req_builder
                 .json(&payload)
                 .send()
                 .await
                 .map_err(|err| {
-                    SdkError::Other(anyhow!("OpenAI Responses streaming request failed: {err}"))
+                    SdkError::Other(anyhow!("OpenAI streaming request failed: {err}"))
                 })?;
 
             let response = ensure_success(response).await?;
