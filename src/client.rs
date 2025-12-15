@@ -26,8 +26,16 @@ impl WorkerCoordinatorClient {
                 code: crate::error::ErrorCode::ConnectionFailed,
                 source: None,
             })?
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .http2_adaptive_window(true)
             .connect()
-            .await?;
+            .await
+            .map_err(|e| {
+                // Log detailed error for debugging transport issues
+                error!("Connection to {} failed: {:?}", endpoint, e);
+                e
+            })?;
 
         let client = WorkerCoordinatorServiceClient::new(channel);
 
