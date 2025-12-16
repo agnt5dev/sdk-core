@@ -3,6 +3,7 @@
 pub mod adk;
 pub mod checkpoint;
 pub mod client;
+pub mod delta_queue;
 pub mod span_export_queue;
 pub mod context;
 pub mod error;
@@ -21,6 +22,7 @@ pub use adk::{
     SignalControls, TaskControls, TimerControls, ToolDefinition, ToolHandle, ToolRegistry,
 };
 pub use checkpoint::{CheckpointMessage, CheckpointQueue};
+pub use delta_queue::{DeltaMessage, DeltaQueue};
 pub use span_export_queue::{LogExportQueue, LogExportRequest, SpanExportQueue, SpanExportRequest};
 pub use client::{CheckpointResult, WorkerCoordinatorClient};
 pub use context::{

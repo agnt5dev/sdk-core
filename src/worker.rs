@@ -1,5 +1,6 @@
 use crate::checkpoint::{CheckpointMessage, CheckpointQueue};
 use crate::client::WorkerCoordinatorClient;
+use crate::delta_queue::{DeltaMessage, DeltaQueue};
 use crate::error::Result;
 use crate::journal_exporter::{
     create_journal_log_data, create_journal_span_data, export_log_to_journal,
@@ -95,6 +96,7 @@ pub struct Worker {
     metadata: HashMap<String, String>,
     connection_state: Arc<std::sync::Mutex<ConnectionState>>,
     checkpoint_queue: CheckpointQueue,
+    delta_queue: DeltaQueue,
     span_export_queue: SpanExportQueue,
     log_export_queue: LogExportQueue,
 }
@@ -108,6 +110,7 @@ impl std::fmt::Debug for Worker {
             .field("metadata", &self.metadata)
             .field("connection_state", &self.connection_state)
             .field("checkpoint_queue_size", &self.checkpoint_queue.len())
+            .field("delta_queue_size", &self.delta_queue.len())
             .field("span_export_queue_size", &self.span_export_queue.len())
             .field("log_export_queue_size", &self.log_export_queue.len())
             .finish()
@@ -138,9 +141,15 @@ impl Worker {
             .and_then(|s| s.parse().ok())
             .unwrap_or(5000);
 
+        // Get delta buffer size from environment or use default
+        let delta_buffer_size = std::env::var("AGNT5_DELTA_BUFFER_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1000);
+
         info!(
-            "Creating worker with buffer sizes: checkpoints={}, spans={}, logs={}",
-            checkpoint_buffer_size, span_export_buffer_size, log_export_buffer_size
+            "Creating worker with buffer sizes: checkpoints={}, deltas={}, spans={}, logs={}",
+            checkpoint_buffer_size, delta_buffer_size, span_export_buffer_size, log_export_buffer_size
         );
 
         Self {
@@ -149,6 +158,7 @@ impl Worker {
             metadata,
             connection_state: Arc::new(std::sync::Mutex::new(ConnectionState::Disconnected)),
             checkpoint_queue: CheckpointQueue::new(checkpoint_buffer_size),
+            delta_queue: DeltaQueue::new(delta_buffer_size),
             span_export_queue: SpanExportQueue::new(span_export_buffer_size),
             log_export_queue: LogExportQueue::new(log_export_buffer_size),
         }
@@ -266,6 +276,54 @@ impl Worker {
                 )
             })
             .collect()
+    }
+
+    /// Queue a streaming delta for real-time delivery to clients
+    ///
+    /// This is called from language SDKs via FFI during streaming function execution
+    /// to send output chunks (deltas) to the coordinator in real-time.
+    ///
+    /// Deltas are buffered and sent via gRPC with a low-latency flush interval (10ms default).
+    ///
+    /// # Arguments
+    ///
+    /// * `invocation_id` - Function run ID
+    /// * `event_type` - Event type ("output.start", "output.delta", "output.stop", "run.completed", etc.)
+    /// * `output_data` - JSON payload as bytes
+    /// * `content_index` - Index for parallel content blocks
+    /// * `sequence` - Global sequence number for ordering
+    /// * `metadata` - Additional metadata (tenant_id, deployment_id, etc.)
+    pub fn queue_delta(
+        &self,
+        invocation_id: String,
+        event_type: String,
+        output_data: Vec<u8>,
+        content_index: i32,
+        sequence: i64,
+        metadata: HashMap<String, String>,
+    ) -> Result<()> {
+        let delta = DeltaMessage {
+            invocation_id: invocation_id.clone(),
+            event_type: event_type.clone(),
+            output_data,
+            content_index,
+            sequence,
+            metadata,
+            queued_at: std::time::Instant::now(),
+        };
+
+        self.delta_queue.push(delta).map_err(|e| {
+            crate::error::SdkError::Internal(format!("Failed to queue delta: {}", e))
+        })?;
+
+        Ok(())
+    }
+
+    /// Get delta queue metrics
+    ///
+    /// Returns (queued, sent, dropped, errors)
+    pub fn delta_metrics(&self) -> (u64, u64, u64, u64) {
+        self.delta_queue.get_metrics()
     }
 
     /// Run the worker with a message handler
@@ -426,6 +484,9 @@ impl Worker {
 
         // Start checkpoint flushing task
         let checkpoint_task = self.spawn_checkpoint_flush_task(tx.clone());
+
+        // Start delta flushing task for real-time streaming
+        let delta_task = self.spawn_delta_flush_task(tx.clone());
 
         // Start span and log export flush tasks for real-time SSE streaming
         let span_export_task = self.spawn_span_export_flush_task();
@@ -678,6 +739,80 @@ impl Worker {
                         sent_count,
                         checkpoint_queue.len()
                     );
+                }
+            }
+        })
+    }
+
+    /// Spawn delta flush task for real-time streaming
+    ///
+    /// This task periodically flushes buffered streaming deltas to the coordinator via gRPC stream.
+    /// Deltas are sent immediately when queued with a low-latency flush interval (10ms default)
+    /// to enable real-time SSE streaming to clients.
+    fn spawn_delta_flush_task(
+        &self,
+        tx: flume::Sender<ServiceMessage>,
+    ) -> tokio::task::JoinHandle<()> {
+        let worker_id = self.config.worker_id.clone();
+        let delta_queue = self.delta_queue.clone();
+
+        // Get flush interval from environment or use default (10ms for ultra-low latency)
+        let flush_interval_ms = std::env::var("AGNT5_DELTA_FLUSH_INTERVAL_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10); // Default 10ms for real-time streaming
+
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_millis(flush_interval_ms));
+
+            loop {
+                interval.tick().await;
+
+                // Flush all queued deltas
+                while let Some(delta) = delta_queue.pop() {
+                    // Convert delta to ExecuteComponentResponse
+                    let response = crate::pb::ExecuteComponentResponse {
+                        invocation_id: delta.invocation_id.clone(),
+                        success: true,
+                        result: Some(
+                            crate::pb::execute_component_response::Result::OutputData(
+                                delta.output_data.clone(),
+                            ),
+                        ),
+                        error_message: String::new(),
+                        metadata: delta.metadata.clone(),
+                        event_type: delta.event_type.clone(),
+                        content_index: delta.content_index,
+                        sequence: delta.sequence,
+                        attempt: 0,
+                    };
+
+                    let service_message = ServiceMessage {
+                        worker_id: worker_id.clone(),
+                        metadata: std::collections::HashMap::new(),
+                        message_type: Some(
+                            crate::pb::service_message::MessageType::FunctionResponse(response),
+                        ),
+                    };
+
+                    // Send delta - if it fails, re-queue and exit
+                    if let Err(e) = tx.send_async(service_message).await {
+                        warn!(
+                            "Failed to send delta, re-queuing: type={} seq={} error={}",
+                            delta.event_type, delta.sequence, e
+                        );
+
+                        // Re-queue at front to preserve order
+                        if let Err(e) = delta_queue.push_front(delta) {
+                            error!("Failed to re-queue delta: {}", e);
+                        }
+
+                        delta_queue.record_error();
+                        break; // Channel closed, exit task
+                    }
+
+                    delta_queue.record_sent();
                 }
             }
         })
