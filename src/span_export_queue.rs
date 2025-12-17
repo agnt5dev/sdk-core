@@ -319,6 +319,9 @@ pub struct LogExportRequest {
     /// Optional tenant ID
     pub tenant_id: Option<String>,
 
+    /// Optional deployment ID
+    pub deployment_id: Option<String>,
+
     /// OpenTelemetry trace ID
     pub trace_id: String,
 
@@ -346,6 +349,7 @@ impl Default for LogExportRequest {
         Self {
             run_id: String::new(),
             tenant_id: None,
+            deployment_id: None,
             trace_id: String::new(),
             span_id: String::new(),
             timestamp_ns: 0,

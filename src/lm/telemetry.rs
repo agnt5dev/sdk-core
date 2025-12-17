@@ -230,6 +230,14 @@ pub fn create_gen_ai_span(
     span.set_attribute(KeyValue::new(attributes::PROVIDER_NAME, provider.to_string()));
     span.set_attribute(KeyValue::new(attributes::REQUEST_MODEL, model.to_string()));
 
+    // Add tenant_id and deployment_id from global config
+    if let Some(tid) = crate::telemetry::get_tenant_id() {
+        span.set_attribute(KeyValue::new("tenant.id", tid.to_string()));
+    }
+    if let Some(did) = crate::telemetry::get_deployment_id() {
+        span.set_attribute(KeyValue::new("deployment.id", did.to_string()));
+    }
+
     span
 }
 

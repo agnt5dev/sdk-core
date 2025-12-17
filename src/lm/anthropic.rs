@@ -14,9 +14,9 @@ use serde_json::{self, json, Value as JsonValue};
 use crate::error::{Result as SdkResult, SdkError};
 
 use super::interface::{
-    generate as generate_via_model, stream as stream_via_model, GenerateRequest, GenerateResponse,
-    GenerationConfig, LanguageModel, Message, MessageRole, ResponseFormat, StreamChunk,
-    StreamHandle, StreamRequest, TokenUsage, ToolChoice, ToolDefinition,
+    generate as generate_via_model, stream as stream_via_model, ContentBlockType, GenerateRequest,
+    GenerateResponse, GenerationConfig, LanguageModel, Message, MessageRole, ResponseFormat,
+    StreamChunk, StreamHandle, StreamRequest, TokenUsage, ToolChoice, ToolDefinition,
 };
 use super::telemetry;
 
@@ -334,6 +334,9 @@ fn build_stream(
         let mut decoder = SseDecoder::default();
         let mut aggregate = String::new();
         let mut partial = PartialResponse::default();
+        // Track current content block for proper typing of deltas
+        let mut current_block_index: u32 = 0;
+        let mut current_block_type = ContentBlockType::Text;
 
         while let Some(chunk) = bytes_stream.next().await {
             let chunk = chunk.map_err(|err| SdkError::Other(anyhow!("error reading streaming chunk: {err}")))?;
@@ -360,21 +363,58 @@ fn build_stream(
                         partial.model = Some(message.model);
                         partial.usage = Some(message.usage);
                     }
-                    StreamEvent::ContentBlockStart { content_block, .. } => {
-                        if let Some(delta) = content_block.to_text_delta() {
-                            if !delta.is_empty() {
-                                aggregate.push_str(&delta);
-                                yield StreamChunk::Delta { content: delta };
+                    StreamEvent::ContentBlockStart { index, content_block } => {
+                        current_block_index = index;
+                        current_block_type = content_block.content_block_type();
+
+                        // Emit content block start
+                        yield StreamChunk::ContentBlockStart {
+                            index,
+                            block_type: current_block_type,
+                        };
+
+                        // Handle initial content (if any)
+                        if let Some(initial) = content_block.initial_content() {
+                            if !initial.is_empty() {
+                                // Only aggregate text content (not thinking)
+                                if current_block_type == ContentBlockType::Text {
+                                    aggregate.push_str(&initial);
+                                }
+                                yield StreamChunk::Delta {
+                                    content: initial,
+                                    index,
+                                    block_type: current_block_type,
+                                };
                             }
                         } else if let Some(tool_json) = content_block.to_tool_use_json() {
-                            yield StreamChunk::Delta { content: tool_json };
+                            yield StreamChunk::Delta {
+                                content: tool_json,
+                                index,
+                                block_type: ContentBlockType::Text, // Tool calls are text blocks
+                            };
                         }
                     }
-                    StreamEvent::ContentBlockDelta { delta, .. } => {
+                    StreamEvent::ContentBlockDelta { index, delta } => {
                         if let Some(text) = delta.text {
                             if !text.is_empty() {
-                                aggregate.push_str(&text);
-                                yield StreamChunk::Delta { content: text };
+                                // Only aggregate text content (not thinking)
+                                if current_block_type == ContentBlockType::Text {
+                                    aggregate.push_str(&text);
+                                }
+                                yield StreamChunk::Delta {
+                                    content: text,
+                                    index,
+                                    block_type: current_block_type,
+                                };
+                            }
+                        } else if let Some(thinking) = delta.thinking {
+                            // Handle thinking content delta
+                            if !thinking.is_empty() {
+                                yield StreamChunk::Delta {
+                                    content: thinking,
+                                    index,
+                                    block_type: ContentBlockType::Thinking,
+                                };
                             }
                         } else if let Some(input) = delta.input {
                             let tool_delta = json!({
@@ -382,7 +422,11 @@ fn build_stream(
                                 "input": input,
                             })
                             .to_string();
-                            yield StreamChunk::Delta { content: tool_delta };
+                            yield StreamChunk::Delta {
+                                content: tool_delta,
+                                index,
+                                block_type: ContentBlockType::Text,
+                            };
                         }
                     }
                     StreamEvent::MessageDelta { delta, usage } => {
@@ -400,7 +444,9 @@ fn build_stream(
                         yield StreamChunk::Completed(response);
                         return;
                     }
-                    StreamEvent::ContentBlockStop { .. } => {}
+                    StreamEvent::ContentBlockStop { index } => {
+                        yield StreamChunk::ContentBlockStop { index };
+                    }
                 }
             }
         }
@@ -770,6 +816,9 @@ struct StreamContentBlock {
     #[serde(rename = "type")]
     block_type: String,
     text: Option<String>,
+    /// Thinking content (for extended thinking models)
+    #[serde(default)]
+    thinking: Option<String>,
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
@@ -779,9 +828,39 @@ struct StreamContentBlock {
 }
 
 impl StreamContentBlock {
+    /// Get the content block type for this block.
+    fn content_block_type(&self) -> ContentBlockType {
+        match self.block_type.as_str() {
+            "thinking" => ContentBlockType::Thinking,
+            _ => ContentBlockType::Text,
+        }
+    }
+
+    /// Check if this is a thinking block.
+    fn is_thinking(&self) -> bool {
+        self.block_type == "thinking"
+    }
+
+    /// Get the initial content for this block (if any).
+    fn initial_content(&self) -> Option<String> {
+        if self.is_thinking() {
+            self.thinking.clone()
+        } else {
+            self.text.clone()
+        }
+    }
+
     fn to_text_delta(&self) -> Option<String> {
         if self.block_type == "text" {
             self.text.clone()
+        } else {
+            None
+        }
+    }
+
+    fn to_thinking_delta(&self) -> Option<String> {
+        if self.block_type == "thinking" {
+            self.thinking.clone()
         } else {
             None
         }
@@ -808,6 +887,9 @@ struct StreamContentDelta {
     #[allow(unused)]
     delta_type: String,
     text: Option<String>,
+    /// Thinking content delta (for extended thinking models)
+    #[serde(default)]
+    thinking: Option<String>,
     #[serde(default)]
     input: Option<JsonValue>,
 }

@@ -10,8 +10,8 @@ use serde_json::{self, json, Value as JsonValue};
 use crate::error::{Result as SdkResult, SdkError};
 
 use super::interface::{
-    GenerateRequest, GenerateResponse, JsonSchemaFormat, Message, MessageRole, ResponseFormat,
-    StreamChunk, StreamHandle, TokenUsage, ToolChoice, ToolDefinition,
+    ContentBlockType, GenerateRequest, GenerateResponse, JsonSchemaFormat, Message, MessageRole,
+    ResponseFormat, StreamChunk, StreamHandle, TokenUsage, ToolChoice, ToolDefinition,
 };
 
 #[derive(Serialize)]
@@ -467,6 +467,7 @@ fn build_stream(
         let mut decoder = SseDecoder::default();
         let mut aggregate = String::new();
         let mut partial = PartialResponse::default();
+        let mut content_block_started = false;
 
         while let Some(chunk) = bytes_stream.next().await {
             let chunk = chunk.map_err(|err| SdkError::Other(anyhow!("error reading streaming chunk: {err}")))?;
@@ -477,6 +478,10 @@ fn build_stream(
                 }
 
                 if data == "[DONE]" {
+                    // Close any open content block
+                    if content_block_started {
+                        yield StreamChunk::ContentBlockStop { index: 0 };
+                    }
                     let response = partial.into_generate_response(aggregate.clone(), response_format)?;
                     yield StreamChunk::Completed(response);
                     return;
@@ -490,8 +495,20 @@ fn build_stream(
                 for choice in parsed.choices {
                     if let Some(content) = choice.delta.content {
                         if !content.is_empty() {
+                            // Emit ContentBlockStart on first content
+                            if !content_block_started {
+                                yield StreamChunk::ContentBlockStart {
+                                    index: 0,
+                                    block_type: ContentBlockType::Text,
+                                };
+                                content_block_started = true;
+                            }
                             aggregate.push_str(&content);
-                            yield StreamChunk::Delta { content };
+                            yield StreamChunk::Delta {
+                                content,
+                                index: 0,
+                                block_type: ContentBlockType::Text,
+                            };
                         }
                     }
 
