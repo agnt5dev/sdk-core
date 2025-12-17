@@ -17,6 +17,20 @@ use std::sync::OnceLock;
 use std::collections::HashMap;
 use tracing_subscriber::{fmt::format::Writer, layer::SubscriberExt, Layer as _, EnvFilter, Registry};
 
+// Global storage for tenant_id and deployment_id (set at init time)
+static TENANT_ID: OnceLock<Option<String>> = OnceLock::new();
+static DEPLOYMENT_ID: OnceLock<Option<String>> = OnceLock::new();
+
+/// Get the configured tenant_id (set from AGNT5_TENANT_ID env var)
+pub fn get_tenant_id() -> Option<&'static str> {
+    TENANT_ID.get().and_then(|opt| opt.as_deref())
+}
+
+/// Get the configured deployment_id (set from AGNT5_DEPLOYMENT_ID env var)
+pub fn get_deployment_id() -> Option<&'static str> {
+    DEPLOYMENT_ID.get().and_then(|opt| opt.as_deref())
+}
+
 // Newtype wrapper to implement Extractor trait for HashMap (avoids orphan rule)
 struct HashMapExtractor<'a>(&'a HashMap<String, String>);
 
@@ -115,6 +129,10 @@ pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), S
     // These are set by the control plane when deploying workers
     let deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").ok();
     let tenant_id = std::env::var("AGNT5_TENANT_ID").ok();
+
+    // Store globally for use in span/metric/log creation
+    let _ = TENANT_ID.set(tenant_id.clone());
+    let _ = DEPLOYMENT_ID.set(deployment_id.clone());
 
     // Create resource attributes
     let mut resource_attributes = vec![
@@ -332,6 +350,14 @@ pub fn create_component_span(
         KeyValue::new("run.id", run_id.to_string()),
     ];
 
+    // Add tenant_id and deployment_id from global config
+    if let Some(tid) = get_tenant_id() {
+        attributes.push(KeyValue::new("tenant.id", tid.to_string()));
+    }
+    if let Some(did) = get_deployment_id() {
+        attributes.push(KeyValue::new("deployment.id", did.to_string()));
+    }
+
     // Extract baggage items as span attributes if parent context exists
     if let Some(ref ctx) = parent_context {
         let baggage = ctx.baggage();
@@ -425,6 +451,14 @@ pub fn create_tool_execution_span(
         KeyValue::new("gen_ai.operation.name", "execute_tool"),
         KeyValue::new("gen_ai.tool.name", tool_name.to_string()),
     ];
+
+    // Add tenant_id and deployment_id from global config
+    if let Some(tid) = get_tenant_id() {
+        attributes.push(KeyValue::new("tenant.id", tid.to_string()));
+    }
+    if let Some(did) = get_deployment_id() {
+        attributes.push(KeyValue::new("deployment.id", did.to_string()));
+    }
 
     // Optional attributes
     if let Some(call_id) = tool_call_id {
@@ -547,13 +581,20 @@ fn get_execution_requests_counter() -> &'static Counter<u64> {
 /// Call this when a worker receives a new execution request (function, workflow, agent, etc.)
 pub fn record_execution_request(component_name: &str, component_type: &str) {
     let counter = get_execution_requests_counter();
-    counter.add(
-        1,
-        &[
-            KeyValue::new("component.name", component_name.to_string()),
-            KeyValue::new("component.type", component_type.to_string()),
-        ],
-    );
+    let mut attrs = vec![
+        KeyValue::new("component.name", component_name.to_string()),
+        KeyValue::new("component.type", component_type.to_string()),
+    ];
+
+    // Add tenant_id and deployment_id from global config
+    if let Some(tid) = get_tenant_id() {
+        attrs.push(KeyValue::new("tenant.id", tid.to_string()));
+    }
+    if let Some(did) = get_deployment_id() {
+        attrs.push(KeyValue::new("deployment.id", did.to_string()));
+    }
+
+    counter.add(1, &attrs);
 }
 
 /// Record an execution request with additional attributes
@@ -567,6 +608,15 @@ pub fn record_execution_request_with_attrs(
         KeyValue::new("component.name", component_name.to_string()),
         KeyValue::new("component.type", component_type.to_string()),
     ];
+
+    // Add tenant_id and deployment_id from global config
+    if let Some(tid) = get_tenant_id() {
+        attrs.push(KeyValue::new("tenant.id", tid.to_string()));
+    }
+    if let Some(did) = get_deployment_id() {
+        attrs.push(KeyValue::new("deployment.id", did.to_string()));
+    }
+
     attrs.extend_from_slice(additional_attrs);
     counter.add(1, &attrs);
 }

@@ -18,10 +18,10 @@ pub use embedder::{
 };
 pub use groq::{GroqConfig, GroqProvider};
 pub use interface::{
-    generate, stream, BuiltInTool, GenerateRequest, GenerateResponse, GenerationConfig,
-    JsonSchemaFormat, LanguageModel, Message, MessageRole, Modality, ReasoningEffort,
-    ResponseFormat, StreamChunk, StreamHandle, StreamRequest, TokenUsage, ToolChoice,
-    ToolDefinition,
+    generate, stream, BuiltInTool, ContentBlockType, GenerateRequest, GenerateResponse,
+    GenerationConfig, JsonSchemaFormat, LanguageModel, Message, MessageRole, Modality,
+    ReasoningEffort, ResponseFormat, StreamChunk, StreamHandle, StreamRequest, TokenUsage,
+    ToolCall, ToolChoice, ToolDefinition,
 };
 pub use openai::{OpenAiConfig, OpenAiProvider};
 pub use openai_chat::{OpenAiChatConfig, OpenAiChatProvider};

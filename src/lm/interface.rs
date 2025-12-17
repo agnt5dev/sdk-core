@@ -364,8 +364,51 @@ pub struct TokenUsage {
     pub total_tokens: Option<u32>,
 }
 
+/// Type of content block in a streaming response.
+///
+/// Used to distinguish between regular assistant output and thinking/reasoning
+/// content from extended thinking models (Claude) or o-series models (OpenAI).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ContentBlockType {
+    /// Regular text content from the assistant
+    #[default]
+    Text,
+    /// Thinking/reasoning content (extended thinking, chain-of-thought)
+    Thinking,
+}
+
+/// A chunk of streaming response from the language model.
+///
+/// Streaming responses emit these events in order:
+/// 1. `ContentBlockStart` - indicates a new content block is beginning
+/// 2. `Delta` - incremental content (may be emitted multiple times)
+/// 3. `ContentBlockStop` - indicates the content block has finished
+/// 4. `Completed` - final response with full text, usage, and tool calls
+///
+/// A response may contain multiple content blocks (e.g., thinking then text).
 pub enum StreamChunk {
-    Delta { content: String },
+    /// Start of a new content block.
+    ContentBlockStart {
+        /// Index of this content block (0-indexed)
+        index: u32,
+        /// Type of content block (text or thinking)
+        block_type: ContentBlockType,
+    },
+    /// Incremental content within a content block.
+    Delta {
+        /// The content text
+        content: String,
+        /// Index of the content block this delta belongs to
+        index: u32,
+        /// Type of content block (text or thinking)
+        block_type: ContentBlockType,
+    },
+    /// End of a content block.
+    ContentBlockStop {
+        /// Index of the content block that ended
+        index: u32,
+    },
+    /// Stream completed with final response.
     Completed(GenerateResponse),
 }
 
@@ -382,7 +425,9 @@ impl StreamHandle {
         let mut final_response: Option<GenerateResponse> = None;
         while let Some(item) = self.inner.next().await {
             match item? {
+                StreamChunk::ContentBlockStart { .. } => {}
                 StreamChunk::Delta { .. } => {}
+                StreamChunk::ContentBlockStop { .. } => {}
                 StreamChunk::Completed(response) => {
                     final_response = Some(response);
                     break;
