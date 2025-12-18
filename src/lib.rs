@@ -10,6 +10,7 @@ pub mod error;
 pub mod journal_exporter;
 pub mod lm;
 pub mod logging;
+pub mod memory;
 pub mod runtime_adapter;
 pub mod span_filter;
 pub mod telemetry;
@@ -57,8 +58,11 @@ pub use journal_exporter::{
 };
 pub use vectordb::{
     Agnt5Provider, Agnt5ProviderConfig, Collection, DistanceMetric, PgVectorProvider,
-    QdrantProvider, SearchQuery, SearchResult, VectorDatabase, VectorDbRegistry, VectorEntry,
-    VectorFilter, VectorMetadata,
+    PineconeProvider, QdrantProvider, SearchQuery, SearchResult, VectorDatabase, VectorDbRegistry,
+    VectorEntry, VectorFilter, VectorMetadata,
+};
+pub use memory::{
+    MemoryMetadata, MemoryResult, MemoryScope, SemanticMemory, SemanticMemoryConfig,
 };
 pub use worker::Worker;
 
