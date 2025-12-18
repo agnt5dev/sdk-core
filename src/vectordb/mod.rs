@@ -8,6 +8,7 @@ pub mod types;
 pub use providers::{
     agnt5::{Agnt5Provider, Agnt5ProviderConfig},
     pgvector::PgVectorProvider,
+    pinecone::PineconeProvider,
     qdrant::QdrantProvider,
 };
 pub use types::{
@@ -167,6 +168,23 @@ impl VectorDbRegistry {
                 }
                 Err(e) => {
                     tracing::warn!("Failed to connect to Qdrant at {}: {}", url, e);
+                }
+            }
+        }
+
+        // Pinecone (user's own instance)
+        if std::env::var("PINECONE_API_KEY").is_ok() && std::env::var("PINECONE_HOST").is_ok() {
+            match PineconeProvider::from_env() {
+                Ok(provider) => {
+                    self.register_provider("pinecone".to_string(), std::sync::Arc::new(provider));
+                    loaded_count += 1;
+
+                    if self.default_provider.is_none() {
+                        self.default_provider = Some("pinecone".to_string());
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to initialize Pinecone provider: {}", e);
                 }
             }
         }

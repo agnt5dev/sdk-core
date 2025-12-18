@@ -81,15 +81,26 @@ http = "1.1"
 # Qdrant vector database client
 qdrant-client = "1.10"
 
+# PostgreSQL with pgvector support
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres"], optional = true }
+pgvector = { version = "0.4", features = ["sqlx"], optional = true }
+
 # Additional JSON utilities for metadata
 serde_yaml = "0.9"
 
 # For text processing and chunking
 regex = "1.0"
+
+# URL encoding for API requests
+urlencoding = "2.1"
 unicode-segmentation = "1.10"
 hex = "0.4"
 hmac = "0.12"
 sha2 = "0.10"
+
+[features]
+default = []
+pgvector = ["dep:sqlx", "dep:pgvector"]
 
 # Build dependencies
 [build-dependencies]
