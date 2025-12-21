@@ -25,6 +25,8 @@ pub(crate) struct ChatCompletionPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) max_completion_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) user: Option<String>,
@@ -39,12 +41,43 @@ pub(crate) struct ChatCompletionPayload {
 impl ChatCompletionPayload {
     pub(crate) fn from_request(request: &GenerateRequest, model: String, stream: bool) -> Self {
         let messages = build_api_messages(request);
+
+        // Detect reasoning models that don't support temperature, top_p, max_tokens
+        // Reasoning models (gpt-5, o1, o3, o4 series) require max_completion_tokens instead
+        let is_reasoning_model = model.starts_with("gpt-5")
+            || model == "o1"
+            || model.starts_with("o1-")
+            || model == "o3"
+            || model.starts_with("o3-")
+            || model == "o4"
+            || model.starts_with("o4-");
+
+        // Use max_completion_tokens for reasoning models, max_tokens for others
+        let (max_tokens, max_completion_tokens) = if is_reasoning_model {
+            (None, request.config.max_output_tokens)
+        } else {
+            (request.config.max_output_tokens, None)
+        };
+
+        // Exclude temperature and top_p for reasoning models
+        let temperature = if is_reasoning_model {
+            None
+        } else {
+            request.config.temperature
+        };
+        let top_p = if is_reasoning_model {
+            None
+        } else {
+            request.config.top_p
+        };
+
         let mut payload = Self {
             model,
             messages,
-            temperature: request.config.temperature,
-            top_p: request.config.top_p,
-            max_tokens: request.config.max_output_tokens,
+            temperature,
+            top_p,
+            max_tokens,
+            max_completion_tokens,
             stream: stream.then_some(true),
             user: request.user_id.clone(),
             response_format: match &request.config.response_format {
@@ -58,6 +91,9 @@ impl ChatCompletionPayload {
 
         if payload.max_tokens == Some(0) {
             payload.max_tokens = None;
+        }
+        if payload.max_completion_tokens == Some(0) {
+            payload.max_completion_tokens = None;
         }
 
         payload
