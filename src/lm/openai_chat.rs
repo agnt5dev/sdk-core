@@ -230,7 +230,7 @@ impl OpenAiChatProvider {
 #[async_trait]
 impl LanguageModel for OpenAiChatProvider {
     async fn generate(&self, request: GenerateRequest) -> SdkResult<GenerateResponse> {
-        // Create OpenTelemetry span for this LLM call (as child of provided or current context)
+        // Create OpenTelemetry span for this LLM call as child of the current execution span
         let mut span = telemetry::create_gen_ai_span("openai_chat", &request.model, request.otel_context.clone());
 
         // Set request configuration attributes
@@ -325,7 +325,7 @@ impl LanguageModel for OpenAiChatProvider {
     }
 
     async fn stream(&self, request: StreamRequest) -> SdkResult<StreamHandle> {
-        // Create OpenTelemetry span for this streaming LLM call (as child of provided or current context)
+        // Create OpenTelemetry span for this streaming LLM call
         let mut span = telemetry::create_gen_ai_span("openai_chat", &request.model, request.otel_context.clone());
 
         // Set request configuration attributes

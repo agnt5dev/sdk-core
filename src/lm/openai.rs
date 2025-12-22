@@ -617,7 +617,9 @@ async fn ensure_success(response: reqwest::Response) -> SdkResult<reqwest::Respo
 #[async_trait]
 impl LanguageModel for OpenAiProvider {
     async fn generate(&self, request: GenerateRequest) -> SdkResult<GenerateResponse> {
-        // Create OpenTelemetry span for this LLM call
+        // Create OpenTelemetry span for this LLM call as child of the current execution span
+        // request.otel_context is populated by the Python SDK with the current span context
+        // (e.g., python_component_execution) to ensure proper parent-child relationships
         let mut span =
             telemetry::create_gen_ai_span("openai", &request.model, request.otel_context.clone());
 
@@ -723,6 +725,7 @@ impl LanguageModel for OpenAiProvider {
 
     async fn stream(&self, request: StreamRequest) -> SdkResult<StreamHandle> {
         // Create OpenTelemetry span for this streaming LLM call
+        // request.otel_context contains the current execution span context
         let mut span =
             telemetry::create_gen_ai_span("openai", &request.model, request.otel_context.clone());
 
