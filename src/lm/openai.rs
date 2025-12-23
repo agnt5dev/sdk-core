@@ -1,8 +1,11 @@
 use std::env;
+use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::anyhow;
+use async_stream::try_stream;
 use async_trait::async_trait;
+use futures::{Stream, StreamExt};
 use opentelemetry::trace::Span;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -11,10 +14,11 @@ use serde_json::Value;
 use crate::error::{Result as SdkResult, SdkError};
 
 use super::interface::{
-    generate as generate_via_model, stream as stream_via_model, BuiltInTool, GenerateRequest,
-    GenerateResponse, LanguageModel, Modality, ReasoningEffort, StreamHandle, StreamRequest,
+    generate as generate_via_model, stream as stream_via_model, BuiltInTool, ContentBlockType,
+    GenerateRequest, GenerateResponse, LanguageModel, Modality, ReasoningEffort, ResponseFormat,
+    StreamChunk, StreamHandle, StreamRequest, TokenUsage,
 };
-use super::openai_common::{parse_error, stream_handle_from_response};
+use super::openai_common::parse_error;
 use super::telemetry;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -579,6 +583,273 @@ impl ResponsesApiResponse {
 }
 
 // ============================================================================
+// Responses API Streaming Types
+// ============================================================================
+
+/// SSE decoder for Responses API streaming format.
+/// Handles the `event:` and `data:` line format used by the Responses API.
+#[derive(Default)]
+struct ResponsesSseDecoder {
+    buffer: String,
+}
+
+impl ResponsesSseDecoder {
+    /// Ingest raw bytes and return parsed SSE events.
+    /// Each event is a tuple of (event_type, data_json).
+    fn ingest(&mut self, chunk: &[u8]) -> SdkResult<Vec<(String, String)>> {
+        let chunk_str = std::str::from_utf8(chunk)
+            .map_err(|err| SdkError::Other(anyhow!("invalid UTF-8 in SSE stream: {err}")))?;
+        self.buffer.push_str(chunk_str);
+
+        let mut events = Vec::new();
+
+        // Process complete events (separated by double newlines)
+        while let Some(idx) = self.find_event_delimiter() {
+            let (event_block, remaining) = self.buffer.split_at(idx);
+            let delimiter_len = if remaining.starts_with("\r\n\r\n") { 4 } else { 2 };
+            let event_block = event_block.to_string();
+            self.buffer = remaining[delimiter_len..].to_string();
+
+            // Parse event_type and data from the block
+            let mut event_type = String::new();
+            let mut data_parts = Vec::new();
+
+            for line in event_block.lines() {
+                if let Some(rest) = line.strip_prefix("event:") {
+                    event_type = rest.trim().to_string();
+                } else if let Some(rest) = line.strip_prefix("data:") {
+                    data_parts.push(rest.trim_start().to_string());
+                }
+            }
+
+            if !event_type.is_empty() || !data_parts.is_empty() {
+                let data = data_parts.join("\n");
+                events.push((event_type, data));
+            }
+        }
+
+        Ok(events)
+    }
+
+    fn find_event_delimiter(&self) -> Option<usize> {
+        self.buffer.find("\n\n").or_else(|| self.buffer.find("\r\n\r\n"))
+    }
+}
+
+/// Streaming delta event for text output
+#[derive(Debug, Deserialize)]
+struct OutputTextDelta {
+    delta: String,
+    #[allow(dead_code)]
+    item_id: Option<String>,
+    #[allow(dead_code)]
+    output_index: Option<u32>,
+    #[allow(dead_code)]
+    content_index: Option<u32>,
+}
+
+/// Streaming delta event for reasoning/thinking output
+#[derive(Debug, Deserialize)]
+struct ReasoningTextDelta {
+    delta: String,
+    #[allow(dead_code)]
+    item_id: Option<String>,
+}
+
+/// Response completed event with full response data
+#[derive(Debug, Deserialize)]
+struct ResponseCompletedEvent {
+    response: ResponsesApiResponse,
+}
+
+/// Partial response state during streaming
+#[derive(Default)]
+struct StreamingState {
+    text_started: bool,
+    thinking_started: bool,
+    text_aggregate: String,
+    thinking_aggregate: String,
+    response_id: Option<String>,
+    model: Option<String>,
+    created_at: Option<i64>,
+    usage: Option<ApiUsage>,
+}
+
+impl StreamingState {
+    fn into_generate_response(self, response_format: ResponseFormat) -> SdkResult<GenerateResponse> {
+        let text = self.text_aggregate;
+
+        let object = match response_format {
+            ResponseFormat::Text => None,
+            ResponseFormat::Json | ResponseFormat::JsonSchema(_) => {
+                if text.trim().is_empty() {
+                    None
+                } else {
+                    Some(serde_json::from_str(text.trim()).map_err(|err| {
+                        SdkError::Other(anyhow!("failed to parse JSON response: {err}"))
+                    })?)
+                }
+            }
+        };
+
+        Ok(GenerateResponse {
+            id: self.response_id.unwrap_or_default(),
+            model: self.model.unwrap_or_default(),
+            created: self.created_at.map(|t| t as u64),
+            text,
+            usage: self.usage.map(|u| TokenUsage {
+                prompt_tokens: u.prompt_tokens,
+                completion_tokens: u.completion_tokens,
+                total_tokens: u.total_tokens,
+            }),
+            finish_reason: Some("completed".to_string()),
+            tool_calls: None, // TODO: Handle tool calls in streaming
+            object,
+            raw: None,
+        })
+    }
+}
+
+/// Build a streaming response from the Responses API SSE format.
+fn build_responses_stream(
+    response: reqwest::Response,
+    response_format: ResponseFormat,
+) -> SdkResult<Pin<Box<dyn Stream<Item = SdkResult<StreamChunk>> + Send>>> {
+    let bytes_stream = response.bytes_stream();
+
+    let stream = try_stream! {
+        futures::pin_mut!(bytes_stream);
+        let mut decoder = ResponsesSseDecoder::default();
+        let mut state = StreamingState::default();
+
+        while let Some(chunk) = bytes_stream.next().await {
+            let chunk = chunk.map_err(|err| SdkError::Other(anyhow!("error reading streaming chunk: {err}")))?;
+
+            for (event_type, data) in decoder.ingest(chunk.as_ref())? {
+                if data.is_empty() {
+                    continue;
+                }
+
+                match event_type.as_str() {
+                    // Response lifecycle events
+                    "response.created" => {
+                        // Extract response metadata
+                        if let Ok(resp) = serde_json::from_str::<ResponsesApiResponse>(&data) {
+                            state.response_id = Some(resp.id);
+                            state.model = Some(resp.model);
+                            state.created_at = Some(resp.created_at);
+                        }
+                    }
+
+                    // Text output delta
+                    "response.output_text.delta" => {
+                        if let Ok(delta) = serde_json::from_str::<OutputTextDelta>(&data) {
+                            if !delta.delta.is_empty() {
+                                // Emit ContentBlockStart on first text content
+                                if !state.text_started {
+                                    yield StreamChunk::ContentBlockStart {
+                                        index: 0,
+                                        block_type: ContentBlockType::Text,
+                                    };
+                                    state.text_started = true;
+                                }
+                                state.text_aggregate.push_str(&delta.delta);
+                                yield StreamChunk::Delta {
+                                    content: delta.delta,
+                                    index: 0,
+                                    block_type: ContentBlockType::Text,
+                                };
+                            }
+                        }
+                    }
+
+                    // Text output done - mark as closed but don't emit stop yet
+                    // (we emit all stops together in response.completed)
+                    "response.output_text.done" => {
+                        // Text block is done, but we wait for response.completed to emit stop
+                    }
+
+                    // Reasoning/thinking delta (for o1, o3, gpt-5 models)
+                    "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                        if let Ok(delta) = serde_json::from_str::<ReasoningTextDelta>(&data) {
+                            if !delta.delta.is_empty() {
+                                // Emit ContentBlockStart on first thinking content
+                                if !state.thinking_started {
+                                    yield StreamChunk::ContentBlockStart {
+                                        index: 1,
+                                        block_type: ContentBlockType::Thinking,
+                                    };
+                                    state.thinking_started = true;
+                                }
+                                state.thinking_aggregate.push_str(&delta.delta);
+                                yield StreamChunk::Delta {
+                                    content: delta.delta,
+                                    index: 1,
+                                    block_type: ContentBlockType::Thinking,
+                                };
+                            }
+                        }
+                    }
+
+                    // Reasoning done - mark as closed but don't emit stop yet
+                    "response.reasoning_summary_text.done" | "response.reasoning_text.done" => {
+                        // Thinking block is done, but we wait for response.completed to emit stop
+                    }
+
+                    // Response completed - final event
+                    "response.completed" => {
+                        if let Ok(completed) = serde_json::from_str::<ResponseCompletedEvent>(&data) {
+                            state.usage = completed.response.usage;
+                            state.response_id = Some(completed.response.id);
+                            state.model = Some(completed.response.model);
+                        }
+
+                        // Close any open content blocks
+                        if state.text_started {
+                            yield StreamChunk::ContentBlockStop { index: 0 };
+                        }
+                        if state.thinking_started {
+                            yield StreamChunk::ContentBlockStop { index: 1 };
+                        }
+
+                        let response = state.into_generate_response(response_format)?;
+                        yield StreamChunk::Completed(response);
+                        return;
+                    }
+
+                    // Error event
+                    "error" => {
+                        Err(SdkError::Other(anyhow!("OpenAI Responses API streaming error: {}", data)))?;
+                    }
+
+                    // Ignore other events (response.in_progress, response.output_item.added, etc.)
+                    _ => {}
+                }
+            }
+        }
+
+        // If we get here without a response.completed event, create response from state
+        if state.text_started || state.thinking_started {
+            let response = state.into_generate_response(response_format)?;
+            yield StreamChunk::Completed(response);
+        } else {
+            Err(SdkError::Other(anyhow!("stream ended without response data")))?;
+        }
+    };
+
+    Ok(Box::pin(stream))
+}
+
+/// Create a StreamHandle from a Responses API streaming response.
+fn responses_stream_handle(
+    response: reqwest::Response,
+    response_format: ResponseFormat,
+) -> SdkResult<StreamHandle> {
+    let stream = build_responses_stream(response, response_format)?;
+    Ok(StreamHandle::new(stream))
+}
+
+// ============================================================================
 // LanguageModel Trait Implementation
 // ============================================================================
 
@@ -762,48 +1033,27 @@ impl LanguageModel for OpenAiProvider {
         // Track request start time
         let start = std::time::Instant::now();
 
-        // Execute the actual streaming API call
-        // NOTE: For streaming, we use the Chat Completions API (/chat/completions) instead of
-        // the Responses API (/responses) because the Responses API has a different SSE format
-        // that's not yet supported. The Chat Completions streaming format is well-tested.
+        // Execute the actual streaming API call using the Responses API
         let result = async {
             validate_request(&request)?;
             let model = self.normalize_model(&request.model)?;
 
-            // Use Chat Completions format for streaming (different from non-streaming Responses API)
-            let payload = super::openai_common::ChatCompletionPayload::from_request(&request, model, true);
+            // Build Responses API request with streaming enabled
+            let mut payload = ResponsesApiRequest::from_request(&request, model);
+            payload.stream = Some(true);
 
-            // Build Chat Completions URL
-            let base = self.config.base_url.trim_end_matches('/');
-            let url = format!("{base}/chat/completions");
-
-            let mut req_builder = self
-                .http
-                .post(&url)
-                .header("Authorization", format!("Bearer {}", self.config.api_key))
-                .header("Accept", "text/event-stream");
-
-            // Add optional headers
-            if let Some(org) = &self.config.organization {
-                req_builder = req_builder.header("OpenAI-Organization", org);
-            }
-            if let Some(project) = &self.config.project {
-                req_builder = req_builder.header("OpenAI-Project", project);
-            }
-            for (key, value) in &self.config.extra_headers {
-                req_builder = req_builder.header(key, value);
-            }
-
-            let response = req_builder
+            let response = self
+                .request()
+                .header("Accept", "text/event-stream")
                 .json(&payload)
                 .send()
                 .await
                 .map_err(|err| {
-                    SdkError::Other(anyhow!("OpenAI streaming request failed: {err}"))
+                    SdkError::Other(anyhow!("OpenAI Responses streaming request failed: {err}"))
                 })?;
 
             let response = ensure_success(response).await?;
-            stream_handle_from_response(response, request.config.response_format.clone())
+            responses_stream_handle(response, request.config.response_format.clone())
         }
         .await;
 
@@ -826,5 +1076,379 @@ impl LanguageModel for OpenAiProvider {
                 Err(err)
             }
         }
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // ResponsesSseDecoder Tests
+    // ========================================================================
+
+    #[test]
+    fn test_sse_decoder_basic_event() {
+        let mut decoder = ResponsesSseDecoder::default();
+        let chunk = b"event: response.created\ndata: {\"id\": \"resp_123\"}\n\n";
+
+        let events = decoder.ingest(chunk).unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "response.created");
+        assert_eq!(events[0].1, "{\"id\": \"resp_123\"}");
+    }
+
+    #[test]
+    fn test_sse_decoder_multiple_events() {
+        let mut decoder = ResponsesSseDecoder::default();
+        let chunk = b"event: response.output_text.delta\ndata: {\"delta\": \"Hello\"}\n\nevent: response.output_text.delta\ndata: {\"delta\": \" world\"}\n\n";
+
+        let events = decoder.ingest(chunk).unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0, "response.output_text.delta");
+        assert_eq!(events[0].1, "{\"delta\": \"Hello\"}");
+        assert_eq!(events[1].0, "response.output_text.delta");
+        assert_eq!(events[1].1, "{\"delta\": \" world\"}");
+    }
+
+    #[test]
+    fn test_sse_decoder_chunked_input() {
+        let mut decoder = ResponsesSseDecoder::default();
+
+        // First chunk - incomplete event
+        let chunk1 = b"event: response.output_text.delta\ndata: {\"del";
+        let events1 = decoder.ingest(chunk1).unwrap();
+        assert_eq!(events1.len(), 0); // No complete events yet
+
+        // Second chunk - completes the event
+        let chunk2 = b"ta\": \"Hello\"}\n\n";
+        let events2 = decoder.ingest(chunk2).unwrap();
+        assert_eq!(events2.len(), 1);
+        assert_eq!(events2[0].0, "response.output_text.delta");
+        assert_eq!(events2[0].1, "{\"delta\": \"Hello\"}");
+    }
+
+    #[test]
+    fn test_sse_decoder_crlf_delimiter() {
+        let mut decoder = ResponsesSseDecoder::default();
+        let chunk = b"event: response.created\r\ndata: {\"id\": \"resp_123\"}\r\n\r\n";
+
+        let events = decoder.ingest(chunk).unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "response.created");
+    }
+
+    #[test]
+    fn test_sse_decoder_empty_data() {
+        let mut decoder = ResponsesSseDecoder::default();
+        let chunk = b"event: response.in_progress\ndata: \n\n";
+
+        let events = decoder.ingest(chunk).unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "response.in_progress");
+        assert_eq!(events[0].1, "");
+    }
+
+    #[test]
+    fn test_sse_decoder_multiline_data() {
+        let mut decoder = ResponsesSseDecoder::default();
+        let chunk = b"event: response.completed\ndata: {\"response\":\ndata:  {\"id\": \"123\"}}\n\n";
+
+        let events = decoder.ingest(chunk).unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "response.completed");
+        // Multiline data should be joined
+        assert!(events[0].1.contains("{\"response\":"));
+    }
+
+    // ========================================================================
+    // OutputTextDelta Parsing Tests
+    // ========================================================================
+
+    #[test]
+    fn test_parse_output_text_delta() {
+        let json = r#"{"delta": "Hello, world!", "item_id": "item_123", "output_index": 0, "content_index": 0}"#;
+        let delta: OutputTextDelta = serde_json::from_str(json).unwrap();
+
+        assert_eq!(delta.delta, "Hello, world!");
+        assert_eq!(delta.item_id, Some("item_123".to_string()));
+        assert_eq!(delta.output_index, Some(0));
+        assert_eq!(delta.content_index, Some(0));
+    }
+
+    #[test]
+    fn test_parse_output_text_delta_minimal() {
+        let json = r#"{"delta": "Test"}"#;
+        let delta: OutputTextDelta = serde_json::from_str(json).unwrap();
+
+        assert_eq!(delta.delta, "Test");
+        assert_eq!(delta.item_id, None);
+    }
+
+    // ========================================================================
+    // ReasoningTextDelta Parsing Tests
+    // ========================================================================
+
+    #[test]
+    fn test_parse_reasoning_text_delta() {
+        let json = r#"{"delta": "Let me think about this...", "item_id": "reasoning_123"}"#;
+        let delta: ReasoningTextDelta = serde_json::from_str(json).unwrap();
+
+        assert_eq!(delta.delta, "Let me think about this...");
+        assert_eq!(delta.item_id, Some("reasoning_123".to_string()));
+    }
+
+    // ========================================================================
+    // ResponseCompletedEvent Parsing Tests
+    // ========================================================================
+
+    #[test]
+    fn test_parse_response_completed_event() {
+        let json = r#"{
+            "response": {
+                "id": "resp_abc123",
+                "created_at": 1700000000,
+                "model": "gpt-4o-mini",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {"type": "output_text", "text": "Hello!"}
+                        ]
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "total_tokens": 15
+                }
+            }
+        }"#;
+
+        let event: ResponseCompletedEvent = serde_json::from_str(json).unwrap();
+
+        assert_eq!(event.response.id, "resp_abc123");
+        assert_eq!(event.response.model, "gpt-4o-mini");
+        assert_eq!(event.response.status, "completed");
+        assert!(event.response.usage.is_some());
+        let usage = event.response.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, Some(10));
+        assert_eq!(usage.completion_tokens, Some(5));
+    }
+
+    // ========================================================================
+    // StreamingState Tests
+    // ========================================================================
+
+    #[test]
+    fn test_streaming_state_text_response() {
+        let mut state = StreamingState::default();
+        state.text_started = true;
+        state.text_aggregate = "Hello, world!".to_string();
+        state.response_id = Some("resp_123".to_string());
+        state.model = Some("gpt-4o-mini".to_string());
+        state.created_at = Some(1700000000);
+        state.usage = Some(ApiUsage {
+            prompt_tokens: Some(10),
+            completion_tokens: Some(5),
+            total_tokens: Some(15),
+        });
+
+        let response = state.into_generate_response(ResponseFormat::Text).unwrap();
+
+        assert_eq!(response.id, "resp_123");
+        assert_eq!(response.model, "gpt-4o-mini");
+        assert_eq!(response.text, "Hello, world!");
+        assert_eq!(response.finish_reason, Some("completed".to_string()));
+        assert!(response.usage.is_some());
+        let usage = response.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, Some(10));
+        assert_eq!(usage.completion_tokens, Some(5));
+    }
+
+    #[test]
+    fn test_streaming_state_json_response() {
+        let mut state = StreamingState::default();
+        state.text_started = true;
+        state.text_aggregate = r#"{"name": "test", "value": 42}"#.to_string();
+        state.response_id = Some("resp_456".to_string());
+        state.model = Some("gpt-4o".to_string());
+
+        let response = state.into_generate_response(ResponseFormat::Json).unwrap();
+
+        assert_eq!(response.text, r#"{"name": "test", "value": 42}"#);
+        assert!(response.object.is_some());
+        let obj = response.object.unwrap();
+        assert_eq!(obj["name"], "test");
+        assert_eq!(obj["value"], 42);
+    }
+
+    #[test]
+    fn test_streaming_state_empty_defaults() {
+        let state = StreamingState::default();
+        let response = state.into_generate_response(ResponseFormat::Text).unwrap();
+
+        assert_eq!(response.id, "");
+        assert_eq!(response.model, "");
+        assert_eq!(response.text, "");
+        assert!(response.usage.is_none());
+    }
+
+    // ========================================================================
+    // ResponsesApiRequest Tests
+    // ========================================================================
+
+    #[test]
+    fn test_responses_api_request_simple() {
+        use super::super::interface::{GenerateConfig, Message, MessageRole};
+
+        let request = GenerateRequest {
+            model: "openai/gpt-4o-mini".to_string(),
+            system_prompt: Some("You are a helpful assistant.".to_string()),
+            messages: vec![Message {
+                role: MessageRole::User,
+                content: "Hello".to_string(),
+            }],
+            tools: vec![],
+            tool_choice: None,
+            config: GenerateConfig::default(),
+            otel_context: None,
+        };
+
+        let payload = ResponsesApiRequest::from_request(&request, "gpt-4o-mini".to_string());
+
+        assert_eq!(payload.model, "gpt-4o-mini");
+        assert_eq!(payload.instructions, Some("You are a helpful assistant.".to_string()));
+        assert_eq!(payload.store, Some(false));
+        assert!(payload.stream.is_none()); // Not set by from_request
+    }
+
+    #[test]
+    fn test_responses_api_request_with_streaming() {
+        use super::super::interface::{GenerateConfig, Message, MessageRole};
+
+        let request = GenerateRequest {
+            model: "openai/gpt-4o-mini".to_string(),
+            system_prompt: Some("Test".to_string()),
+            messages: vec![Message {
+                role: MessageRole::User,
+                content: "Hi".to_string(),
+            }],
+            tools: vec![],
+            tool_choice: None,
+            config: GenerateConfig::default(),
+            otel_context: None,
+        };
+
+        let mut payload = ResponsesApiRequest::from_request(&request, "gpt-4o-mini".to_string());
+        payload.stream = Some(true);
+
+        assert_eq!(payload.stream, Some(true));
+    }
+
+    #[test]
+    fn test_responses_api_request_reasoning_model() {
+        use super::super::interface::{GenerateConfig, Message, MessageRole};
+
+        let mut config = GenerateConfig::default();
+        config.temperature = Some(0.7);
+        config.top_p = Some(0.9);
+
+        let request = GenerateRequest {
+            model: "openai/gpt-5".to_string(),
+            system_prompt: Some("Test".to_string()),
+            messages: vec![Message {
+                role: MessageRole::User,
+                content: "Hi".to_string(),
+            }],
+            tools: vec![],
+            tool_choice: None,
+            config,
+            otel_context: None,
+        };
+
+        let payload = ResponsesApiRequest::from_request(&request, "gpt-5".to_string());
+
+        // Reasoning models should NOT have temperature or top_p
+        assert!(payload.temperature.is_none());
+        assert!(payload.top_p.is_none());
+    }
+
+    #[test]
+    fn test_responses_api_request_non_reasoning_model() {
+        use super::super::interface::{GenerateConfig, Message, MessageRole};
+
+        let mut config = GenerateConfig::default();
+        config.temperature = Some(0.7);
+        config.top_p = Some(0.9);
+
+        let request = GenerateRequest {
+            model: "openai/gpt-4o".to_string(),
+            system_prompt: Some("Test".to_string()),
+            messages: vec![Message {
+                role: MessageRole::User,
+                content: "Hi".to_string(),
+            }],
+            tools: vec![],
+            tool_choice: None,
+            config,
+            otel_context: None,
+        };
+
+        let payload = ResponsesApiRequest::from_request(&request, "gpt-4o".to_string());
+
+        // Non-reasoning models SHOULD have temperature and top_p
+        assert_eq!(payload.temperature, Some(0.7));
+        assert_eq!(payload.top_p, Some(0.9));
+    }
+
+    // ========================================================================
+    // Model Normalization Tests
+    // ========================================================================
+
+    #[test]
+    fn test_normalize_model_with_prefix() {
+        let config = OpenAiConfig::new("test-key");
+        let provider = OpenAiProvider::new(config).unwrap();
+
+        let result = provider.normalize_model("openai/gpt-4o-mini");
+        assert_eq!(result.unwrap(), "gpt-4o-mini");
+    }
+
+    #[test]
+    fn test_normalize_model_wrong_prefix() {
+        let config = OpenAiConfig::new("test-key");
+        let provider = OpenAiProvider::new(config).unwrap();
+
+        let result = provider.normalize_model("anthropic/claude-3");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_normalize_model_no_prefix_required() {
+        let config = OpenAiConfig::new("test-key").with_model_prefix(None::<String>);
+        let provider = OpenAiProvider::new(config).unwrap();
+
+        let result = provider.normalize_model("gpt-4o-mini");
+        assert_eq!(result.unwrap(), "gpt-4o-mini");
+    }
+
+    #[test]
+    fn test_normalize_model_empty() {
+        let config = OpenAiConfig::new("test-key");
+        let provider = OpenAiProvider::new(config).unwrap();
+
+        let result = provider.normalize_model("");
+        assert!(result.is_err());
     }
 }

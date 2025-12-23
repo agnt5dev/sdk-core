@@ -369,32 +369,28 @@ pub fn create_component_span(
     }
 
     if let Some(meta) = metadata {
-        if let Some(tenant_id) = meta.get("tenant_id") {
-            attributes.push(KeyValue::new("tenant.id", tenant_id.clone()));
-        }
-        if let Some(run_id) = meta.get("run_id") {
-            attributes.push(KeyValue::new("run.id", run_id.clone()));
-        }
-        if let Some(step_name) = meta.get("step_name") {
-            attributes.push(KeyValue::new("function.step_name", step_name.clone()));
-        }
-        if let Some(attempt) = meta
-            .get("attempt")
-            .or_else(|| meta.get("attempt_number"))
-            .or_else(|| meta.get("step_attempt"))
-        {
-            if let Ok(parsed) = attempt.parse::<i64>() {
-                attributes.push(KeyValue::new("function.step_attempt", parsed));
-            }
-        }
-        if let Some(traceparent) = meta.get("traceparent") {
-            attributes.push(KeyValue::new("traceparent", traceparent.clone()));
-        }
-        if let Some(user_id) = meta.get("user_id") {
-            attributes.push(KeyValue::new("user.id", user_id.clone()));
-        }
-        if let Some(request_id) = meta.get("request_id") {
-            attributes.push(KeyValue::new("request.id", request_id.clone()));
+        // Pass through all metadata as span attributes
+        // This allows Python code to set custom attributes like input.data, output.data, etc.
+        for (key, value) in meta.iter() {
+            // Map known keys to their canonical names
+            let attr_key = match key.as_str() {
+                "tenant_id" => "tenant.id".to_string(),
+                "run_id" => "run.id".to_string(),
+                "step_name" => "function.step_name".to_string(),
+                "attempt" | "attempt_number" | "step_attempt" => {
+                    // Try to parse as integer for step_attempt
+                    if let Ok(parsed) = value.parse::<i64>() {
+                        attributes.push(KeyValue::new("function.step_attempt", parsed));
+                        continue;
+                    }
+                    "function.step_attempt".to_string()
+                }
+                "user_id" => "user.id".to_string(),
+                "request_id" => "request.id".to_string(),
+                // Pass through all other keys as-is (e.g., input.data, output.data, agent.name, tool.name)
+                other => other.to_string(),
+            };
+            attributes.push(KeyValue::new(attr_key, value.clone()));
         }
     }
 

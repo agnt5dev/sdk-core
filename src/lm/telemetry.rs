@@ -328,15 +328,40 @@ pub fn serialize_system_instructions(system_prompt: &str) -> Value {
 
 /// Serialize output messages to OpenTelemetry Gen AI format
 pub fn serialize_output_messages(response: &GenerateResponse) -> Value {
+    let mut parts = Vec::new();
+
+    // Add text content if present
+    if !response.text.is_empty() {
+        parts.push(json!({
+            "type": "text",
+            "content": &response.text
+        }));
+    }
+
+    // Add tool calls if present
+    if let Some(tool_calls) = &response.tool_calls {
+        for tool_call in tool_calls {
+            parts.push(json!({
+                "type": "tool_call",
+                "id": tool_call.id,
+                "name": tool_call.name,
+                "arguments": tool_call.arguments
+            }));
+        }
+    }
+
+    // If no parts, add empty text part for consistency
+    if parts.is_empty() {
+        parts.push(json!({
+            "type": "text",
+            "content": ""
+        }));
+    }
+
     json!([
         {
             "role": "assistant",
-            "parts": [
-                {
-                    "type": "text",
-                    "content": truncate_content(&response.text, 10_000)
-                }
-            ]
+            "parts": parts
         }
     ])
 }
