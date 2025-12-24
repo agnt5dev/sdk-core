@@ -447,6 +447,9 @@ fn build_stream(
                     StreamEvent::ContentBlockStop { index } => {
                         yield StreamChunk::ContentBlockStop { index };
                     }
+                    StreamEvent::Unknown => {
+                        // Silently ignore unknown events (ping, error, etc.)
+                    }
                 }
             }
         }
@@ -802,6 +805,10 @@ enum StreamEvent {
     },
     #[serde(rename = "message_stop")]
     MessageStop,
+    /// Catch-all for unknown events (e.g., "ping", "error")
+    /// These are silently ignored to keep the stream alive.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Deserialize)]
