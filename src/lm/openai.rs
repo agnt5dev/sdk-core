@@ -228,34 +228,95 @@ impl OpenAiProvider {
 // Responses API Request Types
 // ============================================================================
 
-/// Input for the Responses API - can be simple text or structured messages
+/// Input for the Responses API - can be simple text or structured items
 #[derive(Clone, Debug, Serialize)]
 #[serde(untagged)]
 pub enum InputType {
     /// Simple string input
     Simple(String),
-    /// Structured message array
-    Messages(Vec<ApiMessage>),
+    /// Structured item array (messages, function calls, function outputs)
+    Items(Vec<InputItem>),
+}
+
+/// Input item types for Responses API
+/// Supports messages, function calls, and function call outputs
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "type")]
+pub enum InputItem {
+    /// Regular message item
+    #[serde(rename = "message")]
+    Message(ApiMessage),
+    /// Function call (from assistant's tool calls)
+    #[serde(rename = "function_call")]
+    FunctionCall {
+        call_id: String,
+        name: String,
+        arguments: String,
+    },
+    /// Function call output (tool result)
+    #[serde(rename = "function_call_output")]
+    FunctionCallOutput {
+        call_id: String,
+        output: String,
+    },
 }
 
 /// Message format for Responses API
 #[derive(Clone, Debug, Serialize)]
 pub struct ApiMessage {
     pub role: String,
-    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
 }
 
-impl From<&super::interface::Message> for ApiMessage {
-    fn from(msg: &super::interface::Message) -> Self {
-        Self {
-            role: match msg.role {
-                super::interface::MessageRole::User => "user".to_string(),
-                super::interface::MessageRole::Assistant => "assistant".to_string(),
-                super::interface::MessageRole::System => "system".to_string(),
-            },
-            content: msg.content.clone(),
-        }
+/// Convert SDK Message to InputItem(s)
+/// A single message may produce multiple items (e.g., assistant + function calls)
+fn message_to_input_items(msg: &super::interface::Message) -> Vec<InputItem> {
+    let mut items = Vec::new();
+
+    // Check if this is a tool result message
+    if let Some(tool_call_id) = &msg.tool_call_id {
+        items.push(InputItem::FunctionCallOutput {
+            call_id: tool_call_id.clone(),
+            output: msg.content.clone(),
+        });
+        return items;
     }
+
+    // Check if this is an assistant message with tool calls
+    if let Some(tool_calls) = &msg.tool_calls {
+        // Add assistant message with content (if any)
+        if !msg.content.is_empty() {
+            items.push(InputItem::Message(ApiMessage {
+                role: "assistant".to_string(),
+                content: Some(msg.content.clone()),
+            }));
+        }
+
+        // Add function_call items for each tool call
+        for tc in tool_calls {
+            items.push(InputItem::FunctionCall {
+                call_id: tc.id.clone(),
+                name: tc.name.clone(),
+                arguments: tc.arguments.clone(),
+            });
+        }
+        return items;
+    }
+
+    // Regular message
+    let role = match msg.role {
+        super::interface::MessageRole::User => "user".to_string(),
+        super::interface::MessageRole::Assistant => "assistant".to_string(),
+        super::interface::MessageRole::System => "system".to_string(),
+    };
+
+    items.push(InputItem::Message(ApiMessage {
+        role,
+        content: Some(msg.content.clone()),
+    }));
+
+    items
 }
 
 /// Reasoning configuration for o-series models
@@ -315,8 +376,10 @@ pub struct ResponsesApiRequest {
     pub modalities: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ReasoningConfig>,
+    /// Structured output format for Responses API (replaces response_format)
+    /// Uses text.format instead of response_format for the Responses API
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub response_format: Option<Value>,
+    pub text: Option<Value>,
 }
 
 impl ResponsesApiRequest {
@@ -326,8 +389,13 @@ impl ResponsesApiRequest {
             // Simple string input from system prompt
             InputType::Simple(req.system_prompt.clone().unwrap_or_default())
         } else {
-            // Message array
-            InputType::Messages(req.messages.iter().map(ApiMessage::from).collect())
+            // Convert messages to input items (handles tool results)
+            let items: Vec<InputItem> = req
+                .messages
+                .iter()
+                .flat_map(message_to_input_items)
+                .collect();
+            InputType::Items(items)
         };
 
         // System prompt becomes instructions (separate from messages)
@@ -367,15 +435,18 @@ impl ResponsesApiRequest {
             Some(tools_array)
         };
 
-        // Convert tool_choice
+        // Convert tool_choice - Responses API uses flat format, not nested function object
         let tool_choice = req.tool_choice.as_ref().map(|choice| {
             use super::interface::ToolChoice;
             match choice {
                 ToolChoice::Auto => serde_json::json!("auto"),
                 ToolChoice::None => serde_json::json!("none"),
+                ToolChoice::Required => serde_json::json!("required"),
+                // Responses API format: {"type": "function", "name": "fn_name"}
+                // NOT the Chat Completions format: {"type": "function", "function": {"name": "fn_name"}}
                 ToolChoice::Tool { name } => serde_json::json!({
                     "type": "function",
-                    "function": {"name": name}
+                    "name": name
                 }),
             }
         });
@@ -405,13 +476,15 @@ impl ResponsesApiRequest {
             }
         });
 
-        // Convert response format
-        let response_format = match &req.config.response_format {
+        // Convert response format - Responses API uses text.format instead of response_format
+        let text = match &req.config.response_format {
             super::interface::ResponseFormat::Text => None,
-            super::interface::ResponseFormat::Json => Some(serde_json::json!({"type": "json_object"})),
+            super::interface::ResponseFormat::Json => Some(serde_json::json!({
+                "format": {"type": "json_object"}
+            })),
             super::interface::ResponseFormat::JsonSchema(schema) => Some(serde_json::json!({
-                "type": "json_schema",
-                "json_schema": {
+                "format": {
+                    "type": "json_schema",
                     "name": schema.name,
                     "schema": schema.schema,
                     "strict": schema.strict
@@ -426,12 +499,18 @@ impl ResponsesApiRequest {
             || model.starts_with("o1-")
             || model.starts_with("o3-");
 
+        // Store responses when tools are provided (for agentic continuation)
+        // or when explicitly continuing a conversation with previous_response_id.
+        // This is required because previous_response_id only works if the original
+        // response was stored.
+        let should_store = !req.tools.is_empty() || req.previous_response_id.is_some();
+
         Self {
             model,
             input,
             instructions,
-            previous_response_id: None,
-            store: Some(false), // Stateless by default
+            previous_response_id: req.previous_response_id.clone(),
+            store: Some(should_store),
             stream: None,       // Set to Some(true) for streaming
             temperature: if is_reasoning_model { None } else { req.config.temperature },
             top_p: if is_reasoning_model { None } else { req.config.top_p },
@@ -440,7 +519,7 @@ impl ResponsesApiRequest {
             tool_choice,
             modalities,
             reasoning,
-            response_format,
+            text,
         }
     }
 }

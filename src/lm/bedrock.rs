@@ -502,6 +502,7 @@ fn convert_tool_choice(choice: Option<&ToolChoice>) -> Option<Value> {
         None => None,
         Some(ToolChoice::Auto) => Some(json!({"type": "auto"})),
         Some(ToolChoice::None) => Some(json!({"type": "none"})),
+        Some(ToolChoice::Required) => Some(json!({"type": "any"})), // Bedrock uses "any" for required
         Some(ToolChoice::Tool { name }) => Some(json!({"type": "tool", "name": name})),
     }
 }

@@ -16,7 +16,7 @@ use crate::error::{Result as SdkResult, SdkError};
 use super::interface::{
     generate as generate_via_model, stream as stream_via_model, ContentBlockType, GenerateRequest,
     GenerateResponse, GenerationConfig, LanguageModel, Message, MessageRole, ResponseFormat,
-    StreamChunk, StreamHandle, StreamRequest, TokenUsage, ToolChoice, ToolDefinition,
+    StreamChunk, StreamHandle, StreamRequest, TokenUsage, ToolCall, ToolChoice, ToolDefinition,
 };
 use super::telemetry;
 
@@ -508,7 +508,7 @@ impl MessagesPayload {
             .messages
             .iter()
             .filter(|message| message.role != MessageRole::System)
-            .map(AnthropicMessage::from)
+            .map(AnthropicMessage::from_sdk_message)
             .collect::<Vec<_>>();
         let GenerationConfig {
             temperature,
@@ -545,27 +545,82 @@ impl MessagesPayload {
 #[derive(Serialize)]
 struct AnthropicMessage {
     role: String,
-    content: Vec<TextBlock>,
+    content: Vec<ContentBlock>,
 }
 
-impl From<&Message> for AnthropicMessage {
-    fn from(message: &Message) -> Self {
+impl AnthropicMessage {
+    fn from_sdk_message(message: &Message) -> Self {
+        let mut content = Vec::new();
+
+        // Tool result message
+        if let Some(tool_call_id) = &message.tool_call_id {
+            content.push(ContentBlock::ToolResult {
+                tool_use_id: tool_call_id.clone(),
+                content: message.content.clone(),
+            });
+            return Self {
+                role: "user".to_string(), // Tool results are always user role
+                content,
+            };
+        }
+
+        // Assistant message with tool calls
+        if let Some(tool_calls) = &message.tool_calls {
+            // Add text content if present
+            if !message.content.is_empty() {
+                content.push(ContentBlock::Text {
+                    text: message.content.clone(),
+                });
+            }
+
+            // Add tool_use blocks for each tool call
+            for tc in tool_calls {
+                let input: JsonValue = serde_json::from_str(&tc.arguments)
+                    .unwrap_or_else(|_| json!({}));
+                content.push(ContentBlock::ToolUse {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    input,
+                });
+            }
+
+            return Self {
+                role: "assistant".to_string(),
+                content,
+            };
+        }
+
+        // Regular message
+        content.push(ContentBlock::Text {
+            text: message.content.clone(),
+        });
+
         Self {
             role: message.role.as_str().to_string(),
-            content: vec![TextBlock {
-                content_type: "text".to_string(),
-                text: Some(message.content.clone()),
-            }],
+            content,
         }
     }
 }
 
+/// Content block types for Anthropic Messages API
 #[derive(Serialize)]
-struct TextBlock {
-    #[serde(rename = "type")]
-    content_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    text: Option<String>,
+#[serde(tag = "type")]
+enum ContentBlock {
+    #[serde(rename = "text")]
+    Text {
+        text: String,
+    },
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        id: String,
+        name: String,
+        input: JsonValue,
+    },
+    #[serde(rename = "tool_result")]
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+    },
 }
 
 #[derive(Serialize)]
@@ -733,6 +788,7 @@ fn convert_tool_choice(choice: Option<&ToolChoice>) -> Option<JsonValue> {
         None => None,
         Some(ToolChoice::Auto) => Some(json!({"type": "auto"})),
         Some(ToolChoice::None) => Some(json!({"type": "none"})),
+        Some(ToolChoice::Required) => Some(json!({"type": "any"})), // Anthropic uses "any" for required
         Some(ToolChoice::Tool { name }) => Some(json!({"type": "tool", "name": name})),
     }
 }

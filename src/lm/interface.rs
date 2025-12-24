@@ -37,6 +37,10 @@ pub struct GenerateRequest {
     pub tool_choice: Option<ToolChoice>,
     pub user_id: Option<String>,
     pub config: GenerationConfig,
+    /// Previous response ID for conversation continuation (OpenAI Responses API)
+    /// When set, the API will use this to continue a multi-turn conversation
+    /// with tool calls without needing to resend the full message history.
+    pub previous_response_id: Option<String>,
     /// OpenTelemetry context for trace propagation across async boundaries
     /// This is used internally to ensure LM spans are children of the calling function span
     #[doc(hidden)]
@@ -53,8 +57,14 @@ impl GenerateRequest {
             tool_choice: None,
             user_id: None,
             config: GenerationConfig::default(),
+            previous_response_id: None,
             otel_context: None,
         }
+    }
+
+    pub fn previous_response_id(mut self, id: impl Into<String>) -> Self {
+        self.previous_response_id = Some(id.into());
+        self
     }
 
     pub fn system_prompt(mut self, prompt: impl Into<String>) -> Self {
@@ -256,6 +266,10 @@ pub enum Modality {
 pub struct Message {
     pub role: MessageRole,
     pub content: String,
+    /// Tool calls made by the assistant (for assistant messages)
+    pub tool_calls: Option<Vec<ToolCall>>,
+    /// ID of the tool call this message is responding to (for tool result messages)
+    pub tool_call_id: Option<String>,
 }
 
 impl Message {
@@ -263,6 +277,8 @@ impl Message {
         Self {
             role,
             content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
         }
     }
 
@@ -276,6 +292,26 @@ impl Message {
 
     pub fn assistant(content: impl Into<String>) -> Self {
         Self::new(MessageRole::Assistant, content)
+    }
+
+    /// Create an assistant message with tool calls
+    pub fn assistant_with_tool_calls(content: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
+        Self {
+            role: MessageRole::Assistant,
+            content: content.into(),
+            tool_calls: Some(tool_calls),
+            tool_call_id: None,
+        }
+    }
+
+    /// Create a tool result message
+    pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: MessageRole::User, // Tool results are typically sent as user role
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id.into()),
+        }
     }
 }
 
@@ -334,6 +370,7 @@ impl ToolDefinition {
 pub enum ToolChoice {
     Auto,
     None,
+    Required,
     Tool { name: String },
 }
 

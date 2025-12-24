@@ -106,22 +106,56 @@ impl OpenRouterProvider {
         Self::new(config)
     }
 
+    /// Normalize model name by stripping the `openrouter/` prefix if present.
+    ///
+    /// OpenRouter models are typically specified as `openrouter/provider/model`
+    /// (e.g., `openrouter/meta-llama/llama-3.1-8b-instruct`) for SDK routing,
+    /// but the API expects just `provider/model` (e.g., `meta-llama/llama-3.1-8b-instruct`).
+    fn normalize_model(model: &str) -> String {
+        let trimmed = model.trim();
+        if let Some(rest) = trimmed.strip_prefix("openrouter/") {
+            rest.to_string()
+        } else {
+            trimmed.to_string()
+        }
+    }
+
     pub async fn generate(&self, request: GenerateRequest) -> SdkResult<GenerateResponse> {
-        self.inner.generate(request).await
+        let normalized_model = Self::normalize_model(&request.model);
+        let normalized_request = GenerateRequest {
+            model: normalized_model,
+            ..request
+        };
+        self.inner.generate(normalized_request).await
     }
 
     pub async fn stream(&self, request: StreamRequest) -> SdkResult<StreamHandle> {
-        self.inner.stream(request).await
+        let normalized_model = Self::normalize_model(&request.model);
+        let normalized_request = StreamRequest {
+            model: normalized_model,
+            ..request
+        };
+        self.inner.stream(normalized_request).await
     }
 }
 
 #[async_trait]
 impl LanguageModel for OpenRouterProvider {
     async fn generate(&self, request: GenerateRequest) -> SdkResult<GenerateResponse> {
-        self.inner.generate(request).await
+        let normalized_model = Self::normalize_model(&request.model);
+        let normalized_request = GenerateRequest {
+            model: normalized_model,
+            ..request
+        };
+        self.inner.generate(normalized_request).await
     }
 
     async fn stream(&self, request: StreamRequest) -> SdkResult<StreamHandle> {
-        self.inner.stream(request).await
+        let normalized_model = Self::normalize_model(&request.model);
+        let normalized_request = StreamRequest {
+            model: normalized_model,
+            ..request
+        };
+        self.inner.stream(normalized_request).await
     }
 }

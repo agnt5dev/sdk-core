@@ -62,6 +62,10 @@ pub struct ModelPricing {
 /// Prices are in USD per 1M tokens (as of January 2025).
 pub fn get_model_pricing(provider: &str, model: &str) -> Option<ModelPricing> {
     match (provider.to_lowercase().as_str(), model.to_lowercase().as_str()) {
+        // ============================================================
+        // OpenAI Models
+        // ============================================================
+
         // OpenAI GPT-4o models
         ("openai", m) if m.contains("gpt-4o") && !m.contains("mini") => Some(ModelPricing {
             input_per_1m: 2.50,
@@ -103,9 +107,34 @@ pub fn get_model_pricing(provider: &str, model: &str) -> Option<ModelPricing> {
             input_per_1m: 15.00,
             output_per_1m: 60.00,
         }),
+        // OpenAI o3 models
+        ("openai", m) if m.contains("o3-mini") => Some(ModelPricing {
+            input_per_1m: 1.10,
+            output_per_1m: 4.40,
+        }),
+        ("openai", m) if m == "o3" => Some(ModelPricing {
+            input_per_1m: 10.00,
+            output_per_1m: 40.00,
+        }),
+
+        // ============================================================
+        // Anthropic Models
+        // ============================================================
+
+        // Anthropic Claude 4 Opus
+        ("anthropic", m) if m.contains("claude-opus-4") || m.contains("claude-4-opus") => Some(ModelPricing {
+            input_per_1m: 15.00,
+            output_per_1m: 75.00,
+        }),
+
+        // Anthropic Claude 4 Sonnet
+        ("anthropic", m) if m.contains("claude-sonnet-4") || m.contains("claude-4-sonnet") => Some(ModelPricing {
+            input_per_1m: 3.00,
+            output_per_1m: 15.00,
+        }),
 
         // Anthropic Claude 3.5 Sonnet
-        ("anthropic", m) if m.contains("claude-3-5-sonnet") || m.contains("claude-sonnet-4") => Some(ModelPricing {
+        ("anthropic", m) if m.contains("claude-3-5-sonnet") => Some(ModelPricing {
             input_per_1m: 3.00,
             output_per_1m: 15.00,
         }),
@@ -134,14 +163,226 @@ pub fn get_model_pricing(provider: &str, model: &str) -> Option<ModelPricing> {
             output_per_1m: 1.25,
         }),
 
-        // Groq models (often free or very cheap, but we'll use placeholder pricing)
+        // ============================================================
+        // Google Gemini Models
+        // ============================================================
+
+        // Gemini 2.0 Flash
+        ("google", m) if m.contains("gemini-2.0-flash") => Some(ModelPricing {
+            input_per_1m: 0.10,
+            output_per_1m: 0.40,
+        }),
+
+        // Gemini 1.5 Pro
+        ("google", m) if m.contains("gemini-1.5-pro") => Some(ModelPricing {
+            input_per_1m: 1.25,
+            output_per_1m: 5.00,
+        }),
+
+        // Gemini 1.5 Flash
+        ("google", m) if m.contains("gemini-1.5-flash") => Some(ModelPricing {
+            input_per_1m: 0.075,
+            output_per_1m: 0.30,
+        }),
+
+        // Gemini 1.0 Pro
+        ("google", m) if m.contains("gemini-1.0-pro") || m.contains("gemini-pro") => Some(ModelPricing {
+            input_per_1m: 0.50,
+            output_per_1m: 1.50,
+        }),
+
+        // ============================================================
+        // DeepSeek Models
+        // ============================================================
+
+        // DeepSeek V3 (exceptionally cost-effective)
+        ("deepseek", m) if m.contains("deepseek-chat") || m.contains("deepseek-v3") => Some(ModelPricing {
+            input_per_1m: 0.27,
+            output_per_1m: 1.10,
+        }),
+
+        // DeepSeek R1 (reasoning model)
+        ("deepseek", m) if m.contains("deepseek-reasoner") || m.contains("deepseek-r1") => Some(ModelPricing {
+            input_per_1m: 0.55,
+            output_per_1m: 2.19,
+        }),
+
+        // DeepSeek Coder
+        ("deepseek", m) if m.contains("deepseek-coder") => Some(ModelPricing {
+            input_per_1m: 0.14,
+            output_per_1m: 0.28,
+        }),
+
+        // ============================================================
+        // xAI (Grok) Models
+        // ============================================================
+
+        // Grok-2
+        ("xai", m) if m.contains("grok-2") && !m.contains("mini") => Some(ModelPricing {
+            input_per_1m: 2.00,
+            output_per_1m: 10.00,
+        }),
+
+        // Grok-2 Mini
+        ("xai", m) if m.contains("grok-2-mini") => Some(ModelPricing {
+            input_per_1m: 0.20,
+            output_per_1m: 1.00,
+        }),
+
+        // Grok-beta
+        ("xai", m) if m.contains("grok-beta") => Some(ModelPricing {
+            input_per_1m: 5.00,
+            output_per_1m: 15.00,
+        }),
+
+        // ============================================================
+        // Mistral Models
+        // ============================================================
+
+        // Mistral Large
+        ("mistral", m) if m.contains("mistral-large") => Some(ModelPricing {
+            input_per_1m: 2.00,
+            output_per_1m: 6.00,
+        }),
+
+        // Mistral Medium
+        ("mistral", m) if m.contains("mistral-medium") => Some(ModelPricing {
+            input_per_1m: 2.70,
+            output_per_1m: 8.10,
+        }),
+
+        // Mistral Small
+        ("mistral", m) if m.contains("mistral-small") => Some(ModelPricing {
+            input_per_1m: 0.20,
+            output_per_1m: 0.60,
+        }),
+
+        // Codestral
+        ("mistral", m) if m.contains("codestral") => Some(ModelPricing {
+            input_per_1m: 0.20,
+            output_per_1m: 0.60,
+        }),
+
+        // Ministral 8B
+        ("mistral", m) if m.contains("ministral-8b") => Some(ModelPricing {
+            input_per_1m: 0.10,
+            output_per_1m: 0.10,
+        }),
+
+        // Ministral 3B
+        ("mistral", m) if m.contains("ministral-3b") => Some(ModelPricing {
+            input_per_1m: 0.04,
+            output_per_1m: 0.04,
+        }),
+
+        // Pixtral Large
+        ("mistral", m) if m.contains("pixtral-large") => Some(ModelPricing {
+            input_per_1m: 2.00,
+            output_per_1m: 6.00,
+        }),
+
+        // Pixtral 12B
+        ("mistral", m) if m.contains("pixtral-12b") => Some(ModelPricing {
+            input_per_1m: 0.15,
+            output_per_1m: 0.15,
+        }),
+
+        // Open Mixtral 8x22B
+        ("mistral", m) if m.contains("mixtral-8x22b") || m.contains("open-mixtral-8x22b") => Some(ModelPricing {
+            input_per_1m: 2.00,
+            output_per_1m: 6.00,
+        }),
+
+        // Open Mixtral 8x7B
+        ("mistral", m) if m.contains("mixtral-8x7b") || m.contains("open-mixtral-8x7b") => Some(ModelPricing {
+            input_per_1m: 0.70,
+            output_per_1m: 0.70,
+        }),
+
+        // Open Mistral 7B
+        ("mistral", m) if m.contains("open-mistral-7b") || m.contains("mistral-7b") => Some(ModelPricing {
+            input_per_1m: 0.25,
+            output_per_1m: 0.25,
+        }),
+
+        // ============================================================
+        // Groq Models (hosted inference)
+        // ============================================================
+
+        // Llama 3.3 70B
+        ("groq", m) if m.contains("llama-3.3-70b") => Some(ModelPricing {
+            input_per_1m: 0.59,
+            output_per_1m: 0.79,
+        }),
+
+        // Llama 3.2 90B Vision
+        ("groq", m) if m.contains("llama-3.2-90b") => Some(ModelPricing {
+            input_per_1m: 0.90,
+            output_per_1m: 0.90,
+        }),
+
+        // Llama 3.2 11B Vision
+        ("groq", m) if m.contains("llama-3.2-11b") => Some(ModelPricing {
+            input_per_1m: 0.18,
+            output_per_1m: 0.18,
+        }),
+
+        // Llama 3.1 70B
+        ("groq", m) if m.contains("llama-3.1-70b") => Some(ModelPricing {
+            input_per_1m: 0.59,
+            output_per_1m: 0.79,
+        }),
+
+        // Llama 3.1 8B
+        ("groq", m) if m.contains("llama-3.1-8b") => Some(ModelPricing {
+            input_per_1m: 0.05,
+            output_per_1m: 0.08,
+        }),
+
+        // Llama 3 70B
+        ("groq", m) if m.contains("llama3-70b") || m.contains("llama-3-70b") => Some(ModelPricing {
+            input_per_1m: 0.59,
+            output_per_1m: 0.79,
+        }),
+
+        // Llama 3 8B
+        ("groq", m) if m.contains("llama3-8b") || m.contains("llama-3-8b") => Some(ModelPricing {
+            input_per_1m: 0.05,
+            output_per_1m: 0.08,
+        }),
+
+        // Generic Llama models
         ("groq", m) if m.contains("llama") => Some(ModelPricing {
             input_per_1m: 0.10,
             output_per_1m: 0.10,
         }),
+
+        // Mixtral 8x7B
         ("groq", m) if m.contains("mixtral") => Some(ModelPricing {
             input_per_1m: 0.24,
             output_per_1m: 0.24,
+        }),
+
+        // Gemma 2 9B
+        ("groq", m) if m.contains("gemma2-9b") => Some(ModelPricing {
+            input_per_1m: 0.20,
+            output_per_1m: 0.20,
+        }),
+
+        // Gemma 7B
+        ("groq", m) if m.contains("gemma-7b") => Some(ModelPricing {
+            input_per_1m: 0.07,
+            output_per_1m: 0.07,
+        }),
+
+        // ============================================================
+        // Ollama Models (local - no cost)
+        // ============================================================
+
+        // Ollama models run locally, so cost is $0
+        ("ollama", _) => Some(ModelPricing {
+            input_per_1m: 0.0,
+            output_per_1m: 0.0,
         }),
 
         // Unknown model - return None

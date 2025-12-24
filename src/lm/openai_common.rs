@@ -11,7 +11,7 @@ use crate::error::{Result as SdkResult, SdkError};
 
 use super::interface::{
     ContentBlockType, GenerateRequest, GenerateResponse, JsonSchemaFormat, Message, MessageRole,
-    ResponseFormat, StreamChunk, StreamHandle, TokenUsage, ToolChoice, ToolDefinition,
+    ResponseFormat, StreamChunk, StreamHandle, TokenUsage, ToolCall, ToolChoice, ToolDefinition,
 };
 
 #[derive(Serialize)]
@@ -160,17 +160,63 @@ pub(crate) struct ApiToolFunction {
     strict: Option<bool>,
 }
 
+/// API Message for Chat Completions API
+/// Supports regular messages, assistant messages with tool_calls, and tool result messages
 #[derive(Serialize)]
 pub(crate) struct ApiMessage {
     role: String,
-    content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ApiToolCall>>,
 }
 
-impl From<&Message> for ApiMessage {
-    fn from(message: &Message) -> Self {
+impl ApiMessage {
+    fn from_sdk_message(message: &Message) -> Self {
+        // Tool result message
+        if let Some(tool_call_id) = &message.tool_call_id {
+            return Self {
+                role: "tool".to_string(),
+                content: Some(message.content.clone()),
+                tool_call_id: Some(tool_call_id.clone()),
+                tool_calls: None,
+            };
+        }
+
+        // Assistant message with tool calls
+        if let Some(tool_calls) = &message.tool_calls {
+            let api_tool_calls: Vec<ApiToolCall> = tool_calls
+                .iter()
+                .map(|tc| ApiToolCall {
+                    id: tc.id.clone(),
+                    tool_type: "function".to_string(),
+                    function: ApiToolCallFunction {
+                        name: tc.name.clone(),
+                        arguments: tc.arguments.clone(),
+                    },
+                })
+                .collect();
+
+            return Self {
+                role: "assistant".to_string(),
+                content: if message.content.is_empty() {
+                    None
+                } else {
+                    Some(message.content.clone())
+                },
+                tool_call_id: None,
+                tool_calls: Some(api_tool_calls),
+            };
+        }
+
+        // Regular message
         Self {
             role: message.role.as_str().to_string(),
-            content: message.content.clone(),
+            content: Some(message.content.clone()),
+            tool_call_id: None,
+            tool_calls: None,
         }
     }
 }
@@ -181,11 +227,13 @@ pub(crate) fn build_api_messages(request: &GenerateRequest) -> Vec<ApiMessage> {
     if let Some(system_prompt) = &request.system_prompt {
         messages.push(ApiMessage {
             role: MessageRole::System.as_str().to_string(),
-            content: system_prompt.clone(),
+            content: Some(system_prompt.clone()),
+            tool_call_id: None,
+            tool_calls: None,
         });
     }
 
-    messages.extend(request.messages.iter().map(ApiMessage::from));
+    messages.extend(request.messages.iter().map(ApiMessage::from_sdk_message));
     messages
 }
 
@@ -338,6 +386,7 @@ fn api_tool_choice_from_request(choice: Option<&ToolChoice>) -> Option<JsonValue
         None => None,
         Some(ToolChoice::Auto) => Some(JsonValue::String("auto".to_string())),
         Some(ToolChoice::None) => Some(JsonValue::String("none".to_string())),
+        Some(ToolChoice::Required) => Some(JsonValue::String("required".to_string())),
         Some(ToolChoice::Tool { name }) => Some(json!({
             "type": "function",
             "function": {
