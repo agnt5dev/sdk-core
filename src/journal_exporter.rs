@@ -235,6 +235,73 @@ pub struct JournalLogData {
     pub span_id: String,
 }
 
+/// Write a generic event to the journal.
+///
+/// This is a general-purpose method for writing any event type to the journal,
+/// including lm.call.*, output.*, and custom event types.
+///
+/// # Arguments
+/// * `run_id` - The run ID to associate the event with
+/// * `event_type` - Event type (e.g., "lm.call.started", "lm.call.completed")
+/// * `data` - JSON-serialized event data
+/// * `trace_id` - Trace ID for correlation
+/// * `span_id` - Span ID for correlation
+/// * `tenant_id` - Optional tenant ID
+/// * `source_timestamp_ns` - Source timestamp in nanoseconds
+pub async fn write_event(
+    run_id: &str,
+    event_type: &str,
+    data: &[u8],
+    trace_id: &str,
+    span_id: &str,
+    tenant_id: Option<&str>,
+    source_timestamp_ns: i64,
+) -> Result<(), String> {
+    let client = get_journal_client();
+
+    debug!(
+        "write_event called: run_id={}, event_type={}, trace_id={}",
+        run_id, event_type, trace_id
+    );
+
+    // Ensure connected
+    client.ensure_connected().await?;
+
+    // Build request
+    let request = WriteJournalEventRequest {
+        run_id: run_id.to_string(),
+        event_type: event_type.to_string(),
+        data: data.to_vec(),
+        trace_id: trace_id.to_string(),
+        span_id: span_id.to_string(),
+        tenant_id: tenant_id.unwrap_or_default().to_string(),
+        source_timestamp_ns,
+    };
+
+    // Send via gRPC
+    let mut client_guard = client.client.lock().await;
+    if let Some(ref mut grpc_client) = *client_guard {
+        match grpc_client.write_journal_event(request).await {
+            Ok(_response) => {
+                debug!(
+                    "write_event SUCCESS: run_id={}, event_type={}",
+                    run_id, event_type
+                );
+                Ok(())
+            }
+            Err(e) => {
+                error!(
+                    "write_event FAILED: {} for run_id={}, event_type={}",
+                    e, run_id, event_type
+                );
+                Err(format!("gRPC call failed: {}", e))
+            }
+        }
+    } else {
+        Err("Client not connected".to_string())
+    }
+}
+
 /// Export a log event to the journal for real-time SSE streaming.
 ///
 /// This is the entry point for worker code to export logs.

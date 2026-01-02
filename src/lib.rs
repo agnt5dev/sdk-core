@@ -53,7 +53,7 @@ pub use telemetry::{
 };
 pub use journal_exporter::{
     create_journal_log_data, create_journal_span_data, export_log_to_journal,
-    export_span_to_journal, get_journal_client, JournalClient, JournalExporterConfig,
+    export_span_to_journal, get_journal_client, write_event, JournalClient, JournalExporterConfig,
     JournalLogData, JournalSpanData, JournalSpanStatus,
 };
 pub use vectordb::{

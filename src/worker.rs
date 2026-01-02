@@ -293,6 +293,7 @@ impl Worker {
     /// * `content_index` - Index for parallel content blocks
     /// * `sequence` - Global sequence number for ordering
     /// * `metadata` - Additional metadata (tenant_id, deployment_id, etc.)
+    /// * `source_timestamp_ns` - Nanosecond timestamp when event was created at SDK
     pub fn queue_delta(
         &self,
         invocation_id: String,
@@ -301,6 +302,7 @@ impl Worker {
         content_index: i32,
         sequence: i64,
         metadata: HashMap<String, String>,
+        source_timestamp_ns: i64,
     ) -> Result<()> {
         let delta = DeltaMessage {
             invocation_id: invocation_id.clone(),
@@ -310,6 +312,7 @@ impl Worker {
             sequence,
             metadata,
             queued_at: std::time::Instant::now(),
+            source_timestamp_ns,
         };
 
         self.delta_queue.push(delta).map_err(|e| {
@@ -771,12 +774,12 @@ impl Worker {
 
                 // Flush all queued deltas
                 while let Some(delta) = delta_queue.pop() {
-                    // Convert delta to ExecuteComponentResponse
-                    let response = crate::pb::ExecuteComponentResponse {
+                    // Convert delta to DispatchComponentResponse
+                    let response = crate::pb::DispatchComponentResponse {
                         invocation_id: delta.invocation_id.clone(),
                         success: true,
                         result: Some(
-                            crate::pb::execute_component_response::Result::OutputData(
+                            crate::pb::dispatch_component_response::Result::OutputData(
                                 delta.output_data.clone(),
                             ),
                         ),
@@ -786,6 +789,7 @@ impl Worker {
                         content_index: delta.content_index,
                         sequence: delta.sequence,
                         attempt: 0,
+                        source_timestamp_ns: delta.source_timestamp_ns,
                     };
 
                     let service_message = ServiceMessage {

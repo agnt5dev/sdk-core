@@ -59,6 +59,10 @@ pub struct DeltaMessage {
 
     /// When delta was queued (for metrics)
     pub queued_at: Instant,
+
+    /// Source timestamp in nanoseconds when the event was created at the SDK
+    /// Used for correct logical ordering of events in the journal
+    pub source_timestamp_ns: i64,
 }
 
 /// Thread-safe delta queue with overflow protection
@@ -298,6 +302,7 @@ mod tests {
             sequence: seq,
             metadata: HashMap::new(),
             queued_at: Instant::now(),
+            source_timestamp_ns: 0, // Test value
         }
     }
 
