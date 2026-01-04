@@ -1,13 +1,11 @@
 // AGNT5 SDK Core - Simple, focused foundation for worker coordination
 
 pub mod adk;
-pub mod checkpoint;
 pub mod client;
-pub mod delta_queue;
-pub mod span_export_queue;
 pub mod context;
 pub mod error;
 pub mod journal_exporter;
+pub mod journal_queue;
 pub mod lm;
 pub mod logging;
 pub mod memory;
@@ -22,9 +20,7 @@ pub use adk::{
     AgentHandle, ContextHandle, DeterministicUtils, RuntimeControls, RuntimeServiceClient,
     SignalControls, TaskControls, TimerControls, ToolDefinition, ToolHandle, ToolRegistry,
 };
-pub use checkpoint::{CheckpointMessage, CheckpointQueue};
-pub use delta_queue::{DeltaMessage, DeltaQueue};
-pub use span_export_queue::{LogExportQueue, LogExportRequest, SpanExportQueue, SpanExportRequest};
+pub use journal_queue::{JournalEventMessage, JournalEventQueue, JournalQueueConfig, JournalQueueMetrics};
 pub use client::{CheckpointResult, WorkerCoordinatorClient};
 pub use context::{
     ContextConfig, CoreContext, FunctionCall, FunctionHandle, FunctionNamespace, FunctionRegistry,

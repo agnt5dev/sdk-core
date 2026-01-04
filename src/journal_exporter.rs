@@ -159,6 +159,10 @@ impl JournalClient {
             span_id: span_data.span_id.clone(),
             tenant_id: tenant_id.unwrap_or_default().to_string(),
             source_timestamp_ns: span_data.end_time_unix_nano,
+            // New fields for event pairing and hierarchy (not used for span exports)
+            correlation_id: String::new(),
+            parent_event_id: String::new(),
+            metadata: std::collections::HashMap::new(),
         };
 
         // Send via gRPC
@@ -248,6 +252,9 @@ pub struct JournalLogData {
 /// * `span_id` - Span ID for correlation
 /// * `tenant_id` - Optional tenant ID
 /// * `source_timestamp_ns` - Source timestamp in nanoseconds
+/// * `correlation_id` - Optional correlation ID for pairing start/complete events
+/// * `parent_event_id` - Optional parent event ID for hierarchy
+/// * `metadata` - Optional display-friendly metadata
 pub async fn write_event(
     run_id: &str,
     event_type: &str,
@@ -256,12 +263,15 @@ pub async fn write_event(
     span_id: &str,
     tenant_id: Option<&str>,
     source_timestamp_ns: i64,
+    correlation_id: Option<&str>,
+    parent_event_id: Option<&str>,
+    metadata: Option<std::collections::HashMap<String, String>>,
 ) -> Result<(), String> {
     let client = get_journal_client();
 
     debug!(
-        "write_event called: run_id={}, event_type={}, trace_id={}",
-        run_id, event_type, trace_id
+        "write_event called: run_id={}, event_type={}, trace_id={}, correlation_id={:?}",
+        run_id, event_type, trace_id, correlation_id
     );
 
     // Ensure connected
@@ -276,6 +286,9 @@ pub async fn write_event(
         span_id: span_id.to_string(),
         tenant_id: tenant_id.unwrap_or_default().to_string(),
         source_timestamp_ns,
+        correlation_id: correlation_id.unwrap_or_default().to_string(),
+        parent_event_id: parent_event_id.unwrap_or_default().to_string(),
+        metadata: metadata.unwrap_or_default(),
     };
 
     // Send via gRPC
@@ -340,6 +353,10 @@ pub async fn export_log_to_journal(
         span_id: log_data.span_id.clone(),
         tenant_id: tenant_id.unwrap_or_default().to_string(),
         source_timestamp_ns: log_data.timestamp_unix_nano,
+        // New fields for event pairing and hierarchy (not used for log exports)
+        correlation_id: String::new(),
+        parent_event_id: String::new(),
+        metadata: std::collections::HashMap::new(),
     };
 
     // Send via gRPC

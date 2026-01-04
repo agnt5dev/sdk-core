@@ -1,16 +1,10 @@
-use crate::checkpoint::{CheckpointMessage, CheckpointQueue};
 use crate::client::WorkerCoordinatorClient;
-use crate::delta_queue::{DeltaMessage, DeltaQueue};
 use crate::error::Result;
-use crate::journal_exporter::{
-    create_journal_log_data, create_journal_span_data, export_log_to_journal,
-    export_span_to_journal,
-};
+use crate::journal_queue::{JournalEventMessage, JournalEventQueue, JournalQueueConfig};
 use crate::pb::{
-    ComponentInfo, HealthCheck, RegisterService, RuntimeMessage, ServiceMessage, UnregisterService,
-    WorkerHealthStatus, WorkflowCheckpoint,
+    ComponentInfo, DispatchComponentResponse, HealthCheck, RegisterService, RuntimeMessage,
+    ServiceMessage, UnregisterService, WorkerHealthStatus,
 };
-use crate::span_export_queue::{LogExportQueue, SpanExportQueue};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -95,13 +89,11 @@ pub struct Worker {
     components: Vec<ComponentInfo>,
     metadata: HashMap<String, String>,
     connection_state: Arc<std::sync::Mutex<ConnectionState>>,
-    checkpoint_queue: CheckpointQueue,
-    delta_queue: DeltaQueue,
-    span_export_queue: SpanExportQueue,
-    log_export_queue: LogExportQueue,
+    /// Unified journal event queue (replaces checkpoint_queue, delta_queue, span_export_queue, log_export_queue)
+    journal_queue: JournalEventQueue,
 }
 
-// Implement Debug manually to avoid requiring Debug on CheckpointQueue's internals
+// Implement Debug manually to avoid requiring Debug on JournalEventQueue's internals
 impl std::fmt::Debug for Worker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Worker")
@@ -109,10 +101,7 @@ impl std::fmt::Debug for Worker {
             .field("components", &self.components)
             .field("metadata", &self.metadata)
             .field("connection_state", &self.connection_state)
-            .field("checkpoint_queue_size", &self.checkpoint_queue.len())
-            .field("delta_queue_size", &self.delta_queue.len())
-            .field("span_export_queue_size", &self.span_export_queue.len())
-            .field("log_export_queue_size", &self.log_export_queue.len())
+            .field("journal_queue_size", &self.journal_queue.len())
             .finish()
     }
 }
@@ -124,32 +113,12 @@ impl Worker {
         components: Vec<ComponentInfo>,
         metadata: HashMap<String, String>,
     ) -> Self {
-        // Get checkpoint buffer size from environment or use default
-        let checkpoint_buffer_size = std::env::var("AGNT5_CHECKPOINT_BUFFER_SIZE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1000);
-
-        // Get span/log export buffer sizes from environment or use defaults
-        let span_export_buffer_size = std::env::var("AGNT5_SPAN_EXPORT_BUFFER_SIZE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1000);
-
-        let log_export_buffer_size = std::env::var("AGNT5_LOG_EXPORT_BUFFER_SIZE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(5000);
-
-        // Get delta buffer size from environment or use default
-        let delta_buffer_size = std::env::var("AGNT5_DELTA_BUFFER_SIZE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1000);
+        // Create unified journal queue with config from environment
+        let journal_config = JournalQueueConfig::from_env();
 
         info!(
-            "Creating worker with buffer sizes: checkpoints={}, deltas={}, spans={}, logs={}",
-            checkpoint_buffer_size, delta_buffer_size, span_export_buffer_size, log_export_buffer_size
+            "Creating worker with unified journal queue: max_size={}, batch_size={}, flush_interval_ms={}",
+            journal_config.max_size, journal_config.batch_size, journal_config.flush_interval_ms
         );
 
         Self {
@@ -157,21 +126,13 @@ impl Worker {
             components,
             metadata,
             connection_state: Arc::new(std::sync::Mutex::new(ConnectionState::Disconnected)),
-            checkpoint_queue: CheckpointQueue::new(checkpoint_buffer_size),
-            delta_queue: DeltaQueue::new(delta_buffer_size),
-            span_export_queue: SpanExportQueue::new(span_export_buffer_size),
-            log_export_queue: LogExportQueue::new(log_export_buffer_size),
+            journal_queue: JournalEventQueue::new(journal_config),
         }
     }
 
-    /// Get a clone of the span export queue for use by language SDKs
-    pub fn span_export_queue(&self) -> SpanExportQueue {
-        self.span_export_queue.clone()
-    }
-
-    /// Get a clone of the log export queue for use by language SDKs
-    pub fn log_export_queue(&self) -> LogExportQueue {
-        self.log_export_queue.clone()
+    /// Get a clone of the journal event queue for use by language SDKs
+    pub fn journal_queue(&self) -> JournalEventQueue {
+        self.journal_queue.clone()
     }
 
     /// Set components for the worker
@@ -204,21 +165,26 @@ impl Worker {
         *guard = state;
     }
 
-    /// Queue a workflow checkpoint for progressive durability
+    /// Queue a journal event for delivery to the platform
     ///
-    /// This is called from language SDKs via FFI during workflow execution to send
-    /// checkpoints (state changes, step completions) to the platform in real-time.
-    ///
-    /// Checkpoints are buffered and sent via gRPC when the stream is active.
+    /// This is the unified method for queueing all event types. Events are classified as:
+    /// - Boundary events: Persisted to journal_events table (workflow.*, agent.*, lm.call.*, etc.)
+    /// - SSE-only events: Forwarded to SSE stream but NOT persisted (output.delta, log, etc.)
     ///
     /// # Arguments
     ///
-    /// * `invocation_id` - Workflow run ID
-    /// * `checkpoint_type` - Event type ("workflow.state.changed", "workflow.step.started", etc.)
-    /// * `checkpoint_data` - JSON payload as bytes
-    /// * `sequence_number` - Monotonic sequence for ordering
-    /// * `metadata` - Additional metadata (tenant_id, deployment_id, etc.)
-    /// * `source_timestamp_ns` - Nanosecond timestamp when event was created (for correct logical ordering)
+    /// * `event` - The journal event message to queue
+    pub fn queue_event(&self, event: JournalEventMessage) -> Result<()> {
+        self.journal_queue.push(event).map_err(|e| {
+            crate::error::SdkError::Internal(format!("Failed to queue journal event: {}", e))
+        })?;
+        Ok(())
+    }
+
+    /// Queue a workflow checkpoint for progressive durability (legacy API)
+    ///
+    /// This method wraps the unified queue_event for backward compatibility.
+    /// Use queue_event directly for new code.
     pub fn queue_checkpoint(
         &self,
         invocation_id: String,
@@ -227,73 +193,46 @@ impl Worker {
         sequence_number: i64,
         metadata: HashMap<String, String>,
         source_timestamp_ns: i64,
+        correlation_id: String,
+        parent_event_id: String,
     ) -> Result<()> {
-        let checkpoint = CheckpointMessage {
-            invocation_id: invocation_id.clone(),
-            checkpoint_type: checkpoint_type.clone(),
-            checkpoint_data,
-            sequence_number,
+        let event = JournalEventMessage {
+            run_id: invocation_id,
+            event_type: checkpoint_type,
+            data: checkpoint_data,
+            sequence: sequence_number,
             metadata,
             source_timestamp_ns,
+            correlation_id,
+            parent_event_id,
+            is_sse_only: false, // Checkpoints are boundary events (persisted)
             queued_at: std::time::Instant::now(),
+            ..Default::default()
         };
 
-        self.checkpoint_queue.push(checkpoint).map_err(|e| {
-            crate::error::SdkError::Internal(format!("Failed to queue checkpoint: {}", e))
-        })?;
-
-        Ok(())
+        self.queue_event(event)
     }
 
-    /// Get checkpoint queue metrics
+    /// Get journal queue metrics
     ///
     /// Returns (queued, sent, dropped, errors)
-    pub fn checkpoint_metrics(&self) -> (u64, u64, u64, u64) {
-        self.checkpoint_queue.get_metrics()
+    pub fn journal_metrics(&self) -> (u64, u64, u64, u64) {
+        self.journal_queue.get_metrics()
     }
 
-    /// Drain all buffered checkpoints for synchronous flushing
+    /// Drain all buffered events for synchronous flushing
     ///
-    /// This method removes and returns all queued checkpoints.
+    /// This method removes and returns all queued events.
     /// Used before sending workflow completion response to ensure
-    /// checkpoints arrive before run.completed event.
-    ///
-    /// # Returns
-    ///
-    /// Vector of (invocation_id, checkpoint_type, checkpoint_data, sequence_number, metadata) tuples
-    pub fn drain_checkpoints(&self) -> Vec<(String, String, Vec<u8>, i64, HashMap<String, String>)> {
-        let checkpoints = self.checkpoint_queue.drain_all();
-
-        checkpoints
-            .into_iter()
-            .map(|cp| {
-                (
-                    cp.invocation_id,
-                    cp.checkpoint_type,
-                    cp.checkpoint_data,
-                    cp.sequence_number,
-                    cp.metadata,
-                )
-            })
-            .collect()
+    /// events arrive before run.completed event.
+    pub fn drain_events(&self) -> Vec<JournalEventMessage> {
+        self.journal_queue.drain_all()
     }
 
-    /// Queue a streaming delta for real-time delivery to clients
+    /// Queue a streaming delta for real-time delivery to clients (legacy API)
     ///
-    /// This is called from language SDKs via FFI during streaming function execution
-    /// to send output chunks (deltas) to the coordinator in real-time.
-    ///
-    /// Deltas are buffered and sent via gRPC with a low-latency flush interval (10ms default).
-    ///
-    /// # Arguments
-    ///
-    /// * `invocation_id` - Function run ID
-    /// * `event_type` - Event type ("output.start", "output.delta", "output.stop", "run.completed", etc.)
-    /// * `output_data` - JSON payload as bytes
-    /// * `content_index` - Index for parallel content blocks
-    /// * `sequence` - Global sequence number for ordering
-    /// * `metadata` - Additional metadata (tenant_id, deployment_id, etc.)
-    /// * `source_timestamp_ns` - Nanosecond timestamp when event was created at SDK
+    /// This method wraps the unified queue_event for backward compatibility.
+    /// Use queue_event directly for new code.
     pub fn queue_delta(
         &self,
         invocation_id: String,
@@ -303,30 +242,27 @@ impl Worker {
         sequence: i64,
         metadata: HashMap<String, String>,
         source_timestamp_ns: i64,
+        correlation_id: String,
+        parent_event_id: String,
     ) -> Result<()> {
-        let delta = DeltaMessage {
-            invocation_id: invocation_id.clone(),
-            event_type: event_type.clone(),
-            output_data,
+        let is_sse_only = JournalEventMessage::is_sse_only_event_type(&event_type);
+
+        let event = JournalEventMessage {
+            run_id: invocation_id,
+            event_type,
+            data: output_data,
             content_index,
             sequence,
             metadata,
-            queued_at: std::time::Instant::now(),
             source_timestamp_ns,
+            correlation_id,
+            parent_event_id,
+            is_sse_only,
+            queued_at: std::time::Instant::now(),
+            ..Default::default()
         };
 
-        self.delta_queue.push(delta).map_err(|e| {
-            crate::error::SdkError::Internal(format!("Failed to queue delta: {}", e))
-        })?;
-
-        Ok(())
-    }
-
-    /// Get delta queue metrics
-    ///
-    /// Returns (queued, sent, dropped, errors)
-    pub fn delta_metrics(&self) -> (u64, u64, u64, u64) {
-        self.delta_queue.get_metrics()
+        self.queue_event(event)
     }
 
     /// Run the worker with a message handler
@@ -485,15 +421,8 @@ impl Worker {
         // Start heartbeat task
         let heartbeat_task = self.spawn_heartbeat_task(tx.clone());
 
-        // Start checkpoint flushing task
-        let checkpoint_task = self.spawn_checkpoint_flush_task(tx.clone());
-
-        // Start delta flushing task for real-time streaming
-        let delta_task = self.spawn_delta_flush_task(tx.clone());
-
-        // Start span and log export flush tasks for real-time SSE streaming
-        let span_export_task = self.spawn_span_export_flush_task();
-        let log_export_task = self.spawn_log_export_flush_task();
+        // Start unified journal event flush task (replaces checkpoint, delta, span, log flush tasks)
+        let journal_flush_task = self.spawn_journal_flush_task(tx.clone());
 
         // Get concurrency configuration
         let max_concurrency = std::env::var("AGNT5_MAX_CONCURRENCY")
@@ -618,9 +547,7 @@ impl Worker {
         // Send shutdown message and stop background tasks
         let _ = self.send_shutdown_message(&tx).await;
         heartbeat_task.abort();
-        checkpoint_task.abort();
-        span_export_task.abort();
-        log_export_task.abort();
+        journal_flush_task.abort();
 
         dispatch_result
     }
@@ -668,128 +595,73 @@ impl Worker {
         })
     }
 
-    /// Spawn checkpoint flushing task for progressive workflow durability
+    /// Spawn unified journal event flush task
     ///
-    /// This task periodically flushes buffered checkpoints to the coordinator via gRPC stream.
-    /// Checkpoints are sent immediately when queued if the queue was previously empty,
-    /// otherwise they're batched and sent periodically.
-    fn spawn_checkpoint_flush_task(
+    /// This task periodically flushes all buffered events to the coordinator via gRPC stream.
+    /// It handles both:
+    /// - Boundary events (workflow.*, agent.*, lm.call.*): Sent as DispatchComponentResponse for persistence
+    /// - SSE-only events (output.delta, log, etc.): Sent as DispatchComponentResponse for SSE forwarding only
+    ///
+    /// The coordinator will persist boundary events and forward SSE-only events to the stream.
+    fn spawn_journal_flush_task(
         &self,
         tx: flume::Sender<ServiceMessage>,
     ) -> tokio::task::JoinHandle<()> {
         let worker_id = self.config.worker_id.clone();
-        let checkpoint_queue = self.checkpoint_queue.clone();
-
-        // Get flush interval from environment or use default (100ms for low latency)
-        let flush_interval_ms = std::env::var("AGNT5_CHECKPOINT_FLUSH_INTERVAL_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(100); // Default 100ms for low-latency checkpoint streaming
-
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(
-                std::time::Duration::from_millis(flush_interval_ms)
-            );
-
-            loop {
-                interval.tick().await;
-
-                // Flush all queued checkpoints
-                let mut sent_count = 0;
-                while let Some(checkpoint) = checkpoint_queue.pop() {
-                    let workflow_checkpoint = WorkflowCheckpoint {
-                        invocation_id: checkpoint.invocation_id.clone(),
-                        checkpoint_type: checkpoint.checkpoint_type.clone(),
-                        checkpoint_data: checkpoint.checkpoint_data.clone(),
-                        sequence_number: checkpoint.sequence_number,
-                        metadata: checkpoint.metadata.clone(),
-                        source_timestamp_ns: checkpoint.source_timestamp_ns,
-                    };
-
-                    let service_message = ServiceMessage {
-                        worker_id: worker_id.clone(),
-                        metadata: std::collections::HashMap::new(),
-                        message_type: Some(
-                            crate::pb::service_message::MessageType::WorkflowCheckpoint(
-                                workflow_checkpoint,
-                            ),
-                        ),
-                    };
-
-                    // Send checkpoint - if it fails, re-queue and exit
-                    if let Err(e) = tx.send_async(service_message).await {
-                        warn!(
-                            "Failed to send checkpoint, re-queuing: type={} seq={} error={}",
-                            checkpoint.checkpoint_type, checkpoint.sequence_number, e
-                        );
-
-                        // Re-queue at front to preserve order
-                        if let Err(e) = checkpoint_queue.push_front(checkpoint) {
-                            error!("Failed to re-queue checkpoint: {}", e);
-                        }
-
-                        checkpoint_queue.record_error();
-                        break; // Channel closed, exit task
-                    }
-
-                    checkpoint_queue.record_sent();
-                    sent_count += 1;
-                }
-
-                if sent_count > 0 {
-                    info!(
-                        "Flushed {} checkpoints to coordinator (queue_size={})",
-                        sent_count,
-                        checkpoint_queue.len()
-                    );
-                }
-            }
-        })
-    }
-
-    /// Spawn delta flush task for real-time streaming
-    ///
-    /// This task periodically flushes buffered streaming deltas to the coordinator via gRPC stream.
-    /// Deltas are sent immediately when queued with a low-latency flush interval (10ms default)
-    /// to enable real-time SSE streaming to clients.
-    fn spawn_delta_flush_task(
-        &self,
-        tx: flume::Sender<ServiceMessage>,
-    ) -> tokio::task::JoinHandle<()> {
-        let worker_id = self.config.worker_id.clone();
-        let delta_queue = self.delta_queue.clone();
-
-        // Get flush interval from environment or use default (10ms for ultra-low latency)
-        let flush_interval_ms = std::env::var("AGNT5_DELTA_FLUSH_INTERVAL_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(10); // Default 10ms for real-time streaming
+        let journal_queue = self.journal_queue.clone();
+        let flush_interval_ms = journal_queue.flush_interval_ms();
+        let batch_size = journal_queue.batch_size();
 
         tokio::spawn(async move {
             let mut interval =
-                tokio::time::interval(std::time::Duration::from_millis(flush_interval_ms));
+                tokio::time::interval(Duration::from_millis(flush_interval_ms));
 
             loop {
                 interval.tick().await;
 
-                // Flush all queued deltas
-                while let Some(delta) = delta_queue.pop() {
-                    // Convert delta to DispatchComponentResponse
-                    let response = crate::pb::DispatchComponentResponse {
-                        invocation_id: delta.invocation_id.clone(),
+                // Drain batch of events
+                let batch = journal_queue.drain_batch(batch_size);
+                if batch.is_empty() {
+                    continue;
+                }
+
+                let mut sent_count = 0;
+                let mut sse_only_count = 0;
+
+                for event in batch {
+                    // Track SSE-only events for metrics
+                    if event.is_sse_only {
+                        sse_only_count += 1;
+                    }
+
+                    // Build metadata with correlation_id and parent_event_id
+                    let mut metadata = event.metadata.clone();
+                    if !event.correlation_id.is_empty() {
+                        metadata.insert("correlation_id".to_string(), event.correlation_id.clone());
+                    }
+                    if !event.parent_event_id.is_empty() {
+                        metadata.insert("parent_event_id".to_string(), event.parent_event_id.clone());
+                    }
+
+                    // Send as DispatchComponentResponse for now (existing proto)
+                    // The coordinator will:
+                    // - Persist boundary events to journal_events table
+                    // - Forward SSE-only events to SSE stream without persistence
+                    let response = DispatchComponentResponse {
+                        invocation_id: event.run_id.clone(),
                         success: true,
                         result: Some(
                             crate::pb::dispatch_component_response::Result::OutputData(
-                                delta.output_data.clone(),
+                                event.data.clone(),
                             ),
                         ),
                         error_message: String::new(),
-                        metadata: delta.metadata.clone(),
-                        event_type: delta.event_type.clone(),
-                        content_index: delta.content_index,
-                        sequence: delta.sequence,
+                        metadata,
+                        event_type: event.event_type.clone(),
+                        content_index: event.content_index,
+                        sequence: event.sequence,
                         attempt: 0,
-                        source_timestamp_ns: delta.source_timestamp_ns,
+                        source_timestamp_ns: event.source_timestamp_ns,
                     };
 
                     let service_message = ServiceMessage {
@@ -800,170 +672,33 @@ impl Worker {
                         ),
                     };
 
-                    // Send delta - if it fails, re-queue and exit
+                    // Send event - if it fails, re-queue and exit
                     if let Err(e) = tx.send_async(service_message).await {
                         warn!(
-                            "Failed to send delta, re-queuing: type={} seq={} error={}",
-                            delta.event_type, delta.sequence, e
+                            "Failed to send journal event, re-queuing: type={} run_id={} error={}",
+                            event.event_type, event.run_id, e
                         );
 
                         // Re-queue at front to preserve order
-                        if let Err(e) = delta_queue.push_front(delta) {
-                            error!("Failed to re-queue delta: {}", e);
+                        if let Err(e) = journal_queue.push_front(event) {
+                            error!("Failed to re-queue journal event: {}", e);
                         }
 
-                        delta_queue.record_error();
+                        journal_queue.record_error();
                         break; // Channel closed, exit task
                     }
 
-                    delta_queue.record_sent();
-                }
-            }
-        })
-    }
-
-    /// Spawn span export flush task for real-time SSE streaming
-    ///
-    /// This task periodically flushes buffered span export requests to the journal via gRPC.
-    /// Spans are exported directly to enable real-time visibility in SSE streams.
-    fn spawn_span_export_flush_task(&self) -> tokio::task::JoinHandle<()> {
-        let span_queue = self.span_export_queue.clone();
-
-        // Get flush interval from environment or use default (50ms for low latency)
-        let flush_interval_ms = std::env::var("AGNT5_SPAN_EXPORT_FLUSH_INTERVAL_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(50); // Default 50ms for low-latency span streaming
-
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(flush_interval_ms));
-
-            loop {
-                interval.tick().await;
-
-                // Flush all queued span exports
-                let mut sent_count = 0;
-                while let Some(request) = span_queue.pop() {
-                    // Convert attributes from HashMap to serde_json::Value
-                    let attributes_json = request.attributes.map(|attrs| {
-                        serde_json::Value::Object(
-                            attrs
-                                .into_iter()
-                                .map(|(k, v)| (k, serde_json::Value::String(v)))
-                                .collect(),
-                        )
-                    });
-
-                    // Convert request to JournalSpanData
-                    let span_data = create_journal_span_data(
-                        &request.trace_id,
-                        &request.span_id,
-                        request.parent_span_id.as_deref(),
-                        &request.name,
-                        &request.kind,
-                        request.start_time_ns,
-                        request.end_time_ns,
-                        &request.status_code,
-                        request.status_description.as_deref(),
-                        attributes_json,
-                    );
-
-                    // Export to journal
-                    if let Err(e) = export_span_to_journal(
-                        &request.run_id,
-                        &span_data,
-                        request.tenant_id.as_deref(),
-                    )
-                    .await
-                    {
-                        warn!(
-                            "Failed to export span to journal: {} (run_id={}, span={})",
-                            e, request.run_id, request.name
-                        );
-                        span_queue.record_error();
-                    } else {
-                        span_queue.record_sent();
-                        sent_count += 1;
-                    }
+                    sent_count += 1;
                 }
 
                 if sent_count > 0 {
+                    journal_queue.record_sent_batch(sent_count, sse_only_count);
                     debug!(
-                        "Flushed {} spans to journal (queue_size={})",
+                        "Flushed {} journal events to coordinator (boundary={}, sse_only={}, queue_size={})",
                         sent_count,
-                        span_queue.len()
-                    );
-                }
-            }
-        })
-    }
-
-    /// Spawn log export flush task for real-time SSE streaming
-    ///
-    /// This task periodically flushes buffered log export requests to the journal via gRPC.
-    /// Logs are exported directly to enable real-time visibility in SSE streams.
-    fn spawn_log_export_flush_task(&self) -> tokio::task::JoinHandle<()> {
-        let log_queue = self.log_export_queue.clone();
-
-        // Get flush interval from environment or use default (50ms for low latency)
-        let flush_interval_ms = std::env::var("AGNT5_LOG_EXPORT_FLUSH_INTERVAL_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(50); // Default 50ms for low-latency log streaming
-
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(flush_interval_ms));
-
-            loop {
-                interval.tick().await;
-
-                // Flush all queued log exports
-                let mut sent_count = 0;
-                while let Some(request) = log_queue.pop() {
-                    // Convert attributes from HashMap to serde_json::Value
-                    let attributes_json = request.attributes.map(|attrs| {
-                        serde_json::Value::Object(
-                            attrs
-                                .into_iter()
-                                .map(|(k, v)| (k, serde_json::Value::String(v)))
-                                .collect(),
-                        )
-                    });
-
-                    // Convert request to JournalLogData
-                    let log_data = create_journal_log_data(
-                        request.timestamp_ns,
-                        &request.severity,
-                        &request.body,
-                        &request.trace_id,
-                        &request.span_id,
-                        attributes_json,
-                    );
-
-                    // Export to journal
-                    if let Err(e) = export_log_to_journal(
-                        &request.run_id,
-                        &log_data,
-                        request.tenant_id.as_deref(),
-                    )
-                    .await
-                    {
-                        warn!(
-                            "Failed to export log to journal: {} (run_id={}, severity={})",
-                            e, request.run_id, request.severity
-                        );
-                        log_queue.record_error();
-                    } else {
-                        log_queue.record_sent();
-                        sent_count += 1;
-                    }
-                }
-
-                if sent_count > 0 {
-                    debug!(
-                        "Flushed {} logs to journal (queue_size={})",
-                        sent_count,
-                        log_queue.len()
+                        sent_count - sse_only_count,
+                        sse_only_count,
+                        journal_queue.len()
                     );
                 }
             }
