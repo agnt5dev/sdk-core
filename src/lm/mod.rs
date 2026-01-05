@@ -14,6 +14,7 @@ mod openai_common;
 mod openrouter;
 mod telemetry;
 mod xai;
+mod huggingface;
 
 pub use anthropic::{AnthropicConfig, AnthropicProvider};
 pub use azure::{AzureOpenAiConfig, AzureOpenAiProvider};
@@ -36,3 +37,4 @@ pub use openai::{OpenAiConfig, OpenAiProvider};
 pub use openai_chat::{OpenAiChatConfig, OpenAiChatProvider};
 pub use openrouter::{OpenRouterConfig, OpenRouterProvider};
 pub use xai::{XaiConfig, XaiProvider};
+pub use huggingface::{HuggingFaceConfig, HuggingFaceProvider};
