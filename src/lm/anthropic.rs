@@ -334,6 +334,7 @@ fn build_stream(
         let mut decoder = SseDecoder::default();
         let mut aggregate = String::new();
         let mut partial = PartialResponse::default();
+        let mut tool_calls: Vec<super::interface::ToolCall> = Vec::new();
         // Track current content block for proper typing of deltas
         let mut current_block_index: u32 = 0;
         let mut current_block_type = ContentBlockType::Text;
@@ -349,7 +350,7 @@ fn build_stream(
                 if trimmed == "[DONE]" {
                     let response = partial
                         .clone()
-                        .into_generate_response(aggregate.clone(), response_format.clone())?;
+                        .into_generate_response(aggregate.clone(), tool_calls.clone(), response_format.clone())?;
                     yield StreamChunk::Completed(response);
                     return;
                 }
@@ -372,6 +373,18 @@ fn build_stream(
                             index,
                             block_type: current_block_type,
                         };
+
+                        // Extract tool_use blocks and accumulate tool calls
+                        if content_block.block_type == "tool_use" {
+                            if let (Some(id), Some(name)) = (&content_block.id, &content_block.name) {
+                                let input = content_block.input.clone().unwrap_or_else(|| json!({}));
+                                tool_calls.push(super::interface::ToolCall {
+                                    id: id.clone(),
+                                    name: name.clone(),
+                                    arguments: input.to_string(),
+                                });
+                            }
+                        }
 
                         // Handle initial content (if any)
                         if let Some(initial) = content_block.initial_content() {
@@ -440,7 +453,7 @@ fn build_stream(
                     StreamEvent::MessageStop => {
                         let response = partial
                             .clone()
-                            .into_generate_response(aggregate.clone(), response_format.clone())?;
+                            .into_generate_response(aggregate.clone(), tool_calls.clone(), response_format.clone())?;
                         yield StreamChunk::Completed(response);
                         return;
                     }
@@ -656,6 +669,7 @@ impl MessagesResponse {
         } = self;
 
         let mut text_parts = Vec::new();
+        let mut tool_calls = Vec::new();
 
         for block in content {
             match block.block_type.as_str() {
@@ -664,7 +678,18 @@ impl MessagesResponse {
                         text_parts.push(text.clone());
                     }
                 }
-                "tool_use" => {}
+                "tool_use" => {
+                    // Extract tool call information from tool_use block
+                    if let (Some(id), Some(name), Some(input)) =
+                        (&block.id, &block.name, &block.input)
+                    {
+                        tool_calls.push(super::interface::ToolCall {
+                            id: id.clone(),
+                            name: name.clone(),
+                            arguments: input.to_string(),
+                        });
+                    }
+                }
                 _ => {}
             }
         }
@@ -684,7 +709,11 @@ impl MessagesResponse {
             text,
             usage: usage_from_api(usage),
             finish_reason: stop_reason,
-            tool_calls: None,  // Anthropic tool calls handled separately
+            tool_calls: if tool_calls.is_empty() {
+                None
+            } else {
+                Some(tool_calls)
+            },
             object,
             raw: Some(raw),
         })
@@ -974,6 +1003,7 @@ impl PartialResponse {
     fn into_generate_response(
         self,
         text: String,
+        tool_calls: Vec<super::interface::ToolCall>,
         response_format: ResponseFormat,
     ) -> SdkResult<GenerateResponse> {
         let usage = usage_from_api(self.usage.clone());
@@ -990,7 +1020,11 @@ impl PartialResponse {
             text,
             usage,
             finish_reason: self.stop_reason,
-            tool_calls: None,  // Anthropic streaming tool calls handled separately
+            tool_calls: if tool_calls.is_empty() {
+                None
+            } else {
+                Some(tool_calls)
+            },
             object,
             raw: None,
         })
