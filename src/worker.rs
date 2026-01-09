@@ -634,13 +634,25 @@ impl Worker {
                         sse_only_count += 1;
                     }
 
-                    // Build metadata with correlation_id and parent_event_id
+                    // Build metadata with correlation_id, parent_event_id, tenant_id, and deployment_id
                     let mut metadata = event.metadata.clone();
                     if !event.correlation_id.is_empty() {
                         metadata.insert("correlation_id".to_string(), event.correlation_id.clone());
                     }
                     if !event.parent_event_id.is_empty() {
                         metadata.insert("parent_event_id".to_string(), event.parent_event_id.clone());
+                    }
+
+                    // Include tenant_id and deployment_id from environment variables if present
+                    if let Ok(tenant_id) = std::env::var("AGNT5_TENANT_ID") {
+                        if !tenant_id.is_empty() {
+                            metadata.insert("tenant_id".to_string(), tenant_id);
+                        }
+                    }
+                    if let Ok(deployment_id) = std::env::var("AGNT5_DEPLOYMENT_ID") {
+                        if !deployment_id.is_empty() {
+                            metadata.insert("deployment_id".to_string(), deployment_id);
+                        }
                     }
 
                     // Send as DispatchComponentResponse for now (existing proto)
