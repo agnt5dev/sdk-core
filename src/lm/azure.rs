@@ -16,7 +16,7 @@ use super::openai_common::{
 };
 
 const DEFAULT_API_VERSION: &str = "2024-02-01";
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600); // 10 minutes to match official OpenAI SDK (Azure uses OpenAI API)
 const MODEL_PREFIX: &str = "azure";
 
 #[derive(Clone, Debug)]
@@ -186,7 +186,7 @@ impl LanguageModel for AzureOpenAiProvider {
             })?;
 
         let response = ensure_success(response).await?;
-        stream_handle_from_response(response, request.config.response_format.clone())
+        stream_handle_from_response(response, request.config.response_format.clone(), self.config.timeout.as_secs())
     }
 }
 

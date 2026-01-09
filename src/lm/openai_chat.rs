@@ -19,7 +19,7 @@ use super::telemetry;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_CHAT_PATH: &str = "chat/completions";
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600); // 10 minutes to match official OpenAI SDK
 const DEFAULT_MODEL_PREFIX: &str = "openai_chat";
 
 /// Configuration for OpenAI-compatible chat completion endpoints.
@@ -227,6 +227,32 @@ impl OpenAiChatProvider {
     }
 }
 
+/// Format reqwest errors with clear, actionable messages
+fn format_reqwest_error(err: &reqwest::Error, context: &str, timeout_secs: u64) -> SdkError {
+    if err.is_timeout() {
+        SdkError::Other(anyhow!(
+            "{} timed out after {} seconds. \
+            To increase, set OPENAI_REQUEST_TIMEOUT_SECS (e.g., OPENAI_REQUEST_TIMEOUT_SECS=1200)",
+            context,
+            timeout_secs
+        ))
+    } else if err.is_connect() {
+        SdkError::Other(anyhow!(
+            "{} failed: Unable to connect to OpenAI API. Check your network connection. Error: {}",
+            context,
+            err
+        ))
+    } else if err.is_decode() {
+        SdkError::Other(anyhow!(
+            "{} failed: Unable to decode response. The response may be malformed. Error: {}",
+            context,
+            err
+        ))
+    } else {
+        SdkError::Other(anyhow!("{} failed: {}", context, err))
+    }
+}
+
 #[async_trait]
 impl LanguageModel for OpenAiChatProvider {
     async fn generate(&self, request: GenerateRequest) -> SdkResult<GenerateResponse> {
@@ -274,14 +300,14 @@ impl LanguageModel for OpenAiChatProvider {
                 .json(&payload)
                 .send()
                 .await
-                .map_err(|err| SdkError::Other(anyhow!("OpenAI request failed: {err}")))?;
+                .map_err(|err| format_reqwest_error(&err, "OpenAI Chat Completions API request", self.config.timeout.as_secs()))?;
 
             let response = ensure_success(response).await?;
 
             let parsed: ChatCompletionResponse = response
                 .json()
                 .await
-                .map_err(|err| SdkError::Other(anyhow!("failed to parse OpenAI response: {err}")))?;
+                .map_err(|err| format_reqwest_error(&err, "OpenAI Chat Completions API response parsing", self.config.timeout.as_secs()))?;
 
             parsed.into_generate_response(request.config.response_format.clone())
         }
@@ -373,10 +399,10 @@ impl LanguageModel for OpenAiChatProvider {
                 .json(&payload)
                 .send()
                 .await
-                .map_err(|err| SdkError::Other(anyhow!("OpenAI streaming request failed: {err}")))?;
+                .map_err(|err| format_reqwest_error(&err, "OpenAI Chat Completions API streaming request", self.config.timeout.as_secs()))?;
 
             let response = ensure_success(response).await?;
-            stream_handle_from_response(response, request.config.response_format.clone())
+            stream_handle_from_response(response, request.config.response_format.clone(), self.config.timeout.as_secs())
         }
         .await;
 
