@@ -533,17 +533,40 @@ fn delimiter_length(remaining: &str) -> usize {
     }
 }
 
+/// Format reqwest errors with clear, actionable messages for OpenAI-compatible APIs
+fn format_streaming_error(err: &reqwest::Error, timeout_secs: u64) -> SdkError {
+    if err.is_timeout() {
+        SdkError::Other(anyhow!(
+            "OpenAI API streaming timed out after {} seconds. \
+            To increase, set OPENAI_REQUEST_TIMEOUT_SECS (e.g., OPENAI_REQUEST_TIMEOUT_SECS=1200)",
+            timeout_secs
+        ))
+    } else if err.is_connect() {
+        SdkError::Other(anyhow!(
+            "OpenAI API streaming failed: Unable to connect. Check your network connection. Error: {}", err
+        ))
+    } else if err.is_decode() {
+        SdkError::Other(anyhow!(
+            "OpenAI API streaming failed: Unable to decode response. The response may be malformed. Error: {}", err
+        ))
+    } else {
+        SdkError::Other(anyhow!("OpenAI API streaming failed: {}", err))
+    }
+}
+
 pub(crate) fn stream_handle_from_response(
     response: Response,
     response_format: ResponseFormat,
+    timeout_secs: u64,
 ) -> SdkResult<StreamHandle> {
-    let stream = build_stream(response, response_format)?;
+    let stream = build_stream(response, response_format, timeout_secs)?;
     Ok(StreamHandle::new(stream))
 }
 
 fn build_stream(
     response: Response,
     response_format: ResponseFormat,
+    timeout_secs: u64,
 ) -> SdkResult<Pin<Box<dyn Stream<Item = SdkResult<StreamChunk>> + Send>>> {
     let bytes_stream = response.bytes_stream();
 
@@ -555,7 +578,7 @@ fn build_stream(
         let mut content_block_started = false;
 
         while let Some(chunk) = bytes_stream.next().await {
-            let chunk = chunk.map_err(|err| SdkError::Other(anyhow!("error reading streaming chunk: {err}")))?;
+            let chunk = chunk.map_err(|err| format_streaming_error(&err, timeout_secs))?;
             for event in decoder.ingest(chunk.as_ref())? {
                 let data = event.trim();
                 if data.is_empty() {

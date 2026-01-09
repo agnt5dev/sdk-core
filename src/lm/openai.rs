@@ -23,7 +23,7 @@ use super::telemetry;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_RESPONSES_PATH: &str = "responses";
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600); // 10 minutes to match official OpenAI SDK
 const DEFAULT_MODEL_PREFIX: &str = "openai";
 
 /// Configuration for OpenAI Responses API.
@@ -793,6 +793,7 @@ impl StreamingState {
 fn build_responses_stream(
     response: reqwest::Response,
     response_format: ResponseFormat,
+    timeout_secs: u64,
 ) -> SdkResult<Pin<Box<dyn Stream<Item = SdkResult<StreamChunk>> + Send>>> {
     let bytes_stream = response.bytes_stream();
 
@@ -802,7 +803,7 @@ fn build_responses_stream(
         let mut state = StreamingState::default();
 
         while let Some(chunk) = bytes_stream.next().await {
-            let chunk = chunk.map_err(|err| SdkError::Other(anyhow!("error reading streaming chunk: {err}")))?;
+            let chunk = chunk.map_err(|err| format_reqwest_error(&err, "OpenAI Responses API streaming", timeout_secs))?;
 
             for (event_type, data) in decoder.ingest(chunk.as_ref())? {
                 if data.is_empty() {
@@ -923,9 +924,40 @@ fn build_responses_stream(
 fn responses_stream_handle(
     response: reqwest::Response,
     response_format: ResponseFormat,
+    timeout_secs: u64,
 ) -> SdkResult<StreamHandle> {
-    let stream = build_responses_stream(response, response_format)?;
+    let stream = build_responses_stream(response, response_format, timeout_secs)?;
     Ok(StreamHandle::new(stream))
+}
+
+// ============================================================================
+// Error Handling Helpers
+// ============================================================================
+
+/// Format reqwest errors with clear, actionable messages
+fn format_reqwest_error(err: &reqwest::Error, context: &str, timeout_secs: u64) -> SdkError {
+    if err.is_timeout() {
+        SdkError::Other(anyhow!(
+            "{} timed out after {} seconds. \
+            To increase, set OPENAI_REQUEST_TIMEOUT_SECS (e.g., OPENAI_REQUEST_TIMEOUT_SECS=1200)",
+            context,
+            timeout_secs
+        ))
+    } else if err.is_connect() {
+        SdkError::Other(anyhow!(
+            "{} failed: Unable to connect to OpenAI API. Check your network connection. Error: {}",
+            context,
+            err
+        ))
+    } else if err.is_decode() {
+        SdkError::Other(anyhow!(
+            "{} failed: Unable to decode response. The response may be malformed. Error: {}",
+            context,
+            err
+        ))
+    } else {
+        SdkError::Other(anyhow!("{} failed: {}", context, err))
+    }
 }
 
 // ============================================================================
@@ -1014,7 +1046,7 @@ impl LanguageModel for OpenAiProvider {
                 .json(&payload)
                 .send()
                 .await
-                .map_err(|err| SdkError::Other(anyhow!("OpenAI Responses request failed: {err}")))?;
+                .map_err(|err| format_reqwest_error(&err, "OpenAI Responses API request", self.config.timeout.as_secs()))?;
 
             let response = ensure_success(response).await?;
 
@@ -1022,7 +1054,7 @@ impl LanguageModel for OpenAiProvider {
             let response_text = response
                 .text()
                 .await
-                .map_err(|err| SdkError::Other(anyhow!("failed to read OpenAI Responses response body: {err}")))?;
+                .map_err(|err| format_reqwest_error(&err, "OpenAI Responses API response body read", self.config.timeout.as_secs()))?;
 
             tracing::debug!("OpenAI Responses API raw response: {}", response_text);
 
@@ -1127,12 +1159,10 @@ impl LanguageModel for OpenAiProvider {
                 .json(&payload)
                 .send()
                 .await
-                .map_err(|err| {
-                    SdkError::Other(anyhow!("OpenAI Responses streaming request failed: {err}"))
-                })?;
+                .map_err(|err| format_reqwest_error(&err, "OpenAI Responses API streaming request", self.config.timeout.as_secs()))?;
 
             let response = ensure_success(response).await?;
-            responses_stream_handle(response, request.config.response_format.clone())
+            responses_stream_handle(response, request.config.response_format.clone(), self.config.timeout.as_secs())
         }
         .await;
 
