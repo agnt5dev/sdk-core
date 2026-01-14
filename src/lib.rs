@@ -4,6 +4,7 @@ pub mod adk;
 pub mod client;
 pub mod context;
 pub mod error;
+pub mod graph;
 pub mod journal_exporter;
 pub mod journal_queue;
 pub mod lm;
@@ -60,6 +61,11 @@ pub use vectordb::{
 pub use memory::{
     MemoryMetadata, MemoryResult, MemoryScope, SemanticMemory, SemanticMemoryConfig,
 };
+pub use graph::{
+    GraphDatabase, GraphNode, GraphRelationship, GraphTraversalResult,
+    RelationshipQuery, TraversalFilters,
+};
+pub use graph::memory_graph::MemoryGraphDatabase;
 pub use worker::Worker;
 
 // Re-export flume for language bindings
