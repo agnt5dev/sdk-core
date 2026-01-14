@@ -109,16 +109,16 @@ impl GraphDatabase for MemoryGraphDatabase {
         // Check that both nodes exist
         let nodes = self.nodes.read().await;
         if !nodes.contains_key(from_node) {
-            return Err(SdkError::InvalidInput(format!(
-                "Source node '{}' not found",
-                from_node
-            )));
+            return Err(SdkError::InvalidArgument {
+                message: format!("Source node '{}' not found", from_node),
+                argument: Some("from_node".to_string()),
+            });
         }
         if !nodes.contains_key(to_node) {
-            return Err(SdkError::InvalidInput(format!(
-                "Target node '{}' not found",
-                to_node
-            )));
+            return Err(SdkError::InvalidArgument {
+                message: format!("Target node '{}' not found", to_node),
+                argument: Some("to_node".to_string()),
+            });
         }
         drop(nodes); // Release read lock
 
@@ -216,10 +216,10 @@ impl GraphDatabase for MemoryGraphDatabase {
 
         // Check start node exists
         if !nodes_map.contains_key(start_node) {
-            return Err(SdkError::InvalidInput(format!(
-                "Start node '{}' not found",
-                start_node
-            )));
+            return Err(SdkError::InvalidArgument {
+                message: format!("Start node '{}' not found", start_node),
+                argument: Some("start_node".to_string()),
+            });
         }
 
         // BFS traversal with depth tracking
