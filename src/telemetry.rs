@@ -245,8 +245,8 @@ pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), S
     let filter_directive = std::env::var("RUST_LOG").unwrap_or_else(|_| {
         // Default filter: debug level for AGNT5 and Python SDK, error for noisy dependencies
         // Filter out noisy gRPC/HTTP2 traces from h2, hyper, tonic, tower
-        // Include python_log for Python SDK ctx.logger logs
-        "agnt5=debug,python_log=debug,h2=error,hyper=error,tonic=warn,tower=warn".to_string()
+        // Include agnt5_sdk_python for Python logs forwarded via log_from_python()
+        "agnt5=debug,agnt5_sdk_python=debug,h2=error,hyper=error,tonic=warn,tower=warn".to_string()
     });
 
     let console_filter = EnvFilter::new(&filter_directive);
