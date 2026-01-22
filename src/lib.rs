@@ -4,6 +4,7 @@ pub mod adk;
 pub mod client;
 pub mod context;
 pub mod error;
+pub mod eval;
 pub mod graph;
 pub mod journal_exporter;
 pub mod journal_queue;
@@ -66,6 +67,11 @@ pub use graph::{
     RelationshipQuery, TraversalFilters,
 };
 pub use graph::memory_graph::MemoryGraphDatabase;
+pub use eval::{
+    contains, exact_match, json_valid, levenshtein, llm_judge, regex_match, trace_score,
+    ContainsConfig, ExactMatchConfig, LevenshteinConfig, LlmJudgeConfig, RegexConfig,
+    ScorerInput, ScorerResult, TraceAssertion, TraceEvent,
+};
 pub use worker::Worker;
 
 // Re-export flume for language bindings
