@@ -56,6 +56,7 @@ struct QueryRequest {
 #[derive(Deserialize)]
 struct QueryResponse {
     matches: Vec<QueryMatch>,
+    #[allow(dead_code)]
     namespace: Option<String>,
 }
 
@@ -80,12 +81,14 @@ struct DeleteRequest {
 }
 
 #[derive(Serialize)]
+#[allow(dead_code)]
 struct FetchRequest {
     ids: Vec<String>,
     namespace: Option<String>,
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct FetchResponse {
     vectors: HashMap<String, FetchedVector>,
     namespace: Option<String>,
@@ -100,6 +103,7 @@ struct FetchedVector {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct DescribeIndexStatsResponse {
     namespaces: Option<HashMap<String, NamespaceStats>>,
     dimension: u32,
@@ -119,6 +123,7 @@ struct NamespaceStats {
 struct PineconeError {
     message: String,
     #[serde(default)]
+    #[allow(dead_code)]
     code: Option<u32>,
 }
 

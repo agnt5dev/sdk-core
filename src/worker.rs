@@ -194,7 +194,7 @@ impl Worker {
         metadata: HashMap<String, String>,
         source_timestamp_ns: i64,
         correlation_id: String,
-        parent_event_id: String,
+        parent_correlation_id: String,
     ) -> Result<()> {
         let event = JournalEventMessage {
             run_id: invocation_id,
@@ -204,7 +204,7 @@ impl Worker {
             metadata,
             source_timestamp_ns,
             correlation_id,
-            parent_event_id,
+            parent_correlation_id,
             is_sse_only: false, // Checkpoints are boundary events (persisted)
             queued_at: std::time::Instant::now(),
             ..Default::default()
@@ -243,7 +243,7 @@ impl Worker {
         metadata: HashMap<String, String>,
         source_timestamp_ns: i64,
         correlation_id: String,
-        parent_event_id: String,
+        parent_correlation_id: String,
     ) -> Result<()> {
         let is_sse_only = JournalEventMessage::is_sse_only_event_type(&event_type);
 
@@ -256,7 +256,7 @@ impl Worker {
             metadata,
             source_timestamp_ns,
             correlation_id,
-            parent_event_id,
+            parent_correlation_id,
             is_sse_only,
             queued_at: std::time::Instant::now(),
             ..Default::default()
@@ -634,13 +634,14 @@ impl Worker {
                         sse_only_count += 1;
                     }
 
-                    // Build metadata with correlation_id, parent_event_id, tenant_id, and deployment_id
+                    // Build metadata with cid, pcid, tenant_id, and deployment_id
+                    // Using short keys (cid, pcid) to reduce JSONB storage overhead
                     let mut metadata = event.metadata.clone();
                     if !event.correlation_id.is_empty() {
-                        metadata.insert("correlation_id".to_string(), event.correlation_id.clone());
+                        metadata.insert("cid".to_string(), event.correlation_id.clone());
                     }
-                    if !event.parent_event_id.is_empty() {
-                        metadata.insert("parent_event_id".to_string(), event.parent_event_id.clone());
+                    if !event.parent_correlation_id.is_empty() {
+                        metadata.insert("pcid".to_string(), event.parent_correlation_id.clone());
                     }
 
                     // Include tenant_id and deployment_id from environment variables if present

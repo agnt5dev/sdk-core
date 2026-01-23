@@ -11,7 +11,7 @@ use crate::error::{Result as SdkResult, SdkError};
 
 use super::interface::{
     ContentBlockType, GenerateRequest, GenerateResponse, JsonSchemaFormat, Message, MessageRole,
-    ResponseFormat, StreamChunk, StreamHandle, TokenUsage, ToolCall, ToolChoice, ToolDefinition,
+    ResponseFormat, StreamChunk, StreamHandle, TokenUsage, ToolChoice, ToolDefinition,
 };
 
 #[derive(Serialize)]

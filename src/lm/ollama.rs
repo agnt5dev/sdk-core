@@ -2,7 +2,7 @@ use std::env;
 
 use async_trait::async_trait;
 
-use crate::error::{Result as SdkResult, SdkError};
+use crate::error::Result as SdkResult;
 
 use super::interface::{
     GenerateRequest, GenerateResponse, LanguageModel, StreamHandle, StreamRequest,

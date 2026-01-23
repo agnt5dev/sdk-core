@@ -109,8 +109,8 @@ pub struct JournalEventMessage {
     // Event correlation
     /// Correlation ID for pairing started↔completed events
     pub correlation_id: String,
-    /// Parent event ID for hierarchy (tree view)
-    pub parent_event_id: String,
+    /// Parent correlation ID for hierarchy (tree view)
+    pub parent_correlation_id: String,
 
     // Metadata
     /// Optional tenant ID
@@ -142,7 +142,7 @@ impl Default for JournalEventMessage {
             event_type: String::new(),
             data: Vec::new(),
             correlation_id: String::new(),
-            parent_event_id: String::new(),
+            parent_correlation_id: String::new(),
             tenant_id: None,
             source_timestamp_ns: 0,
             metadata: HashMap::new(),

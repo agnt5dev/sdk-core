@@ -32,6 +32,7 @@ pub struct MemoryGraphDatabase {
     /// Index: to_node -> relationship IDs
     to_index: Arc<RwLock<HashMap<String, Vec<String>>>>,
     /// Scope identifier for isolation
+    #[allow(dead_code)]
     scope: String,
 }
 

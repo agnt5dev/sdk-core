@@ -16,7 +16,7 @@ use crate::error::{Result as SdkResult, SdkError};
 use super::interface::{
     generate as generate_via_model, stream as stream_via_model, ContentBlockType, GenerateRequest,
     GenerateResponse, GenerationConfig, LanguageModel, Message, MessageRole, ResponseFormat,
-    StreamChunk, StreamHandle, StreamRequest, TokenUsage, ToolCall, ToolChoice, ToolDefinition,
+    StreamChunk, StreamHandle, StreamRequest, TokenUsage, ToolChoice, ToolDefinition,
 };
 use super::telemetry;
 
@@ -336,7 +336,7 @@ fn build_stream(
         let mut partial = PartialResponse::default();
         let mut tool_calls: Vec<super::interface::ToolCall> = Vec::new();
         // Track current content block for proper typing of deltas
-        let mut current_block_index: u32 = 0;
+        let mut _current_block_index: u32 = 0;
         let mut current_block_type = ContentBlockType::Text;
 
         while let Some(chunk) = bytes_stream.next().await {
@@ -365,7 +365,7 @@ fn build_stream(
                         partial.usage = Some(message.usage);
                     }
                     StreamEvent::ContentBlockStart { index, content_block } => {
-                        current_block_index = index;
+                        _current_block_index = index;
                         current_block_type = content_block.content_block_type();
 
                         // Emit content block start
@@ -942,6 +942,7 @@ impl StreamContentBlock {
         }
     }
 
+    #[allow(dead_code)]
     fn to_text_delta(&self) -> Option<String> {
         if self.block_type == "text" {
             self.text.clone()
@@ -950,6 +951,7 @@ impl StreamContentBlock {
         }
     }
 
+    #[allow(dead_code)]
     fn to_thinking_delta(&self) -> Option<String> {
         if self.block_type == "thinking" {
             self.thinking.clone()

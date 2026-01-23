@@ -16,7 +16,7 @@ use crate::error::{Result as SdkResult, SdkError};
 use super::interface::{
     generate as generate_via_model, stream as stream_via_model, ContentBlockType, GenerateRequest,
     GenerateResponse, GenerationConfig, LanguageModel, Message, MessageRole, ResponseFormat,
-    StreamChunk, StreamHandle, StreamRequest, TokenUsage, ToolCall, ToolChoice, ToolDefinition,
+    StreamChunk, StreamHandle, StreamRequest, TokenUsage, ToolChoice, ToolDefinition,
 };
 use super::telemetry;
 

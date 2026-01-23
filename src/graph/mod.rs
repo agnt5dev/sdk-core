@@ -7,7 +7,7 @@ use std::fmt;
 
 pub mod memory_graph;
 
-use crate::error::{Result, SdkError};
+use crate::error::Result;
 
 /// Node in a knowledge graph
 #[derive(Debug, Clone, Serialize, Deserialize)]

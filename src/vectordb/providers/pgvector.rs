@@ -4,9 +4,11 @@
 use async_trait::async_trait;
 
 use super::super::{
-    Collection, CollectionInfo, DistanceMetric, SearchQuery, SearchResult, VectorDatabase,
-    VectorEntry, VectorFilter, VectorMetadata,
+    Collection, CollectionInfo, SearchQuery, SearchResult, VectorDatabase, VectorEntry,
+    VectorFilter,
 };
+#[cfg(feature = "pgvector")]
+use super::super::DistanceMetric;
 use crate::error::{Result, SdkError};
 
 #[cfg(feature = "pgvector")]
@@ -82,6 +84,7 @@ impl PgVectorProvider {
     }
 
     /// Get the table name for a collection (sanitized)
+    #[allow(dead_code)]
     fn table_name(collection_name: &str) -> String {
         // Sanitize collection name to prevent SQL injection
         let sanitized: String = collection_name
