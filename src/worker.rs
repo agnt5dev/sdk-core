@@ -2,14 +2,30 @@ use crate::client::WorkerCoordinatorClient;
 use crate::error::Result;
 use crate::journal_queue::{JournalEventMessage, JournalEventQueue, JournalQueueConfig};
 use crate::pb::{
-    ComponentInfo, DispatchComponentResponse, HealthCheck, RegisterService, RuntimeMessage,
-    ServiceMessage, UnregisterService, WorkerHealthStatus,
+    CheckpointAck, ComponentInfo, DispatchComponentResponse, HealthCheck, RegisterService,
+    RuntimeMessage, RuntimeMessageType, ServiceMessage, UnregisterService, WorkerHealthStatus,
+    WorkflowCheckpoint,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::{oneshot, Mutex as TokioMutex};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+/// Key for tracking pending checkpoint acknowledgements
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct PendingAckKey {
+    run_id: String,
+    sequence_number: i64,
+}
+
+/// Pending acknowledgement tracker for async checkpoint events (used by async emit_checkpoint_sync)
+type PendingAcks = Arc<TokioMutex<HashMap<PendingAckKey, oneshot::Sender<CheckpointAck>>>>;
+
+/// Pending acknowledgement tracker for truly synchronous checkpoint events
+/// Uses std::sync primitives for blocking operations from sync Python code
+type SyncPendingAcks = Arc<std::sync::Mutex<HashMap<PendingAckKey, std::sync::mpsc::Sender<CheckpointAck>>>>;
 
 /// Connection states for tracking worker status
 #[derive(Debug, Clone, PartialEq)]
@@ -91,6 +107,16 @@ pub struct Worker {
     connection_state: Arc<std::sync::Mutex<ConnectionState>>,
     /// Unified journal event queue (replaces checkpoint_queue, delta_queue, span_export_queue, log_export_queue)
     journal_queue: JournalEventQueue,
+    /// Pending checkpoint acknowledgements for async emit (tokio oneshot)
+    pending_acks: PendingAcks,
+    /// Sender for checkpoint events that need synchronous acknowledgement (async version)
+    checkpoint_tx: Arc<TokioMutex<Option<flume::Sender<ServiceMessage>>>>,
+    /// Sender for checkpoint events - sync version using std::sync::Mutex
+    /// This allows truly blocking sends from sync Python code
+    sync_checkpoint_tx: Arc<std::sync::Mutex<Option<flume::Sender<ServiceMessage>>>>,
+    /// Pending checkpoint acknowledgements for truly synchronous emit (std::sync::mpsc)
+    /// Uses blocking channels so sync Python code can wait without async runtime
+    sync_pending_acks: SyncPendingAcks,
 }
 
 // Implement Debug manually to avoid requiring Debug on JournalEventQueue's internals
@@ -102,6 +128,8 @@ impl std::fmt::Debug for Worker {
             .field("metadata", &self.metadata)
             .field("connection_state", &self.connection_state)
             .field("journal_queue_size", &self.journal_queue.len())
+            .field("pending_acks", &"<PendingAcks>")
+            .field("sync_pending_acks", &"<SyncPendingAcks>")
             .finish()
     }
 }
@@ -127,6 +155,10 @@ impl Worker {
             metadata,
             connection_state: Arc::new(std::sync::Mutex::new(ConnectionState::Disconnected)),
             journal_queue: JournalEventQueue::new(journal_config),
+            pending_acks: Arc::new(TokioMutex::new(HashMap::new())),
+            checkpoint_tx: Arc::new(TokioMutex::new(None)),
+            sync_checkpoint_tx: Arc::new(std::sync::Mutex::new(None)),
+            sync_pending_acks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -227,6 +259,336 @@ impl Worker {
     /// events arrive before run.completed event.
     pub fn drain_events(&self) -> Vec<JournalEventMessage> {
         self.journal_queue.drain_all()
+    }
+
+    /// Emit a checkpoint event synchronously and wait for acknowledgement
+    ///
+    /// This method blocks until the platform acknowledges that the event has been
+    /// persisted to the journal. This ensures correct event ordering for lifecycle
+    /// events that affect workflow state.
+    ///
+    /// # Arguments
+    ///
+    /// * `run_id` - The run ID this checkpoint belongs to
+    /// * `event_type` - The event type (e.g., "approval.requested", "workflow.step.paused")
+    /// * `event_data` - JSON-encoded event payload
+    /// * `sequence_number` - Sequence number for ordering within execution
+    /// * `metadata` - Additional metadata
+    /// * `source_timestamp_ns` - Nanosecond timestamp when event was created
+    /// * `timeout_ms` - Timeout in milliseconds to wait for acknowledgement
+    ///
+    /// # Returns
+    ///
+    /// Ok(()) if the checkpoint was acknowledged, or an error if:
+    /// - The connection is not established
+    /// - The timeout was reached
+    /// - The send failed
+    pub async fn emit_checkpoint_sync(
+        &self,
+        run_id: String,
+        event_type: String,
+        event_data: Vec<u8>,
+        sequence_number: i64,
+        metadata: HashMap<String, String>,
+        source_timestamp_ns: i64,
+        timeout_ms: u64,
+    ) -> Result<()> {
+        // Get the checkpoint sender (must be connected)
+        let tx = {
+            let guard = self.checkpoint_tx.lock().await;
+            guard.clone().ok_or_else(|| {
+                crate::error::SdkError::Connection {
+                    message: "Worker not connected, cannot emit checkpoint".to_string(),
+                    code: crate::error::ErrorCode::ConnectionFailed,
+                    source: None,
+                }
+            })?
+        };
+
+        // Create oneshot channel for ack
+        let (ack_tx, ack_rx) = oneshot::channel();
+
+        // Register pending ack
+        let key = PendingAckKey {
+            run_id: run_id.clone(),
+            sequence_number,
+        };
+        {
+            let mut pending = self.pending_acks.lock().await;
+            pending.insert(key.clone(), ack_tx);
+        }
+
+        // Merge service metadata (tenant_id, deployment_id) with passed metadata
+        // Service metadata provides authoritative tenant/deployment info needed for journal writes
+        let mut merged_metadata = metadata;
+        for (key, value) in &self.metadata {
+            if !merged_metadata.contains_key(key) {
+                merged_metadata.insert(key.clone(), value.clone());
+            }
+        }
+
+        // Build the checkpoint message
+        let checkpoint = WorkflowCheckpoint {
+            invocation_id: run_id.clone(),
+            checkpoint_type: event_type.clone(),
+            checkpoint_data: event_data,
+            sequence_number,
+            metadata: merged_metadata,
+            source_timestamp_ns,
+        };
+
+        let service_message = ServiceMessage {
+            worker_id: self.config.worker_id.clone(),
+            metadata: std::collections::HashMap::new(),
+            message_type: Some(
+                crate::pb::service_message::MessageType::WorkflowCheckpoint(checkpoint),
+            ),
+        };
+
+        // Send the checkpoint
+        if let Err(e) = tx.send_async(service_message).await {
+            // Remove pending ack on send failure
+            let mut pending = self.pending_acks.lock().await;
+            pending.remove(&key);
+            return Err(crate::error::SdkError::Connection {
+                message: format!("Failed to send checkpoint: {}", e),
+                code: crate::error::ErrorCode::ConnectionFailed,
+                source: None,
+            });
+        }
+
+        debug!(
+            "Sent checkpoint event, waiting for ack: run_id={} event_type={} seq={}",
+            run_id, event_type, sequence_number
+        );
+
+        // Wait for ack with timeout
+        let timeout = Duration::from_millis(timeout_ms);
+        match tokio::time::timeout(timeout, ack_rx).await {
+            Ok(Ok(ack)) => {
+                debug!(
+                    "Received checkpoint ack: run_id={} event_type={} seq={}",
+                    ack.run_id, ack.event_type, ack.sequence_number
+                );
+                Ok(())
+            }
+            Ok(Err(_)) => {
+                // Channel was dropped (sender gone)
+                warn!(
+                    "Checkpoint ack channel dropped: run_id={} event_type={} seq={}",
+                    run_id, event_type, sequence_number
+                );
+                // Remove from pending (may have been cleaned up already)
+                let mut pending = self.pending_acks.lock().await;
+                pending.remove(&key);
+                Err(crate::error::SdkError::Internal(
+                    "Checkpoint ack channel dropped".to_string(),
+                ))
+            }
+            Err(_) => {
+                // Timeout
+                warn!(
+                    "Checkpoint ack timeout after {}ms: run_id={} event_type={} seq={} (platform may not support acks yet)",
+                    timeout_ms, run_id, event_type, sequence_number
+                );
+                // Remove pending ack on timeout
+                let mut pending = self.pending_acks.lock().await;
+                pending.remove(&key);
+                // Return Ok for graceful degradation with old platforms
+                // The event was sent, we just didn't get confirmation
+                Ok(())
+            }
+        }
+    }
+
+    /// Emit a checkpoint event and block until the platform acknowledges it (TRULY SYNCHRONOUS)
+    ///
+    /// This is the sync version that can be called from non-async Python code.
+    /// It uses std::sync primitives to block the calling thread until the ack is received.
+    ///
+    /// # Arguments
+    ///
+    /// * `run_id` - The run/invocation ID this checkpoint belongs to
+    /// * `event_type` - The checkpoint event type (e.g., "approval.requested", "workflow.paused")
+    /// * `event_data` - The event payload as bytes
+    /// * `sequence_number` - Sequence number for ordering
+    /// * `metadata` - Additional metadata for the event
+    /// * `source_timestamp_ns` - Nanosecond timestamp when event was created
+    /// * `timeout_ms` - Timeout in milliseconds to wait for acknowledgement
+    ///
+    /// # Returns
+    ///
+    /// Ok(()) if the checkpoint was acknowledged, or an error if:
+    /// - The connection is not established
+    /// - The timeout was reached
+    /// - The send failed
+    pub fn emit_checkpoint_sync_blocking(
+        &self,
+        run_id: String,
+        event_type: String,
+        event_data: Vec<u8>,
+        sequence_number: i64,
+        metadata: HashMap<String, String>,
+        source_timestamp_ns: i64,
+        timeout_ms: u64,
+    ) -> Result<()> {
+        // Get the checkpoint sender (must be connected)
+        // Using std::sync::Mutex so this can be called from sync code
+        let tx = {
+            let guard = self.sync_checkpoint_tx.lock().map_err(|e| {
+                crate::error::SdkError::Internal(format!("Failed to lock sync_checkpoint_tx: {}", e))
+            })?;
+            guard.clone().ok_or_else(|| {
+                crate::error::SdkError::Connection {
+                    message: "Worker not connected, cannot emit checkpoint".to_string(),
+                    code: crate::error::ErrorCode::ConnectionFailed,
+                    source: None,
+                }
+            })?
+        };
+
+        // Create sync channel for ack (std::sync::mpsc)
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+
+        // Register pending ack in the sync map
+        let key = PendingAckKey {
+            run_id: run_id.clone(),
+            sequence_number,
+        };
+        {
+            let mut pending = self.sync_pending_acks.lock().map_err(|e| {
+                crate::error::SdkError::Internal(format!("Failed to lock sync_pending_acks: {}", e))
+            })?;
+            pending.insert(key.clone(), ack_tx);
+        }
+
+        // Merge service metadata (tenant_id, deployment_id) with passed metadata
+        // Service metadata provides authoritative tenant/deployment info needed for journal writes
+        let mut merged_metadata = metadata;
+
+        for (key, value) in &self.metadata {
+            if !merged_metadata.contains_key(key) {
+                merged_metadata.insert(key.clone(), value.clone());
+            }
+        }
+
+        // Build the checkpoint message
+        let checkpoint = WorkflowCheckpoint {
+            invocation_id: run_id.clone(),
+            checkpoint_type: event_type.clone(),
+            checkpoint_data: event_data,
+            sequence_number,
+            metadata: merged_metadata,
+            source_timestamp_ns,
+        };
+
+        let service_message = ServiceMessage {
+            worker_id: self.config.worker_id.clone(),
+            metadata: std::collections::HashMap::new(),
+            message_type: Some(
+                crate::pb::service_message::MessageType::WorkflowCheckpoint(checkpoint),
+            ),
+        };
+
+        // Send the checkpoint using blocking send (flume supports this)
+        if let Err(e) = tx.send(service_message) {
+            // Remove pending ack on send failure
+            if let Ok(mut pending) = self.sync_pending_acks.lock() {
+                pending.remove(&key);
+            }
+            return Err(crate::error::SdkError::Connection {
+                message: format!("Failed to send checkpoint: {}", e),
+                code: crate::error::ErrorCode::ConnectionFailed,
+                source: None,
+            });
+        }
+
+        debug!(
+            "Sent checkpoint event (sync blocking), waiting for ack: run_id={} event_type={} seq={}",
+            run_id, event_type, sequence_number
+        );
+
+        // Wait for ack with timeout using blocking recv
+        let timeout = Duration::from_millis(timeout_ms);
+        match ack_rx.recv_timeout(timeout) {
+            Ok(ack) => {
+                debug!(
+                    "Received checkpoint ack (sync blocking): run_id={} event_type={} seq={}",
+                    ack.run_id, ack.event_type, ack.sequence_number
+                );
+                Ok(())
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                warn!(
+                    "Checkpoint ack timeout (sync blocking) after {}ms: run_id={} event_type={} seq={} (platform may not support acks yet)",
+                    timeout_ms, run_id, event_type, sequence_number
+                );
+                // Remove pending ack on timeout
+                if let Ok(mut pending) = self.sync_pending_acks.lock() {
+                    pending.remove(&key);
+                }
+                // Return Ok for graceful degradation with old platforms
+                Ok(())
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                warn!(
+                    "Checkpoint ack channel disconnected (sync blocking): run_id={} event_type={} seq={}",
+                    run_id, event_type, sequence_number
+                );
+                // Remove from pending
+                if let Ok(mut pending) = self.sync_pending_acks.lock() {
+                    pending.remove(&key);
+                }
+                Err(crate::error::SdkError::Internal(
+                    "Checkpoint ack channel disconnected".to_string(),
+                ))
+            }
+        }
+    }
+
+    /// Handle a checkpoint acknowledgement from the platform
+    ///
+    /// This is called internally when the dispatch loop receives a CheckpointAck message.
+    /// It checks both async (tokio oneshot) and sync (std::sync::mpsc) pending acks.
+    async fn handle_checkpoint_ack(&self, ack: CheckpointAck) {
+        let key = PendingAckKey {
+            run_id: ack.run_id.clone(),
+            sequence_number: ack.sequence_number,
+        };
+
+        // First, try the async pending acks (tokio oneshot)
+        let async_sender = {
+            let mut pending = self.pending_acks.lock().await;
+            pending.remove(&key)
+        };
+
+        if let Some(tx) = async_sender {
+            if tx.send(ack).is_err() {
+                debug!("Checkpoint ack receiver dropped (async, caller may have timed out)");
+            }
+            return;
+        }
+
+        // Second, try the sync pending acks (std::sync::mpsc)
+        let sync_sender = {
+            if let Ok(mut pending) = self.sync_pending_acks.lock() {
+                pending.remove(&key)
+            } else {
+                None
+            }
+        };
+
+        if let Some(tx) = sync_sender {
+            if tx.send(ack).is_err() {
+                debug!("Checkpoint ack receiver dropped (sync, caller may have timed out)");
+            }
+            return;
+        }
+
+        debug!(
+            "Received ack for unknown checkpoint: run_id={} seq={}",
+            key.run_id, key.sequence_number
+        );
     }
 
     /// Queue a streaming delta for real-time delivery to clients (legacy API)
@@ -418,6 +780,19 @@ impl Worker {
         );
         self.set_connection_state(ConnectionState::Connected);
 
+        // Store the tx for emit_checkpoint_sync to use (async version)
+        {
+            let mut guard = self.checkpoint_tx.lock().await;
+            *guard = Some(tx.clone());
+        }
+
+        // Store the tx for emit_checkpoint_sync_blocking to use (sync version)
+        {
+            if let Ok(mut guard) = self.sync_checkpoint_tx.lock() {
+                *guard = Some(tx.clone());
+            }
+        }
+
         // Start heartbeat task
         let heartbeat_task = self.spawn_heartbeat_task(tx.clone());
 
@@ -480,6 +855,20 @@ impl Worker {
                 result = rx.recv_async() => {
                     match result {
                         Ok(runtime_message) => {
+                            // Check if this is a CheckpointAck message - handle internally
+                            if runtime_message.message_type == RuntimeMessageType::CheckpointAck as i32 {
+                                if let Some(crate::pb::runtime_message::MessageData::CheckpointAck(ack)) =
+                                    runtime_message.message_data
+                                {
+                                    debug!(
+                                        "Received CheckpointAck: run_id={} seq={} event_type={}",
+                                        ack.run_id, ack.sequence_number, ack.event_type
+                                    );
+                                    self.handle_checkpoint_ack(ack).await;
+                                    continue; // Don't dispatch to worker pool
+                                }
+                            }
+
                             // Send to worker pool (bounded channel provides backpressure)
                             if let Err(e) = task_tx.send_async(runtime_message).await {
                                 error!("Failed to dispatch message to worker pool: {}", e);
@@ -538,6 +927,40 @@ impl Worker {
         drop(task_tx); // Signal workers to exit
         drop(task_rx); // Close receiver
         drop(response_tx); // Close response sender
+
+        // Clear checkpoint_tx to prevent emit_checkpoint_sync from sending after disconnect (async)
+        {
+            let mut guard = self.checkpoint_tx.lock().await;
+            *guard = None;
+        }
+
+        // Clear sync_checkpoint_tx to prevent emit_checkpoint_sync_blocking from sending after disconnect
+        {
+            if let Ok(mut guard) = self.sync_checkpoint_tx.lock() {
+                *guard = None;
+            }
+        }
+
+        // Cancel any pending checkpoint acks (async)
+        {
+            let mut pending = self.pending_acks.lock().await;
+            let count = pending.len();
+            if count > 0 {
+                debug!("Cancelling {} pending async checkpoint acks on disconnect", count);
+            }
+            pending.clear();
+        }
+
+        // Cancel any pending sync checkpoint acks
+        {
+            if let Ok(mut pending) = self.sync_pending_acks.lock() {
+                let count = pending.len();
+                if count > 0 {
+                    debug!("Cancelling {} pending sync checkpoint acks on disconnect", count);
+                }
+                pending.clear();
+            }
+        }
 
         // Wait for all worker tasks to complete
         for handle in worker_handles {

@@ -10,6 +10,7 @@ pub mod journal_exporter;
 pub mod journal_queue;
 pub mod lm;
 pub mod logging;
+pub mod mcp;
 pub mod memory;
 pub mod runtime_adapter;
 pub mod span_filter;
@@ -73,6 +74,12 @@ pub use eval::{
     ScorerInput, ScorerResult, TraceAssertion, TraceEvent,
 };
 pub use worker::Worker;
+
+// MCP (Model Context Protocol) support
+pub use mcp::{
+    McpClient, McpError, McpResult, McpTool, McpToolWithServer, ServerConfig, SseConfig,
+    StdioConfig, Transport,
+};
 
 // Re-export flume for language bindings
 pub use flume;

@@ -159,12 +159,28 @@ impl JournalEventMessage {
     /// Check if this event type is an SSE-only event (delta, log, etc.)
     pub fn is_sse_only_event_type(event_type: &str) -> bool {
         // SSE-only event types (not persisted to journal_events)
+        // These are streaming/observability events that don't affect replay
         event_type.starts_with("output.")
             || event_type.starts_with("lm.stream.")
             || event_type.starts_with("lm.message.")
             || event_type.starts_with("lm.thinking.")
             || event_type.starts_with("progress.")
-            || event_type == "log"
+            || event_type.starts_with("log")  // log, log.info, log.warn, log.error, etc.
+    }
+
+    /// Check if this event type is a checkpoint event that requires sync acknowledgement
+    ///
+    /// Checkpoint events block until the platform acknowledges persistence. This ensures
+    /// correct event ordering for lifecycle events that affect workflow state.
+    ///
+    /// Checkpoint events include:
+    /// - `*.started`, `*.completed`, `*.failed`, `*.paused`
+    /// - `approval.requested`, `approval.resolved`
+    ///
+    /// This is the inverse of `is_sse_only_event_type()` - if an event is NOT SSE-only,
+    /// it's a checkpoint event.
+    pub fn is_checkpoint_event_type(event_type: &str) -> bool {
+        !Self::is_sse_only_event_type(event_type)
     }
 
     /// Create with automatic is_sse_only detection based on event_type
@@ -498,6 +514,37 @@ mod tests {
         assert!(JournalEventMessage::is_sse_only_event_type("lm.thinking.delta"));
         assert!(JournalEventMessage::is_sse_only_event_type("progress.update"));
         assert!(JournalEventMessage::is_sse_only_event_type("log"));
+        assert!(JournalEventMessage::is_sse_only_event_type("log.info"));
+        assert!(JournalEventMessage::is_sse_only_event_type("log.warn"));
+        assert!(JournalEventMessage::is_sse_only_event_type("log.error"));
+    }
+
+    #[test]
+    fn test_checkpoint_event_detection() {
+        // Checkpoint events (require sync ack) - inverse of SSE-only
+        assert!(JournalEventMessage::is_checkpoint_event_type("workflow.started"));
+        assert!(JournalEventMessage::is_checkpoint_event_type("workflow.completed"));
+        assert!(JournalEventMessage::is_checkpoint_event_type("workflow.failed"));
+        assert!(JournalEventMessage::is_checkpoint_event_type("workflow.paused"));
+        assert!(JournalEventMessage::is_checkpoint_event_type("workflow.step.started"));
+        assert!(JournalEventMessage::is_checkpoint_event_type("workflow.step.completed"));
+        assert!(JournalEventMessage::is_checkpoint_event_type("workflow.step.paused"));
+        assert!(JournalEventMessage::is_checkpoint_event_type("agent.started"));
+        assert!(JournalEventMessage::is_checkpoint_event_type("agent.completed"));
+        assert!(JournalEventMessage::is_checkpoint_event_type("approval.requested"));
+        assert!(JournalEventMessage::is_checkpoint_event_type("approval.resolved"));
+        assert!(JournalEventMessage::is_checkpoint_event_type("lm.call.started"));
+        assert!(JournalEventMessage::is_checkpoint_event_type("lm.call.completed"));
+        assert!(JournalEventMessage::is_checkpoint_event_type("tool.call.started"));
+        assert!(JournalEventMessage::is_checkpoint_event_type("tool.call.completed"));
+
+        // NOT checkpoint events (SSE-only)
+        assert!(!JournalEventMessage::is_checkpoint_event_type("output.delta"));
+        assert!(!JournalEventMessage::is_checkpoint_event_type("lm.stream.delta"));
+        assert!(!JournalEventMessage::is_checkpoint_event_type("lm.message.delta"));
+        assert!(!JournalEventMessage::is_checkpoint_event_type("lm.thinking.delta"));
+        assert!(!JournalEventMessage::is_checkpoint_event_type("progress.update"));
+        assert!(!JournalEventMessage::is_checkpoint_event_type("log"));
     }
 
     #[test]
