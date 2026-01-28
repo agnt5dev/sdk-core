@@ -113,16 +113,10 @@ pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), S
     let otel_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
         .unwrap_or_else(|_| "http://localhost:4317".to_string());
 
-    // Print to stderr immediately so it's visible even if tracing setup fails
-    eprintln!("🔭 AGNT5 OpenTelemetry Configuration:");
-    eprintln!("   Endpoint: {}", otel_endpoint);
-    eprintln!("   Service:  {}", service_name);
-    eprintln!("   Version:  {}", service_version);
-    eprintln!("   Journal:  enabled (filtered by is_streaming attribute)");
-
-    tracing::info!(
-        "Initializing OpenTelemetry with OTLP endpoint: {}",
-        otel_endpoint
+    tracing::debug!(
+        "Initializing OpenTelemetry: endpoint={}, service={}",
+        otel_endpoint,
+        service_name
     );
 
     // Extract deployment_id and tenant_id from environment variables
@@ -141,12 +135,10 @@ pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), S
 
     if let Some(ref deployment_id) = deployment_id {
         resource_attributes.push(KeyValue::new("deployment.id", deployment_id.clone()));
-        eprintln!("   Deployment ID: {}", deployment_id);
     }
 
     if let Some(ref tenant_id) = tenant_id {
         resource_attributes.push(KeyValue::new("tenant.id", tenant_id.clone()));
-        eprintln!("   Tenant ID: {}", tenant_id);
     }
 
     // Create resource with service information and deployment/tenant IDs
@@ -242,25 +234,33 @@ pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), S
         opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&log_provider);
 
     // Create filters for both console and OpenTelemetry (need separate instances)
+    // Check AGNT5_DEBUG for debug mode, otherwise default to warn level for clean output
+    let debug_enabled = std::env::var("AGNT5_DEBUG")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false);
+
     let filter_directive = std::env::var("RUST_LOG").unwrap_or_else(|_| {
-        // Default filter: debug level for AGNT5 and Python SDK, error for noisy dependencies
-        // Filter out noisy gRPC/HTTP2 traces from h2, hyper, tonic, tower
-        // Include agnt5_sdk_python for Python logs forwarded via log_from_python()
-        "agnt5=debug,agnt5_sdk_python=debug,h2=error,hyper=error,tonic=warn,tower=warn".to_string()
+        if debug_enabled {
+            // Debug mode: show debug logs for AGNT5 components
+            "agnt5=debug,agnt5_sdk_python=debug,h2=error,hyper=error,tonic=warn,tower=warn".to_string()
+        } else {
+            // Normal mode: only show warnings and errors (clean output)
+            "agnt5=warn,agnt5_sdk_python=warn,h2=error,hyper=error,tonic=error,tower=error".to_string()
+        }
     });
 
     let console_filter = EnvFilter::new(&filter_directive);
     let otel_filter = EnvFilter::new(&filter_directive);
 
-    // Create custom fmt layer that includes run.id in log output
+    // Create custom fmt layer with clean output (no file paths or line numbers)
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
         .with_thread_ids(false)
         .with_thread_names(false)
-        .with_file(true)
-        .with_line_number(true)
+        .with_file(false)
+        .with_line_number(false)
         .fmt_fields(RunFieldFormatter)
-        .with_filter(console_filter);  // Filter console output
+        .with_filter(console_filter);
 
     let subscriber = Registry::default()
         .with(telemetry_layer)
@@ -273,15 +273,7 @@ pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), S
 
     // Initialize LogTracer to bridge log crate to tracing
     // This allows log::info!() calls to be forwarded to tracing (and thus OpenTelemetry)
-    if let Err(e) = tracing_log::LogTracer::init() {
-        eprintln!("⚠️  Warning: Failed to initialize LogTracer (log → tracing bridge): {}", e);
-        eprintln!("   Some logs using log::info!() may not appear in OpenTelemetry");
-    }
-
-    tracing::info!(
-        "OpenTelemetry with tracing integration initialized successfully for service: {}",
-        service_name
-    );
+    let _ = tracing_log::LogTracer::init();
     Ok(())
 }
 

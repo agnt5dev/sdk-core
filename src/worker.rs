@@ -144,7 +144,7 @@ impl Worker {
         // Create unified journal queue with config from environment
         let journal_config = JournalQueueConfig::from_env();
 
-        info!(
+        debug!(
             "Creating worker with unified journal queue: max_size={}, batch_size={}, flush_interval_ms={}",
             journal_config.max_size, journal_config.batch_size, journal_config.flush_interval_ms
         );
@@ -774,7 +774,7 @@ impl Worker {
             .create_worker_stream_with_registration(self.config.worker_id.clone(), registration)
             .await?;
 
-        info!(
+        debug!(
             "Worker {} registered successfully and connected",
             self.config.worker_id
         );
@@ -805,7 +805,7 @@ impl Worker {
             .and_then(|s| s.parse().ok())
             .unwrap_or(100);
 
-        info!(
+        debug!(
             "Worker {} starting with concurrency limit: {}",
             self.config.worker_id, max_concurrency
         );
