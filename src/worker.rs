@@ -44,6 +44,11 @@ pub struct WorkerConfig {
 
     pub worker_id: String,
     pub coordinator_endpoint: String,
+
+    /// Maximum connection retry attempts before exiting.
+    /// 0 = infinite retry (worker never exits due to connection issues)
+    /// Default: 5
+    pub max_retries: u32,
 }
 
 impl WorkerConfig {
@@ -55,12 +60,19 @@ impl WorkerConfig {
         let coordinator_endpoint = std::env::var("AGNT5_COORDINATOR_ENDPOINT")
             .unwrap_or_else(|_| "http://localhost:34186".to_string());
 
+        // Parse max retries from environment (0 = infinite, default: 5)
+        let max_retries = std::env::var("AGNT5_MAX_RETRIES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5);
+
         Self {
             service_name,
             service_version,
             service_type,
             worker_id,
             coordinator_endpoint,
+            max_retries,
         }
     }
 }
@@ -660,9 +672,10 @@ impl Worker {
         });
 
         // Retry configuration with jitter to prevent thundering herd
-        let max_retries = 5;
+        let max_retries = self.config.max_retries;
+        let infinite_retry = max_retries == 0;
         let base_delay = std::time::Duration::from_secs(1);
-        let mut retry_count = 0;
+        let mut retry_count: u32 = 0;
 
         loop {
             // Check for shutdown signal (non-blocking)
@@ -682,10 +695,18 @@ impl Worker {
                 let jitter_ms = (exp_delay.as_millis() as f64 * jitter) as u64;
                 let delay = exp_delay + std::time::Duration::from_millis(jitter_ms);
 
-                info!(
-                    "Worker {} reconnect attempt {} (waiting {:?})",
-                    self.config.worker_id, retry_count, delay
-                );
+                // User-friendly reconnection message
+                if infinite_retry {
+                    warn!(
+                        "Connection lost, reconnecting... (attempt {})",
+                        retry_count
+                    );
+                } else {
+                    warn!(
+                        "Connection lost, reconnecting... (attempt {}/{})",
+                        retry_count, max_retries
+                    );
+                }
 
                 // Use select to allow shutdown during delay
                 tokio::select! {
@@ -712,29 +733,30 @@ impl Worker {
                     return Ok(());
                 }
                 Err(e) => {
+                    // Store error for state tracking (used internally)
                     let error_msg = format!(
-                        "Worker {} connection failed (attempt {}): {}",
-                        self.config.worker_id,
+                        "Connection failed (attempt {}): {}",
                         retry_count + 1,
                         e
                     );
-                    error!("{}", error_msg);
+                    debug!("{}", error_msg);
                     self.set_connection_state(ConnectionState::Error(error_msg));
 
                     retry_count += 1;
-                    if retry_count >= max_retries {
+
+                    // Check if we've exceeded max retries (skip check for infinite retry mode)
+                    if !infinite_retry && retry_count >= max_retries {
                         // After max retries, exit instead of infinite loop
                         error!(
-                            "Worker {} failed to connect after {} attempts, exiting",
-                            self.config.worker_id, max_retries
+                            "Failed to connect after {} attempts, exiting",
+                            max_retries
                         );
                         self.set_connection_state(ConnectionState::Error(format!(
                             "Failed to connect after {} attempts",
                             max_retries
                         )));
                         return Err(anyhow::anyhow!(
-                            "Worker {} failed to connect to coordinator after {} attempts",
-                            self.config.worker_id,
+                            "Worker failed to connect to coordinator after {} attempts",
                             max_retries
                         ).into());
                     }
@@ -774,8 +796,12 @@ impl Worker {
             .create_worker_stream_with_registration(self.config.worker_id.clone(), registration)
             .await?;
 
+        info!(
+            "Connected to coordinator ({})",
+            self.config.coordinator_endpoint
+        );
         debug!(
-            "Worker {} registered successfully and connected",
+            "Worker {} registered successfully",
             self.config.worker_id
         );
         self.set_connection_state(ConnectionState::Connected);
