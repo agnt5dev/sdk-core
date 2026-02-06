@@ -2,9 +2,9 @@ use crate::client::WorkerCoordinatorClient;
 use crate::error::Result;
 use crate::journal_queue::{JournalEventMessage, JournalEventQueue, JournalQueueConfig};
 use crate::pb::{
-    CheckpointAck, ComponentInfo, DispatchComponentResponse, HealthCheck, RegisterService,
-    RuntimeMessage, RuntimeMessageType, ServiceMessage, UnregisterService, WorkerHealthStatus,
-    WorkflowCheckpoint,
+    CheckpointAck, CompleteJobRequest, ComponentInfo, DispatchComponentResponse, HealthCheck,
+    PollJobsRequest, RegisterService, RuntimeMessage, RuntimeMessageType, ServiceMessage,
+    UnregisterService, WorkerHealthStatus, WorkflowCheckpoint,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -694,17 +694,24 @@ impl Worker {
                 let jitter = rand::random::<f64>() * 0.5 - 0.25;
                 let jitter_ms = (exp_delay.as_millis() as f64 * jitter) as u64;
                 let delay = exp_delay + std::time::Duration::from_millis(jitter_ms);
+                let delay_secs = delay.as_secs_f64();
 
-                // User-friendly reconnection message
-                if infinite_retry {
-                    warn!(
-                        "Connection lost, reconnecting... (attempt {})",
-                        retry_count
+                // User-friendly reconnection messages (printed directly, not via tracing,
+                // since these are user-facing status and should always be visible)
+                if retry_count == 1 {
+                    eprintln!(
+                        "[WARN] Connection lost, reconnecting in {:.1}s...",
+                        delay_secs
+                    );
+                } else if infinite_retry {
+                    eprintln!(
+                        "[WARN] Reconnecting in {:.1}s... (attempt {})",
+                        delay_secs, retry_count
                     );
                 } else {
-                    warn!(
-                        "Connection lost, reconnecting... (attempt {}/{})",
-                        retry_count, max_retries
+                    eprintln!(
+                        "[WARN] Reconnecting in {:.1}s... (attempt {}/{})",
+                        delay_secs, retry_count, max_retries
                     );
                 }
 
@@ -720,12 +727,13 @@ impl Worker {
 
             // Try to connect and run
             self.set_connection_state(ConnectionState::Connecting);
+            let was_reconnecting = retry_count > 0;
 
             // Create a new receiver for this connection attempt
             let shutdown_rx_inner = shutdown_tx.subscribe();
 
             match self
-                .try_connect_and_run(message_handler.clone(), shutdown_rx_inner)
+                .try_connect_and_run(message_handler.clone(), shutdown_rx_inner, was_reconnecting)
                 .await
             {
                 Ok(()) => {
@@ -733,6 +741,13 @@ impl Worker {
                     return Ok(());
                 }
                 Err(e) => {
+                    // Check if we had a working session (Connected) that dropped,
+                    // vs. failing to connect in the first place.
+                    let was_connected = matches!(
+                        self.connection_state(),
+                        ConnectionState::Connected
+                    );
+
                     // Store error for state tracking (used internally)
                     let error_msg = format!(
                         "Connection failed (attempt {}): {}",
@@ -742,7 +757,13 @@ impl Worker {
                     debug!("{}", error_msg);
                     self.set_connection_state(ConnectionState::Error(error_msg));
 
-                    retry_count += 1;
+                    if was_connected {
+                        // Had a working session that dropped — reset retry count
+                        // so backoff starts fresh for this new disconnect.
+                        retry_count = 1;
+                    } else {
+                        retry_count += 1;
+                    }
 
                     // Check if we've exceeded max retries (skip check for infinite retry mode)
                     if !infinite_retry && retry_count >= max_retries {
@@ -770,6 +791,7 @@ impl Worker {
         &self,
         message_handler: F,
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+        is_reconnect: bool,
     ) -> Result<()>
     where
         F: Fn(RuntimeMessage, flume::Sender<ServiceMessage>) -> Fut + Send + Clone + 'static,
@@ -796,10 +818,17 @@ impl Worker {
             .create_worker_stream_with_registration(self.config.worker_id.clone(), registration)
             .await?;
 
-        info!(
-            "Connected to coordinator ({})",
-            self.config.coordinator_endpoint
-        );
+        if is_reconnect {
+            eprintln!(
+                "[INFO] Reconnected to coordinator ({})",
+                self.config.coordinator_endpoint
+            );
+        } else {
+            eprintln!(
+                "[INFO] Connected to coordinator ({})",
+                self.config.coordinator_endpoint
+            );
+        }
         debug!(
             "Worker {} registered successfully",
             self.config.worker_id
@@ -874,6 +903,23 @@ impl Worker {
             worker_handles.push(handle);
         }
 
+        // Spawn poll task for durable job queue (managed edition)
+        // Check AGNT5_POLL_ENABLED env var (default: true)
+        let poll_enabled = std::env::var("AGNT5_POLL_ENABLED")
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(true);
+
+        let poll_task = if poll_enabled {
+            let poll_shutdown = shutdown_rx.resubscribe();
+            Some(self.spawn_poll_task(
+                task_tx.clone(),
+                poll_shutdown,
+                max_concurrency,
+            ))
+        } else {
+            None
+        };
+
         // Main dispatch loop
         let dispatch_result = loop {
             tokio::select! {
@@ -906,7 +952,7 @@ impl Worker {
                             }
                         }
                         Err(e) => {
-                            error!("Channel error for worker {}, will reconnect: {}", self.config.worker_id, e);
+                            debug!("Channel closed for worker {}, will reconnect: {}", self.config.worker_id, e);
                             break Err(crate::error::SdkError::Connection {
                                 message: format!("Receive failed: {}", e),
                                 code: crate::error::ErrorCode::ConnectionFailed,
@@ -920,13 +966,31 @@ impl Worker {
                 response = response_rx.recv_async() => {
                     match response {
                         Ok(service_message) => {
-                            if let Err(e) = tx.send_async(service_message).await {
-                                error!("Failed to send response to coordinator: {}", e);
-                                break Err(crate::error::SdkError::Connection {
-                                    message: format!("Send failed: {}", e),
-                                    code: crate::error::ErrorCode::ConnectionFailed,
-                                    source: None,
-                                });
+                            // Check if this is a polled job response by looking inside
+                            // the FunctionResponse metadata (not ServiceMessage.metadata,
+                            // which is always empty). The _job_id tag was placed into
+                            // DispatchComponentRequest.metadata by spawn_poll_task, and
+                            // language handlers preserve it through to the response.
+                            let is_polled_job = match &service_message.message_type {
+                                Some(crate::pb::service_message::MessageType::FunctionResponse(resp)) => {
+                                    resp.metadata.contains_key("_job_id")
+                                }
+                                _ => false,
+                            };
+
+                            if is_polled_job {
+                                // Polled job - route to CompleteJob RPC
+                                self.handle_polled_job_response(service_message).await;
+                            } else {
+                                // Streamed invocation - send via bidirectional stream
+                                if let Err(e) = tx.send_async(service_message).await {
+                                    error!("Failed to send response to coordinator: {}", e);
+                                    break Err(crate::error::SdkError::Connection {
+                                        message: format!("Send failed: {}", e),
+                                        code: crate::error::ErrorCode::ConnectionFailed,
+                                        source: None,
+                                    });
+                                }
                             }
                         }
                         Err(e) => {
@@ -947,6 +1011,11 @@ impl Worker {
                 }
             }
         };
+
+        // Cancel poll task
+        if let Some(task) = poll_task {
+            task.abort();
+        }
 
         // Cleanup: close channels and wait for workers
         info!("Worker {} shutting down task pool", self.config.worker_id);
@@ -1167,6 +1236,250 @@ impl Worker {
         })
     }
 
+    /// Spawn a polling task that claims jobs from the durable queue (managed edition).
+    /// Runs alongside the streaming dispatch loop. Uses exponential backoff when no jobs.
+    fn spawn_poll_task(
+        &self,
+        task_tx: flume::Sender<RuntimeMessage>,
+        mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+        max_concurrency: usize,
+    ) -> tokio::task::JoinHandle<()> {
+        let worker_id = self.config.worker_id.clone();
+        let endpoint = self.config.coordinator_endpoint.clone();
+        let component_ids: Vec<String> = self
+            .components
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        let tenant_id = std::env::var("AGNT5_TENANT_ID").unwrap_or_default();
+        let deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").ok();
+
+        // Polling config from env
+        let initial_backoff_ms: u64 = std::env::var("AGNT5_POLL_INITIAL_BACKOFF_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1000);
+        let max_backoff_ms: u64 = std::env::var("AGNT5_POLL_MAX_BACKOFF_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30000);
+
+        tokio::spawn(async move {
+            // Skip polling if no tenant_id (not in managed mode)
+            if tenant_id.is_empty() {
+                debug!("Poll task skipped - no AGNT5_TENANT_ID set (not managed edition)");
+                return;
+            }
+
+            // Skip if no component IDs available
+            if component_ids.is_empty() {
+                debug!("Poll task skipped - no component IDs registered");
+                return;
+            }
+
+            // Create dedicated gRPC client for polling
+            let mut client = match WorkerCoordinatorClient::connect(endpoint.clone()).await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("Poll task failed to connect: {}", e);
+                    return;
+                }
+            };
+
+            info!(
+                "Poll task started for worker {} ({} components)",
+                worker_id,
+                component_ids.len()
+            );
+
+            let mut backoff = Duration::from_millis(initial_backoff_ms);
+            let max_backoff = Duration::from_millis(max_backoff_ms);
+
+            loop {
+                // Wait with backoff, respecting shutdown
+                tokio::select! {
+                    _ = shutdown_rx.recv() => {
+                        info!("Poll task shutting down");
+                        return;
+                    }
+                    _ = tokio::time::sleep(backoff) => {}
+                }
+
+                // Capacity-aware: only poll when worker pool has spare slots
+                let queue_len = task_tx.len();
+                let available = max_concurrency.saturating_sub(queue_len);
+                if available == 0 {
+                    debug!("Poll task: worker pool full (queue={}), waiting", queue_len);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+
+                let max_jobs = available.min(10) as i32; // Cap at 10 per poll
+
+                match client
+                    .poll_jobs(PollJobsRequest {
+                        worker_id: worker_id.clone(),
+                        component_ids: component_ids.clone(),
+                        max_jobs,
+                        tenant_id: tenant_id.clone(),
+                        deployment_id: deployment_id.clone(),
+                        claim_timeout_ms: 300_000,
+                    })
+                    .await
+                {
+                    Ok(resp) if resp.jobs.is_empty() => {
+                        // No work — increase backoff
+                        backoff = std::cmp::min(backoff * 2, max_backoff);
+                    }
+                    Ok(resp) => {
+                        // Reset backoff on successful poll
+                        backoff = Duration::from_millis(initial_backoff_ms);
+                        let job_count = resp.jobs.len();
+
+                        for job in resp.jobs {
+                            // Convert JobAssignment → RuntimeMessage (DispatchComponentRequest)
+                            // Tag with _source=poll and _job_id for response routing
+                            let mut metadata = job.metadata.clone();
+                            metadata.insert("_source".to_string(), "poll".to_string());
+                            metadata.insert("_job_id".to_string(), job.job_id.clone());
+                            metadata.insert("_tenant_id".to_string(), tenant_id.clone());
+                            if !job.trace_id.is_empty() {
+                                metadata.insert("trace_id".to_string(), job.trace_id.clone());
+                            }
+
+                            // Use invocation_id = run_id (this is how the WC dispatches)
+                            let runtime_message = RuntimeMessage {
+                                worker_id: String::new(),
+                                message_type: RuntimeMessageType::InvokeFunction as i32,
+                                metadata: HashMap::new(),
+                                message_data: Some(
+                                    crate::pb::runtime_message::MessageData::DispatchComponent(
+                                        crate::pb::DispatchComponentRequest {
+                                            invocation_id: job.run_id.clone(),
+                                            service_name: String::new(),
+                                            component_type: job.component_type,
+                                            component_name: job.component_name.clone(),
+                                            input_data: job.input_data,
+                                            metadata,
+                                            attempt: job.attempt,
+                                            // Unused fields for polled jobs
+                                            object_id: String::new(),
+                                            method_name: String::new(),
+                                            flow_instance_id: String::new(),
+                                            flow_step: 0,
+                                            state_snapshot: Vec::new(),
+                                            journal_position: 0,
+                                            step_checkpoints: Vec::new(),
+                                            session_id: String::new(),
+                                            user_id: String::new(),
+                                            is_streaming: false,
+                                        },
+                                    ),
+                                ),
+                            };
+
+                            if let Err(e) = task_tx.send_async(runtime_message).await {
+                                warn!("Poll task: failed to dispatch job to worker pool: {}", e);
+                                break;
+                            }
+                        }
+
+                        debug!("Poll task: dispatched {} jobs to worker pool", job_count);
+                    }
+                    Err(e) => {
+                        // Check if this is an Unimplemented error (not managed edition)
+                        let err_msg = format!("{}", e);
+                        if err_msg.contains("Unimplemented") || err_msg.contains("UNIMPLEMENTED") {
+                            info!("PollJobs not available (not managed edition), disabling poll task");
+                            return;
+                        }
+                        debug!("Poll task error: {}", e);
+                        backoff = std::cmp::min(backoff * 2, max_backoff);
+                    }
+                }
+            }
+        })
+    }
+
+    /// Handle a polled job response by calling CompleteJob RPC.
+    /// Called from the dispatch loop when a FunctionResponse has _job_id in its metadata.
+    async fn handle_polled_job_response(&self, service_message: ServiceMessage) {
+        // Extract all data from the inner FunctionResponse (DispatchComponentResponse).
+        // The _job_id and _tenant_id metadata tags flow through the handler:
+        //   DispatchComponentRequest.metadata → handler → DispatchComponentResponse.metadata
+        let (job_id, tenant_id, success, output_data, error_message, error_code) =
+            match &service_message.message_type {
+                Some(crate::pb::service_message::MessageType::FunctionResponse(resp)) => {
+                    let jid = match resp.metadata.get("_job_id") {
+                        Some(id) => id.clone(),
+                        None => return,
+                    };
+                    let tid = resp
+                        .metadata
+                        .get("_tenant_id")
+                        .cloned()
+                        .unwrap_or_default();
+                    let output = match &resp.result {
+                        Some(crate::pb::dispatch_component_response::Result::OutputData(data)) => {
+                            data.clone()
+                        }
+                        _ => Vec::new(),
+                    };
+                    (
+                        jid,
+                        tid,
+                        resp.success,
+                        output,
+                        resp.error_message.clone(),
+                        resp.metadata
+                            .get("error_code")
+                            .cloned()
+                            .unwrap_or_default(),
+                    )
+                }
+                _ => {
+                    warn!("Unexpected message type for polled job completion");
+                    return;
+                }
+            };
+
+        // Call CompleteJob RPC
+        let endpoint = self.config.coordinator_endpoint.clone();
+        let worker_id = self.config.worker_id.clone();
+
+        // Spawn a task to avoid blocking the dispatch loop
+        tokio::spawn(async move {
+            let mut client = match WorkerCoordinatorClient::connect(endpoint).await {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("Failed to connect for CompleteJob: job_id={} error={}", job_id, e);
+                    return;
+                }
+            };
+
+            match client
+                .complete_job(CompleteJobRequest {
+                    job_id: job_id.clone(),
+                    worker_id,
+                    success,
+                    output_data,
+                    error_message,
+                    error_code,
+                    metadata: HashMap::new(),
+                    tenant_id,
+                })
+                .await
+            {
+                Ok(_) => {
+                    debug!("CompleteJob succeeded: job_id={}", job_id);
+                }
+                Err(e) => {
+                    error!("CompleteJob failed: job_id={} error={}", job_id, e);
+                }
+            }
+        });
+    }
+
     /// Send graceful shutdown message
     async fn send_shutdown_message(&self, tx: &flume::Sender<ServiceMessage>) -> Result<()> {
         let timestamp = SystemTime::now()
@@ -1198,7 +1511,7 @@ impl Worker {
                 Ok(())
             }
             Err(e) => {
-                warn!(
+                debug!(
                     "Failed to send shutdown message for worker {}: {}",
                     self.config.worker_id, e
                 );

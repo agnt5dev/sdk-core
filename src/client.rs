@@ -1,13 +1,14 @@
 use crate::error::{Result, SdkError};
 use crate::pb::{
     worker_coordinator_service_client::WorkerCoordinatorServiceClient, CheckpointRequest,
-    CheckpointType, DurableStepCheckpoint, GetMemoizedStepRequest, RegisterService,
-    RuntimeMessage, ServiceMessage,
+    CheckpointType, CompleteJobRequest, CompleteJobResponse, DurableStepCheckpoint,
+    GetMemoizedStepRequest, PollJobsRequest, PollJobsResponse, RegisterService, RuntimeMessage,
+    ServiceMessage,
 };
 use std::collections::HashMap;
 use std::time::Duration;
 use tonic::transport::Channel;
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 
 /// Simple client for communicating with the Worker Coordinator service
 #[derive(Debug, Clone)]
@@ -18,7 +19,7 @@ pub struct WorkerCoordinatorClient {
 impl WorkerCoordinatorClient {
     /// Create a new client connected to the Worker Coordinator
     pub async fn connect(endpoint: String) -> Result<Self> {
-        info!("Connecting to Worker Coordinator at {}", endpoint);
+        debug!("Connecting to Worker Coordinator at {}", endpoint);
 
         let channel = Channel::from_shared(endpoint.clone())
             .map_err(|e| SdkError::Connection {
@@ -32,8 +33,8 @@ impl WorkerCoordinatorClient {
             .connect()
             .await
             .map_err(|e| {
-                // Log detailed error for debugging transport issues
-                error!("Connection to {} failed: {:?}", endpoint, e);
+                // Expected during reconnection — debug level to avoid noisy logs
+                debug!("Connection to {} failed: {:?}", endpoint, e);
                 e
             })?;
 
@@ -88,7 +89,7 @@ impl WorkerCoordinatorClient {
             .worker_stream(outgoing_stream)
             .await
             .map_err(|e| {
-                error!("Failed to create gRPC worker stream: {}", e);
+                debug!("Failed to create gRPC worker stream: {}", e);
                 SdkError::Connection {
                     message: format!("gRPC stream failed: {}", e),
                     code: crate::error::ErrorCode::ConnectionFailed,
@@ -109,7 +110,7 @@ impl WorkerCoordinatorClient {
                     }
                 })?
                 .map_err(|e| {
-                    error!("Failed to receive registration response: {}", e);
+                    debug!("Failed to receive registration response: {}", e);
                     SdkError::Connection {
                         message: format!("Stream error: {}", e),
                         code: crate::error::ErrorCode::ConnectionFailed,
@@ -160,7 +161,7 @@ impl WorkerCoordinatorClient {
                         }
                     }
                     Err(e) => {
-                        error!("Stream error: {}", e);
+                        debug!("Stream closed: {}", e);
                         break;
                     }
                 }
@@ -301,6 +302,46 @@ impl WorkerCoordinatorClient {
         } else {
             Ok(None)
         }
+    }
+
+    /// Poll for available jobs from the durable queue (managed edition).
+    /// Workers call this with exponential backoff to claim pending jobs.
+    pub async fn poll_jobs(&mut self, req: PollJobsRequest) -> Result<PollJobsResponse> {
+        let response = self
+            .client
+            .poll_jobs(req)
+            .await
+            .map_err(|e| {
+                debug!("PollJobs RPC failed: {}", e);
+                SdkError::Connection {
+                    message: format!("PollJobs failed: {}", e),
+                    code: crate::error::ErrorCode::ConnectionFailed,
+                    source: None,
+                }
+            })?
+            .into_inner();
+
+        Ok(response)
+    }
+
+    /// Report the result of a polled job back to the coordinator.
+    /// Updates job_queue, run status, journal, and batch counters.
+    pub async fn complete_job(&mut self, req: CompleteJobRequest) -> Result<CompleteJobResponse> {
+        let response = self
+            .client
+            .complete_job(req)
+            .await
+            .map_err(|e| {
+                error!("CompleteJob RPC failed: {}", e);
+                SdkError::Connection {
+                    message: format!("CompleteJob failed: {}", e),
+                    code: crate::error::ErrorCode::ConnectionFailed,
+                    source: None,
+                }
+            })?
+            .into_inner();
+
+        Ok(response)
     }
 }
 
