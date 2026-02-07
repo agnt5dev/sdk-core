@@ -8,7 +8,7 @@ use crate::pb::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{oneshot, Mutex as TokioMutex};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -677,6 +677,9 @@ impl Worker {
         let base_delay = std::time::Duration::from_secs(1);
         let mut retry_count: u32 = 0;
 
+        // Track disconnect time for reconnection duration metrics
+        let mut disconnect_instant: Option<Instant> = None;
+
         loop {
             // Check for shutdown signal (non-blocking)
             if let Ok(()) = shutdown_rx.try_recv() {
@@ -727,17 +730,22 @@ impl Worker {
 
             // Try to connect and run
             self.set_connection_state(ConnectionState::Connecting);
+            crate::telemetry::update_connection_state(1); // 1 = connecting
+            if disconnect_instant.is_none() && retry_count > 0 {
+                disconnect_instant = Some(Instant::now());
+            }
             let was_reconnecting = retry_count > 0;
 
             // Create a new receiver for this connection attempt
             let shutdown_rx_inner = shutdown_tx.subscribe();
 
             match self
-                .try_connect_and_run(message_handler.clone(), shutdown_rx_inner, was_reconnecting)
+                .try_connect_and_run(message_handler.clone(), shutdown_rx_inner, was_reconnecting, disconnect_instant)
                 .await
             {
                 Ok(()) => {
                     self.set_connection_state(ConnectionState::Disconnected);
+                    crate::telemetry::update_connection_state(0); // 0 = disconnected
                     return Ok(());
                 }
                 Err(e) => {
@@ -748,6 +756,12 @@ impl Worker {
                         ConnectionState::Connected
                     );
 
+                    // Record failed reconnection attempt (only for actual connect failures,
+                    // not for an active session that dropped)
+                    if retry_count > 0 && !was_connected {
+                        crate::telemetry::record_reconnection_attempt(false);
+                    }
+
                     // Store error for state tracking (used internally)
                     let error_msg = format!(
                         "Connection failed (attempt {}): {}",
@@ -756,11 +770,14 @@ impl Worker {
                     );
                     debug!("{}", error_msg);
                     self.set_connection_state(ConnectionState::Error(error_msg));
+                    crate::telemetry::update_connection_state(0); // 0 = disconnected
 
                     if was_connected {
                         // Had a working session that dropped — reset retry count
                         // so backoff starts fresh for this new disconnect.
                         retry_count = 1;
+                        // Capture disconnect instant for duration tracking
+                        disconnect_instant = Some(Instant::now());
                     } else {
                         retry_count += 1;
                     }
@@ -792,6 +809,7 @@ impl Worker {
         message_handler: F,
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
         is_reconnect: bool,
+        disconnect_instant: Option<Instant>,
     ) -> Result<()>
     where
         F: Fn(RuntimeMessage, flume::Sender<ServiceMessage>) -> Fut + Send + Clone + 'static,
@@ -834,6 +852,15 @@ impl Worker {
             self.config.worker_id
         );
         self.set_connection_state(ConnectionState::Connected);
+        crate::telemetry::update_connection_state(2); // 2 = connected
+
+        // Record reconnection metrics on successful reconnect
+        if is_reconnect {
+            crate::telemetry::record_reconnection_attempt(true);
+            if let Some(disc_instant) = disconnect_instant {
+                crate::telemetry::record_reconnection_duration(disc_instant.elapsed().as_secs_f64());
+            }
+        }
 
         // Store the tx for emit_checkpoint_sync to use (async version)
         {

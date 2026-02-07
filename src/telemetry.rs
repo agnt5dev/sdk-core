@@ -1,7 +1,7 @@
 // OpenTelemetry telemetry module with OTLP exporter for traces, logs, and metrics
 use crate::error::SdkError;
 use opentelemetry::global::BoxedSpan;
-use opentelemetry::metrics::Counter;
+use opentelemetry::metrics::{Counter, Gauge, Histogram};
 use opentelemetry::propagation::{Extractor, TextMapCompositePropagator, TextMapPropagator};
 use opentelemetry::trace::{Span, SpanKind, Status, Tracer, TracerProvider};
 use opentelemetry::{baggage::BaggageExt, global, Context, KeyValue};
@@ -607,6 +607,85 @@ pub fn record_execution_request_with_attrs(
 
     attrs.extend_from_slice(additional_attrs);
     counter.add(1, &attrs);
+}
+
+// =============================================================================
+// Reconnection Metrics
+// =============================================================================
+
+/// Histogram for time from disconnect to successful reconnect (client-perceived)
+static RECONNECTION_DURATION_HISTOGRAM: OnceLock<Histogram<f64>> = OnceLock::new();
+
+/// Counter for total reconnection attempts (success + failure)
+static RECONNECTION_ATTEMPTS_COUNTER: OnceLock<Counter<u64>> = OnceLock::new();
+
+/// Gauge for current connection state (0=disconnected, 1=connecting, 2=connected)
+static CONNECTION_STATE_GAUGE: OnceLock<Gauge<i64>> = OnceLock::new();
+
+fn get_reconnection_duration_histogram() -> &'static Histogram<f64> {
+    RECONNECTION_DURATION_HISTOGRAM.get_or_init(|| {
+        let meter = global::meter("agnt5-sdk-core");
+        meter
+            .f64_histogram("agnt5.worker.reconnection.duration.seconds")
+            .with_description("Time from disconnect to successful reconnect")
+            .with_unit("s")
+            .with_boundaries(vec![0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0])
+            .build()
+    })
+}
+
+fn get_reconnection_attempts_counter() -> &'static Counter<u64> {
+    RECONNECTION_ATTEMPTS_COUNTER.get_or_init(|| {
+        let meter = global::meter("agnt5-sdk-core");
+        meter
+            .u64_counter("agnt5.worker.reconnection.attempts.total")
+            .with_description("Total reconnection attempts")
+            .with_unit("attempts")
+            .build()
+    })
+}
+
+fn get_connection_state_gauge() -> &'static Gauge<i64> {
+    CONNECTION_STATE_GAUGE.get_or_init(|| {
+        let meter = global::meter("agnt5-sdk-core");
+        meter
+            .i64_gauge("agnt5.worker.connection.state")
+            .with_description("Current connection state (0=disconnected, 1=connecting, 2=connected)")
+            .build()
+    })
+}
+
+/// Build common attributes for reconnection metrics
+fn reconnection_attrs() -> Vec<KeyValue> {
+    let mut attrs = Vec::new();
+    if let Some(tid) = get_tenant_id() {
+        attrs.push(KeyValue::new("tenant.id", tid.to_string()));
+    }
+    if let Some(did) = get_deployment_id() {
+        attrs.push(KeyValue::new("deployment.id", did.to_string()));
+    }
+    attrs
+}
+
+/// Record the duration of a successful reconnection
+pub fn record_reconnection_duration(duration_secs: f64) {
+    let histogram = get_reconnection_duration_histogram();
+    histogram.record(duration_secs, &reconnection_attrs());
+}
+
+/// Record a reconnection attempt (success or failure)
+pub fn record_reconnection_attempt(success: bool) {
+    let counter = get_reconnection_attempts_counter();
+    let mut attrs = reconnection_attrs();
+    attrs.push(KeyValue::new("success", success));
+    counter.add(1, &attrs);
+}
+
+/// Update the current connection state gauge
+/// 0 = disconnected, 1 = connecting, 2 = connected
+pub fn update_connection_state(state: i64) {
+    let gauge = get_connection_state_gauge();
+    gauge.record(state, &reconnection_attrs());
 }
 
 #[cfg(test)]
