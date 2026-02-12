@@ -16,7 +16,7 @@ use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tonic::transport::Channel;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 /// Journal-compatible span data structure.
 /// This mirrors the SpanEventData type from platform/pkg/journal/types.go
@@ -64,10 +64,13 @@ pub struct JournalSpanLink {
     pub attributes: Option<serde_json::Value>,
 }
 
-/// Client for exporting spans directly to the AGNT5 journal.
+/// Client for exporting spans and logs to the Worker Coordinator for real-time SSE streaming.
 ///
-/// This is a simple gRPC client - NOT an OpenTelemetry SpanExporter.
-/// Call `export_span` directly from worker code for real-time streaming.
+/// Uses WC's WriteJournalEvent RPC which publishes to Centrifuge/Redis without
+/// journal persistence. Spans and logs are SSE-only events — they need real-time
+/// delivery but not durable storage.
+///
+/// TODO: Migrate to EventStream (client-streaming) for lower overhead.
 #[derive(Debug, Clone)]
 pub struct JournalClient {
     client: Arc<Mutex<Option<WorkerCoordinatorServiceClient<Channel>>>>,
@@ -79,7 +82,7 @@ impl JournalClient {
     ///
     /// The client will lazily connect to the coordinator on first export.
     pub fn new(endpoint: String) -> Self {
-        info!("🔍 STREAM-DEBUG: JournalClient created for endpoint: {}", endpoint);
+        debug!("JournalClient created for endpoint: {}", endpoint);
         Self {
             client: Arc::new(Mutex::new(None)),
             endpoint,
@@ -104,7 +107,7 @@ impl JournalClient {
                 Ok(channel_builder) => {
                     match channel_builder.connect().await {
                         Ok(channel) => {
-                            info!("🔍 STREAM-DEBUG: JournalClient connected to {}", self.endpoint);
+                            debug!("JournalClient connected to {} (WC)", self.endpoint);
                             *client_guard = Some(WorkerCoordinatorServiceClient::new(channel));
                         }
                         Err(e) => {
@@ -137,8 +140,8 @@ impl JournalClient {
         span_data: &JournalSpanData,
         tenant_id: Option<&str>,
     ) -> Result<(), String> {
-        info!(
-            "🔍 STREAM-DEBUG: JournalClient.export_span called for run_id={}, span={}",
+        debug!(
+            "JournalClient.export_span: run_id={} span={}",
             run_id, span_data.name
         );
 
@@ -170,15 +173,15 @@ impl JournalClient {
         if let Some(ref mut grpc_client) = *client_guard {
             match grpc_client.write_journal_event(request).await {
                 Ok(_response) => {
-                    info!(
-                        "🔍 STREAM-DEBUG: JournalClient.export_span SUCCESS for run_id={}, span={}",
+                    debug!(
+                        "export_span SUCCESS: run_id={} span={}",
                         run_id, span_data.name
                     );
                     Ok(())
                 }
                 Err(e) => {
                     error!(
-                        "🔍 STREAM-DEBUG: JournalClient.export_span FAILED: {} for run_id={}, span={}",
+                        "export_span FAILED: {} for run_id={} span={}",
                         e, run_id, span_data.name
                     );
                     Err(format!("gRPC call failed: {}", e))
@@ -331,8 +334,8 @@ pub async fn export_log_to_journal(
 ) -> Result<(), String> {
     let client = get_journal_client();
 
-    info!(
-        "🔍 STREAM-DEBUG: export_log_to_journal called for run_id={}, severity={}",
+    debug!(
+        "export_log_to_journal: run_id={} severity={}",
         run_id, log_data.severity
     );
 
@@ -364,17 +367,11 @@ pub async fn export_log_to_journal(
     if let Some(ref mut grpc_client) = *client_guard {
         match grpc_client.write_journal_event(request).await {
             Ok(_response) => {
-                info!(
-                    "🔍 STREAM-DEBUG: export_log_to_journal SUCCESS for run_id={}",
-                    run_id
-                );
+                debug!("export_log_to_journal SUCCESS: run_id={}", run_id);
                 Ok(())
             }
             Err(e) => {
-                error!(
-                    "🔍 STREAM-DEBUG: export_log_to_journal FAILED: {} for run_id={}",
-                    e, run_id
-                );
+                error!("export_log_to_journal FAILED: {} for run_id={}", e, run_id);
                 Err(format!("gRPC call failed: {}", e))
             }
         }

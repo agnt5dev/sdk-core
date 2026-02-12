@@ -2,8 +2,8 @@ use crate::error::{Result, SdkError};
 use crate::pb::{
     worker_coordinator_service_client::WorkerCoordinatorServiceClient, CheckpointRequest,
     CheckpointType, CompleteJobRequest, CompleteJobResponse, DurableStepCheckpoint,
-    GetMemoizedStepRequest, PollJobsRequest, PollJobsResponse, RegisterService, RuntimeMessage,
-    ServiceMessage,
+    EventStreamMessage, GetMemoizedStepRequest, PollJobsRequest, PollJobsResponse,
+    RegisterService, RuntimeMessage, ServiceMessage,
 };
 use std::collections::HashMap;
 use std::time::Duration;
@@ -169,6 +169,46 @@ impl WorkerCoordinatorClient {
         });
 
         Ok((outgoing_tx, runtime_msg_rx))
+    }
+
+    /// Open an EventStream for sending ephemeral events (SSE-only: tokens, progress, logs, spans).
+    ///
+    /// Returns a sender for EventStreamMessage. Events sent through this channel are published
+    /// to Centrifuge/Redis for real-time SSE delivery without journal persistence.
+    /// Drop the sender to close the stream.
+    pub async fn create_event_stream(
+        &mut self,
+        worker_id: String,
+    ) -> Result<flume::Sender<EventStreamMessage>> {
+        let (tx, rx) = flume::bounded::<EventStreamMessage>(1000);
+
+        let stream = async_stream::stream! {
+            loop {
+                match rx.recv_async().await {
+                    Ok(msg) => yield msg,
+                    Err(_) => break, // Sender dropped, close stream
+                }
+            }
+        };
+
+        let mut client = self.client.clone();
+        tokio::spawn(async move {
+            match client.event_stream(stream).await {
+                Ok(response) => {
+                    let ack = response.into_inner();
+                    debug!(
+                        "EventStream closed: success={} events_received={}",
+                        ack.success, ack.events_received
+                    );
+                }
+                Err(e) => {
+                    debug!("EventStream error: {}", e);
+                }
+            }
+        });
+
+        debug!("EventStream opened for worker {}", worker_id);
+        Ok(tx)
     }
 
     /// Send a step checkpoint and check for memoized result

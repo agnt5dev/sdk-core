@@ -8,6 +8,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compile_protos(
             &[
                 "../../protos/proto/api/v1/worker_coordinator.proto",
+                "../../protos/proto/api/v1/execution_engine.proto",
                 "../../protos/proto/api/v1/common.proto",
             ],
             &["../../protos/proto"],

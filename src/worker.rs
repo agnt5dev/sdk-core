@@ -2,30 +2,18 @@ use crate::client::WorkerCoordinatorClient;
 use crate::error::Result;
 use crate::journal_queue::{JournalEventMessage, JournalEventQueue, JournalQueueConfig};
 use crate::pb::{
-    CheckpointAck, CompleteJobRequest, ComponentInfo, DispatchComponentResponse, HealthCheck,
-    PollJobsRequest, RegisterService, RuntimeMessage, RuntimeMessageType, ServiceMessage,
-    UnregisterService, WorkerHealthStatus, WorkflowCheckpoint,
+    execution_engine_service_client::ExecutionEngineServiceClient, CompleteJobRequest,
+    ComponentInfo, DispatchComponentResponse, EventStreamMessage, HealthCheck, PollJobsRequest,
+    RegisterService, RuntimeMessage, RuntimeMessageType, ServiceMessage, UnregisterService,
+    WorkerHealthStatus, WriteCheckpointRequest,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{oneshot, Mutex as TokioMutex};
+use tokio::sync::Mutex as TokioMutex;
+use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
-
-/// Key for tracking pending checkpoint acknowledgements
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-struct PendingAckKey {
-    run_id: String,
-    sequence_number: i64,
-}
-
-/// Pending acknowledgement tracker for async checkpoint events (used by async emit_checkpoint_sync)
-type PendingAcks = Arc<TokioMutex<HashMap<PendingAckKey, oneshot::Sender<CheckpointAck>>>>;
-
-/// Pending acknowledgement tracker for truly synchronous checkpoint events
-/// Uses std::sync primitives for blocking operations from sync Python code
-type SyncPendingAcks = Arc<std::sync::Mutex<HashMap<PendingAckKey, std::sync::mpsc::Sender<CheckpointAck>>>>;
 
 /// Connection states for tracking worker status
 #[derive(Debug, Clone, PartialEq)]
@@ -45,6 +33,12 @@ pub struct WorkerConfig {
     pub worker_id: String,
     pub coordinator_endpoint: String,
 
+    /// Execution Engine endpoint for journal writes and checkpoints.
+    /// In production with Envoy, this equals coordinator_endpoint (Envoy routes by gRPC service).
+    /// In standalone/dev mode, EE runs on a separate port (default: 34185).
+    /// Env: AGNT5_EE_ENDPOINT. Defaults to coordinator_endpoint.
+    pub ee_endpoint: String,
+
     /// Maximum connection retry attempts before exiting.
     /// 0 = infinite retry (worker never exits due to connection issues)
     /// Default: 5
@@ -60,6 +54,11 @@ impl WorkerConfig {
         let coordinator_endpoint = std::env::var("AGNT5_COORDINATOR_ENDPOINT")
             .unwrap_or_else(|_| "http://localhost:34186".to_string());
 
+        // EE endpoint defaults to coordinator endpoint (works with Envoy routing).
+        // In standalone/dev mode, set AGNT5_EE_ENDPOINT to the EE port (e.g., http://localhost:34185).
+        let ee_endpoint = std::env::var("AGNT5_EE_ENDPOINT")
+            .unwrap_or_else(|_| coordinator_endpoint.clone());
+
         // Parse max retries from environment (0 = infinite, default: 5)
         let max_retries = std::env::var("AGNT5_MAX_RETRIES")
             .ok()
@@ -72,6 +71,7 @@ impl WorkerConfig {
             service_type,
             worker_id,
             coordinator_endpoint,
+            ee_endpoint,
             max_retries,
         }
     }
@@ -119,16 +119,13 @@ pub struct Worker {
     connection_state: Arc<std::sync::Mutex<ConnectionState>>,
     /// Unified journal event queue (replaces checkpoint_queue, delta_queue, span_export_queue, log_export_queue)
     journal_queue: JournalEventQueue,
-    /// Pending checkpoint acknowledgements for async emit (tokio oneshot)
-    pending_acks: PendingAcks,
-    /// Sender for checkpoint events that need synchronous acknowledgement (async version)
-    checkpoint_tx: Arc<TokioMutex<Option<flume::Sender<ServiceMessage>>>>,
-    /// Sender for checkpoint events - sync version using std::sync::Mutex
-    /// This allows truly blocking sends from sync Python code
-    sync_checkpoint_tx: Arc<std::sync::Mutex<Option<flume::Sender<ServiceMessage>>>>,
-    /// Pending checkpoint acknowledgements for truly synchronous emit (std::sync::mpsc)
-    /// Uses blocking channels so sync Python code can wait without async runtime
-    sync_pending_acks: SyncPendingAcks,
+    /// Lazily-connected EE gRPC client for WriteCheckpoint unary RPCs.
+    /// Used by emit_checkpoint_sync/emit_checkpoint_sync_blocking to persist checkpoints
+    /// directly to EE, replacing the old WorkflowCheckpoint→CheckpointAck stream round-trip.
+    ee_client: Arc<TokioMutex<Option<ExecutionEngineServiceClient<Channel>>>>,
+    /// Tokio runtime handle captured in run() for use by emit_checkpoint_sync_blocking.
+    /// Python threads (via PyO3) are NOT tokio threads, so they can't use Handle::current().
+    tokio_handle: Arc<std::sync::Mutex<Option<tokio::runtime::Handle>>>,
 }
 
 // Implement Debug manually to avoid requiring Debug on JournalEventQueue's internals
@@ -140,8 +137,6 @@ impl std::fmt::Debug for Worker {
             .field("metadata", &self.metadata)
             .field("connection_state", &self.connection_state)
             .field("journal_queue_size", &self.journal_queue.len())
-            .field("pending_acks", &"<PendingAcks>")
-            .field("sync_pending_acks", &"<SyncPendingAcks>")
             .finish()
     }
 }
@@ -167,10 +162,8 @@ impl Worker {
             metadata,
             connection_state: Arc::new(std::sync::Mutex::new(ConnectionState::Disconnected)),
             journal_queue: JournalEventQueue::new(journal_config),
-            pending_acks: Arc::new(TokioMutex::new(HashMap::new())),
-            checkpoint_tx: Arc::new(TokioMutex::new(None)),
-            sync_checkpoint_tx: Arc::new(std::sync::Mutex::new(None)),
-            sync_pending_acks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            ee_client: Arc::new(TokioMutex::new(None)),
+            tokio_handle: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -179,7 +172,10 @@ impl Worker {
         self.journal_queue.clone()
     }
 
-    /// Set components for the worker
+    /// Set components for the worker.
+    /// Note: Built-in scorers are NOT registered as components. The platform
+    /// routes scorer requests to any available worker without component lookup,
+    /// and the worker handles them via the Rust fast-path or language SDK.
     pub fn set_components(&mut self, components: Vec<ComponentInfo>) {
         self.components = components;
     }
@@ -273,11 +269,47 @@ impl Worker {
         self.journal_queue.drain_all()
     }
 
-    /// Emit a checkpoint event synchronously and wait for acknowledgement
+    /// Ensure the EE gRPC client is connected, lazily creating it on first use.
+    async fn ensure_ee_client(&self) -> Result<ExecutionEngineServiceClient<Channel>> {
+        let mut guard = self.ee_client.lock().await;
+        if let Some(ref client) = *guard {
+            return Ok(client.clone());
+        }
+
+        // Connect to EE. In production, Envoy routes by gRPC service name
+        // (ee_endpoint == coordinator_endpoint). In dev mode, EE is on a separate port.
+        let endpoint = &self.config.ee_endpoint;
+        debug!("Connecting EE client to {}", endpoint);
+
+        let channel = Channel::from_shared(endpoint.clone())
+            .map_err(|e| crate::error::SdkError::Connection {
+                message: format!("Invalid EE endpoint {}: {}", endpoint, e),
+                code: crate::error::ErrorCode::ConnectionFailed,
+                source: None,
+            })?
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .connect()
+            .await
+            .map_err(|e| {
+                debug!("EE connection to {} failed: {:?}", endpoint, e);
+                crate::error::SdkError::Connection {
+                    message: format!("EE connection failed: {}", e),
+                    code: crate::error::ErrorCode::ConnectionFailed,
+                    source: None,
+                }
+            })?;
+
+        let client = ExecutionEngineServiceClient::new(channel);
+        *guard = Some(client.clone());
+        debug!("EE client connected to {}", endpoint);
+        Ok(client)
+    }
+
+    /// Emit a checkpoint event synchronously and wait for acknowledgement.
     ///
-    /// This method blocks until the platform acknowledges that the event has been
-    /// persisted to the journal. This ensures correct event ordering for lifecycle
-    /// events that affect workflow state.
+    /// Sends a WriteCheckpoint unary RPC directly to the Execution Engine.
+    /// The RPC response serves as the acknowledgement — no stream round-trip needed.
     ///
     /// # Arguments
     ///
@@ -287,14 +319,11 @@ impl Worker {
     /// * `sequence_number` - Sequence number for ordering within execution
     /// * `metadata` - Additional metadata
     /// * `source_timestamp_ns` - Nanosecond timestamp when event was created
-    /// * `timeout_ms` - Timeout in milliseconds to wait for acknowledgement
+    /// * `timeout_ms` - Timeout in milliseconds for the RPC call
     ///
     /// # Returns
     ///
-    /// Ok(()) if the checkpoint was acknowledged, or an error if:
-    /// - The connection is not established
-    /// - The timeout was reached
-    /// - The send failed
+    /// Ok(()) if the checkpoint was persisted, or an error if the RPC failed.
     pub async fn emit_checkpoint_sync(
         &self,
         run_id: String,
@@ -305,109 +334,77 @@ impl Worker {
         source_timestamp_ns: i64,
         timeout_ms: u64,
     ) -> Result<()> {
-        // Get the checkpoint sender (must be connected)
-        let tx = {
-            let guard = self.checkpoint_tx.lock().await;
-            guard.clone().ok_or_else(|| {
-                crate::error::SdkError::Connection {
-                    message: "Worker not connected, cannot emit checkpoint".to_string(),
-                    code: crate::error::ErrorCode::ConnectionFailed,
-                    source: None,
-                }
-            })?
-        };
-
-        // Create oneshot channel for ack
-        let (ack_tx, ack_rx) = oneshot::channel();
-
-        // Register pending ack
-        let key = PendingAckKey {
-            run_id: run_id.clone(),
-            sequence_number,
-        };
-        {
-            let mut pending = self.pending_acks.lock().await;
-            pending.insert(key.clone(), ack_tx);
-        }
-
         // Merge service metadata (tenant_id, deployment_id) with passed metadata
-        // Service metadata provides authoritative tenant/deployment info needed for journal writes
         let mut merged_metadata = metadata;
-        for (key, value) in &self.metadata {
-            if !merged_metadata.contains_key(key) {
-                merged_metadata.insert(key.clone(), value.clone());
+        for (k, v) in &self.metadata {
+            if !merged_metadata.contains_key(k) {
+                merged_metadata.insert(k.clone(), v.clone());
             }
         }
 
-        // Build the checkpoint message
-        let checkpoint = WorkflowCheckpoint {
-            invocation_id: run_id.clone(),
+        // Extract correlation/parent IDs from metadata
+        let correlation_id = merged_metadata.remove("cid").unwrap_or_default();
+        let parent_event_id = merged_metadata.remove("pcid").unwrap_or_default();
+
+        let request = WriteCheckpointRequest {
+            run_id: run_id.clone(),
             checkpoint_type: event_type.clone(),
             checkpoint_data: event_data,
             sequence_number,
-            metadata: merged_metadata,
+            trace_id: String::new(),
+            tenant_id: merged_metadata.get("tenant_id").cloned().unwrap_or_default(),
             source_timestamp_ns,
+            correlation_id,
+            parent_event_id,
+            metadata: merged_metadata,
         };
 
-        let service_message = ServiceMessage {
-            worker_id: self.config.worker_id.clone(),
-            metadata: std::collections::HashMap::new(),
-            message_type: Some(
-                crate::pb::service_message::MessageType::WorkflowCheckpoint(checkpoint),
-            ),
-        };
+        // Get EE client and call WriteCheckpoint with timeout
+        let mut ee_client = self.ensure_ee_client().await?;
 
-        // Send the checkpoint
-        if let Err(e) = tx.send_async(service_message).await {
-            // Remove pending ack on send failure
-            let mut pending = self.pending_acks.lock().await;
-            pending.remove(&key);
-            return Err(crate::error::SdkError::Connection {
-                message: format!("Failed to send checkpoint: {}", e),
-                code: crate::error::ErrorCode::ConnectionFailed,
-                source: None,
-            });
-        }
-
-        debug!(
-            "Sent checkpoint event, waiting for ack: run_id={} event_type={} seq={}",
-            run_id, event_type, sequence_number
-        );
-
-        // Wait for ack with timeout
         let timeout = Duration::from_millis(timeout_ms);
-        match tokio::time::timeout(timeout, ack_rx).await {
-            Ok(Ok(ack)) => {
-                debug!(
-                    "Received checkpoint ack: run_id={} event_type={} seq={}",
-                    ack.run_id, ack.event_type, ack.sequence_number
-                );
-                Ok(())
+        match tokio::time::timeout(timeout, ee_client.write_checkpoint(request)).await {
+            Ok(Ok(response)) => {
+                let resp = response.into_inner();
+                if resp.success {
+                    debug!(
+                        "Checkpoint persisted: run_id={} event_type={} seq={} journal_seq={}",
+                        run_id, event_type, sequence_number, resp.sequence_number
+                    );
+                    Ok(())
+                } else {
+                    warn!(
+                        "Checkpoint rejected: run_id={} event_type={} seq={} error={}",
+                        run_id, event_type, sequence_number, resp.error_message
+                    );
+                    Err(crate::error::SdkError::Internal(format!(
+                        "Checkpoint rejected: {}",
+                        resp.error_message
+                    )))
+                }
             }
-            Ok(Err(_)) => {
-                // Channel was dropped (sender gone)
+            Ok(Err(e)) => {
                 warn!(
-                    "Checkpoint ack channel dropped: run_id={} event_type={} seq={}",
-                    run_id, event_type, sequence_number
+                    "WriteCheckpoint RPC failed: run_id={} event_type={} seq={} error={}",
+                    run_id, event_type, sequence_number, e
                 );
-                // Remove from pending (may have been cleaned up already)
-                let mut pending = self.pending_acks.lock().await;
-                pending.remove(&key);
-                Err(crate::error::SdkError::Internal(
-                    "Checkpoint ack channel dropped".to_string(),
-                ))
+                // Clear cached client on RPC failure so next call reconnects
+                {
+                    let mut guard = self.ee_client.lock().await;
+                    *guard = None;
+                }
+                Err(crate::error::SdkError::Connection {
+                    message: format!("WriteCheckpoint failed: {}", e),
+                    code: crate::error::ErrorCode::ConnectionFailed,
+                    source: None,
+                })
             }
             Err(_) => {
-                // Timeout
                 warn!(
-                    "Checkpoint ack timeout after {}ms: run_id={} event_type={} seq={} (platform may not support acks yet)",
+                    "WriteCheckpoint timeout after {}ms: run_id={} event_type={} seq={}",
                     timeout_ms, run_id, event_type, sequence_number
                 );
-                // Remove pending ack on timeout
-                let mut pending = self.pending_acks.lock().await;
-                pending.remove(&key);
-                // Return Ok for graceful degradation with old platforms
-                // The event was sent, we just didn't get confirmation
+                // Return Ok for graceful degradation — event may have been persisted
                 Ok(())
             }
         }
@@ -416,7 +413,7 @@ impl Worker {
     /// Emit a checkpoint event and block until the platform acknowledges it (TRULY SYNCHRONOUS)
     ///
     /// This is the sync version that can be called from non-async Python code.
-    /// It uses std::sync primitives to block the calling thread until the ack is received.
+    /// It creates a temporary tokio runtime to execute the async WriteCheckpoint RPC.
     ///
     /// # Arguments
     ///
@@ -426,14 +423,11 @@ impl Worker {
     /// * `sequence_number` - Sequence number for ordering
     /// * `metadata` - Additional metadata for the event
     /// * `source_timestamp_ns` - Nanosecond timestamp when event was created
-    /// * `timeout_ms` - Timeout in milliseconds to wait for acknowledgement
+    /// * `timeout_ms` - Timeout in milliseconds for the RPC call
     ///
     /// # Returns
     ///
-    /// Ok(()) if the checkpoint was acknowledged, or an error if:
-    /// - The connection is not established
-    /// - The timeout was reached
-    /// - The send failed
+    /// Ok(()) if the checkpoint was persisted, or an error if the RPC failed.
     pub fn emit_checkpoint_sync_blocking(
         &self,
         run_id: String,
@@ -444,163 +438,59 @@ impl Worker {
         source_timestamp_ns: i64,
         timeout_ms: u64,
     ) -> Result<()> {
-        // Get the checkpoint sender (must be connected)
-        // Using std::sync::Mutex so this can be called from sync code
-        let tx = {
-            let guard = self.sync_checkpoint_tx.lock().map_err(|e| {
-                crate::error::SdkError::Internal(format!("Failed to lock sync_checkpoint_tx: {}", e))
-            })?;
-            guard.clone().ok_or_else(|| {
-                crate::error::SdkError::Connection {
-                    message: "Worker not connected, cannot emit checkpoint".to_string(),
+        let worker = self.clone();
+
+        // Detect whether we're on a tokio thread or not.
+        // Python threads (via PyO3 allow_threads) are NOT tokio threads,
+        // so Handle::current() would panic. Use the stored handle instead.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            // On a tokio thread — use block_in_place to yield the thread back to tokio
+            tokio::task::block_in_place(move || {
+                handle.block_on(async move {
+                    worker
+                        .emit_checkpoint_sync(
+                            run_id,
+                            event_type,
+                            event_data,
+                            sequence_number,
+                            metadata,
+                            source_timestamp_ns,
+                            timeout_ms,
+                        )
+                        .await
+                })
+            })
+        } else {
+            // Not on a tokio thread (e.g., Python asyncio event loop via PyO3)
+            // Use the stored handle captured in run()
+            let handle = {
+                let guard = self.tokio_handle.lock().map_err(|e| {
+                    crate::error::SdkError::Internal(format!(
+                        "Failed to lock tokio_handle: {}",
+                        e
+                    ))
+                })?;
+                guard.clone().ok_or_else(|| crate::error::SdkError::Connection {
+                    message: "Worker not running, cannot emit checkpoint".to_string(),
                     code: crate::error::ErrorCode::ConnectionFailed,
                     source: None,
-                }
-            })?
-        };
+                })?
+            };
 
-        // Create sync channel for ack (std::sync::mpsc)
-        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
-
-        // Register pending ack in the sync map
-        let key = PendingAckKey {
-            run_id: run_id.clone(),
-            sequence_number,
-        };
-        {
-            let mut pending = self.sync_pending_acks.lock().map_err(|e| {
-                crate::error::SdkError::Internal(format!("Failed to lock sync_pending_acks: {}", e))
-            })?;
-            pending.insert(key.clone(), ack_tx);
+            handle.block_on(async move {
+                worker
+                    .emit_checkpoint_sync(
+                        run_id,
+                        event_type,
+                        event_data,
+                        sequence_number,
+                        metadata,
+                        source_timestamp_ns,
+                        timeout_ms,
+                    )
+                    .await
+            })
         }
-
-        // Merge service metadata (tenant_id, deployment_id) with passed metadata
-        // Service metadata provides authoritative tenant/deployment info needed for journal writes
-        let mut merged_metadata = metadata;
-
-        for (key, value) in &self.metadata {
-            if !merged_metadata.contains_key(key) {
-                merged_metadata.insert(key.clone(), value.clone());
-            }
-        }
-
-        // Build the checkpoint message
-        let checkpoint = WorkflowCheckpoint {
-            invocation_id: run_id.clone(),
-            checkpoint_type: event_type.clone(),
-            checkpoint_data: event_data,
-            sequence_number,
-            metadata: merged_metadata,
-            source_timestamp_ns,
-        };
-
-        let service_message = ServiceMessage {
-            worker_id: self.config.worker_id.clone(),
-            metadata: std::collections::HashMap::new(),
-            message_type: Some(
-                crate::pb::service_message::MessageType::WorkflowCheckpoint(checkpoint),
-            ),
-        };
-
-        // Send the checkpoint using blocking send (flume supports this)
-        if let Err(e) = tx.send(service_message) {
-            // Remove pending ack on send failure
-            if let Ok(mut pending) = self.sync_pending_acks.lock() {
-                pending.remove(&key);
-            }
-            return Err(crate::error::SdkError::Connection {
-                message: format!("Failed to send checkpoint: {}", e),
-                code: crate::error::ErrorCode::ConnectionFailed,
-                source: None,
-            });
-        }
-
-        debug!(
-            "Sent checkpoint event (sync blocking), waiting for ack: run_id={} event_type={} seq={}",
-            run_id, event_type, sequence_number
-        );
-
-        // Wait for ack with timeout using blocking recv
-        let timeout = Duration::from_millis(timeout_ms);
-        match ack_rx.recv_timeout(timeout) {
-            Ok(ack) => {
-                debug!(
-                    "Received checkpoint ack (sync blocking): run_id={} event_type={} seq={}",
-                    ack.run_id, ack.event_type, ack.sequence_number
-                );
-                Ok(())
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                warn!(
-                    "Checkpoint ack timeout (sync blocking) after {}ms: run_id={} event_type={} seq={} (platform may not support acks yet)",
-                    timeout_ms, run_id, event_type, sequence_number
-                );
-                // Remove pending ack on timeout
-                if let Ok(mut pending) = self.sync_pending_acks.lock() {
-                    pending.remove(&key);
-                }
-                // Return Ok for graceful degradation with old platforms
-                Ok(())
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                warn!(
-                    "Checkpoint ack channel disconnected (sync blocking): run_id={} event_type={} seq={}",
-                    run_id, event_type, sequence_number
-                );
-                // Remove from pending
-                if let Ok(mut pending) = self.sync_pending_acks.lock() {
-                    pending.remove(&key);
-                }
-                Err(crate::error::SdkError::Internal(
-                    "Checkpoint ack channel disconnected".to_string(),
-                ))
-            }
-        }
-    }
-
-    /// Handle a checkpoint acknowledgement from the platform
-    ///
-    /// This is called internally when the dispatch loop receives a CheckpointAck message.
-    /// It checks both async (tokio oneshot) and sync (std::sync::mpsc) pending acks.
-    async fn handle_checkpoint_ack(&self, ack: CheckpointAck) {
-        let key = PendingAckKey {
-            run_id: ack.run_id.clone(),
-            sequence_number: ack.sequence_number,
-        };
-
-        // First, try the async pending acks (tokio oneshot)
-        let async_sender = {
-            let mut pending = self.pending_acks.lock().await;
-            pending.remove(&key)
-        };
-
-        if let Some(tx) = async_sender {
-            if tx.send(ack).is_err() {
-                debug!("Checkpoint ack receiver dropped (async, caller may have timed out)");
-            }
-            return;
-        }
-
-        // Second, try the sync pending acks (std::sync::mpsc)
-        let sync_sender = {
-            if let Ok(mut pending) = self.sync_pending_acks.lock() {
-                pending.remove(&key)
-            } else {
-                None
-            }
-        };
-
-        if let Some(tx) = sync_sender {
-            if tx.send(ack).is_err() {
-                debug!("Checkpoint ack receiver dropped (sync, caller may have timed out)");
-            }
-            return;
-        }
-
-        debug!(
-            "Received ack for unknown checkpoint: run_id={} seq={}",
-            key.run_id, key.sequence_number
-        );
     }
 
     /// Queue a streaming delta for real-time delivery to clients (legacy API)
@@ -649,6 +539,14 @@ impl Worker {
         Fut: std::future::Future<Output = Result<Option<ServiceMessage>>> + Send + 'static,
     {
         info!("Starting worker {}", self.config.worker_id);
+
+        // Capture the tokio runtime handle for emit_checkpoint_sync_blocking.
+        // Python threads (via PyO3) are not tokio threads, so they need a stored handle.
+        {
+            if let Ok(mut guard) = self.tokio_handle.lock() {
+                *guard = Some(tokio::runtime::Handle::current());
+            }
+        }
 
         // Initialize telemetry automatically in async context
         if let Err(e) = crate::telemetry::init_telemetry(
@@ -862,24 +760,29 @@ impl Worker {
             }
         }
 
-        // Store the tx for emit_checkpoint_sync to use (async version)
+        // Open EventStream for ephemeral events (SSE-only: tokens, progress, logs)
+        // This is a separate client-streaming gRPC connection alongside the dispatch stream.
+        let event_stream_tx = match client
+            .create_event_stream(self.config.worker_id.clone())
+            .await
         {
-            let mut guard = self.checkpoint_tx.lock().await;
-            *guard = Some(tx.clone());
-        }
-
-        // Store the tx for emit_checkpoint_sync_blocking to use (sync version)
-        {
-            if let Ok(mut guard) = self.sync_checkpoint_tx.lock() {
-                *guard = Some(tx.clone());
+            Ok(es_tx) => {
+                debug!("EventStream opened for SSE-only events");
+                Some(es_tx)
             }
-        }
+            Err(e) => {
+                // EventStream is optional — fall back to dispatch stream if unavailable
+                // (e.g., older WC versions that don't support EventStream)
+                warn!("Failed to open EventStream, SSE-only events will use dispatch stream: {}", e);
+                None
+            }
+        };
 
         // Start heartbeat task
         let heartbeat_task = self.spawn_heartbeat_task(tx.clone());
 
         // Start unified journal event flush task (replaces checkpoint, delta, span, log flush tasks)
-        let journal_flush_task = self.spawn_journal_flush_task(tx.clone());
+        let journal_flush_task = self.spawn_journal_flush_task(tx.clone(), event_stream_tx.clone());
 
         // Get concurrency configuration
         let max_concurrency = std::env::var("AGNT5_MAX_CONCURRENCY")
@@ -954,17 +857,89 @@ impl Worker {
                 result = rx.recv_async() => {
                     match result {
                         Ok(runtime_message) => {
-                            // Check if this is a CheckpointAck message - handle internally
+                            // Legacy CheckpointAck messages from older WC — ignore silently.
+                            // Checkpoints now use WriteCheckpoint unary RPC to EE directly.
                             if runtime_message.message_type == RuntimeMessageType::CheckpointAck as i32 {
-                                if let Some(crate::pb::runtime_message::MessageData::CheckpointAck(ack)) =
-                                    runtime_message.message_data
-                                {
-                                    debug!(
-                                        "Received CheckpointAck: run_id={} seq={} event_type={}",
-                                        ack.run_id, ack.sequence_number, ack.event_type
-                                    );
-                                    self.handle_checkpoint_ack(ack).await;
-                                    continue; // Don't dispatch to worker pool
+                                debug!("Ignoring legacy CheckpointAck on dispatch stream");
+                                continue;
+                            }
+
+                            // Fast path: handle built-in scorers directly in Rust
+                            if let Some(ref msg_data) = runtime_message.message_data {
+                                if let crate::pb::runtime_message::MessageData::DispatchComponent(ref req) = msg_data {
+                                    // component_type 10 = COMPONENT_TYPE_SCORER
+                                    if req.component_type == 10 {
+                                        if let Some(result) = crate::eval::builtin_scorer::execute(&req.component_name, &req.input_data) {
+                                            let output_data = serde_json::to_vec(&result).unwrap_or_default();
+                                            let response = DispatchComponentResponse {
+                                                invocation_id: req.invocation_id.clone(),
+                                                success: true,
+                                                result: Some(
+                                                    crate::pb::dispatch_component_response::Result::OutputData(output_data.clone()),
+                                                ),
+                                                error_message: String::new(),
+                                                metadata: req.metadata.clone(),
+                                                event_type: "run.completed".to_string(),
+                                                content_index: 0,
+                                                sequence: 0,
+                                                attempt: 0,
+                                                source_timestamp_ns: 0,
+                                            };
+                                            let service_message = ServiceMessage {
+                                                worker_id: self.config.worker_id.clone(),
+                                                metadata: std::collections::HashMap::new(),
+                                                message_type: Some(
+                                                    crate::pb::service_message::MessageType::FunctionResponse(response),
+                                                ),
+                                            };
+                                            if let Err(e) = response_tx.send_async(service_message).await {
+                                                error!("Failed to send built-in scorer response: {}", e);
+                                            }
+
+                                            // Emit boundary events to EE via WriteCheckpoint so
+                                            // journal entries are created and NATS terminal events
+                                            // are published (the gateway waits on these).
+                                            let run_id = if let Some(idx) = req.invocation_id.find(':') {
+                                                req.invocation_id[..idx].to_string()
+                                            } else {
+                                                req.invocation_id.clone()
+                                            };
+
+                                            let timestamp_ns = std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_nanos() as i64;
+
+                                            // run.started
+                                            if let Err(e) = self.emit_checkpoint_sync(
+                                                run_id.clone(),
+                                                "run.started".to_string(),
+                                                req.input_data.clone(),
+                                                0,
+                                                req.metadata.clone(),
+                                                timestamp_ns,
+                                                5000,
+                                            ).await {
+                                                warn!("Built-in scorer: failed to emit run.started checkpoint: {}", e);
+                                            }
+
+                                            // run.completed
+                                            if let Err(e) = self.emit_checkpoint_sync(
+                                                run_id,
+                                                "run.completed".to_string(),
+                                                output_data.clone(),
+                                                1,
+                                                req.metadata.clone(),
+                                                timestamp_ns,
+                                                5000,
+                                            ).await {
+                                                warn!("Built-in scorer: failed to emit run.completed checkpoint: {}", e);
+                                            }
+
+                                            continue;
+                                        }
+                                        // Not a fast-path scorer — fall through to language handler
+                                    }
                                 }
                             }
 
@@ -1050,38 +1025,10 @@ impl Worker {
         drop(task_rx); // Close receiver
         drop(response_tx); // Close response sender
 
-        // Clear checkpoint_tx to prevent emit_checkpoint_sync from sending after disconnect (async)
+        // Clear cached EE client on disconnect so it reconnects on next connection
         {
-            let mut guard = self.checkpoint_tx.lock().await;
+            let mut guard = self.ee_client.lock().await;
             *guard = None;
-        }
-
-        // Clear sync_checkpoint_tx to prevent emit_checkpoint_sync_blocking from sending after disconnect
-        {
-            if let Ok(mut guard) = self.sync_checkpoint_tx.lock() {
-                *guard = None;
-            }
-        }
-
-        // Cancel any pending checkpoint acks (async)
-        {
-            let mut pending = self.pending_acks.lock().await;
-            let count = pending.len();
-            if count > 0 {
-                debug!("Cancelling {} pending async checkpoint acks on disconnect", count);
-            }
-            pending.clear();
-        }
-
-        // Cancel any pending sync checkpoint acks
-        {
-            if let Ok(mut pending) = self.sync_pending_acks.lock() {
-                let count = pending.len();
-                if count > 0 {
-                    debug!("Cancelling {} pending sync checkpoint acks on disconnect", count);
-                }
-                pending.clear();
-            }
         }
 
         // Wait for all worker tasks to complete
@@ -1142,20 +1089,25 @@ impl Worker {
 
     /// Spawn unified journal event flush task
     ///
-    /// This task periodically flushes all buffered events to the coordinator via gRPC stream.
-    /// It handles both:
-    /// - Boundary events (workflow.*, agent.*, lm.call.*): Sent as DispatchComponentResponse for persistence
-    /// - SSE-only events (output.delta, log, etc.): Sent as DispatchComponentResponse for SSE forwarding only
+    /// This task periodically flushes all buffered events to the coordinator.
+    /// Events are routed based on type:
+    /// - SSE-only events (output.delta, log, etc.): Sent via EventStream for real-time SSE delivery
+    /// - Boundary events (workflow.*, agent.*, lm.call.*): Sent as DispatchComponentResponse on dispatch stream
     ///
-    /// The coordinator will persist boundary events and forward SSE-only events to the stream.
+    /// If EventStream is not available, all events fall back to the dispatch stream.
     fn spawn_journal_flush_task(
         &self,
         tx: flume::Sender<ServiceMessage>,
+        event_stream_tx: Option<flume::Sender<EventStreamMessage>>,
     ) -> tokio::task::JoinHandle<()> {
         let worker_id = self.config.worker_id.clone();
         let journal_queue = self.journal_queue.clone();
         let flush_interval_ms = journal_queue.flush_interval_ms();
         let batch_size = journal_queue.batch_size();
+
+        // Cache tenant_id and deployment_id to avoid repeated env lookups per event
+        let cached_tenant_id = std::env::var("AGNT5_TENANT_ID").unwrap_or_default();
+        let cached_deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").unwrap_or_default();
 
         tokio::spawn(async move {
             let mut interval =
@@ -1174,13 +1126,40 @@ impl Worker {
                 let mut sse_only_count = 0;
 
                 for event in batch {
-                    // Track SSE-only events for metrics
-                    if event.is_sse_only {
-                        sse_only_count += 1;
+                    let is_sse_only = event.is_sse_only;
+
+                    // Route SSE-only events through EventStream if available
+                    if is_sse_only {
+                        if let Some(ref es_tx) = event_stream_tx {
+                            let es_msg = EventStreamMessage {
+                                run_id: event.run_id.clone(),
+                                event_type: event.event_type.clone(),
+                                data: event.data.clone(),
+                                trace_id: String::new(),
+                                span_id: String::new(),
+                                tenant_id: cached_tenant_id.clone(),
+                                source_timestamp_ns: event.source_timestamp_ns,
+                                worker_id: worker_id.clone(),
+                            };
+
+                            if let Err(e) = es_tx.send_async(es_msg).await {
+                                // EventStream channel closed — fall through to dispatch stream
+                                warn!(
+                                    "EventStream send failed, falling back to dispatch stream: type={} run_id={} error={}",
+                                    event.event_type, event.run_id, e
+                                );
+                                // Fall through to send via dispatch stream below
+                            } else {
+                                sse_only_count += 1;
+                                sent_count += 1;
+                                continue; // Successfully sent via EventStream
+                            }
+                        }
+                        // No EventStream available — fall through to dispatch stream
                     }
 
+                    // Send via dispatch stream (boundary events, or SSE-only fallback)
                     // Build metadata with cid, pcid, tenant_id, and deployment_id
-                    // Using short keys (cid, pcid) to reduce JSONB storage overhead
                     let mut metadata = event.metadata.clone();
                     if !event.correlation_id.is_empty() {
                         metadata.insert("cid".to_string(), event.correlation_id.clone());
@@ -1188,23 +1167,13 @@ impl Worker {
                     if !event.parent_correlation_id.is_empty() {
                         metadata.insert("pcid".to_string(), event.parent_correlation_id.clone());
                     }
-
-                    // Include tenant_id and deployment_id from environment variables if present
-                    if let Ok(tenant_id) = std::env::var("AGNT5_TENANT_ID") {
-                        if !tenant_id.is_empty() {
-                            metadata.insert("tenant_id".to_string(), tenant_id);
-                        }
+                    if !cached_tenant_id.is_empty() {
+                        metadata.insert("tenant_id".to_string(), cached_tenant_id.clone());
                     }
-                    if let Ok(deployment_id) = std::env::var("AGNT5_DEPLOYMENT_ID") {
-                        if !deployment_id.is_empty() {
-                            metadata.insert("deployment_id".to_string(), deployment_id);
-                        }
+                    if !cached_deployment_id.is_empty() {
+                        metadata.insert("deployment_id".to_string(), cached_deployment_id.clone());
                     }
 
-                    // Send as DispatchComponentResponse for now (existing proto)
-                    // The coordinator will:
-                    // - Persist boundary events to journal_events table
-                    // - Forward SSE-only events to SSE stream without persistence
                     let response = DispatchComponentResponse {
                         invocation_id: event.run_id.clone(),
                         success: true,
@@ -1246,13 +1215,16 @@ impl Worker {
                         break; // Channel closed, exit task
                     }
 
+                    if is_sse_only {
+                        sse_only_count += 1; // SSE-only that fell back to dispatch stream
+                    }
                     sent_count += 1;
                 }
 
                 if sent_count > 0 {
                     journal_queue.record_sent_batch(sent_count, sse_only_count);
                     debug!(
-                        "Flushed {} journal events to coordinator (boundary={}, sse_only={}, queue_size={})",
+                        "Flushed {} journal events (boundary={}, sse_only={}, queue_size={})",
                         sent_count,
                         sent_count - sse_only_count,
                         sse_only_count,
@@ -1294,13 +1266,13 @@ impl Worker {
         tokio::spawn(async move {
             // Skip polling if no tenant_id (not in managed mode)
             if tenant_id.is_empty() {
-                debug!("Poll task skipped - no AGNT5_TENANT_ID set (not managed edition)");
+                eprintln!("[INFO] Job queue polling disabled (AGNT5_TENANT_ID not set)");
                 return;
             }
 
             // Skip if no component IDs available
             if component_ids.is_empty() {
-                debug!("Poll task skipped - no component IDs registered");
+                eprintln!("[INFO] Job queue polling disabled (no components registered)");
                 return;
             }
 
@@ -1308,15 +1280,15 @@ impl Worker {
             let mut client = match WorkerCoordinatorClient::connect(endpoint.clone()).await {
                 Ok(c) => c,
                 Err(e) => {
-                    warn!("Poll task failed to connect: {}", e);
+                    eprintln!("[WARN] Job queue poll task failed to connect: {}", e);
                     return;
                 }
             };
 
-            info!(
-                "Poll task started for worker {} ({} components)",
-                worker_id,
-                component_ids.len()
+            eprintln!(
+                "[INFO] Job queue polling started ({} components, tenant={})",
+                component_ids.len(),
+                tenant_id
             );
 
             let mut backoff = Duration::from_millis(initial_backoff_ms);
@@ -1356,12 +1328,17 @@ impl Worker {
                 {
                     Ok(resp) if resp.jobs.is_empty() => {
                         // No work — increase backoff
+                        if backoff.as_millis() <= initial_backoff_ms as u128 {
+                            // Log only on first empty poll to avoid spam
+                            eprintln!("[INFO] Job queue: no jobs available, polling with backoff");
+                        }
                         backoff = std::cmp::min(backoff * 2, max_backoff);
                     }
                     Ok(resp) => {
                         // Reset backoff on successful poll
                         backoff = Duration::from_millis(initial_backoff_ms);
                         let job_count = resp.jobs.len();
+                        eprintln!("[INFO] Job queue: claimed {} jobs", job_count);
 
                         for job in resp.jobs {
                             // Convert JobAssignment → RuntimeMessage (DispatchComponentRequest)
@@ -1411,16 +1388,16 @@ impl Worker {
                             }
                         }
 
-                        debug!("Poll task: dispatched {} jobs to worker pool", job_count);
+                        eprintln!("[INFO] Job queue: dispatched {} jobs to worker pool", job_count);
                     }
                     Err(e) => {
                         // Check if this is an Unimplemented error (not managed edition)
                         let err_msg = format!("{}", e);
                         if err_msg.contains("Unimplemented") || err_msg.contains("UNIMPLEMENTED") {
-                            info!("PollJobs not available (not managed edition), disabling poll task");
+                            eprintln!("[INFO] Job queue polling disabled (not managed edition)");
                             return;
                         }
-                        debug!("Poll task error: {}", e);
+                        eprintln!("[WARN] Job queue poll error: {}", e);
                         backoff = std::cmp::min(backoff * 2, max_backoff);
                     }
                 }

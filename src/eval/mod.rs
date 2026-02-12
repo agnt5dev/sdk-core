@@ -5,6 +5,7 @@
 //! - LLM-as-judge scorers for semantic evaluation
 //! - Trace assertions for glassbox testing
 
+pub mod builtin_scorer;
 pub mod deterministic;
 pub mod llm_judge;
 pub mod trace;
