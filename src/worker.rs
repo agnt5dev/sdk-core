@@ -752,6 +752,9 @@ impl Worker {
         self.set_connection_state(ConnectionState::Connected);
         crate::telemetry::update_connection_state(2); // 2 = connected
 
+        // Write health marker file so K8s readiness probe passes
+        self.write_health_marker();
+
         // Record reconnection metrics on successful reconnect
         if is_reconnect {
             crate::telemetry::record_reconnection_attempt(true);
@@ -1035,6 +1038,9 @@ impl Worker {
         for handle in worker_handles {
             let _ = handle.await;
         }
+
+        // Remove health marker file so K8s readiness probe fails
+        self.remove_health_marker();
 
         // Send shutdown message and stop background tasks
         let _ = self.send_shutdown_message(&tx).await;
@@ -1482,6 +1488,38 @@ impl Worker {
                 }
             }
         });
+    }
+
+    /// Write a health marker file so the K8s readiness probe passes.
+    /// The file is written to `$AGNT5_HEALTH_DIR/worker_{id}.txt`.
+    fn write_health_marker(&self) {
+        let health_dir =
+            std::env::var("AGNT5_HEALTH_DIR").unwrap_or_else(|_| "/tmp/health".into());
+        if let Err(e) = std::fs::create_dir_all(&health_dir) {
+            warn!("Failed to create health dir {}: {}", health_dir, e);
+            return;
+        }
+        let path = format!("{}/worker_{}.txt", health_dir, self.config.worker_id);
+        if let Err(e) = std::fs::write(&path, "") {
+            warn!("Failed to write health marker {}: {}", path, e);
+        } else {
+            debug!("Wrote health marker file {}", path);
+        }
+    }
+
+    /// Remove the health marker file so the K8s readiness probe fails.
+    fn remove_health_marker(&self) {
+        let health_dir =
+            std::env::var("AGNT5_HEALTH_DIR").unwrap_or_else(|_| "/tmp/health".into());
+        let path = format!("{}/worker_{}.txt", health_dir, self.config.worker_id);
+        if let Err(e) = std::fs::remove_file(&path) {
+            // Not an error if the file doesn't exist (e.g., first connect failed before marker was written)
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!("Failed to remove health marker {}: {}", path, e);
+            }
+        } else {
+            debug!("Removed health marker file {}", path);
+        }
     }
 
     /// Send graceful shutdown message
