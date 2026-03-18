@@ -688,6 +688,67 @@ pub fn update_connection_state(state: i64) {
     gauge.record(state, &reconnection_attrs());
 }
 
+// =============================================================================
+// Checkpoint Metrics
+// =============================================================================
+
+/// Histogram for checkpoint round-trip duration (worker → EE → DB → worker)
+static CHECKPOINT_DURATION_HISTOGRAM: OnceLock<Histogram<f64>> = OnceLock::new();
+
+/// Counter for checkpoint events emitted
+static CHECKPOINT_TOTAL_COUNTER: OnceLock<Counter<u64>> = OnceLock::new();
+
+fn get_checkpoint_duration_histogram() -> &'static Histogram<f64> {
+    CHECKPOINT_DURATION_HISTOGRAM.get_or_init(|| {
+        let meter = global::meter("agnt5-sdk-core");
+        meter
+            .f64_histogram("agnt5.worker.checkpoint.duration.seconds")
+            .with_description("Round-trip duration of checkpoint gRPC calls from worker to platform")
+            .with_unit("s")
+            .with_boundaries(vec![
+                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+            ])
+            .build()
+    })
+}
+
+fn get_checkpoint_total_counter() -> &'static Counter<u64> {
+    CHECKPOINT_TOTAL_COUNTER.get_or_init(|| {
+        let meter = global::meter("agnt5-sdk-core");
+        meter
+            .u64_counter("agnt5.worker.checkpoint.total")
+            .with_description("Total checkpoint events emitted by the worker")
+            .with_unit("events")
+            .build()
+    })
+}
+
+/// Record a checkpoint round-trip duration and increment counter
+pub fn record_checkpoint(
+    event_type: &str,
+    duration_secs: f64,
+    success: bool,
+    experiment_id: Option<&str>,
+) {
+    let mut attrs = vec![
+        KeyValue::new("checkpoint.type", event_type.to_string()),
+        KeyValue::new("success", success),
+    ];
+
+    if let Some(tid) = get_tenant_id() {
+        attrs.push(KeyValue::new("tenant.id", tid.to_string()));
+    }
+    if let Some(did) = get_deployment_id() {
+        attrs.push(KeyValue::new("deployment.id", did.to_string()));
+    }
+    if let Some(eid) = experiment_id {
+        attrs.push(KeyValue::new("experiment.id", eid.to_string()));
+    }
+
+    get_checkpoint_duration_histogram().record(duration_secs, &attrs);
+    get_checkpoint_total_counter().add(1, &attrs);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -346,6 +346,9 @@ impl Worker {
         let correlation_id = merged_metadata.remove("cid").unwrap_or_default();
         let parent_event_id = merged_metadata.remove("pcid").unwrap_or_default();
 
+        // Extract experiment_id before metadata is moved into the request
+        let experiment_id = merged_metadata.get("experiment_id").cloned();
+
         let request = WriteCheckpointRequest {
             run_id: run_id.clone(),
             checkpoint_type: event_type.clone(),
@@ -363,7 +366,8 @@ impl Worker {
         let mut ee_client = self.ensure_ee_client().await?;
 
         let timeout = Duration::from_millis(timeout_ms);
-        match tokio::time::timeout(timeout, ee_client.write_checkpoint(request)).await {
+        let start = Instant::now();
+        let result = match tokio::time::timeout(timeout, ee_client.write_checkpoint(request)).await {
             Ok(Ok(response)) => {
                 let resp = response.into_inner();
                 if resp.success {
@@ -407,7 +411,18 @@ impl Worker {
                 // Return Ok for graceful degradation — event may have been persisted
                 Ok(())
             }
-        }
+        };
+
+        // Record OTEL metrics for checkpoint round-trip
+        let duration_secs = start.elapsed().as_secs_f64();
+        crate::telemetry::record_checkpoint(
+            &event_type,
+            duration_secs,
+            result.is_ok(),
+            experiment_id.as_deref(),
+        );
+
+        result
     }
 
     /// Emit a checkpoint event and block until the platform acknowledges it (TRULY SYNCHRONOUS)
