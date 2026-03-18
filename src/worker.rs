@@ -126,6 +126,9 @@ pub struct Worker {
     /// Tokio runtime handle captured in run() for use by emit_checkpoint_sync_blocking.
     /// Python threads (via PyO3) are NOT tokio threads, so they can't use Handle::current().
     tokio_handle: Arc<std::sync::Mutex<Option<tokio::runtime::Handle>>>,
+    /// Tracks which run_ids have is_streaming=true. Ephemeral events are skipped
+    /// for non-streaming runs since nobody is listening via SSE.
+    streaming_runs: Arc<std::sync::Mutex<HashMap<String, bool>>>,
 }
 
 // Implement Debug manually to avoid requiring Debug on JournalEventQueue's internals
@@ -137,6 +140,7 @@ impl std::fmt::Debug for Worker {
             .field("metadata", &self.metadata)
             .field("connection_state", &self.connection_state)
             .field("journal_queue_size", &self.journal_queue.len())
+            .field("streaming_runs", &self.streaming_runs)
             .finish()
     }
 }
@@ -164,6 +168,7 @@ impl Worker {
             journal_queue: JournalEventQueue::new(journal_config),
             ee_client: Arc::new(TokioMutex::new(None)),
             tokio_handle: Arc::new(std::sync::Mutex::new(None)),
+            streaming_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -778,20 +783,23 @@ impl Worker {
             }
         }
 
-        // Open EventStream for ephemeral events (SSE-only: tokens, progress, logs)
-        // This is a separate client-streaming gRPC connection alongside the dispatch stream.
-        let event_stream_tx = match client
-            .create_event_stream(self.config.worker_id.clone())
-            .await
-        {
-            Ok(es_tx) => {
-                debug!("EventStream opened for SSE-only events");
-                Some(es_tx)
+        // Open EventStream on EE for ephemeral events (SSE-only: tokens, progress, logs).
+        // EE is the single SSE publisher — WC no longer publishes to Centrifuge.
+        let event_stream_tx = match self.ensure_ee_client().await {
+            Ok(mut ee_client) => {
+                match crate::client::create_ee_event_stream(&mut ee_client, self.config.worker_id.clone()).await {
+                    Ok(es_tx) => {
+                        debug!("EE EventStream opened for SSE-only events");
+                        Some(es_tx)
+                    }
+                    Err(e) => {
+                        warn!("Failed to open EE EventStream, SSE-only events will use dispatch stream: {}", e);
+                        None
+                    }
+                }
             }
             Err(e) => {
-                // EventStream is optional — fall back to dispatch stream if unavailable
-                // (e.g., older WC versions that don't support EventStream)
-                warn!("Failed to open EventStream, SSE-only events will use dispatch stream: {}", e);
+                warn!("Failed to get EE client for EventStream, SSE-only events will use dispatch stream: {}", e);
                 None
             }
         };
@@ -880,6 +888,22 @@ impl Worker {
                             if runtime_message.message_type == RuntimeMessageType::CheckpointAck as i32 {
                                 debug!("Ignoring legacy CheckpointAck on dispatch stream");
                                 continue;
+                            }
+
+                            // Track is_streaming per run for ephemeral event gating
+                            if let Some(ref msg_data) = runtime_message.message_data {
+                                if let crate::pb::runtime_message::MessageData::DispatchComponent(ref req) = msg_data {
+                                    if req.is_streaming {
+                                        let run_id = if let Some(idx) = req.invocation_id.find(':') {
+                                            req.invocation_id[..idx].to_string()
+                                        } else {
+                                            req.invocation_id.clone()
+                                        };
+                                        if let Ok(mut map) = self.streaming_runs.lock() {
+                                            map.insert(run_id, true);
+                                        }
+                                    }
+                                }
                             }
 
                             // Fast path: handle built-in scorers directly in Rust
@@ -991,6 +1015,20 @@ impl Worker {
                             // which is always empty). The _job_id tag was placed into
                             // DispatchComponentRequest.metadata by spawn_poll_task, and
                             // language handlers preserve it through to the response.
+                            // Clean up streaming_runs tracking for terminal events
+                            if let Some(crate::pb::service_message::MessageType::FunctionResponse(ref resp)) = service_message.message_type {
+                                if resp.event_type == "run.completed" || resp.event_type == "run.failed" {
+                                    let run_id = if let Some(idx) = resp.invocation_id.find(':') {
+                                        resp.invocation_id[..idx].to_string()
+                                    } else {
+                                        resp.invocation_id.clone()
+                                    };
+                                    if let Ok(mut map) = self.streaming_runs.lock() {
+                                        map.remove(&run_id);
+                                    }
+                                }
+                            }
+
                             let is_polled_job = match &service_message.message_type {
                                 Some(crate::pb::service_message::MessageType::FunctionResponse(resp)) => {
                                     resp.metadata.contains_key("_job_id")
@@ -1062,6 +1100,12 @@ impl Worker {
         heartbeat_task.abort();
         journal_flush_task.abort();
 
+        // Clear streaming runs tracking AFTER flush task is aborted,
+        // so the flush task can drain any remaining SSE events first
+        if let Ok(mut map) = self.streaming_runs.lock() {
+            map.clear();
+        }
+
         dispatch_result
     }
 
@@ -1125,6 +1169,7 @@ impl Worker {
         let journal_queue = self.journal_queue.clone();
         let flush_interval_ms = journal_queue.flush_interval_ms();
         let batch_size = journal_queue.batch_size();
+        let streaming_runs = self.streaming_runs.clone();
 
         // Cache tenant_id and deployment_id to avoid repeated env lookups per event
         let cached_tenant_id = std::env::var("AGNT5_TENANT_ID").unwrap_or_default();
@@ -1149,8 +1194,19 @@ impl Worker {
                 for event in batch {
                     let is_sse_only = event.is_sse_only;
 
-                    // Route SSE-only events through EventStream if available
+                    // Route SSE-only events through EventStream if available.
+                    // Skip ephemeral events for non-streaming runs — nobody is listening via SSE.
                     if is_sse_only {
+                        let is_run_streaming = match streaming_runs.lock() {
+                            Ok(map) => map.get(&event.run_id).copied().unwrap_or(false),
+                            Err(poisoned) => {
+                                warn!("streaming_runs mutex poisoned, assuming non-streaming for run_id={}", event.run_id);
+                                poisoned.into_inner().get(&event.run_id).copied().unwrap_or(false)
+                            }
+                        };
+                        if !is_run_streaming {
+                            continue; // Skip — no SSE listeners for this run
+                        }
                         if let Some(ref es_tx) = event_stream_tx {
                             let es_msg = EventStreamMessage {
                                 run_id: event.run_id.clone(),

@@ -1,5 +1,6 @@
 use crate::error::{Result, SdkError};
 use crate::pb::{
+    execution_engine_service_client::ExecutionEngineServiceClient,
     worker_coordinator_service_client::WorkerCoordinatorServiceClient, CheckpointRequest,
     CheckpointType, CompleteJobRequest, CompleteJobResponse, DurableStepCheckpoint,
     EventStreamMessage, GetMemoizedStepRequest, PollJobsRequest, PollJobsResponse,
@@ -383,6 +384,45 @@ impl WorkerCoordinatorClient {
 
         Ok(response)
     }
+}
+
+/// Open an EventStream on the Execution Engine for sending ephemeral events (SSE-only).
+///
+/// Same pattern as WC's create_event_stream but routes to EE, which is the single
+/// SSE publisher. Drop the sender to close the stream.
+pub async fn create_ee_event_stream(
+    ee_client: &mut ExecutionEngineServiceClient<Channel>,
+    worker_id: String,
+) -> Result<flume::Sender<EventStreamMessage>> {
+    let (tx, rx) = flume::bounded::<EventStreamMessage>(1000);
+
+    let stream = async_stream::stream! {
+        loop {
+            match rx.recv_async().await {
+                Ok(msg) => yield msg,
+                Err(_) => break, // Sender dropped, close stream
+            }
+        }
+    };
+
+    let mut client = ee_client.clone();
+    tokio::spawn(async move {
+        match client.event_stream(stream).await {
+            Ok(response) => {
+                let ack = response.into_inner();
+                debug!(
+                    "EE EventStream closed: success={} events_received={}",
+                    ack.success, ack.events_received
+                );
+            }
+            Err(e) => {
+                debug!("EE EventStream error: {}", e);
+            }
+        }
+    });
+
+    debug!("EE EventStream opened for worker {}", worker_id);
+    Ok(tx)
 }
 
 /// Result of a checkpoint operation
