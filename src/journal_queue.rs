@@ -164,6 +164,7 @@ impl JournalEventMessage {
             || event_type.starts_with("lm.stream.")
             || event_type.starts_with("lm.message.")
             || event_type.starts_with("lm.thinking.")
+            || event_type.starts_with("lm.tool_call.")  // LLM tool call content blocks (transient deltas)
             || event_type.starts_with("progress.")
             || event_type.starts_with("log")  // log, log.info, log.warn, log.error, etc.
     }
@@ -364,6 +365,42 @@ impl JournalEventQueue {
         events
     }
 
+    /// Drain all events for a specific run_id from the queue.
+    /// Events for other runs remain in the queue (order preserved).
+    pub fn drain_run_events(&self, run_id: &str) -> Vec<JournalEventMessage> {
+        let mut queue = match self.queue.lock() {
+            Ok(q) => q,
+            Err(e) => {
+                log::error!("Failed to lock journal queue for drain_run_events: {}", e);
+                return Vec::new();
+            }
+        };
+
+        let mut matched = Vec::new();
+        let mut remaining = std::collections::VecDeque::with_capacity(queue.len());
+
+        while let Some(event) = queue.pop_front() {
+            if event.run_id == run_id {
+                matched.push(event);
+            } else {
+                remaining.push_back(event);
+            }
+        }
+
+        *queue = remaining;
+
+        if !matched.is_empty() {
+            log::debug!(
+                "Drained {} events for run_id={} (remaining={})",
+                matched.len(),
+                run_id,
+                queue.len()
+            );
+        }
+
+        matched
+    }
+
     /// Get current queue length
     pub fn len(&self) -> usize {
         self.queue.lock().map(|q| q.len()).unwrap_or(0)
@@ -512,6 +549,9 @@ mod tests {
         assert!(JournalEventMessage::is_sse_only_event_type("lm.stream.delta"));
         assert!(JournalEventMessage::is_sse_only_event_type("lm.message.delta"));
         assert!(JournalEventMessage::is_sse_only_event_type("lm.thinking.delta"));
+        assert!(JournalEventMessage::is_sse_only_event_type("lm.tool_call.start"));
+        assert!(JournalEventMessage::is_sse_only_event_type("lm.tool_call.delta"));
+        assert!(JournalEventMessage::is_sse_only_event_type("lm.tool_call.stop"));
         assert!(JournalEventMessage::is_sse_only_event_type("progress.update"));
         assert!(JournalEventMessage::is_sse_only_event_type("log"));
         assert!(JournalEventMessage::is_sse_only_event_type("log.info"));

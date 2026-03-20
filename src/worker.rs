@@ -129,6 +129,12 @@ pub struct Worker {
     /// Tracks which run_ids have is_streaming=true. Ephemeral events are skipped
     /// for non-streaming runs since nobody is listening via SSE.
     streaming_runs: Arc<std::sync::Mutex<HashMap<String, bool>>>,
+    /// EventStream sender for SSE-only events (EE path). Set during run().
+    event_stream_tx: Arc<std::sync::Mutex<Option<flume::Sender<EventStreamMessage>>>>,
+    /// Dispatch stream sender (bidirectional gRPC to WC). Used by emit_checkpoint_sync
+    /// to flush pending SSE-only events before terminal checkpoints, ensuring they
+    /// arrive while the invocation is still tracked in pendingStreamInvocations.
+    dispatch_tx: Arc<std::sync::Mutex<Option<flume::Sender<ServiceMessage>>>>,
 }
 
 // Implement Debug manually to avoid requiring Debug on JournalEventQueue's internals
@@ -169,6 +175,8 @@ impl Worker {
             ee_client: Arc::new(TokioMutex::new(None)),
             tokio_handle: Arc::new(std::sync::Mutex::new(None)),
             streaming_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            event_stream_tx: Arc::new(std::sync::Mutex::new(None)),
+            dispatch_tx: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -339,6 +347,58 @@ impl Worker {
         source_timestamp_ns: i64,
         timeout_ms: u64,
     ) -> Result<()> {
+        // Before sending terminal checkpoints (run.completed/run.failed), flush any
+        // pending SSE-only events (logs, deltas) for this run via the dispatch stream.
+        // This ensures they arrive at the WC while the invocation is still in
+        // pendingStreamInvocations, so the WC forwards them to Centrifuge for SSE.
+        if event_type == "run.completed" || event_type == "run.failed" {
+            let dispatch = self.dispatch_tx.lock().ok().and_then(|g| g.clone());
+            if let Some(dtx) = dispatch {
+                let pending = self.journal_queue.drain_run_events(&run_id);
+                for event in &pending {
+                    let mut meta = event.metadata.clone();
+                    if !event.correlation_id.is_empty() {
+                        meta.insert("cid".to_string(), event.correlation_id.clone());
+                    }
+                    if !event.parent_correlation_id.is_empty() {
+                        meta.insert("pcid".to_string(), event.parent_correlation_id.clone());
+                    }
+
+                    let response = DispatchComponentResponse {
+                        invocation_id: event.run_id.clone(),
+                        success: true,
+                        result: Some(
+                            crate::pb::dispatch_component_response::Result::OutputData(
+                                event.data.clone(),
+                            ),
+                        ),
+                        error_message: String::new(),
+                        metadata: meta,
+                        event_type: event.event_type.clone(),
+                        content_index: event.content_index,
+                        sequence: event.sequence,
+                        attempt: 0,
+                        source_timestamp_ns: event.source_timestamp_ns,
+                    };
+
+                    let service_message = ServiceMessage {
+                        worker_id: self.config.worker_id.clone(),
+                        metadata: std::collections::HashMap::new(),
+                        message_type: Some(
+                            crate::pb::service_message::MessageType::FunctionResponse(response),
+                        ),
+                    };
+
+                    if let Err(e) = dtx.send_async(service_message).await {
+                        warn!("Failed to flush pre-checkpoint event via dispatch: type={} run_id={} error={}", event.event_type, event.run_id, e);
+                    }
+                }
+                if !pending.is_empty() {
+                    debug!("Flushed {} SSE-only events before {}: run_id={}", pending.len(), event_type, run_id);
+                }
+            }
+        }
+
         // Merge service metadata (tenant_id, deployment_id) with passed metadata
         let mut merged_metadata = metadata;
         for (k, v) in &self.metadata {
@@ -804,6 +864,14 @@ impl Worker {
             }
         };
 
+        // Store senders so emit_checkpoint_sync can flush pending events
+        if let Ok(mut guard) = self.event_stream_tx.lock() {
+            *guard = event_stream_tx.clone();
+        }
+        if let Ok(mut guard) = self.dispatch_tx.lock() {
+            *guard = Some(tx.clone());
+        }
+
         // Start heartbeat task
         let heartbeat_task = self.spawn_heartbeat_task(tx.clone());
 
@@ -1198,7 +1266,10 @@ impl Worker {
                     // Skip ephemeral events for non-streaming runs — nobody is listening via SSE.
                     if is_sse_only {
                         let is_run_streaming = match streaming_runs.lock() {
-                            Ok(map) => map.get(&event.run_id).copied().unwrap_or(false),
+                            Ok(map) => {
+                                let val = map.get(&event.run_id).copied().unwrap_or(false);
+                                val
+                            },
                             Err(poisoned) => {
                                 warn!("streaming_runs mutex poisoned, assuming non-streaming for run_id={}", event.run_id);
                                 poisoned.into_inner().get(&event.run_id).copied().unwrap_or(false)
@@ -1428,6 +1499,9 @@ impl Worker {
                                 metadata.insert("trace_id".to_string(), job.trace_id.clone());
                             }
 
+                            // Check stream_mode before metadata is moved into the struct
+                            let is_streaming = metadata.get("stream_mode").map_or(false, |m| m == "full");
+
                             // Use invocation_id = run_id (this is how the WC dispatches)
                             let runtime_message = RuntimeMessage {
                                 worker_id: String::new(),
@@ -1453,7 +1527,7 @@ impl Worker {
                                             step_checkpoints: Vec::new(),
                                             session_id: String::new(),
                                             user_id: String::new(),
-                                            is_streaming: false,
+                                            is_streaming,
                                         },
                                     ),
                                 ),
