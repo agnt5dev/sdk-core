@@ -348,54 +348,72 @@ impl Worker {
         timeout_ms: u64,
     ) -> Result<()> {
         // Before sending terminal checkpoints (run.completed/run.failed), flush any
-        // pending SSE-only events (logs, deltas) for this run via the dispatch stream.
-        // This ensures they arrive at the WC while the invocation is still in
-        // pendingStreamInvocations, so the WC forwards them to Centrifuge for SSE.
+        // pending SSE-only events (logs, deltas) for this run.
+        // Route through EventStream (EE) which is the single SSE publisher.
+        // Falls back to dispatch stream (WC) only if EventStream is unavailable.
         if event_type == "run.completed" || event_type == "run.failed" {
-            let dispatch = self.dispatch_tx.lock().ok().and_then(|g| g.clone());
-            if let Some(dtx) = dispatch {
-                let pending = self.journal_queue.drain_run_events(&run_id);
+            let pending = self.journal_queue.drain_run_events(&run_id);
+            if !pending.is_empty() {
+                let es_tx = self.event_stream_tx.lock().ok().and_then(|g| g.clone());
+                let dispatch = self.dispatch_tx.lock().ok().and_then(|g| g.clone());
+
                 for event in &pending {
-                    let mut meta = event.metadata.clone();
-                    if !event.correlation_id.is_empty() {
-                        meta.insert("cid".to_string(), event.correlation_id.clone());
-                    }
-                    if !event.parent_correlation_id.is_empty() {
-                        meta.insert("pcid".to_string(), event.parent_correlation_id.clone());
-                    }
+                    // Prefer EventStream (EE) — the single SSE publisher
+                    if let Some(ref es) = es_tx {
+                        let es_msg = EventStreamMessage {
+                            run_id: event.run_id.clone(),
+                            event_type: event.event_type.clone(),
+                            data: event.data.clone(),
+                            trace_id: String::new(),
+                            span_id: String::new(),
+                            tenant_id: event.metadata.get("tenant_id").cloned().unwrap_or_default(),
+                            source_timestamp_ns: event.source_timestamp_ns,
+                            worker_id: self.config.worker_id.clone(),
+                        };
+                        if let Err(e) = es.send_async(es_msg).await {
+                            warn!("Failed to flush pre-checkpoint event via EventStream: type={} run_id={} error={}", event.event_type, event.run_id, e);
+                        }
+                    } else if let Some(ref dtx) = dispatch {
+                        // Fallback: dispatch stream (WC) — only works for streamed invocations
+                        let mut meta = event.metadata.clone();
+                        if !event.correlation_id.is_empty() {
+                            meta.insert("cid".to_string(), event.correlation_id.clone());
+                        }
+                        if !event.parent_correlation_id.is_empty() {
+                            meta.insert("pcid".to_string(), event.parent_correlation_id.clone());
+                        }
 
-                    let response = DispatchComponentResponse {
-                        invocation_id: event.run_id.clone(),
-                        success: true,
-                        result: Some(
-                            crate::pb::dispatch_component_response::Result::OutputData(
-                                event.data.clone(),
+                        let response = DispatchComponentResponse {
+                            invocation_id: event.run_id.clone(),
+                            success: true,
+                            result: Some(
+                                crate::pb::dispatch_component_response::Result::OutputData(
+                                    event.data.clone(),
+                                ),
                             ),
-                        ),
-                        error_message: String::new(),
-                        metadata: meta,
-                        event_type: event.event_type.clone(),
-                        content_index: event.content_index,
-                        sequence: event.sequence,
-                        attempt: 0,
-                        source_timestamp_ns: event.source_timestamp_ns,
-                    };
+                            error_message: String::new(),
+                            metadata: meta,
+                            event_type: event.event_type.clone(),
+                            content_index: event.content_index,
+                            sequence: event.sequence,
+                            attempt: 0,
+                            source_timestamp_ns: event.source_timestamp_ns,
+                        };
 
-                    let service_message = ServiceMessage {
-                        worker_id: self.config.worker_id.clone(),
-                        metadata: std::collections::HashMap::new(),
-                        message_type: Some(
-                            crate::pb::service_message::MessageType::FunctionResponse(response),
-                        ),
-                    };
+                        let service_message = ServiceMessage {
+                            worker_id: self.config.worker_id.clone(),
+                            metadata: std::collections::HashMap::new(),
+                            message_type: Some(
+                                crate::pb::service_message::MessageType::FunctionResponse(response),
+                            ),
+                        };
 
-                    if let Err(e) = dtx.send_async(service_message).await {
-                        warn!("Failed to flush pre-checkpoint event via dispatch: type={} run_id={} error={}", event.event_type, event.run_id, e);
+                        if let Err(e) = dtx.send_async(service_message).await {
+                            warn!("Failed to flush pre-checkpoint event via dispatch: type={} run_id={} error={}", event.event_type, event.run_id, e);
+                        }
                     }
                 }
-                if !pending.is_empty() {
-                    debug!("Flushed {} SSE-only events before {}: run_id={}", pending.len(), event_type, run_id);
-                }
+                debug!("Flushed {} SSE-only events before {}: run_id={}", pending.len(), event_type, run_id);
             }
         }
 
@@ -1400,6 +1418,7 @@ impl Worker {
             .collect();
         let tenant_id = std::env::var("AGNT5_TENANT_ID").unwrap_or_default();
         let deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").ok();
+        let streaming_runs = self.streaming_runs.clone();
 
         // Polling config from env
         let initial_backoff_ms: u64 = std::env::var("AGNT5_POLL_INITIAL_BACKOFF_MS")
@@ -1532,6 +1551,16 @@ impl Worker {
                                     ),
                                 ),
                             };
+
+                            // Track streaming runs for polled jobs (same as dispatch stream path)
+                            // Without this, the journal flush task drops SSE-only events (logs, deltas)
+                            // because it doesn't know the run has an SSE listener.
+                            if is_streaming {
+                                let run_id = job.run_id.clone();
+                                if let Ok(mut map) = streaming_runs.lock() {
+                                    map.insert(run_id, true);
+                                }
+                            }
 
                             if let Err(e) = task_tx.send_async(runtime_message).await {
                                 warn!("Poll task: failed to dispatch job to worker pool: {}", e);
