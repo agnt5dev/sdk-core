@@ -140,6 +140,14 @@ pub enum SdkError {
         message: String,
         argument: Option<String>,
     },
+
+    #[error("LM API error ({status}): {message}")]
+    LmApiError {
+        status: u16,
+        provider: String,
+        message: String,
+        request_id: Option<String>,
+    },
 }
 
 impl SdkError {
@@ -163,6 +171,13 @@ impl SdkError {
             Self::InvalidArgument { .. } => ErrorCode::InvalidInput,
             Self::Serialization(_) => ErrorCode::InvalidInput,
             Self::Other(_) => ErrorCode::InternalError,
+            Self::LmApiError { status, .. } => match *status {
+                401 | 403 => ErrorCode::InvalidConfiguration,
+                429 => ErrorCode::ResourceExhausted,
+                408 => ErrorCode::ExecutionTimeout,
+                500 | 502 | 503 | 504 | 529 => ErrorCode::ServiceUnavailable,
+                _ => ErrorCode::InvalidInput,
+            },
         }
     }
 
@@ -213,6 +228,12 @@ impl SdkError {
 
             // Unknown errors are not retryable by default
             Self::Other(_) => RetryHint::NotRetryable,
+
+            // LM API errors: retry on transient HTTP status codes
+            Self::LmApiError { status, .. } => match *status {
+                408 | 429 | 500 | 502 | 503 | 504 | 529 => RetryHint::RetryableWithBackoff,
+                _ => RetryHint::NotRetryable,
+            },
         }
     }
 

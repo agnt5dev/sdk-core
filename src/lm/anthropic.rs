@@ -18,6 +18,7 @@ use super::interface::{
     GenerateResponse, GenerationConfig, LanguageModel, Message, MessageRole, ResponseFormat,
     StreamChunk, StreamHandle, StreamRequest, TokenUsage, ToolChoice, ToolDefinition,
 };
+use super::http;
 use super::telemetry;
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -32,6 +33,7 @@ pub struct AnthropicConfig {
     pub base_url: String,
     pub version: String,
     pub timeout: Duration,
+    pub retry_config: http::RetryConfig,
 }
 
 impl AnthropicConfig {
@@ -41,6 +43,7 @@ impl AnthropicConfig {
             base_url: DEFAULT_BASE_URL.to_string(),
             version: DEFAULT_VERSION.to_string(),
             timeout: DEFAULT_TIMEOUT,
+            retry_config: http::RetryConfig::from_env(),
         }
     }
 
@@ -99,10 +102,7 @@ pub struct AnthropicProvider {
 
 impl AnthropicProvider {
     pub fn new(config: AnthropicConfig) -> SdkResult<Self> {
-        let http = Client::builder()
-            .timeout(config.timeout)
-            .build()
-            .map_err(|err| SdkError::Other(anyhow!("failed to construct HTTP client: {err}")))?;
+        let http = http::build_http_client(config.timeout)?;
 
         Ok(Self { http, config })
     }
@@ -169,24 +169,26 @@ impl LanguageModel for AnthropicProvider {
 
         let start = std::time::Instant::now();
 
-        let result = async {
+        let result: SdkResult<GenerateResponse> = async {
             validate_request(&request)?;
             let payload = MessagesPayload::from_request(&request, false)?;
-            let response = self
-                .request()
-                .json(&payload)
-                .send()
-                .await
-                .map_err(|err| SdkError::Other(anyhow!("Anthropic request failed: {err}")))?;
+            let response = http::send_with_retry(
+                || self.request().json(&payload),
+                &self.config.retry_config,
+                "anthropic",
+                request.config.timeout,
+            )
+            .await?;
 
-            let response = ensure_success(response).await?;
-
+            let metadata = http::extract_metadata(&response);
             let parsed: MessagesResponse = response
                 .json()
                 .await
                 .map_err(|err| SdkError::Other(anyhow!("failed to parse Anthropic response: {err}")))?;
 
-            parsed.into_generate_response(request.config.response_format.clone())
+            let mut result = parsed.into_generate_response(request.config.response_format.clone())?;
+            result.metadata = Some(metadata);
+            Ok(result)
         }
         .await;
 
@@ -261,15 +263,13 @@ impl LanguageModel for AnthropicProvider {
         let result: SdkResult<StreamHandle> = async {
             validate_request(&request)?;
             let payload = MessagesPayload::from_request(&request, true)?;
-            let response = self
-                .request()
-                .header("accept", "text/event-stream")
-                .json(&payload)
-                .send()
-                .await
-                .map_err(|err| SdkError::Other(anyhow!("Anthropic streaming request failed: {err}")))?;
-
-            let response = ensure_success(response).await?;
+            let response = http::send_with_retry(
+                || self.request().header("accept", "text/event-stream").json(&payload),
+                &self.config.retry_config,
+                "anthropic",
+                request.config.timeout,
+            )
+            .await?;
 
             let stream = build_stream(response, request.config.response_format.clone());
             Ok(StreamHandle::new(stream))
@@ -473,28 +473,6 @@ fn build_stream(
     Box::pin(stream)
 }
 
-async fn ensure_success(response: reqwest::Response) -> SdkResult<reqwest::Response> {
-    let status = response.status();
-    if status.is_success() {
-        return Ok(response);
-    }
-
-    let body = response
-        .text()
-        .await
-        .unwrap_or_else(|_| "<unable to read body>".to_string());
-
-    if let Ok(api_error) = serde_json::from_str::<ApiError>(&body) {
-        return Err(SdkError::Other(anyhow!(
-            "Anthropic API error ({status}): {}",
-            api_error.error.message
-        )));
-    }
-
-    Err(SdkError::Other(anyhow!(
-        "Anthropic API error ({status}): {body}"
-    )))
-}
 
 #[derive(Serialize)]
 struct MessagesPayload {
@@ -531,6 +509,7 @@ impl MessagesPayload {
             reasoning_effort: _,
             modalities: _,
             built_in_tools: _,
+            timeout: _,
         } = request.config.clone();
 
         let max_tokens = max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS).max(1);
@@ -716,6 +695,7 @@ impl MessagesResponse {
             },
             object,
             raw: Some(raw),
+            metadata: None,
         })
     }
 }
@@ -849,16 +829,6 @@ fn normalize_model(model: &str) -> SdkResult<String> {
     } else {
         Ok(trimmed.to_string())
     }
-}
-
-#[derive(Deserialize)]
-struct ApiError {
-    error: ApiErrorDetail,
-}
-
-#[derive(Deserialize)]
-struct ApiErrorDetail {
-    message: String,
 }
 
 #[derive(Deserialize)]
@@ -1029,6 +999,7 @@ impl PartialResponse {
             },
             object,
             raw: None,
+            metadata: None,
         })
     }
 }

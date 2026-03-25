@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Result as SdkResult, SdkError};
 
+use super::http;
+
 // ============================================================================
 // Embedder Trait
 // ============================================================================
@@ -199,10 +201,7 @@ pub struct OpenAiEmbedder {
 
 impl OpenAiEmbedder {
     pub fn new(config: OpenAiEmbedderConfig) -> SdkResult<Self> {
-        let client = Client::builder()
-            .timeout(config.timeout)
-            .build()
-            .map_err(|e| SdkError::Other(anyhow!("Failed to create HTTP client: {}", e)))?;
+        let client = http::build_http_client(config.timeout)?;
 
         Ok(Self { config, client })
     }

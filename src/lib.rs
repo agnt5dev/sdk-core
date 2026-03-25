@@ -1,6 +1,7 @@
 // AGNT5 SDK Core - Simple, focused foundation for worker coordination
 
 pub mod adk;
+pub mod chat;
 pub mod client;
 pub mod context;
 pub mod error;

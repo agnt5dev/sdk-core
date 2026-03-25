@@ -1,5 +1,6 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -148,6 +149,9 @@ pub struct GenerationConfig {
     /// Built-in tools (web search, code interpreter, file search)
     /// Only supported by OpenAI Responses API
     pub built_in_tools: Vec<BuiltInTool>,
+    /// Per-request timeout override. When set, overrides the provider-level timeout
+    /// for this specific request.
+    pub timeout: Option<Duration>,
 }
 
 impl GenerationConfig {
@@ -188,6 +192,11 @@ impl GenerationConfig {
 
     pub fn built_in_tools(mut self, tools: Vec<BuiltInTool>) -> Self {
         self.built_in_tools = tools;
+        self
+    }
+
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
         self
     }
 }
@@ -374,6 +383,15 @@ pub enum ToolChoice {
     Tool { name: String },
 }
 
+/// Metadata from the HTTP response headers of an LM API call.
+#[derive(Clone, Debug, Default)]
+pub struct ResponseMetadata {
+    pub status_code: Option<u16>,
+    pub request_id: Option<String>,
+    pub rate_limit_remaining: Option<u32>,
+    pub rate_limit_reset: Option<Duration>,
+}
+
 #[derive(Clone, Debug)]
 pub struct GenerateResponse {
     pub id: String,
@@ -385,6 +403,7 @@ pub struct GenerateResponse {
     pub tool_calls: Option<Vec<ToolCall>>,
     pub object: Option<Value>,
     pub raw: Option<Value>,
+    pub metadata: Option<ResponseMetadata>,
 }
 
 #[derive(Clone, Debug)]

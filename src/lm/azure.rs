@@ -1,7 +1,6 @@
 use std::env;
 use std::time::Duration;
 
-use anyhow::anyhow;
 use async_trait::async_trait;
 use reqwest::Client;
 
@@ -11,8 +10,9 @@ use super::interface::{
     generate as generate_via_model, stream as stream_via_model, GenerateRequest, GenerateResponse,
     LanguageModel, StreamHandle, StreamRequest,
 };
+use super::http;
 use super::openai_common::{
-    parse_error, stream_handle_from_response, ChatCompletionPayload, ChatCompletionResponse,
+    stream_handle_from_response, ChatCompletionPayload, ChatCompletionResponse,
 };
 
 const DEFAULT_API_VERSION: &str = "2024-02-01";
@@ -25,6 +25,7 @@ pub struct AzureOpenAiConfig {
     pub endpoint: String,
     pub api_version: String,
     pub timeout: Duration,
+    pub retry_config: http::RetryConfig,
 }
 
 impl AzureOpenAiConfig {
@@ -34,6 +35,7 @@ impl AzureOpenAiConfig {
             endpoint: endpoint.into(),
             api_version: DEFAULT_API_VERSION.to_string(),
             timeout: DEFAULT_TIMEOUT,
+            retry_config: http::RetryConfig::from_env(),
         }
     }
 
@@ -87,10 +89,7 @@ pub struct AzureOpenAiProvider {
 
 impl AzureOpenAiProvider {
     pub fn new(config: AzureOpenAiConfig) -> SdkResult<Self> {
-        let http = Client::builder()
-            .timeout(config.timeout)
-            .build()
-            .map_err(|err| SdkError::Other(anyhow!("failed to construct HTTP client: {err}")))?;
+        let http = http::build_http_client(config.timeout)?;
 
         Ok(Self { http, config })
     }
@@ -154,20 +153,22 @@ impl LanguageModel for AzureOpenAiProvider {
         let deployment = self.normalize_model(&request.model)?;
         let payload = ChatCompletionPayload::from_request(&request, deployment.clone(), false);
 
-        let response = self
-            .request(&deployment)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|err| SdkError::Other(anyhow!("Azure OpenAI request failed: {err}")))?;
+        let response = http::send_with_retry(
+            || self.request(&deployment).json(&payload),
+            &self.config.retry_config,
+            "azure",
+            request.config.timeout,
+        )
+        .await?;
 
-        let response = ensure_success(response).await?;
-
+        let metadata = http::extract_metadata(&response);
         let parsed: ChatCompletionResponse = response.json().await.map_err(|err| {
-            SdkError::Other(anyhow!("failed to parse Azure OpenAI response: {err}"))
+            http::classify_reqwest_error(err, "azure")
         })?;
 
-        parsed.into_generate_response(request.config.response_format.clone())
+        let mut result = parsed.into_generate_response(request.config.response_format.clone())?;
+        result.metadata = Some(metadata);
+        Ok(result)
     }
 
     async fn stream(&self, request: StreamRequest) -> SdkResult<StreamHandle> {
@@ -175,17 +176,13 @@ impl LanguageModel for AzureOpenAiProvider {
         let deployment = self.normalize_model(&request.model)?;
         let payload = ChatCompletionPayload::from_request(&request, deployment.clone(), true);
 
-        let response = self
-            .request(&deployment)
-            .header("Accept", "text/event-stream")
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|err| {
-                SdkError::Other(anyhow!("Azure OpenAI streaming request failed: {err}"))
-            })?;
-
-        let response = ensure_success(response).await?;
+        let response = http::send_with_retry(
+            || self.request(&deployment).header("Accept", "text/event-stream").json(&payload),
+            &self.config.retry_config,
+            "azure",
+            request.config.timeout,
+        )
+        .await?;
         stream_handle_from_response(response, request.config.response_format.clone(), self.config.timeout.as_secs())
     }
 }
@@ -200,24 +197,3 @@ fn validate_request(request: &GenerateRequest) -> SdkResult<()> {
     Ok(())
 }
 
-async fn ensure_success(response: reqwest::Response) -> SdkResult<reqwest::Response> {
-    let status = response.status();
-    if status.is_success() {
-        return Ok(response);
-    }
-
-    let body = response
-        .text()
-        .await
-        .unwrap_or_else(|_| "<unable to read body>".to_string());
-
-    if let Some(message) = parse_error(&body) {
-        return Err(SdkError::Other(anyhow!(
-            "Azure OpenAI API error ({status}): {message}"
-        )));
-    }
-
-    Err(SdkError::Other(anyhow!(
-        "Azure OpenAI API error ({status}): {body}"
-    )))
-}

@@ -1,7 +1,6 @@
 use std::env;
 use std::time::Duration;
 
-use anyhow::anyhow;
 use async_trait::async_trait;
 use opentelemetry::trace::Span;
 use reqwest::Client;
@@ -12,8 +11,9 @@ use super::interface::{
     generate as generate_via_model, stream as stream_via_model, GenerateRequest, GenerateResponse,
     LanguageModel, StreamHandle, StreamRequest,
 };
+use super::http;
 use super::openai_common::{
-    parse_error, stream_handle_from_response, ChatCompletionPayload, ChatCompletionResponse,
+    stream_handle_from_response, ChatCompletionPayload, ChatCompletionResponse,
 };
 use super::telemetry;
 
@@ -36,6 +36,7 @@ pub struct OpenAiChatConfig {
     pub timeout: Duration,
     pub extra_headers: Vec<(String, String)>,
     pub model_prefix: Option<String>,
+    pub retry_config: http::RetryConfig,
 }
 
 impl OpenAiChatConfig {
@@ -49,6 +50,7 @@ impl OpenAiChatConfig {
             timeout: DEFAULT_TIMEOUT,
             extra_headers: Vec::new(),
             model_prefix: Some(DEFAULT_MODEL_PREFIX.to_string()),
+            retry_config: http::RetryConfig::from_env(),
         }
     }
 
@@ -142,10 +144,7 @@ pub struct OpenAiChatProvider {
 
 impl OpenAiChatProvider {
     pub fn new(config: OpenAiChatConfig) -> SdkResult<Self> {
-        let http = Client::builder()
-            .timeout(config.timeout)
-            .build()
-            .map_err(|err| SdkError::Other(anyhow!("failed to construct HTTP client: {err}")))?;
+        let http = http::build_http_client(config.timeout)?;
 
         Ok(Self { http, config })
     }
@@ -227,32 +226,6 @@ impl OpenAiChatProvider {
     }
 }
 
-/// Format reqwest errors with clear, actionable messages
-fn format_reqwest_error(err: &reqwest::Error, context: &str, timeout_secs: u64) -> SdkError {
-    if err.is_timeout() {
-        SdkError::Other(anyhow!(
-            "{} timed out after {} seconds. \
-            To increase, set OPENAI_REQUEST_TIMEOUT_SECS (e.g., OPENAI_REQUEST_TIMEOUT_SECS=1200)",
-            context,
-            timeout_secs
-        ))
-    } else if err.is_connect() {
-        SdkError::Other(anyhow!(
-            "{} failed: Unable to connect to OpenAI API. Check your network connection. Error: {}",
-            context,
-            err
-        ))
-    } else if err.is_decode() {
-        SdkError::Other(anyhow!(
-            "{} failed: Unable to decode response. The response may be malformed. Error: {}",
-            context,
-            err
-        ))
-    } else {
-        SdkError::Other(anyhow!("{} failed: {}", context, err))
-    }
-}
-
 #[async_trait]
 impl LanguageModel for OpenAiChatProvider {
     async fn generate(&self, request: GenerateRequest) -> SdkResult<GenerateResponse> {
@@ -290,26 +263,28 @@ impl LanguageModel for OpenAiChatProvider {
         let start = std::time::Instant::now();
 
         // Execute the actual API call (span is already linked to parent via create_gen_ai_span)
-        let result = async {
+        let result: SdkResult<GenerateResponse> = async {
             validate_request(&request)?;
             let model = self.normalize_model(&request.model)?;
             let payload = ChatCompletionPayload::from_request(&request, model, false);
 
-            let response = self
-                .request()
-                .json(&payload)
-                .send()
-                .await
-                .map_err(|err| format_reqwest_error(&err, "OpenAI Chat Completions API request", self.config.timeout.as_secs()))?;
+            let response = http::send_with_retry(
+                || self.request().json(&payload),
+                &self.config.retry_config,
+                "openai_chat",
+                request.config.timeout,
+            )
+            .await?;
 
-            let response = ensure_success(response).await?;
-
+            let metadata = http::extract_metadata(&response);
             let parsed: ChatCompletionResponse = response
                 .json()
                 .await
-                .map_err(|err| format_reqwest_error(&err, "OpenAI Chat Completions API response parsing", self.config.timeout.as_secs()))?;
+                .map_err(|err| http::classify_reqwest_error(err, "openai_chat"))?;
 
-            parsed.into_generate_response(request.config.response_format.clone())
+            let mut result = parsed.into_generate_response(request.config.response_format.clone())?;
+            result.metadata = Some(metadata);
+            Ok(result)
         }
         .await;
 
@@ -393,15 +368,13 @@ impl LanguageModel for OpenAiChatProvider {
             let model = self.normalize_model(&request.model)?;
             let payload = ChatCompletionPayload::from_request(&request, model, true);
 
-            let response = self
-                .request()
-                .header("Accept", "text/event-stream")
-                .json(&payload)
-                .send()
-                .await
-                .map_err(|err| format_reqwest_error(&err, "OpenAI Chat Completions API streaming request", self.config.timeout.as_secs()))?;
-
-            let response = ensure_success(response).await?;
+            let response = http::send_with_retry(
+                || self.request().header("Accept", "text/event-stream").json(&payload),
+                &self.config.retry_config,
+                "openai_chat",
+                request.config.timeout,
+            )
+            .await?;
             stream_handle_from_response(response, request.config.response_format.clone(), self.config.timeout.as_secs())
         }
         .await;
@@ -438,24 +411,3 @@ fn validate_request(request: &GenerateRequest) -> SdkResult<()> {
     Ok(())
 }
 
-async fn ensure_success(response: reqwest::Response) -> SdkResult<reqwest::Response> {
-    let status = response.status();
-    if status.is_success() {
-        return Ok(response);
-    }
-
-    let body = response
-        .text()
-        .await
-        .unwrap_or_else(|_| "<unable to read body>".to_string());
-
-    if let Some(message) = parse_error(&body) {
-        return Err(SdkError::Other(anyhow!(
-            "OpenAI API error ({status}): {message}"
-        )));
-    }
-
-    Err(SdkError::Other(anyhow!(
-        "OpenAI API error ({status}): {body}"
-    )))
-}

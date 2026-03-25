@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{Result as SdkResult, SdkError};
 
+use super::http;
 use super::interface::{
     generate as generate_via_model, stream as stream_via_model, GenerateRequest, GenerateResponse,
     LanguageModel, MessageRole, ResponseFormat, StreamChunk, StreamHandle, StreamRequest,
@@ -36,6 +37,7 @@ pub struct BedrockConfig {
     pub credentials: AwsCredentials,
     pub default_region: Option<String>,
     pub timeout: Duration,
+    pub retry_config: http::RetryConfig,
 }
 
 impl BedrockConfig {
@@ -65,6 +67,7 @@ impl BedrockConfig {
             },
             default_region,
             timeout: DEFAULT_TIMEOUT,
+            retry_config: http::RetryConfig::from_env(),
         })
     }
 }
@@ -77,10 +80,7 @@ pub struct BedrockProvider {
 
 impl BedrockProvider {
     pub fn new(config: BedrockConfig) -> SdkResult<Self> {
-        let http = Client::builder()
-            .timeout(config.timeout)
-            .build()
-            .map_err(|err| SdkError::Other(anyhow!("failed to construct HTTP client: {err}")))?;
+        let http = http::build_http_client(config.timeout)?;
 
         Ok(Self { http, config })
     }
@@ -418,6 +418,7 @@ impl BedrockAnthropicResponse {
             tool_calls: None,  // Bedrock tool calls not yet supported
             object,
             raw: None,
+            metadata: None,
         })
     }
 }

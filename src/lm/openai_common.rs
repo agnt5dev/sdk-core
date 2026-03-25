@@ -304,6 +304,7 @@ impl ChatCompletionResponse {
             tool_calls,
             object,
             raw: Some(raw),
+            metadata: None,
         })
     }
 }
@@ -420,16 +421,6 @@ pub(crate) struct ChunkDelta {
     content: Option<String>,
 }
 
-#[derive(Deserialize, Serialize)]
-pub(crate) struct ApiErrorResponse {
-    pub(crate) error: ApiError,
-}
-
-#[derive(Deserialize, Serialize)]
-pub(crate) struct ApiError {
-    pub(crate) message: String,
-}
-
 #[derive(Default, Clone)]
 struct PartialResponse {
     id: Option<String>,
@@ -476,6 +467,7 @@ impl PartialResponse {
             tool_calls: None,  // Streaming doesn't support tool calls yet
             object,
             raw: None,
+            metadata: None,
         })
     }
 }
@@ -635,8 +627,3 @@ fn build_stream(
     Ok(Box::pin(stream))
 }
 
-pub(crate) fn parse_error(body: &str) -> Option<String> {
-    serde_json::from_str::<ApiErrorResponse>(body)
-        .ok()
-        .map(|err| err.error.message)
-}

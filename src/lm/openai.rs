@@ -18,7 +18,7 @@ use super::interface::{
     GenerateRequest, GenerateResponse, LanguageModel, Modality, ReasoningEffort, ResponseFormat,
     StreamChunk, StreamHandle, StreamRequest, TokenUsage,
 };
-use super::openai_common::parse_error;
+use super::http;
 use super::telemetry;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -39,6 +39,7 @@ pub struct OpenAiConfig {
     pub timeout: Duration,
     pub extra_headers: Vec<(String, String)>,
     pub model_prefix: Option<String>,
+    pub retry_config: http::RetryConfig,
 }
 
 impl OpenAiConfig {
@@ -52,6 +53,7 @@ impl OpenAiConfig {
             timeout: DEFAULT_TIMEOUT,
             extra_headers: Vec::new(),
             model_prefix: Some(DEFAULT_MODEL_PREFIX.to_string()),
+            retry_config: http::RetryConfig::from_env(),
         }
     }
 
@@ -139,10 +141,7 @@ pub struct OpenAiProvider {
 
 impl OpenAiProvider {
     pub fn new(config: OpenAiConfig) -> SdkResult<Self> {
-        let http = Client::builder()
-            .timeout(config.timeout)
-            .build()
-            .map_err(|err| SdkError::Other(anyhow!("failed to construct HTTP client: {err}")))?;
+        let http = http::build_http_client(config.timeout)?;
 
         Ok(Self { http, config })
     }
@@ -657,6 +656,7 @@ impl ResponsesApiResponse {
             },
             object: None,
             raw: None,
+            metadata: None,
         })
     }
 }
@@ -785,6 +785,7 @@ impl StreamingState {
             tool_calls: None, // TODO: Handle tool calls in streaming
             object,
             raw: None,
+            metadata: None,
         })
     }
 }
@@ -803,7 +804,7 @@ fn build_responses_stream(
         let mut state = StreamingState::default();
 
         while let Some(chunk) = bytes_stream.next().await {
-            let chunk = chunk.map_err(|err| format_reqwest_error(&err, "OpenAI Responses API streaming", timeout_secs))?;
+            let chunk = chunk.map_err(|err| http::classify_reqwest_error(err, "openai"))?;
 
             for (event_type, data) in decoder.ingest(chunk.as_ref())? {
                 if data.is_empty() {
@@ -934,32 +935,6 @@ fn responses_stream_handle(
 // Error Handling Helpers
 // ============================================================================
 
-/// Format reqwest errors with clear, actionable messages
-fn format_reqwest_error(err: &reqwest::Error, context: &str, timeout_secs: u64) -> SdkError {
-    if err.is_timeout() {
-        SdkError::Other(anyhow!(
-            "{} timed out after {} seconds. \
-            To increase, set OPENAI_REQUEST_TIMEOUT_SECS (e.g., OPENAI_REQUEST_TIMEOUT_SECS=1200)",
-            context,
-            timeout_secs
-        ))
-    } else if err.is_connect() {
-        SdkError::Other(anyhow!(
-            "{} failed: Unable to connect to OpenAI API. Check your network connection. Error: {}",
-            context,
-            err
-        ))
-    } else if err.is_decode() {
-        SdkError::Other(anyhow!(
-            "{} failed: Unable to decode response. The response may be malformed. Error: {}",
-            context,
-            err
-        ))
-    } else {
-        SdkError::Other(anyhow!("{} failed: {}", context, err))
-    }
-}
-
 // ============================================================================
 // LanguageModel Trait Implementation
 // ============================================================================
@@ -972,28 +947,6 @@ fn validate_request(request: &GenerateRequest) -> SdkResult<()> {
         });
     }
     Ok(())
-}
-
-async fn ensure_success(response: reqwest::Response) -> SdkResult<reqwest::Response> {
-    let status = response.status();
-    if status.is_success() {
-        return Ok(response);
-    }
-
-    let body = response
-        .text()
-        .await
-        .unwrap_or_else(|_| "<unable to read body>".to_string());
-
-    if let Some(message) = parse_error(&body) {
-        return Err(SdkError::Other(anyhow!(
-            "OpenAI Responses API error ({status}): {message}"
-        )));
-    }
-
-    Err(SdkError::Other(anyhow!(
-        "OpenAI Responses API error ({status}): {body}"
-    )))
 }
 
 #[async_trait]
@@ -1036,25 +989,26 @@ impl LanguageModel for OpenAiProvider {
         let start = std::time::Instant::now();
 
         // Execute the actual API call
-        let result = async {
+        let result: SdkResult<GenerateResponse> = async {
             validate_request(&request)?;
             let model = self.normalize_model(&request.model)?;
             let payload = ResponsesApiRequest::from_request(&request, model);
 
-            let response = self
-                .request()
-                .json(&payload)
-                .send()
-                .await
-                .map_err(|err| format_reqwest_error(&err, "OpenAI Responses API request", self.config.timeout.as_secs()))?;
+            let response = http::send_with_retry(
+                || self.request().json(&payload),
+                &self.config.retry_config,
+                "openai",
+                request.config.timeout,
+            )
+            .await?;
 
-            let response = ensure_success(response).await?;
+            let metadata = http::extract_metadata(&response);
 
             // Get response text for debugging
             let response_text = response
                 .text()
                 .await
-                .map_err(|err| format_reqwest_error(&err, "OpenAI Responses API response body read", self.config.timeout.as_secs()))?;
+                .map_err(|err| http::classify_reqwest_error(err, "openai"))?;
 
             tracing::debug!("OpenAI Responses API raw response: {}", response_text);
 
@@ -1064,7 +1018,9 @@ impl LanguageModel for OpenAiProvider {
                     SdkError::Other(anyhow!("failed to parse OpenAI Responses response: {err}"))
                 })?;
 
-            parsed.into_generate_response()
+            let mut result = parsed.into_generate_response()?;
+            result.metadata = Some(metadata);
+            Ok(result)
         }
         .await;
 
@@ -1153,15 +1109,13 @@ impl LanguageModel for OpenAiProvider {
             let mut payload = ResponsesApiRequest::from_request(&request, model);
             payload.stream = Some(true);
 
-            let response = self
-                .request()
-                .header("Accept", "text/event-stream")
-                .json(&payload)
-                .send()
-                .await
-                .map_err(|err| format_reqwest_error(&err, "OpenAI Responses API streaming request", self.config.timeout.as_secs()))?;
-
-            let response = ensure_success(response).await?;
+            let response = http::send_with_retry(
+                || self.request().header("Accept", "text/event-stream").json(&payload),
+                &self.config.retry_config,
+                "openai",
+                request.config.timeout,
+            )
+            .await?;
             responses_stream_handle(response, request.config.response_format.clone(), self.config.timeout.as_secs())
         }
         .await;
@@ -1419,20 +1373,9 @@ mod tests {
 
     #[test]
     fn test_responses_api_request_simple() {
-        use super::super::interface::{GenerateConfig, Message, MessageRole};
-
-        let request = GenerateRequest {
-            model: "openai/gpt-4o-mini".to_string(),
-            system_prompt: Some("You are a helpful assistant.".to_string()),
-            messages: vec![Message {
-                role: MessageRole::User,
-                content: "Hello".to_string(),
-            }],
-            tools: vec![],
-            tool_choice: None,
-            config: GenerateConfig::default(),
-            otel_context: None,
-        };
+        let request = GenerateRequest::new("openai/gpt-4o-mini")
+            .system_prompt("You are a helpful assistant.")
+            .user_message("Hello");
 
         let payload = ResponsesApiRequest::from_request(&request, "gpt-4o-mini".to_string());
 
@@ -1444,20 +1387,9 @@ mod tests {
 
     #[test]
     fn test_responses_api_request_with_streaming() {
-        use super::super::interface::{GenerateConfig, Message, MessageRole};
-
-        let request = GenerateRequest {
-            model: "openai/gpt-4o-mini".to_string(),
-            system_prompt: Some("Test".to_string()),
-            messages: vec![Message {
-                role: MessageRole::User,
-                content: "Hi".to_string(),
-            }],
-            tools: vec![],
-            tool_choice: None,
-            config: GenerateConfig::default(),
-            otel_context: None,
-        };
+        let request = GenerateRequest::new("openai/gpt-4o-mini")
+            .system_prompt("Test")
+            .user_message("Hi");
 
         let mut payload = ResponsesApiRequest::from_request(&request, "gpt-4o-mini".to_string());
         payload.stream = Some(true);
@@ -1467,24 +1399,13 @@ mod tests {
 
     #[test]
     fn test_responses_api_request_reasoning_model() {
-        use super::super::interface::{GenerateConfig, Message, MessageRole};
-
-        let mut config = GenerateConfig::default();
-        config.temperature = Some(0.7);
-        config.top_p = Some(0.9);
-
-        let request = GenerateRequest {
-            model: "openai/gpt-5".to_string(),
-            system_prompt: Some("Test".to_string()),
-            messages: vec![Message {
-                role: MessageRole::User,
-                content: "Hi".to_string(),
-            }],
-            tools: vec![],
-            tool_choice: None,
-            config,
-            otel_context: None,
-        };
+        let request = GenerateRequest::new("openai/gpt-5")
+            .system_prompt("Test")
+            .user_message("Hi")
+            .configure(|c| {
+                c.temperature = Some(0.7);
+                c.top_p = Some(0.9);
+            });
 
         let payload = ResponsesApiRequest::from_request(&request, "gpt-5".to_string());
 
@@ -1495,24 +1416,13 @@ mod tests {
 
     #[test]
     fn test_responses_api_request_non_reasoning_model() {
-        use super::super::interface::{GenerateConfig, Message, MessageRole};
-
-        let mut config = GenerateConfig::default();
-        config.temperature = Some(0.7);
-        config.top_p = Some(0.9);
-
-        let request = GenerateRequest {
-            model: "openai/gpt-4o".to_string(),
-            system_prompt: Some("Test".to_string()),
-            messages: vec![Message {
-                role: MessageRole::User,
-                content: "Hi".to_string(),
-            }],
-            tools: vec![],
-            tool_choice: None,
-            config,
-            otel_context: None,
-        };
+        let request = GenerateRequest::new("openai/gpt-4o")
+            .system_prompt("Test")
+            .user_message("Hi")
+            .configure(|c| {
+                c.temperature = Some(0.7);
+                c.top_p = Some(0.9);
+            });
 
         let payload = ResponsesApiRequest::from_request(&request, "gpt-4o".to_string());
 

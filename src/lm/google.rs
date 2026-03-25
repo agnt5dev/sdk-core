@@ -13,6 +13,8 @@ use serde_json::{self, json, Value as JsonValue};
 
 use crate::error::{Result as SdkResult, SdkError};
 
+use super::http;
+
 use super::interface::{
     generate as generate_via_model, stream as stream_via_model, ContentBlockType, GenerateRequest,
     GenerateResponse, GenerationConfig, LanguageModel, Message, MessageRole, ResponseFormat,
@@ -35,6 +37,7 @@ pub struct GoogleConfig {
     pub base_url: String,
     pub version: String,
     pub timeout: Duration,
+    pub retry_config: http::RetryConfig,
 }
 
 impl GoogleConfig {
@@ -44,6 +47,7 @@ impl GoogleConfig {
             base_url: DEFAULT_BASE_URL.to_string(),
             version: DEFAULT_VERSION.to_string(),
             timeout: DEFAULT_TIMEOUT,
+            retry_config: http::RetryConfig::from_env(),
         }
     }
 
@@ -125,10 +129,7 @@ pub struct GoogleProvider {
 
 impl GoogleProvider {
     pub fn new(config: GoogleConfig) -> SdkResult<Self> {
-        let http = Client::builder()
-            .timeout(config.timeout)
-            .build()
-            .map_err(|err| SdkError::Other(anyhow!("failed to construct HTTP client: {err}")))?;
+        let http = http::build_http_client(config.timeout)?;
 
         Ok(Self { http, config })
     }
@@ -197,27 +198,29 @@ impl LanguageModel for GoogleProvider {
 
         let start = std::time::Instant::now();
 
-        let result = async {
+        let result: SdkResult<GenerateResponse> = async {
             validate_request(&request)?;
             let model = normalize_model(&request.model)?;
             let payload = GeminiPayload::from_request(&request)?;
             let url = self.generate_endpoint(&model);
 
-            let response = self
-                .request(&url)
-                .json(&payload)
-                .send()
-                .await
-                .map_err(|err| SdkError::Other(anyhow!("Google API request failed: {err}")))?;
+            let response = http::send_with_retry(
+                || self.request(&url).json(&payload),
+                &self.config.retry_config,
+                "google",
+                request.config.timeout,
+            )
+            .await?;
 
-            let response = ensure_success(response).await?;
-
+            let metadata = http::extract_metadata(&response);
             let parsed: GeminiResponse = response
                 .json()
                 .await
                 .map_err(|err| SdkError::Other(anyhow!("failed to parse Google response: {err}")))?;
 
-            parsed.into_generate_response(&model, request.config.response_format.clone())
+            let mut result = parsed.into_generate_response(&model, request.config.response_format.clone())?;
+            result.metadata = Some(metadata);
+            Ok(result)
         }
         .await;
 
@@ -288,17 +291,13 @@ impl LanguageModel for GoogleProvider {
             let payload = GeminiPayload::from_request(&request)?;
             let url = self.stream_endpoint(&model);
 
-            let response = self
-                .request(&url)
-                .header("accept", "text/event-stream")
-                .json(&payload)
-                .send()
-                .await
-                .map_err(|err| {
-                    SdkError::Other(anyhow!("Google streaming request failed: {err}"))
-                })?;
-
-            let response = ensure_success(response).await?;
+            let response = http::send_with_retry(
+                || self.request(&url).header("accept", "text/event-stream").json(&payload),
+                &self.config.retry_config,
+                "google",
+                request.config.timeout,
+            )
+            .await?;
             let stream = build_stream(response, model, request.config.response_format.clone());
             Ok(StreamHandle::new(stream))
         }
@@ -453,29 +452,6 @@ fn build_stream(
     Box::pin(stream)
 }
 
-async fn ensure_success(response: reqwest::Response) -> SdkResult<reqwest::Response> {
-    let status = response.status();
-    if status.is_success() {
-        return Ok(response);
-    }
-
-    let body = response
-        .text()
-        .await
-        .unwrap_or_else(|_| "<unable to read body>".to_string());
-
-    if let Ok(api_error) = serde_json::from_str::<ApiError>(&body) {
-        return Err(SdkError::Other(anyhow!(
-            "Google API error ({status}): {}",
-            api_error.error.message
-        )));
-    }
-
-    Err(SdkError::Other(anyhow!(
-        "Google API error ({status}): {body}"
-    )))
-}
-
 // Request structures
 #[derive(Serialize)]
 struct GeminiPayload {
@@ -516,6 +492,7 @@ impl GeminiPayload {
             reasoning_effort: _,
             modalities: _,
             built_in_tools: _,
+            timeout: _,
         } = request.config.clone();
 
         let generation_config = Some(GeminiGenerationConfig {
@@ -804,6 +781,7 @@ impl GeminiResponse {
             tool_calls: None,
             object,
             raw,
+            metadata: None,
         })
     }
 }
@@ -836,16 +814,6 @@ struct GeminiStreamResponse {
     candidates: Option<Vec<GeminiCandidate>>,
     #[serde(rename = "usageMetadata")]
     usage_metadata: Option<GeminiUsageMetadata>,
-}
-
-#[derive(Deserialize)]
-struct ApiError {
-    error: ApiErrorDetail,
-}
-
-#[derive(Deserialize)]
-struct ApiErrorDetail {
-    message: String,
 }
 
 fn parse_json_value(text: &str) -> SdkResult<JsonValue> {
@@ -908,6 +876,7 @@ impl PartialResponse {
             tool_calls: None,
             object,
             raw: None,
+            metadata: None,
         })
     }
 }

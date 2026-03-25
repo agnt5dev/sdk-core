@@ -273,7 +273,10 @@ mod tests {
     async fn function_namespace_handles_handler_error() {
         let registry = Arc::new(FunctionRegistry::new());
         registry.register("svc", "fail", |_call, _ctx| async move {
-            Err(crate::error::SdkError::Invocation("boom".into()))
+            Err(crate::error::SdkError::Invocation {
+                message: "boom".into(),
+                function_name: None,
+            })
         });
 
         let cfg = ContextConfig::new("tenant", "session", "run", "step", 0)
@@ -294,6 +297,6 @@ mod tests {
         let request = FunctionCall::new("missing", "handler", json!({}));
 
         let err = ctx.functions().call(request).await;
-        assert!(matches!(err, Err(SdkError::InvalidArgument(_))));
+        assert!(matches!(err, Err(SdkError::InvalidArgument { .. })));
     }
 }

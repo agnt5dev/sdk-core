@@ -5,6 +5,7 @@ mod deepseek;
 mod embedder;
 mod google;
 mod groq;
+pub(crate) mod http;
 mod interface;
 mod mistral;
 mod ollama;
@@ -28,8 +29,8 @@ pub use groq::{GroqConfig, GroqProvider};
 pub use interface::{
     generate, stream, BuiltInTool, ContentBlockType, GenerateRequest, GenerateResponse,
     GenerationConfig, JsonSchemaFormat, LanguageModel, Message, MessageRole, Modality,
-    ReasoningEffort, ResponseFormat, StreamChunk, StreamHandle, StreamRequest, TokenUsage,
-    ToolCall, ToolChoice, ToolDefinition,
+    ReasoningEffort, ResponseFormat, ResponseMetadata, StreamChunk, StreamHandle, StreamRequest,
+    TokenUsage, ToolCall, ToolChoice, ToolDefinition,
 };
 pub use mistral::{MistralConfig, MistralProvider};
 pub use ollama::{OllamaConfig, OllamaProvider};
@@ -37,4 +38,5 @@ pub use openai::{OpenAiConfig, OpenAiProvider};
 pub use openai_chat::{OpenAiChatConfig, OpenAiChatProvider};
 pub use openrouter::{OpenRouterConfig, OpenRouterProvider};
 pub use xai::{XaiConfig, XaiProvider};
+pub use http::RetryConfig;
 pub use huggingface::{HuggingFaceConfig, HuggingFaceProvider};
