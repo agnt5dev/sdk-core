@@ -233,24 +233,32 @@ pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), S
     let log_appender =
         opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&log_provider);
 
-    // Create filters for both console and OpenTelemetry (need separate instances)
-    // Check AGNT5_DEBUG for debug mode, otherwise default to warn level for clean output
+    // Check AGNT5_DEBUG for debug mode
     let debug_enabled = std::env::var("AGNT5_DEBUG")
         .map(|v| v == "1" || v.to_lowercase() == "true")
         .unwrap_or(false);
 
-    let filter_directive = std::env::var("RUST_LOG").unwrap_or_else(|_| {
+    // Console filter: controlled by RUST_LOG / AGNT5_DEBUG, keeps output clean in production
+    let console_directive = std::env::var("RUST_LOG").unwrap_or_else(|_| {
         if debug_enabled {
-            // Debug mode: show debug logs for AGNT5 components
             "agnt5=debug,agnt5_sdk_python=debug,h2=error,hyper=error,tonic=warn,tower=warn".to_string()
         } else {
-            // Normal mode: only show warnings and errors (clean output)
             "agnt5=warn,agnt5_sdk_python=warn,h2=error,hyper=error,tonic=error,tower=error".to_string()
         }
     });
+    let console_filter = EnvFilter::new(&console_directive);
 
-    let console_filter = EnvFilter::new(&filter_directive);
-    let otel_filter = EnvFilter::new(&filter_directive);
+    // OTLP filter: user application logs (agnt5_sdk_python, agnt5_sdk_typescript) always
+    // exported at all levels, so the control plane can query them by log_source="application" + run_id.
+    // Platform-internal logs stay at warn. Override with AGNT5_OTEL_LOG_FILTER.
+    let otel_directive = std::env::var("AGNT5_OTEL_LOG_FILTER").unwrap_or_else(|_| {
+        if debug_enabled {
+            "agnt5=debug,agnt5_sdk_python=trace,agnt5_sdk_typescript=trace,h2=error,hyper=error,tonic=warn,tower=warn".to_string()
+        } else {
+            "agnt5=warn,agnt5_sdk_python=trace,agnt5_sdk_typescript=trace,h2=error,hyper=error,tonic=error,tower=error".to_string()
+        }
+    });
+    let otel_filter = EnvFilter::new(&otel_directive);
 
     // Create custom fmt layer with clean output (no file paths or line numbers)
     let fmt_layer = tracing_subscriber::fmt::layer()
@@ -264,7 +272,7 @@ pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), S
 
     let subscriber = Registry::default()
         .with(telemetry_layer)
-        .with(log_appender.with_filter(otel_filter))  // Filter OTLP logs too!
+        .with(log_appender.with_filter(otel_filter))  // OTLP logs: all user levels, platform at warn
         .with(fmt_layer);  // Filtered console output
 
     // Set as global default subscriber
