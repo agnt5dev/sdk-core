@@ -1,10 +1,11 @@
 use crate::error::{Result, SdkError};
 use crate::pb::{
+    engine_service_client::EngineServiceClient,
     execution_engine_service_client::ExecutionEngineServiceClient,
-    worker_coordinator_service_client::WorkerCoordinatorServiceClient, CheckpointRequest,
-    CheckpointType, CompleteJobRequest, CompleteJobResponse, DurableStepCheckpoint,
-    EventStreamMessage, GetMemoizedStepRequest, PollJobsRequest, PollJobsResponse,
-    RegisterService, RuntimeMessage, ServiceMessage,
+    worker_coordinator_service_client::WorkerCoordinatorServiceClient, AppendBatchRequest,
+    AppendRequest, CheckpointRequest, CheckpointType, CompleteJobRequest, CompleteJobResponse,
+    DurableStepCheckpoint, EventStreamMessage, GetMemoizedStepRequest, PollJobsRequest,
+    PollJobsResponse, Record, RegisterService, RuntimeMessage, ServiceMessage,
 };
 use std::collections::HashMap;
 use std::time::Duration;
@@ -423,6 +424,127 @@ pub async fn create_ee_event_stream(
 
     debug!("EE EventStream opened for worker {}", worker_id);
     Ok(tx)
+}
+
+// =============================================================================
+// Engine Client — routes events to the AGNT5 Rust engine (Append/AppendBatch)
+// =============================================================================
+
+/// Client for communicating with the AGNT5 Engine.
+///
+/// When `AGNT5_ENGINE_URL` is set, all event paths (checkpoints, boundary events,
+/// SSE-only events) are routed here instead of the Go Execution Engine.
+/// The engine persists ALL events — no SSE-only/boundary distinction.
+#[derive(Debug, Clone)]
+pub struct EngineClient {
+    client: EngineServiceClient<Channel>,
+}
+
+impl EngineClient {
+    /// Connect to the engine at the given endpoint.
+    pub async fn connect(endpoint: &str) -> Result<Self> {
+        debug!("Connecting to Engine at {}", endpoint);
+
+        // tonic requires a URI with scheme; accept bare host:port for convenience.
+        let uri = if endpoint.contains("://") {
+            endpoint.to_string()
+        } else {
+            format!("http://{}", endpoint)
+        };
+
+        let channel = Channel::from_shared(uri)
+            .map_err(|e| SdkError::Connection {
+                message: format!("Invalid engine endpoint {}: {}", endpoint, e),
+                code: crate::error::ErrorCode::ConnectionFailed,
+                source: None,
+            })?
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .http2_adaptive_window(true)
+            .connect()
+            .await
+            .map_err(|e| {
+                debug!("Engine connection to {} failed: {:?}", endpoint, e);
+                SdkError::Connection {
+                    message: format!("Engine connection failed: {}", e),
+                    code: crate::error::ErrorCode::ConnectionFailed,
+                    source: None,
+                }
+            })?;
+
+        Ok(Self {
+            client: EngineServiceClient::new(channel),
+        })
+    }
+
+    /// Append a single record to the engine.
+    pub async fn append(&mut self, record: Record) -> Result<(u64, i64)> {
+        let response = self
+            .client
+            .append(AppendRequest {
+                record: Some(record),
+            })
+            .await
+            .map_err(|e| {
+                debug!("Engine Append failed: {}", e);
+                SdkError::Connection {
+                    message: format!("Engine Append failed: {}", e),
+                    code: crate::error::ErrorCode::ConnectionFailed,
+                    source: None,
+                }
+            })?
+            .into_inner();
+
+        Ok((response.offset, response.timestamp_ns))
+    }
+
+    /// Append a batch of records to the engine.
+    pub async fn append_batch(&mut self, records: Vec<Record>) -> Result<i32> {
+        let response = self
+            .client
+            .append_batch(AppendBatchRequest { records })
+            .await
+            .map_err(|e| {
+                debug!("Engine AppendBatch failed: {}", e);
+                SdkError::Connection {
+                    message: format!("Engine AppendBatch failed: {}", e),
+                    code: crate::error::ErrorCode::ConnectionFailed,
+                    source: None,
+                }
+            })?
+            .into_inner();
+
+        Ok(response.written_count)
+    }
+}
+
+/// Build an engine `Record` from SDK event fields.
+pub fn build_engine_record(
+    tenant_id: String,
+    run_id: String,
+    event_type: String,
+    data: Vec<u8>,
+    timestamp_ns: i64,
+    step_key: String,
+    correlation_id: String,
+    parent_event_id: String,
+    metadata: HashMap<String, String>,
+) -> Record {
+    Record {
+        offset: 0, // Assigned by engine
+        tenant_id,
+        run_id,
+        event_type,
+        data,
+        timestamp_ns,
+        step_key,
+        correlation_id,
+        parent_event_id,
+        metadata,
+        data_type: "json".to_string(),
+        data_checksum: vec![],
+        data_compressed: false,
+    }
 }
 
 /// Result of a checkpoint operation

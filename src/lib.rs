@@ -7,7 +7,6 @@ pub mod context;
 pub mod error;
 pub mod eval;
 pub mod graph;
-pub mod journal_exporter;
 pub mod journal_queue;
 pub mod lm;
 pub mod logging;
@@ -25,7 +24,7 @@ pub use adk::{
     SignalControls, TaskControls, TimerControls, ToolDefinition, ToolHandle, ToolRegistry,
 };
 pub use journal_queue::{JournalEventMessage, JournalEventQueue, JournalQueueConfig, JournalQueueMetrics};
-pub use client::{CheckpointResult, WorkerCoordinatorClient};
+pub use client::{build_engine_record, CheckpointResult, EngineClient, WorkerCoordinatorClient};
 pub use context::{
     ContextConfig, CoreContext, FunctionCall, FunctionHandle, FunctionNamespace, FunctionRegistry,
     FunctionResult, FunctionStatus, LanguageModelNamespace, SignalNamespace, TimerNamespace,
@@ -50,11 +49,6 @@ pub use telemetry::{
     create_component_span, create_function_span, end_span, extract_context_from_runtime_message,
     init_telemetry, record_execution_request, record_execution_request_with_attrs,
     record_span_error, record_span_success, shutdown_telemetry,
-};
-pub use journal_exporter::{
-    create_journal_log_data, create_journal_span_data, export_log_to_journal,
-    export_span_to_journal, get_journal_client, write_event, JournalClient, JournalExporterConfig,
-    JournalLogData, JournalSpanData, JournalSpanStatus,
 };
 pub use vectordb::{
     Agnt5Provider, Agnt5ProviderConfig, Collection, DistanceMetric, PgVectorProvider,

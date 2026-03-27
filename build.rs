@@ -9,6 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &[
                 "../../protos/proto/api/v1/worker_coordinator.proto",
                 "../../protos/proto/api/v1/execution_engine.proto",
+                "../../protos/proto/api/v1/engine.proto",
                 "../../protos/proto/api/v1/common.proto",
             ],
             &["../../protos/proto"],

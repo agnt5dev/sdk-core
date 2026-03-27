@@ -175,9 +175,9 @@ pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), S
         .with_resource(resource.clone())
         .with_batch_exporter(filtering_exporter);
 
-    // NOTE: Journal export for real-time SSE streaming is NOT done via the tracer provider.
-    // Instead, the worker code directly calls export_span_to_journal() after streaming spans end.
-    // This avoids BatchSpanProcessor delays and Tokio runtime issues, providing true real-time delivery.
+    // NOTE: Real-time SSE streaming events go through the unified JournalEventQueue.
+    // The flush task routes SSE-only events via EventStream and boundary events via
+    // WriteJournalEventsBatch — both directly to EE, bypassing the dispatch stream.
 
     // Build tracer provider
     let trace_provider = trace_provider_builder.build();

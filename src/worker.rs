@@ -1,4 +1,4 @@
-use crate::client::WorkerCoordinatorClient;
+use crate::client::{self, EngineClient, WorkerCoordinatorClient};
 use crate::error::Result;
 use crate::journal_queue::{JournalEventMessage, JournalEventQueue, JournalQueueConfig};
 use crate::pb::{
@@ -43,6 +43,12 @@ pub struct WorkerConfig {
     /// 0 = infinite retry (worker never exits due to connection issues)
     /// Default: 5
     pub max_retries: u32,
+
+    /// AGNT5 Engine endpoint for direct event writes.
+    /// When set, all event paths (checkpoints, boundary, SSE-only) route to the engine's
+    /// Append/AppendBatch RPCs instead of the Go Execution Engine.
+    /// Env: AGNT5_ENGINE_URL. None = use Go EE (default).
+    pub engine_endpoint: Option<String>,
 }
 
 impl WorkerConfig {
@@ -65,6 +71,9 @@ impl WorkerConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(5);
 
+        // Engine endpoint — when set, bypasses Go EE for all event writes.
+        let engine_endpoint = std::env::var("AGNT5_ENGINE_URL").ok();
+
         Self {
             service_name,
             service_version,
@@ -73,6 +82,7 @@ impl WorkerConfig {
             coordinator_endpoint,
             ee_endpoint,
             max_retries,
+            engine_endpoint,
         }
     }
 }
@@ -135,6 +145,9 @@ pub struct Worker {
     /// to flush pending SSE-only events before terminal checkpoints, ensuring they
     /// arrive while the invocation is still tracked in pendingStreamInvocations.
     dispatch_tx: Arc<std::sync::Mutex<Option<flume::Sender<ServiceMessage>>>>,
+    /// Lazily-connected Engine gRPC client. When AGNT5_ENGINE_URL is set, all event paths
+    /// route through this client instead of the Go EE.
+    engine_client: Arc<TokioMutex<Option<EngineClient>>>,
 }
 
 // Implement Debug manually to avoid requiring Debug on JournalEventQueue's internals
@@ -177,6 +190,7 @@ impl Worker {
             streaming_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             event_stream_tx: Arc::new(std::sync::Mutex::new(None)),
             dispatch_tx: Arc::new(std::sync::Mutex::new(None)),
+            engine_client: Arc::new(TokioMutex::new(None)),
         }
     }
 
@@ -319,6 +333,26 @@ impl Worker {
         Ok(client)
     }
 
+    /// Ensure the Engine gRPC client is connected, lazily creating it on first use.
+    /// Returns None if AGNT5_ENGINE_URL is not configured.
+    async fn ensure_engine_client(&self) -> Result<Option<EngineClient>> {
+        let endpoint = match &self.config.engine_endpoint {
+            Some(ep) => ep.clone(),
+            None => return Ok(None),
+        };
+
+        let mut guard = self.engine_client.lock().await;
+        if let Some(ref client) = *guard {
+            return Ok(Some(client.clone()));
+        }
+
+        debug!("Connecting Engine client to {}", endpoint);
+        let client = EngineClient::connect(&endpoint).await?;
+        *guard = Some(client.clone());
+        debug!("Engine client connected to {}", endpoint);
+        Ok(Some(client))
+    }
+
     /// Emit a checkpoint event synchronously and wait for acknowledgement.
     ///
     /// Sends a WriteCheckpoint unary RPC directly to the Execution Engine.
@@ -347,6 +381,104 @@ impl Worker {
         source_timestamp_ns: i64,
         timeout_ms: u64,
     ) -> Result<()> {
+        // ── Engine path: when AGNT5_ENGINE_URL is set, route directly to engine ──
+        if let Some(mut engine) = self.ensure_engine_client().await? {
+            // Before terminal checkpoints, flush any pending events for this run
+            // directly to the engine via AppendBatch.
+            if event_type == "run.completed" || event_type == "run.failed" {
+                let pending = self.journal_queue.drain_run_events(&run_id);
+                if !pending.is_empty() {
+                    let tenant_id = metadata.get("tenant_id").cloned()
+                        .or_else(|| self.metadata.get("tenant_id").cloned())
+                        .unwrap_or_default();
+                    let records: Vec<_> = pending.iter().map(|e| {
+                        client::build_engine_record(
+                            tenant_id.clone(),
+                            e.run_id.clone(),
+                            e.event_type.clone(),
+                            e.data.clone(),
+                            e.source_timestamp_ns,
+                            String::new(),
+                            e.correlation_id.clone(),
+                            e.parent_correlation_id.clone(),
+                            e.metadata.clone(),
+                        )
+                    }).collect();
+                    if let Err(e) = engine.append_batch(records).await {
+                        warn!("Engine: failed to flush {} pre-checkpoint events for run_id={}: {}", pending.len(), run_id, e);
+                    } else {
+                        debug!("Engine: flushed {} events before {} for run_id={}", pending.len(), event_type, run_id);
+                    }
+                }
+            }
+
+            let mut merged_metadata = metadata;
+            for (k, v) in &self.metadata {
+                if !merged_metadata.contains_key(k) {
+                    merged_metadata.insert(k.clone(), v.clone());
+                }
+            }
+            let correlation_id = merged_metadata.remove("cid").unwrap_or_default();
+            let parent_event_id = merged_metadata.remove("pcid").unwrap_or_default();
+            let tenant_id = merged_metadata.remove("tenant_id").unwrap_or_default();
+            let experiment_id = merged_metadata.get("experiment_id").cloned();
+
+            let record = client::build_engine_record(
+                tenant_id,
+                run_id.clone(),
+                event_type.clone(),
+                event_data,
+                source_timestamp_ns,
+                String::new(), // step_key — checkpoints don't set this directly
+                correlation_id,
+                parent_event_id,
+                merged_metadata,
+            );
+
+            let timeout = Duration::from_millis(timeout_ms);
+            let start = Instant::now();
+            let result = match tokio::time::timeout(timeout, engine.append(record)).await {
+                Ok(Ok((_offset, _ts))) => {
+                    debug!(
+                        "Engine checkpoint persisted: run_id={} event_type={} seq={}",
+                        run_id, event_type, sequence_number
+                    );
+                    Ok(())
+                }
+                Ok(Err(e)) => {
+                    warn!(
+                        "Engine Append failed: run_id={} event_type={} seq={} error={}",
+                        run_id, event_type, sequence_number, e
+                    );
+                    // Clear cached client for reconnection
+                    {
+                        let mut guard = self.engine_client.lock().await;
+                        *guard = None;
+                    }
+                    Err(e)
+                }
+                Err(_) => {
+                    warn!(
+                        "Engine Append timeout after {}ms: run_id={} event_type={} seq={}",
+                        timeout_ms, run_id, event_type, sequence_number
+                    );
+                    Ok(()) // Graceful degradation
+                }
+            };
+
+            let duration_secs = start.elapsed().as_secs_f64();
+            crate::telemetry::record_checkpoint(
+                &event_type,
+                duration_secs,
+                result.is_ok(),
+                experiment_id.as_deref(),
+            );
+
+            return result;
+        }
+
+        // ── Legacy EE path (AGNT5_ENGINE_URL not set) ──
+
         // Before sending terminal checkpoints (run.completed/run.failed), flush any
         // pending SSE-only events (logs, deltas) for this run.
         // Route through EventStream (EE) which is the single SSE publisher.
@@ -1240,15 +1372,16 @@ impl Worker {
 
     /// Spawn unified journal event flush task
     ///
-    /// This task periodically flushes all buffered events to the coordinator.
+    /// This task periodically flushes all buffered events to EE.
     /// Events are routed based on type:
     /// - SSE-only events (output.delta, log, etc.): Sent via EventStream for real-time SSE delivery
-    /// - Boundary events (workflow.*, agent.*, lm.call.*): Sent as DispatchComponentResponse on dispatch stream
+    /// - Boundary events (workflow.*, agent.*, lm.call.*): Sent via WriteJournalEventsBatch to EE for durable persistence + SSE
     ///
-    /// If EventStream is not available, all events fall back to the dispatch stream.
+    /// All events go directly to EE — the dispatch stream is only used as a fallback
+    /// for SSE-only events when EventStream is unavailable.
     fn spawn_journal_flush_task(
         &self,
-        tx: flume::Sender<ServiceMessage>,
+        dispatch_tx: flume::Sender<ServiceMessage>,
         event_stream_tx: Option<flume::Sender<EventStreamMessage>>,
     ) -> tokio::task::JoinHandle<()> {
         let worker_id = self.config.worker_id.clone();
@@ -1256,6 +1389,8 @@ impl Worker {
         let flush_interval_ms = journal_queue.flush_interval_ms();
         let batch_size = journal_queue.batch_size();
         let streaming_runs = self.streaming_runs.clone();
+        let ee_endpoint = self.config.ee_endpoint.clone();
+        let engine_endpoint = self.config.engine_endpoint.clone();
 
         // Cache tenant_id and deployment_id to avoid repeated env lookups per event
         let cached_tenant_id = std::env::var("AGNT5_TENANT_ID").unwrap_or_default();
@@ -1264,6 +1399,13 @@ impl Worker {
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(Duration::from_millis(flush_interval_ms));
+
+            // Lazily-connected EE client for boundary event writes.
+            // Separate from the Worker's ee_client to avoid lock contention with emit_checkpoint_sync.
+            let mut ee_client: Option<ExecutionEngineServiceClient<Channel>> = None;
+
+            // Lazily-connected Engine client (when AGNT5_ENGINE_URL is set).
+            let mut engine: Option<EngineClient> = None;
 
             loop {
                 interval.tick().await;
@@ -1274,8 +1416,76 @@ impl Worker {
                     continue;
                 }
 
+                // ── Engine path: send ALL events via AppendBatch ──
+                if let Some(ref ep) = engine_endpoint {
+                    // Ensure engine client is connected
+                    if engine.is_none() {
+                        match EngineClient::connect(ep).await {
+                            Ok(c) => {
+                                debug!("Flush task: Engine client connected to {}", ep);
+                                engine = Some(c);
+                            }
+                            Err(e) => {
+                                warn!("Flush task: failed to connect to Engine {}: {}", ep, e);
+                                // Re-queue all events for next flush
+                                for event in batch.into_iter().rev() {
+                                    journal_queue.push_front(event).ok();
+                                }
+                                journal_queue.record_error();
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Convert ALL events to engine Records (no SSE-only/boundary split)
+                    let originals: Vec<JournalEventMessage> = batch;
+                    let records: Vec<_> = originals.iter().map(|e| {
+                        let tenant = if let Some(ref tid) = e.tenant_id {
+                            tid.clone()
+                        } else {
+                            cached_tenant_id.clone()
+                        };
+                        client::build_engine_record(
+                            tenant,
+                            e.run_id.clone(),
+                            e.event_type.clone(),
+                            e.data.clone(),
+                            e.source_timestamp_ns,
+                            String::new(),
+                            e.correlation_id.clone(),
+                            e.parent_correlation_id.clone(),
+                            e.metadata.clone(),
+                        )
+                    }).collect();
+
+                    if let Some(ref mut eng) = engine {
+                        match eng.append_batch(records).await {
+                            Ok(written) => {
+                                journal_queue.record_sent_batch(written as usize, 0);
+                                debug!(
+                                    "Flush task: wrote {} events to Engine (queue_size={})",
+                                    written, journal_queue.len()
+                                );
+                            }
+                            Err(e) => {
+                                warn!("Flush task: Engine AppendBatch failed: {}", e);
+                                engine = None; // Clear for reconnection
+                                for event in originals.into_iter().rev() {
+                                    journal_queue.push_front(event).ok();
+                                }
+                                journal_queue.record_error();
+                            }
+                        }
+                    }
+                    continue; // Skip EE path entirely
+                }
+
+                // ── Legacy EE path (AGNT5_ENGINE_URL not set) ──
+
                 let mut sent_count = 0;
                 let mut sse_only_count = 0;
+                let mut boundary_events: Vec<(usize, crate::pb::WriteJournalEventRequest)> = Vec::new();
+                let mut boundary_originals: Vec<JournalEventMessage> = Vec::new();
 
                 for event in batch {
                     let is_sse_only = event.is_sse_only;
@@ -1285,8 +1495,7 @@ impl Worker {
                     if is_sse_only {
                         let is_run_streaming = match streaming_runs.lock() {
                             Ok(map) => {
-                                let val = map.get(&event.run_id).copied().unwrap_or(false);
-                                val
+                                map.get(&event.run_id).copied().unwrap_or(false)
                             },
                             Err(poisoned) => {
                                 warn!("streaming_runs mutex poisoned, assuming non-streaming for run_id={}", event.run_id);
@@ -1309,82 +1518,169 @@ impl Worker {
                             };
 
                             if let Err(e) = es_tx.send_async(es_msg).await {
-                                // EventStream channel closed — fall through to dispatch stream
                                 warn!(
                                     "EventStream send failed, falling back to dispatch stream: type={} run_id={} error={}",
                                     event.event_type, event.run_id, e
                                 );
-                                // Fall through to send via dispatch stream below
+                                // Fall through to dispatch stream fallback below
                             } else {
                                 sse_only_count += 1;
                                 sent_count += 1;
                                 continue; // Successfully sent via EventStream
                             }
                         }
-                        // No EventStream available — fall through to dispatch stream
+                        // No EventStream or EventStream failed — fallback to dispatch stream for SSE-only
+                        let mut metadata = event.metadata.clone();
+                        if !cached_tenant_id.is_empty() {
+                            metadata.insert("tenant_id".to_string(), cached_tenant_id.clone());
+                        }
+                        if !cached_deployment_id.is_empty() {
+                            metadata.insert("deployment_id".to_string(), cached_deployment_id.clone());
+                        }
+                        let response = DispatchComponentResponse {
+                            invocation_id: event.run_id.clone(),
+                            success: true,
+                            result: Some(
+                                crate::pb::dispatch_component_response::Result::OutputData(
+                                    event.data.clone(),
+                                ),
+                            ),
+                            error_message: String::new(),
+                            metadata,
+                            event_type: event.event_type.clone(),
+                            content_index: event.content_index,
+                            sequence: event.sequence,
+                            attempt: 0,
+                            source_timestamp_ns: event.source_timestamp_ns,
+                        };
+                        let service_message = ServiceMessage {
+                            worker_id: worker_id.clone(),
+                            metadata: std::collections::HashMap::new(),
+                            message_type: Some(
+                                crate::pb::service_message::MessageType::FunctionResponse(response),
+                            ),
+                        };
+                        if let Err(e) = dispatch_tx.send_async(service_message).await {
+                            warn!("Failed to send SSE-only event via dispatch fallback: type={} run_id={} error={}", event.event_type, event.run_id, e);
+                            journal_queue.push_front(event).ok();
+                            journal_queue.record_error();
+                            break;
+                        }
+                        sse_only_count += 1;
+                        sent_count += 1;
+                        continue;
                     }
 
-                    // Send via dispatch stream (boundary events, or SSE-only fallback)
-                    // Build metadata with cid, pcid, tenant_id, and deployment_id
+                    // Boundary event — collect for batch WriteJournalEventsBatch to EE
                     let mut metadata = event.metadata.clone();
-                    if !event.correlation_id.is_empty() {
-                        metadata.insert("cid".to_string(), event.correlation_id.clone());
-                    }
-                    if !event.parent_correlation_id.is_empty() {
-                        metadata.insert("pcid".to_string(), event.parent_correlation_id.clone());
-                    }
                     if !cached_tenant_id.is_empty() {
-                        metadata.insert("tenant_id".to_string(), cached_tenant_id.clone());
+                        metadata.entry("tenant_id".to_string()).or_insert_with(|| cached_tenant_id.clone());
                     }
                     if !cached_deployment_id.is_empty() {
-                        metadata.insert("deployment_id".to_string(), cached_deployment_id.clone());
+                        metadata.entry("deployment_id".to_string()).or_insert_with(|| cached_deployment_id.clone());
                     }
+                    let tenant_id = metadata.remove("tenant_id").unwrap_or_default();
 
-                    let response = DispatchComponentResponse {
-                        invocation_id: event.run_id.clone(),
-                        success: true,
-                        result: Some(
-                            crate::pb::dispatch_component_response::Result::OutputData(
-                                event.data.clone(),
-                            ),
-                        ),
-                        error_message: String::new(),
-                        metadata,
+                    let req = crate::pb::WriteJournalEventRequest {
+                        run_id: event.run_id.clone(),
                         event_type: event.event_type.clone(),
-                        content_index: event.content_index,
-                        sequence: event.sequence,
-                        attempt: 0,
+                        data: event.data.clone(),
+                        trace_id: String::new(),
+                        span_id: String::new(),
+                        tenant_id,
                         source_timestamp_ns: event.source_timestamp_ns,
+                        correlation_id: event.correlation_id.clone(),
+                        parent_event_id: event.parent_correlation_id.clone(),
+                        metadata,
                     };
 
-                    let service_message = ServiceMessage {
-                        worker_id: worker_id.clone(),
-                        metadata: std::collections::HashMap::new(),
-                        message_type: Some(
-                            crate::pb::service_message::MessageType::FunctionResponse(response),
-                        ),
-                    };
+                    boundary_events.push((boundary_originals.len(), req));
+                    boundary_originals.push(event);
+                }
 
-                    // Send event - if it fails, re-queue and exit
-                    if let Err(e) = tx.send_async(service_message).await {
-                        warn!(
-                            "Failed to send journal event, re-queuing: type={} run_id={} error={}",
-                            event.event_type, event.run_id, e
-                        );
+                // Send boundary events to EE via WriteJournalEventsBatch
+                if !boundary_events.is_empty() {
+                    let requests: Vec<crate::pb::WriteJournalEventRequest> =
+                        boundary_events.into_iter().map(|(_, req)| req).collect();
+                    let batch_count = requests.len();
 
-                        // Re-queue at front to preserve order
-                        if let Err(e) = journal_queue.push_front(event) {
-                            error!("Failed to re-queue journal event: {}", e);
+                    // Ensure EE client is connected
+                    if ee_client.is_none() {
+                        match Channel::from_shared(ee_endpoint.clone()) {
+                            Ok(ch) => {
+                                match ch.connect_timeout(Duration::from_secs(10))
+                                    .timeout(Duration::from_secs(30))
+                                    .connect()
+                                    .await
+                                {
+                                    Ok(channel) => {
+                                        debug!("Flush task: EE client connected to {}", ee_endpoint);
+                                        ee_client = Some(ExecutionEngineServiceClient::new(channel));
+                                    }
+                                    Err(e) => {
+                                        warn!("Flush task: failed to connect to EE {}: {}", ee_endpoint, e);
+                                        // Re-queue all boundary events for next flush
+                                        for event in boundary_originals.into_iter().rev() {
+                                            journal_queue.push_front(event).ok();
+                                        }
+                                        journal_queue.record_error();
+                                        // Continue — SSE-only events were already sent
+                                        if sent_count > 0 {
+                                            journal_queue.record_sent_batch(sent_count, sse_only_count);
+                                        }
+                                        continue;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("Flush task: invalid EE endpoint {}: {}", ee_endpoint, e);
+                                for event in boundary_originals.into_iter().rev() {
+                                    journal_queue.push_front(event).ok();
+                                }
+                                journal_queue.record_error();
+                                if sent_count > 0 {
+                                    journal_queue.record_sent_batch(sent_count, sse_only_count);
+                                }
+                                continue;
+                            }
                         }
-
-                        journal_queue.record_error();
-                        break; // Channel closed, exit task
                     }
 
-                    if is_sse_only {
-                        sse_only_count += 1; // SSE-only that fell back to dispatch stream
+                    if let Some(ref mut client) = ee_client {
+                        let batch_req = crate::pb::WriteJournalEventsBatchRequest {
+                            events: requests,
+                        };
+                        match client.write_journal_events_batch(batch_req).await {
+                            Ok(resp) => {
+                                let r = resp.into_inner();
+                                sent_count += r.written_count as usize;
+                                if !r.errors.is_empty() {
+                                    warn!(
+                                        "Flush task: {} boundary events had errors (written={})",
+                                        r.errors.len(), r.written_count
+                                    );
+                                    for err in &r.errors {
+                                        warn!("  event[{}]: {}", err.index, err.error_message);
+                                    }
+                                } else {
+                                    debug!(
+                                        "Flush task: wrote {} boundary events to EE",
+                                        batch_count
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Flush task: WriteJournalEventsBatch failed: {}", e);
+                                // Clear client for reconnection
+                                ee_client = None;
+                                // Re-queue boundary events for next flush
+                                for event in boundary_originals.into_iter().rev() {
+                                    journal_queue.push_front(event).ok();
+                                }
+                                journal_queue.record_error();
+                            }
+                        }
                     }
-                    sent_count += 1;
                 }
 
                 if sent_count > 0 {
