@@ -430,57 +430,74 @@ pub async fn create_ee_event_stream(
 // Engine Client — routes events to the AGNT5 Rust engine (Append/AppendBatch)
 // =============================================================================
 
+/// Pool size for engine gRPC connections.
+/// Each connection is an independent h2 session, distributing load to avoid
+/// the h2 PoisonError that occurs when 100+ concurrent requests share one connection.
+const ENGINE_POOL_SIZE: usize = 8;
+
 /// Client for communicating with the AGNT5 Engine.
 ///
-/// When `AGNT5_ENGINE_URL` is set, all event paths (checkpoints, boundary events,
-/// SSE-only events) are routed here instead of the Go Execution Engine.
-/// The engine persists ALL events — no SSE-only/boundary distinction.
+/// Uses a pool of N independent gRPC connections with round-robin selection.
+/// This prevents the h2 PoisonError that occurs when many concurrent checkpoint
+/// events are routed through a single HTTP/2 connection.
 #[derive(Debug, Clone)]
 pub struct EngineClient {
-    client: EngineServiceClient<Channel>,
+    clients: Vec<EngineServiceClient<Channel>>,
+    next: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl EngineClient {
-    /// Connect to the engine at the given endpoint.
+    /// Connect to the engine at the given endpoint with a pool of connections.
     pub async fn connect(endpoint: &str) -> Result<Self> {
-        debug!("Connecting to Engine at {}", endpoint);
+        debug!("Connecting to Engine at {} (pool_size={})", endpoint, ENGINE_POOL_SIZE);
 
-        // tonic requires a URI with scheme; accept bare host:port for convenience.
         let uri = if endpoint.contains("://") {
             endpoint.to_string()
         } else {
             format!("http://{}", endpoint)
         };
 
-        let channel = Channel::from_shared(uri)
-            .map_err(|e| SdkError::Connection {
-                message: format!("Invalid engine endpoint {}: {}", endpoint, e),
-                code: crate::error::ErrorCode::ConnectionFailed,
-                source: None,
-            })?
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .http2_adaptive_window(true)
-            .connect()
-            .await
-            .map_err(|e| {
-                debug!("Engine connection to {} failed: {:?}", endpoint, e);
-                SdkError::Connection {
-                    message: format!("Engine connection failed: {}", e),
+        let mut clients = Vec::with_capacity(ENGINE_POOL_SIZE);
+        for i in 0..ENGINE_POOL_SIZE {
+            let channel = Channel::from_shared(uri.clone())
+                .map_err(|e| SdkError::Connection {
+                    message: format!("Invalid engine endpoint {}: {}", endpoint, e),
                     code: crate::error::ErrorCode::ConnectionFailed,
                     source: None,
-                }
-            })?;
+                })?
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(30))
+                .http2_adaptive_window(true)
+                .connect()
+                .await
+                .map_err(|e| {
+                    debug!("Engine connection {} to {} failed: {:?}", i, endpoint, e);
+                    SdkError::Connection {
+                        message: format!("Engine connection failed: {}", e),
+                        code: crate::error::ErrorCode::ConnectionFailed,
+                        source: None,
+                    }
+                })?;
+            clients.push(EngineServiceClient::new(channel));
+        }
 
+        debug!("Engine client pool connected ({} connections)", ENGINE_POOL_SIZE);
         Ok(Self {
-            client: EngineServiceClient::new(channel),
+            clients,
+            next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
+    }
+
+    /// Get the next client from the pool (round-robin).
+    fn next_client(&mut self) -> &mut EngineServiceClient<Channel> {
+        let idx = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.clients.len();
+        &mut self.clients[idx]
     }
 
     /// Append a single record to the engine.
     pub async fn append(&mut self, record: Record) -> Result<(u64, i64)> {
         let response = self
-            .client
+            .next_client()
             .append(AppendRequest {
                 record: Some(record),
             })
@@ -501,7 +518,7 @@ impl EngineClient {
     /// Append a batch of records to the engine.
     pub async fn append_batch(&mut self, records: Vec<Record>) -> Result<i32> {
         let response = self
-            .client
+            .next_client()
             .append_batch(AppendBatchRequest { records })
             .await
             .map_err(|e| {
