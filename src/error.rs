@@ -42,6 +42,12 @@ pub enum ErrorCode {
     // Internal errors
     InternalError,
     NotImplemented,
+
+    // Sandbox errors
+    SandboxExecutionFailed,
+    SandboxUnavailable,
+    UnsupportedLanguage,
+    UnsupportedOperation,
 }
 
 #[derive(Error, Debug)]
@@ -148,6 +154,13 @@ pub enum SdkError {
         message: String,
         request_id: Option<String>,
     },
+
+    #[error("Sandbox error ({operation}): {message}")]
+    Sandbox {
+        message: String,
+        operation: String,
+        code: ErrorCode,
+    },
 }
 
 impl SdkError {
@@ -178,6 +191,7 @@ impl SdkError {
                 500 | 502 | 503 | 504 | 529 => ErrorCode::ServiceUnavailable,
                 _ => ErrorCode::InvalidInput,
             },
+            Self::Sandbox { code, .. } => *code,
         }
     }
 
@@ -232,6 +246,12 @@ impl SdkError {
             // LM API errors: retry on transient HTTP status codes
             Self::LmApiError { status, .. } => match *status {
                 408 | 429 | 500 | 502 | 503 | 504 | 529 => RetryHint::RetryableWithBackoff,
+                _ => RetryHint::NotRetryable,
+            },
+
+            // Sandbox errors
+            Self::Sandbox { code, .. } => match code {
+                ErrorCode::SandboxUnavailable => RetryHint::RetryableWithBackoff,
                 _ => RetryHint::NotRetryable,
             },
         }

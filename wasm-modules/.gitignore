@@ -1,0 +1,2 @@
+# WASI modules are downloaded, not checked in (1.4MB+)
+*.wasm

@@ -98,9 +98,21 @@ hex = "0.4"
 hmac = "0.12"
 sha2 = "0.10"
 
+# Base64 encoding for sandbox file operations
+base64 = "0.22"
+
+# Bytes for WASI pipe types
+bytes = "1"
+
+# Sandbox - Wasmtime (optional, behind wasm-sandbox feature)
+wasmtime = { version = "29", optional = true }
+wasmtime-wasi = { version = "29", optional = true }
+tempfile = { version = "3", optional = true }
+
 [features]
 default = []
 pgvector = ["dep:sqlx", "dep:pgvector"]
+wasm-sandbox = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:tempfile"]
 
 # Build dependencies
 [build-dependencies]

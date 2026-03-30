@@ -13,6 +13,7 @@ pub mod logging;
 pub mod mcp;
 pub mod memory;
 pub mod runtime_adapter;
+pub mod sandbox;
 pub mod span_filter;
 pub mod telemetry;
 pub mod vectordb;
@@ -58,6 +59,14 @@ pub use vectordb::{
 pub use memory::{
     MemoryMetadata, MemoryResult, MemoryScope, SemanticMemory, SemanticMemoryConfig,
 };
+pub use sandbox::{
+    ExecuteCodeRequest, ExecuteCodeResult, Language, RemoteSandbox, RemoteSandboxConfig,
+    SandboxAuth, SandboxBackend, SandboxBackendKind, SandboxCapabilities, SandboxExecutor,
+    SandboxHealthResult, SandboxRegistry, SandboxWorkspace, WriteFileRequest, WriteFileResult,
+    ReadFileResult, ListFilesResult, FileInfo, StreamEvent,
+};
+#[cfg(feature = "wasm-sandbox")]
+pub use sandbox::{WasmSandbox, WasmSandboxConfig};
 pub use graph::{
     GraphDatabase, GraphNode, GraphRelationship, GraphTraversalResult,
     RelationshipQuery, TraversalFilters,
