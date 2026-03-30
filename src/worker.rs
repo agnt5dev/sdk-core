@@ -263,6 +263,7 @@ impl Worker {
         correlation_id: String,
         parent_correlation_id: String,
     ) -> Result<()> {
+        let tenant_id = metadata.get("tenant_id").cloned();
         let event = JournalEventMessage {
             run_id: invocation_id,
             event_type: checkpoint_type,
@@ -272,6 +273,7 @@ impl Worker {
             source_timestamp_ns,
             correlation_id,
             parent_correlation_id,
+            tenant_id,
             is_sse_only: false, // Checkpoints are boundary events (persisted)
             queued_at: std::time::Instant::now(),
             ..Default::default()
@@ -723,6 +725,51 @@ impl Worker {
         }
     }
 
+    /// Emit a batch of events in a single AppendBatch RPC.
+    ///
+    /// Used for non-terminal events (e.g., run.started + function.started) that
+    /// can be batched to reduce gRPC overhead. Each event tuple contains:
+    /// (run_id, event_type, data, sequence, metadata, timestamp_ns)
+    pub async fn emit_checkpoint_batch(
+        &self,
+        events: Vec<(String, String, Vec<u8>, i64, HashMap<String, String>, i64)>,
+    ) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(mut engine) = self.ensure_engine_client().await? {
+            let records: Vec<_> = events
+                .into_iter()
+                .map(|(run_id, event_type, data, _seq, metadata, ts)| {
+                    let mut merged = metadata;
+                    for (k, v) in &self.metadata {
+                        if !merged.contains_key(k) {
+                            merged.insert(k.clone(), v.clone());
+                        }
+                    }
+                    let cid = merged.remove("cid").unwrap_or_default();
+                    let pcid = merged.remove("pcid").unwrap_or_default();
+                    let tenant_id = merged.remove("tenant_id").unwrap_or_default();
+
+                    client::build_engine_record(
+                        tenant_id, run_id, event_type, data, ts,
+                        String::new(), cid, pcid, merged,
+                    )
+                })
+                .collect();
+
+            let count = records.len();
+            engine.append_batch(records).await?;
+            debug!("Engine batch checkpoint: {} events persisted", count);
+            return Ok(());
+        }
+
+        // Legacy EE path doesn't support batch — fall back to individual emits
+        warn!("emit_checkpoint_batch requires AGNT5_ENGINE_URL, events will be dropped");
+        Ok(())
+    }
+
     /// Queue a streaming delta for real-time delivery to clients (legacy API)
     ///
     /// This method wraps the unified queue_event for backward compatibility.
@@ -740,6 +787,7 @@ impl Worker {
         parent_correlation_id: String,
     ) -> Result<()> {
         let is_sse_only = JournalEventMessage::is_sse_only_event_type(&event_type);
+        let tenant_id = metadata.get("tenant_id").cloned();
 
         let event = JournalEventMessage {
             run_id: invocation_id,
@@ -751,6 +799,7 @@ impl Worker {
             source_timestamp_ns,
             correlation_id,
             parent_correlation_id,
+            tenant_id,
             is_sse_only,
             queued_at: std::time::Instant::now(),
             ..Default::default()
