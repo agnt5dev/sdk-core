@@ -510,6 +510,58 @@ pub fn record_tool_error(span: &mut BoxedSpan, error_msg: &str) {
     span.set_status(Status::error(error_msg.to_string()));
 }
 
+/// Create a span for sandbox execution
+pub fn create_sandbox_span(
+    operation: &str,
+    backend: &str,
+    language: Option<&str>,
+) -> BoxedSpan {
+    let tracer = global::tracer("agnt5-sdk-core");
+    let span_name = format!("sandbox.{}", operation);
+
+    let mut attributes = vec![
+        KeyValue::new("sandbox.operation", operation.to_string()),
+        KeyValue::new("sandbox.backend", backend.to_string()),
+    ];
+
+    if let Some(lang) = language {
+        attributes.push(KeyValue::new("sandbox.language", lang.to_string()));
+    }
+
+    if let Some(tid) = get_tenant_id() {
+        attributes.push(KeyValue::new("tenant.id", tid.to_string()));
+    }
+    if let Some(did) = get_deployment_id() {
+        attributes.push(KeyValue::new("deployment.id", did.to_string()));
+    }
+
+    // Sandbox execution is INTERNAL for wasm, CLIENT for remote
+    let kind = if backend == "remote" {
+        SpanKind::Client
+    } else {
+        SpanKind::Internal
+    };
+
+    tracer
+        .span_builder(span_name)
+        .with_kind(kind)
+        .with_attributes(attributes)
+        .start(&tracer)
+}
+
+/// Record sandbox execution success
+pub fn record_sandbox_success(span: &mut BoxedSpan, exit_code: i32, execution_time_ms: u64) {
+    span.set_attribute(KeyValue::new("sandbox.exit_code", exit_code as i64));
+    span.set_attribute(KeyValue::new("sandbox.execution_time_ms", execution_time_ms as i64));
+    span.set_status(Status::Ok);
+}
+
+/// Record sandbox execution error
+pub fn record_sandbox_error(span: &mut BoxedSpan, error_msg: &str) {
+    span.set_attribute(KeyValue::new("sandbox.error", error_msg.to_string()));
+    span.set_status(Status::error(error_msg.to_string()));
+}
+
 /// End a span (helper function since Span trait may not be accessible)
 pub fn end_span(mut span: BoxedSpan) {
     span.end();

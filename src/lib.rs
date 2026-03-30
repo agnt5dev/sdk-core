@@ -47,8 +47,9 @@ pub use runtime_adapter::{
     StateManager,
 };
 pub use telemetry::{
-    create_component_span, create_function_span, end_span, extract_context_from_runtime_message,
-    init_telemetry, record_execution_request, record_execution_request_with_attrs,
+    create_component_span, create_function_span, create_sandbox_span, end_span,
+    extract_context_from_runtime_message, init_telemetry, record_execution_request,
+    record_execution_request_with_attrs, record_sandbox_error, record_sandbox_success,
     record_span_error, record_span_success, shutdown_telemetry,
 };
 pub use vectordb::{
