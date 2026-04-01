@@ -104,6 +104,9 @@ base64 = "0.22"
 # Bytes for WASI pipe types
 bytes = "1"
 
+# System info for worker metadata
+hostname = "0.4"
+
 # Sandbox - Wasmtime (optional, behind wasm-sandbox feature)
 wasmtime = { version = "29", optional = true }
 wasmtime-wasi = { version = "29", optional = true }

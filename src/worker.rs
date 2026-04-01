@@ -110,7 +110,8 @@ pub fn is_sensitive_env_var(key: &str) -> bool {
 }
 
 /// Collect all AGNT5_* environment variables for registration metadata
-/// Excludes sensitive variables based on blacklist patterns
+/// Excludes sensitive variables based on blacklist patterns.
+/// Also injects system info (hostname, OS, arch) as AGNT5_SYS_* keys.
 pub fn collect_agnt5_env_vars() -> HashMap<String, String> {
     let mut metadata = HashMap::new();
     for (key, value) in std::env::vars() {
@@ -118,6 +119,14 @@ pub fn collect_agnt5_env_vars() -> HashMap<String, String> {
             metadata.insert(key, value);
         }
     }
+
+    // System info — always set, not overridable by env vars
+    if let Ok(h) = hostname::get() {
+        metadata.insert("AGNT5_SYS_HOSTNAME".into(), h.to_string_lossy().into_owned());
+    }
+    metadata.insert("AGNT5_SYS_OS".into(), std::env::consts::OS.into());
+    metadata.insert("AGNT5_SYS_ARCH".into(), std::env::consts::ARCH.into());
+
     metadata
 }
 
