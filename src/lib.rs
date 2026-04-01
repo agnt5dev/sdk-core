@@ -6,7 +6,6 @@ pub mod client;
 pub mod context;
 pub mod error;
 pub mod eval;
-pub mod graph;
 pub mod journal_queue;
 pub mod lm;
 pub mod logging;
@@ -53,7 +52,7 @@ pub use telemetry::{
     record_span_error, record_span_success, shutdown_telemetry,
 };
 pub use vectordb::{
-    Agnt5Provider, Agnt5ProviderConfig, Collection, DistanceMetric, PgVectorProvider,
+    Collection, DistanceMetric, PgVectorProvider,
     PineconeProvider, QdrantProvider, SearchQuery, SearchResult, VectorDatabase, VectorDbRegistry,
     VectorEntry, VectorFilter, VectorMetadata,
 };
@@ -68,11 +67,6 @@ pub use sandbox::{
 };
 #[cfg(feature = "wasm-sandbox")]
 pub use sandbox::{WasmSandbox, WasmSandboxConfig};
-pub use graph::{
-    GraphDatabase, GraphNode, GraphRelationship, GraphTraversalResult,
-    RelationshipQuery, TraversalFilters,
-};
-pub use graph::memory_graph::MemoryGraphDatabase;
 pub use eval::{
     contains, exact_match, json_valid, levenshtein, llm_judge, regex_match, trace_score,
     ContainsConfig, ExactMatchConfig, LevenshteinConfig, LlmJudgeConfig, RegexConfig,
