@@ -1166,6 +1166,19 @@ impl Worker {
                                 continue;
                             }
 
+                            // WORKER_REPLACED: another connection registered with our
+                            // worker_id. Shut down permanently — do NOT reconnect.
+                            if runtime_message.message_type == RuntimeMessageType::WorkerReplaced as i32 {
+                                warn!(
+                                    "Worker {} received WORKER_REPLACED — another instance took over. Shutting down.",
+                                    self.config.worker_id
+                                );
+                                eprintln!(
+                                    "[WARN] Another worker instance connected with the same worker ID. This worker is shutting down."
+                                );
+                                break Ok(());
+                            }
+
                             // Track is_streaming per run for ephemeral event gating
                             if let Some(ref msg_data) = runtime_message.message_data {
                                 if let crate::pb::runtime_message::MessageData::DispatchComponent(ref req) = msg_data {
