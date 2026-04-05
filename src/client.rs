@@ -125,6 +125,25 @@ impl WorkerCoordinatorClient {
             match &runtime_message.message_data {
                 Some(crate::pb::runtime_message::MessageData::RegisterServiceResponse(resp)) => {
                     if !resp.ack {
+                        if let Some(owner_endpoint) =
+                            runtime_message.metadata.get("owner_coordinator_address")
+                        {
+                            let endpoint = if owner_endpoint.starts_with("http://")
+                                || owner_endpoint.starts_with("https://")
+                            {
+                                owner_endpoint.clone()
+                            } else {
+                                format!("http://{owner_endpoint}")
+                            };
+                            error!(
+                                "Registration redirected to owner coordinator {}: {}",
+                                endpoint, resp.error
+                            );
+                            return Err(SdkError::RegistrationRedirect {
+                                endpoint,
+                                message: resp.error.clone(),
+                            });
+                        }
                         error!("Registration failed: {}", resp.error);
                         return Err(SdkError::Connection {
                             message: format!("Registration failed: {}", resp.error),

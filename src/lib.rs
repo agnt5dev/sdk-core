@@ -3,6 +3,7 @@
 pub mod adk;
 pub mod chat;
 pub mod client;
+pub mod coordinator_routing;
 pub mod context;
 pub mod error;
 pub mod eval;

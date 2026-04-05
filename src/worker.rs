@@ -15,6 +15,8 @@ use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use crate::coordinator_routing::CoordinatorRouting;
+
 /// Connection states for tracking worker status
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConnectionState {
@@ -85,6 +87,11 @@ impl WorkerConfig {
             engine_endpoint,
         }
     }
+
+    pub fn resolved_coordinator_endpoint(&self) -> String {
+        let routing = CoordinatorRouting::from_env();
+        routing.endpoint_for_worker(&self.worker_id, &self.coordinator_endpoint)
+    }
 }
 
 /// Blacklist patterns for sensitive environment variables
@@ -154,6 +161,8 @@ pub struct Worker {
     /// to flush pending SSE-only events before terminal checkpoints, ensuring they
     /// arrive while the invocation is still tracked in pendingStreamInvocations.
     dispatch_tx: Arc<std::sync::Mutex<Option<flume::Sender<ServiceMessage>>>>,
+    /// Sticky owner endpoint learned from a registration redirect.
+    owner_endpoint_hint: Arc<std::sync::Mutex<Option<String>>>,
     /// Lazily-connected Engine gRPC client. When AGNT5_ENGINE_URL is set, all event paths
     /// route through this client instead of the Go EE.
     engine_client: Arc<TokioMutex<Option<EngineClient>>>,
@@ -199,6 +208,7 @@ impl Worker {
             streaming_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             event_stream_tx: Arc::new(std::sync::Mutex::new(None)),
             dispatch_tx: Arc::new(std::sync::Mutex::new(None)),
+            owner_endpoint_hint: Arc::new(std::sync::Mutex::new(None)),
             engine_client: Arc::new(TokioMutex::new(None)),
         }
     }
@@ -239,6 +249,21 @@ impl Worker {
             poisoned.into_inner()
         });
         *guard = state;
+    }
+
+    fn preferred_coordinator_endpoint(&self) -> String {
+        if let Ok(guard) = self.owner_endpoint_hint.lock() {
+            if let Some(endpoint) = guard.clone() {
+                return endpoint;
+            }
+        }
+        self.config.resolved_coordinator_endpoint()
+    }
+
+    fn set_owner_endpoint_hint(&self, endpoint: Option<String>) {
+        if let Ok(mut guard) = self.owner_endpoint_hint.lock() {
+            *guard = endpoint;
+        }
     }
 
     /// Queue a journal event for delivery to the platform
@@ -935,6 +960,16 @@ impl Worker {
                     return Ok(());
                 }
                 Err(e) => {
+                    if let crate::error::SdkError::RegistrationRedirect { endpoint, message } = &e
+                    {
+                        self.set_owner_endpoint_hint(Some(endpoint.clone()));
+                        warn!(
+                            "Registration redirected to owner coordinator {}: {}",
+                            endpoint, message
+                        );
+                        continue;
+                    }
+
                     // Check if we had a working session (Connected) that dropped,
                     // vs. failing to connect in the first place.
                     let was_connected = matches!(
@@ -1001,8 +1036,19 @@ impl Worker {
         F: Fn(RuntimeMessage, flume::Sender<ServiceMessage>) -> Fut + Send + Clone + 'static,
         Fut: std::future::Future<Output = Result<Option<ServiceMessage>>> + Send + 'static,
     {
-        let mut client =
-            WorkerCoordinatorClient::connect(self.config.coordinator_endpoint.clone()).await?;
+        // On reconnect, refresh membership from control plane before choosing endpoint.
+        // On first connect, use the preferred endpoint (which may already include
+        // a redirect hint from a previous NACK).
+        let coordinator_endpoint = if is_reconnect {
+            CoordinatorRouting::resolve(
+                &self.config.worker_id,
+                &self.config.coordinator_endpoint,
+            )
+            .await
+        } else {
+            self.preferred_coordinator_endpoint()
+        };
+        let mut client = WorkerCoordinatorClient::connect(coordinator_endpoint.clone()).await?;
 
         // Create registration message with components
         // Merge user-provided metadata with auto-collected AGNT5_* env vars
@@ -1022,15 +1068,17 @@ impl Worker {
             .create_worker_stream_with_registration(self.config.worker_id.clone(), registration)
             .await?;
 
+        self.set_owner_endpoint_hint(Some(coordinator_endpoint.clone()));
+
         if is_reconnect {
             eprintln!(
                 "[INFO] Reconnected to coordinator ({})",
-                self.config.coordinator_endpoint
+                coordinator_endpoint
             );
         } else {
             eprintln!(
                 "[INFO] Connected to coordinator ({})",
-                self.config.coordinator_endpoint
+                coordinator_endpoint
             );
         }
         debug!(
@@ -1777,7 +1825,7 @@ impl Worker {
         max_concurrency: usize,
     ) -> tokio::task::JoinHandle<()> {
         let worker_id = self.config.worker_id.clone();
-        let endpoint = self.config.coordinator_endpoint.clone();
+        let endpoint = self.config.resolved_coordinator_endpoint();
         let component_ids: Vec<String> = self
             .components
             .iter()
@@ -1995,7 +2043,7 @@ impl Worker {
             };
 
         // Call CompleteJob RPC
-        let endpoint = self.config.coordinator_endpoint.clone();
+        let endpoint = self.config.resolved_coordinator_endpoint();
         let worker_id = self.config.worker_id.clone();
 
         // Spawn a task to avoid blocking the dispatch loop
