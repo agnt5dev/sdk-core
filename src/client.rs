@@ -4,7 +4,7 @@ use crate::pb::{
     execution_engine_service_client::ExecutionEngineServiceClient,
     worker_coordinator_service_client::WorkerCoordinatorServiceClient, AppendBatchRequest,
     AppendRequest, CheckpointRequest, CheckpointType, CompleteJobRequest, CompleteJobResponse,
-    DurableStepCheckpoint, EventStreamMessage, GetMemoizedStepRequest, PollJobsRequest,
+    DurableStepCheckpoint, EventStreamMessage, FindByStepKeyRequest, PollJobsRequest,
     PollJobsResponse, Record, RegisterService, RuntimeMessage, ServiceMessage,
 };
 use std::collections::HashMap;
@@ -12,10 +12,21 @@ use std::time::Duration;
 use tonic::transport::Channel;
 use tracing::{debug, error};
 
-/// Simple client for communicating with the Worker Coordinator service
+/// Simple client for communicating with the Worker Coordinator service.
+///
+/// Holds two gRPC clients multiplexed over the same `tonic::Channel`:
+/// - `client`: WorkerCoordinatorService (worker registration, dispatch streaming)
+/// - `engine_client`: EngineService (durable execution: checkpoint, event stream,
+///   job queue poll/complete, memoization lookup via find_by_step_key)
+///
+/// The durable execution RPCs used to live on WorkerCoordinatorService and moved
+/// to EngineService as part of the journal-owner consolidation. Both clients
+/// share one HTTP/2 connection since `tonic::Channel` is cheap to clone and
+/// multiplexes streams.
 #[derive(Debug, Clone)]
 pub struct WorkerCoordinatorClient {
     client: WorkerCoordinatorServiceClient<Channel>,
+    engine_client: EngineServiceClient<Channel>,
 }
 
 impl WorkerCoordinatorClient {
@@ -40,9 +51,13 @@ impl WorkerCoordinatorClient {
                 e
             })?;
 
-        let client = WorkerCoordinatorServiceClient::new(channel);
+        let client = WorkerCoordinatorServiceClient::new(channel.clone());
+        let engine_client = EngineServiceClient::new(channel);
 
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            engine_client,
+        })
     }
 
     /// Create a worker stream with immediate registration (based on working pattern)
@@ -212,7 +227,8 @@ impl WorkerCoordinatorClient {
             }
         };
 
-        let mut client = self.client.clone();
+        // EventStream now lives on EngineService (moved from WorkerCoordinatorService).
+        let mut client = self.engine_client.clone();
         tokio::spawn(async move {
             match client.event_stream(stream).await {
                 Ok(response) => {
@@ -239,6 +255,7 @@ impl WorkerCoordinatorClient {
     ///
     /// # Arguments
     ///
+    /// * `tenant_id` - Tenant the run belongs to (required for engine lookups)
     /// * `run_id` - The workflow run ID
     /// * `step_key` - Unique key for this step (e.g., "step:greet:0")
     /// * `step_name` - Human-readable step name
@@ -254,6 +271,7 @@ impl WorkerCoordinatorClient {
     /// `CheckpointResult` containing memoization status and cached output if available
     pub async fn checkpoint(
         &mut self,
+        tenant_id: String,
         run_id: String,
         step_key: String,
         step_name: String,
@@ -265,8 +283,8 @@ impl WorkerCoordinatorClient {
         latency_ms: Option<i64>,
     ) -> Result<CheckpointResult> {
         debug!(
-            "Sending checkpoint: run_id={}, step_key={}, type={:?}",
-            run_id, step_key, checkpoint_type
+            "Sending checkpoint: tenant_id={}, run_id={}, step_key={}, type={:?}",
+            tenant_id, run_id, step_key, checkpoint_type
         );
 
         let checkpoint = DurableStepCheckpoint {
@@ -288,10 +306,12 @@ impl WorkerCoordinatorClient {
 
         let request = CheckpointRequest {
             checkpoint: Some(checkpoint),
+            tenant_id,
         };
 
+        // Checkpoint moved from WorkerCoordinatorService → EngineService.
         let response = self
-            .client
+            .engine_client
             .checkpoint(request)
             .await
             .map_err(|e| {
@@ -320,56 +340,71 @@ impl WorkerCoordinatorClient {
         })
     }
 
-    /// Check if a step result is memoized without sending a full checkpoint
+    /// Check if a step result is memoized without sending a full checkpoint.
     ///
-    /// Use this for quick memoization lookups before executing expensive steps.
+    /// Uses `EngineService.FindByStepKey` as the canonical memoization lookup
+    /// (replaces the legacy `WorkerCoordinatorService.GetMemoizedStep` RPC,
+    /// which has been removed).
     ///
     /// # Arguments
     ///
-    /// * `run_id` - The workflow run ID
-    /// * `step_key` - Unique key for this step
+    /// * `tenant_id` - The tenant that owns the run (required by the engine's
+    ///   `(tenant_id, run_id)` cache key).
+    /// * `run_id` - The workflow run ID.
+    /// * `step_key` - Unique key for this step.
     ///
     /// # Returns
     ///
-    /// `Some(output)` if the step is memoized, `None` otherwise
+    /// `Some(output)` if the step is memoized, `None` otherwise. Returns the
+    /// record's `data` field (the completed step's journal payload).
     pub async fn get_memoized_step(
         &mut self,
+        tenant_id: String,
         run_id: String,
         step_key: String,
     ) -> Result<Option<Vec<u8>>> {
         debug!(
-            "Checking memoization: run_id={}, step_key={}",
-            run_id, step_key
+            "Checking memoization: tenant_id={}, run_id={}, step_key={}",
+            tenant_id, run_id, step_key
         );
 
-        let request = GetMemoizedStepRequest { run_id, step_key };
+        let request = FindByStepKeyRequest {
+            tenant_id,
+            run_id,
+            step_key,
+        };
 
         let response = self
-            .client
-            .get_memoized_step(request)
+            .engine_client
+            .find_by_step_key(request)
             .await
             .map_err(|e| {
-                debug!("GetMemoizedStep RPC failed: {}", e);
+                debug!("FindByStepKey RPC failed: {}", e);
                 SdkError::Connection {
-                    message: format!("GetMemoizedStep failed: {}", e),
+                    message: format!("FindByStepKey failed: {}", e),
                     code: crate::error::ErrorCode::ConnectionFailed,
                     source: None,
                 }
             })?
             .into_inner();
 
-        if response.found && !response.output.is_empty() {
-            Ok(Some(response.output))
-        } else {
-            Ok(None)
+        if response.found {
+            if let Some(record) = response.record {
+                if !record.data.is_empty() {
+                    return Ok(Some(record.data));
+                }
+            }
         }
+        Ok(None)
     }
 
     /// Poll for available jobs from the durable queue (managed edition).
     /// Workers call this with exponential backoff to claim pending jobs.
+    ///
+    /// PollJobs now lives on EngineService (moved from WorkerCoordinatorService).
     pub async fn poll_jobs(&mut self, req: PollJobsRequest) -> Result<PollJobsResponse> {
         let response = self
-            .client
+            .engine_client
             .poll_jobs(req)
             .await
             .map_err(|e| {
@@ -385,11 +420,13 @@ impl WorkerCoordinatorClient {
         Ok(response)
     }
 
-    /// Report the result of a polled job back to the coordinator.
+    /// Report the result of a polled job back to the engine.
     /// Updates job_queue, run status, journal, and batch counters.
+    ///
+    /// CompleteJob now lives on EngineService (moved from WorkerCoordinatorService).
     pub async fn complete_job(&mut self, req: CompleteJobRequest) -> Result<CompleteJobResponse> {
         let response = self
-            .client
+            .engine_client
             .complete_job(req)
             .await
             .map_err(|e| {

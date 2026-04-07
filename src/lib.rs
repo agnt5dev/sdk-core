@@ -53,10 +53,11 @@ pub use telemetry::{
     record_span_error, record_span_success, shutdown_telemetry,
 };
 pub use vectordb::{
-    Collection, DistanceMetric, PgVectorProvider,
-    PineconeProvider, QdrantProvider, SearchQuery, SearchResult, VectorDatabase, VectorDbRegistry,
-    VectorEntry, VectorFilter, VectorMetadata,
+    Collection, DistanceMetric, PgVectorProvider, PineconeProvider, SearchQuery, SearchResult,
+    VectorDatabase, VectorDbRegistry, VectorEntry, VectorFilter, VectorMetadata,
 };
+#[cfg(feature = "qdrant")]
+pub use vectordb::QdrantProvider;
 pub use memory::{
     MemoryMetadata, MemoryResult, MemoryScope, SemanticMemory, SemanticMemoryConfig,
 };

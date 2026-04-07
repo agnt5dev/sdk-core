@@ -8,8 +8,9 @@ pub mod types;
 pub use providers::{
     pgvector::PgVectorProvider,
     pinecone::PineconeProvider,
-    qdrant::QdrantProvider,
 };
+#[cfg(feature = "qdrant")]
+pub use providers::qdrant::QdrantProvider;
 pub use types::{
     Collection, DistanceMetric, SearchQuery, SearchResult, VectorEntry, VectorFilter,
     VectorMetadata,
@@ -138,19 +139,22 @@ impl VectorDbRegistry {
     pub async fn load_from_environment(&mut self) -> Result<()> {
         let mut loaded_count = 0;
 
-        // Qdrant (user's own instance)
-        if let Ok(url) = std::env::var("QDRANT_URL") {
-            match QdrantProvider::new(&url, None).await {
-                Ok(provider) => {
-                    self.register_provider("qdrant".to_string(), std::sync::Arc::new(provider));
-                    loaded_count += 1;
+        #[cfg(feature = "qdrant")]
+        {
+            // Qdrant (user's own instance)
+            if let Ok(url) = std::env::var("QDRANT_URL") {
+                match QdrantProvider::new(&url, None).await {
+                    Ok(provider) => {
+                        self.register_provider("qdrant".to_string(), std::sync::Arc::new(provider));
+                        loaded_count += 1;
 
-                    if self.default_provider.is_none() {
-                        self.default_provider = Some("qdrant".to_string());
+                        if self.default_provider.is_none() {
+                            self.default_provider = Some("qdrant".to_string());
+                        }
                     }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to connect to Qdrant at {}: {}", url, e);
+                    Err(e) => {
+                        tracing::warn!("Failed to connect to Qdrant at {}: {}", url, e);
+                    }
                 }
             }
         }
@@ -193,7 +197,7 @@ impl VectorDbRegistry {
 
         if loaded_count == 0 {
             return Err(crate::error::SdkError::Other(anyhow::anyhow!(
-                "No vector database providers available. Set QDRANT_URL, PINECONE_API_KEY+PINECONE_HOST, or POSTGRES_URL."
+                "No vector database providers available. Set a supported provider environment variable such as PINECONE_API_KEY+PINECONE_HOST or POSTGRES_URL."
             )));
         }
 
