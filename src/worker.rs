@@ -1909,11 +1909,11 @@ impl Worker {
                     .await
                 {
                     Ok(resp) if resp.jobs.is_empty() => {
-                        // No work — increase backoff
-                        if backoff.as_millis() <= initial_backoff_ms as u128 {
-                            // Log only on first empty poll to avoid spam
-                            eprintln!("[INFO] Job queue: no jobs available, polling with backoff");
-                        }
+                        // No work — log the current backoff so empty-poll behavior is visible.
+                        eprintln!(
+                            "[INFO] Job queue: no jobs available, next poll in {}ms",
+                            backoff.as_millis()
+                        );
                         backoff = std::cmp::min(backoff * 2, max_backoff);
                     }
                     Ok(resp) => {

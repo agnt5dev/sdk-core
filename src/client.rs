@@ -295,7 +295,7 @@ impl WorkerCoordinatorClient {
             .checkpoint(request)
             .await
             .map_err(|e| {
-                error!("Checkpoint RPC failed: {}", e);
+                debug!("Checkpoint RPC failed: {}", e);
                 SdkError::Connection {
                     message: format!("Checkpoint failed: {}", e),
                     code: crate::error::ErrorCode::ConnectionFailed,
@@ -349,7 +349,7 @@ impl WorkerCoordinatorClient {
             .get_memoized_step(request)
             .await
             .map_err(|e| {
-                error!("GetMemoizedStep RPC failed: {}", e);
+                debug!("GetMemoizedStep RPC failed: {}", e);
                 SdkError::Connection {
                     message: format!("GetMemoizedStep failed: {}", e),
                     code: crate::error::ErrorCode::ConnectionFailed,
