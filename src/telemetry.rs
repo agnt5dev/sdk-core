@@ -813,9 +813,11 @@ pub fn record_checkpoint(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_telemetry_init() {
-        // Simple test to ensure init function works
+    #[tokio::test]
+    async fn test_telemetry_init() {
+        // `init_telemetry` constructs an OTLP exporter which uses a
+        // tonic/hyper client under the hood and therefore needs a live
+        // Tokio reactor — hence `#[tokio::test]`, not `#[test]`.
         assert!(init_telemetry("test-service", "1.0.0").is_ok());
     }
 }

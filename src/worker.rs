@@ -155,6 +155,12 @@ pub struct Worker {
     /// Tracks which run_ids have is_streaming=true. Ephemeral events are skipped
     /// for non-streaming runs since nobody is listening via SSE.
     streaming_runs: Arc<std::sync::Mutex<HashMap<String, bool>>>,
+    /// Phase 5: lease_id stash keyed by invocation_id. Populated on
+    /// DispatchComponentRequest receipt (when req.lease_id is non-empty) and
+    /// drained on response forward so the echoed lease_id lands in
+    /// DispatchComponentResponse.lease_id without requiring language bindings
+    /// to thread the value through their handler code.
+    pending_lease_ids: Arc<std::sync::Mutex<HashMap<String, String>>>,
     /// EventStream sender for SSE-only events (EE path). Set during run().
     event_stream_tx: Arc<std::sync::Mutex<Option<flume::Sender<EventStreamMessage>>>>,
     /// Dispatch stream sender (bidirectional gRPC to WC). Used by emit_checkpoint_sync
@@ -206,6 +212,7 @@ impl Worker {
             ee_client: Arc::new(TokioMutex::new(None)),
             tokio_handle: Arc::new(std::sync::Mutex::new(None)),
             streaming_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            pending_lease_ids: Arc::new(std::sync::Mutex::new(HashMap::new())),
             event_stream_tx: Arc::new(std::sync::Mutex::new(None)),
             dispatch_tx: Arc::new(std::sync::Mutex::new(None)),
             owner_endpoint_hint: Arc::new(std::sync::Mutex::new(None)),
@@ -551,6 +558,14 @@ impl Worker {
                             meta.insert("pcid".to_string(), event.parent_correlation_id.clone());
                         }
 
+                        // Phase 5: look up stashed lease_id for this invocation so
+                        // SSE passthrough events carry the fence token. Intermediate
+                        // events don't drain the entry — terminal ack still needs it.
+                        let stashed_lease_id = if let Ok(map) = self.pending_lease_ids.lock() {
+                            map.get(&event.run_id).cloned().unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
                         let response = DispatchComponentResponse {
                             invocation_id: event.run_id.clone(),
                             success: true,
@@ -566,6 +581,7 @@ impl Worker {
                             sequence: event.sequence,
                             attempt: 0,
                             source_timestamp_ns: event.source_timestamp_ns,
+                            lease_id: stashed_lease_id,
                         };
 
                         let service_message = ServiceMessage {
@@ -1055,12 +1071,41 @@ impl Worker {
         let mut metadata = self.metadata.clone();
         metadata.extend(collect_agnt5_env_vars());
 
+        // Phase 6: declare data-path mode at registration. Default PUSH;
+        // `AGNT5_WORKER_MODE=pull` opts into PULL (worker calls PollJobs
+        // instead of receiving dispatches over the bidirectional stream).
+        let is_pull_mode = matches!(
+            std::env::var("AGNT5_WORKER_MODE").ok().as_deref(),
+            Some("pull") | Some("PULL")
+        );
+        let mode = if is_pull_mode {
+            crate::pb::WorkerMode::Pull as i32
+        } else {
+            crate::pb::WorkerMode::Push as i32
+        };
+        // Phase 6: stamp deployment_id from env so the coordinator's
+        // proto-field path picks it up. Falls back to metadata key on
+        // older coordinators that haven't been rebuilt yet.
+        let deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").unwrap_or_default();
+
+        // Phase 7a: declare concurrency budget so the coordinator can
+        // size headroom reservations per priority class. Hoisted out of
+        // the worker pool setup below so a single env read drives both
+        // the local pool size and the registration field.
+        let max_concurrency: u32 = std::env::var("AGNT5_MAX_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100);
+
         let registration = RegisterService {
             service_name: self.config.service_name.clone(),
             service_version: self.config.service_version.clone(),
             service_type: self.config.service_type.clone(),
             components: self.components.clone(),
             metadata,
+            mode,
+            deployment_id,
+            max_concurrency,
         };
 
         // Use the working pattern - create stream with immediate registration
@@ -1134,11 +1179,11 @@ impl Worker {
         // Start unified journal event flush task (replaces checkpoint, delta, span, log flush tasks)
         let journal_flush_task = self.spawn_journal_flush_task(tx.clone(), event_stream_tx.clone());
 
-        // Get concurrency configuration
-        let max_concurrency = std::env::var("AGNT5_MAX_CONCURRENCY")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(100);
+        // Reuse the concurrency budget computed for the registration
+        // message above so the local pool size and the value reported
+        // to the coordinator stay in lock-step. `usize` cast for the
+        // pool channel + spawn loop below.
+        let max_concurrency = max_concurrency as usize;
 
         debug!(
             "Worker {} starting with concurrency limit: {}",
@@ -1183,13 +1228,10 @@ impl Worker {
             worker_handles.push(handle);
         }
 
-        // Spawn poll task for durable job queue (managed edition)
-        // Check AGNT5_POLL_ENABLED env var (default: true)
-        let poll_enabled = std::env::var("AGNT5_POLL_ENABLED")
-            .map(|v| v != "false" && v != "0")
-            .unwrap_or(true);
-
-        let poll_task = if poll_enabled {
+        // Phase 8: PULL workers own the poll task; PUSH workers never
+        // spawn it. The legacy `AGNT5_POLL_ENABLED` env gate has been
+        // removed — mode declared at registration is now the only switch.
+        let poll_task = if is_pull_mode {
             let poll_shutdown = shutdown_rx.resubscribe();
             Some(self.spawn_poll_task(
                 task_tx.clone(),
@@ -1240,6 +1282,14 @@ impl Worker {
                                             map.insert(run_id, true);
                                         }
                                     }
+                                    // Phase 5: stash lease_id keyed by invocation_id so we
+                                    // can echo it on the outbound response. This keeps
+                                    // language bindings unaware of the fence token.
+                                    if !req.lease_id.is_empty() {
+                                        if let Ok(mut map) = self.pending_lease_ids.lock() {
+                                            map.insert(req.invocation_id.clone(), req.lease_id.clone());
+                                        }
+                                    }
                                 }
                             }
 
@@ -1250,6 +1300,16 @@ impl Worker {
                                     if req.component_type == 10 {
                                         if let Some(result) = crate::eval::builtin_scorer::execute(&req.component_name, &req.input_data) {
                                             let output_data = serde_json::to_vec(&result).unwrap_or_default();
+                                            // Phase 5: drain stashed lease_id so the fast path
+                                            // acks under the same fence as the request.
+                                            let lease_id = if !req.lease_id.is_empty() {
+                                                if let Ok(mut map) = self.pending_lease_ids.lock() {
+                                                    map.remove(&req.invocation_id);
+                                                }
+                                                req.lease_id.clone()
+                                            } else {
+                                                String::new()
+                                            };
                                             let response = DispatchComponentResponse {
                                                 invocation_id: req.invocation_id.clone(),
                                                 success: true,
@@ -1263,6 +1323,7 @@ impl Worker {
                                                 sequence: 0,
                                                 attempt: 0,
                                                 source_timestamp_ns: 0,
+                                                lease_id,
                                             };
                                             let service_message = ServiceMessage {
                                                 worker_id: self.config.worker_id.clone(),
@@ -1346,15 +1407,26 @@ impl Worker {
                 // Forward responses from worker pool to coordinator
                 response = response_rx.recv_async() => {
                     match response {
-                        Ok(service_message) => {
-                            // Check if this is a polled job response by looking inside
-                            // the FunctionResponse metadata (not ServiceMessage.metadata,
-                            // which is always empty). The _job_id tag was placed into
-                            // DispatchComponentRequest.metadata by spawn_poll_task, and
-                            // language handlers preserve it through to the response.
+                        Ok(mut service_message) => {
+                            // Phase 5: stamp the stashed lease_id onto the response
+                            // so the coordinator's fencing check passes. On terminal
+                            // events we drain the map entry; on intermediate streaming
+                            // events we leave it so the terminal ack still finds it.
                             // Clean up streaming_runs tracking for terminal events
-                            if let Some(crate::pb::service_message::MessageType::FunctionResponse(ref resp)) = service_message.message_type {
-                                if resp.event_type == "run.completed" || resp.event_type == "run.failed" {
+                            if let Some(crate::pb::service_message::MessageType::FunctionResponse(ref mut resp)) = service_message.message_type {
+                                let is_terminal = resp.event_type == "run.completed" || resp.event_type == "run.failed";
+                                if resp.lease_id.is_empty() {
+                                    if let Ok(mut map) = self.pending_lease_ids.lock() {
+                                        if is_terminal {
+                                            if let Some(lease_id) = map.remove(&resp.invocation_id) {
+                                                resp.lease_id = lease_id;
+                                            }
+                                        } else if let Some(lease_id) = map.get(&resp.invocation_id) {
+                                            resp.lease_id = lease_id.clone();
+                                        }
+                                    }
+                                }
+                                if is_terminal {
                                     let run_id = if let Some(idx) = resp.invocation_id.find(':') {
                                         resp.invocation_id[..idx].to_string()
                                     } else {
@@ -1366,18 +1438,16 @@ impl Worker {
                                 }
                             }
 
-                            let is_polled_job = match &service_message.message_type {
-                                Some(crate::pb::service_message::MessageType::FunctionResponse(resp)) => {
-                                    resp.metadata.contains_key("_job_id")
-                                }
-                                _ => false,
-                            };
-
-                            if is_polled_job {
-                                // Polled job - route to CompleteJob RPC
+                            // Phase 8: route by declared worker mode, not by
+                            // per-response metadata tagging. A PULL worker
+                            // always acks via `CompleteJob`; a PUSH worker
+                            // always responds over the bidirectional stream.
+                            // Phase 7b's scheduler guarantees PULL workers
+                            // never receive push dispatches, so the stream
+                            // carries only control/heartbeat traffic for them.
+                            if is_pull_mode {
                                 self.handle_polled_job_response(service_message).await;
                             } else {
-                                // Streamed invocation - send via bidirectional stream
                                 if let Err(e) = tx.send_async(service_message).await {
                                     error!("Failed to send response to coordinator: {}", e);
                                     break Err(crate::error::SdkError::Connection {
@@ -1508,6 +1578,7 @@ impl Worker {
         let flush_interval_ms = journal_queue.flush_interval_ms();
         let batch_size = journal_queue.batch_size();
         let streaming_runs = self.streaming_runs.clone();
+        let pending_lease_ids = self.pending_lease_ids.clone();
         let ee_endpoint = self.config.ee_endpoint.clone();
         let engine_endpoint = self.config.engine_endpoint.clone();
 
@@ -1656,6 +1727,15 @@ impl Worker {
                         if !cached_deployment_id.is_empty() {
                             metadata.insert("deployment_id".to_string(), cached_deployment_id.clone());
                         }
+                        // Phase 5: stamp stashed lease_id on SSE-only fallback responses.
+                        let stashed_lease_id = match pending_lease_ids.lock() {
+                            Ok(map) => map.get(&event.run_id).cloned().unwrap_or_default(),
+                            Err(poisoned) => poisoned
+                                .into_inner()
+                                .get(&event.run_id)
+                                .cloned()
+                                .unwrap_or_default(),
+                        };
                         let response = DispatchComponentResponse {
                             invocation_id: event.run_id.clone(),
                             success: true,
@@ -1671,6 +1751,7 @@ impl Worker {
                             sequence: event.sequence,
                             attempt: 0,
                             source_timestamp_ns: event.source_timestamp_ns,
+                            lease_id: stashed_lease_id,
                         };
                         let service_message = ServiceMessage {
                             worker_id: worker_id.clone(),
@@ -1923,18 +2004,33 @@ impl Worker {
                         eprintln!("[INFO] Job queue: claimed {} jobs", job_count);
 
                         for job in resp.jobs {
-                            // Convert JobAssignment → RuntimeMessage (DispatchComponentRequest)
-                            // Tag with _source=poll and _job_id for response routing
+                            // Convert JobAssignment → RuntimeMessage (DispatchComponentRequest).
+                            //
+                            // Phase 8: the legacy `_source=poll`/`_job_id`/
+                            // `_tenant_id` synthetic metadata tags are gone.
+                            // The dispatch loop now routes responses by worker
+                            // mode (PULL → CompleteJob, PUSH → stream), and
+                            // `handle_polled_job_response` derives job_id from
+                            // `resp.invocation_id` (which equals run_id which
+                            // equals job_id on the coordinator's poll path)
+                            // and tenant_id from `AGNT5_TENANT_ID`.
                             let mut metadata = job.metadata.clone();
-                            metadata.insert("_source".to_string(), "poll".to_string());
-                            metadata.insert("_job_id".to_string(), job.job_id.clone());
-                            metadata.insert("_tenant_id".to_string(), tenant_id.clone());
                             if !job.trace_id.is_empty() {
                                 metadata.insert("trace_id".to_string(), job.trace_id.clone());
                             }
 
                             // Check stream_mode before metadata is moved into the struct
                             let is_streaming = metadata.get("stream_mode").map_or(false, |m| m == "full");
+
+                            // Phase 5: extract lease/priority/deployment from metadata
+                            // (PULL path: coordinator stuffs lease info into JobAssignment.metadata).
+                            let lease_id = metadata.get("lease_id").cloned().unwrap_or_default();
+                            let deployment_id =
+                                metadata.get("deployment_id").cloned().unwrap_or_default();
+                            let priority = metadata
+                                .get("priority")
+                                .and_then(|v| v.parse::<i32>().ok())
+                                .unwrap_or(0);
 
                             // Use invocation_id = run_id (this is how the WC dispatches)
                             let runtime_message = RuntimeMessage {
@@ -1962,6 +2058,14 @@ impl Worker {
                                             session_id: String::new(),
                                             user_id: String::new(),
                                             is_streaming,
+                                            priority,
+                                            deployment_id,
+                                            lease_id,
+                                            // Phase 7f: polled jobs inherit the policy the
+                                            // orchestrator already stamped on the run's
+                                            // `run.queued` metadata; the worker-side path
+                                            // never reads `retry_policy` so None is fine.
+                                            retry_policy: None,
                                         },
                                     ),
                                 ),
@@ -1986,12 +2090,11 @@ impl Worker {
                         eprintln!("[INFO] Job queue: dispatched {} jobs to worker pool", job_count);
                     }
                     Err(e) => {
-                        // Check if this is an Unimplemented error (not managed edition)
-                        let err_msg = format!("{}", e);
-                        if err_msg.contains("Unimplemented") || err_msg.contains("UNIMPLEMENTED") {
-                            eprintln!("[INFO] Job queue polling disabled (not managed edition)");
-                            return;
-                        }
+                        // Phase 8: the Unimplemented fallback is gone — the
+                        // coordinator always implements PollJobs/CompleteJob
+                        // now that managed-edition gating has been removed.
+                        // Any error here is a real transport/server problem,
+                        // so back off and retry instead of silently stopping.
                         eprintln!("[WARN] Job queue poll error: {}", e);
                         backoff = std::cmp::min(backoff * 2, max_backoff);
                     }
@@ -2001,23 +2104,26 @@ impl Worker {
     }
 
     /// Handle a polled job response by calling CompleteJob RPC.
-    /// Called from the dispatch loop when a FunctionResponse has _job_id in its metadata.
+    ///
+    /// Called from the dispatch loop on PULL workers (mode-based routing,
+    /// Phase 8). On the coordinator's poll path `job_id == run_id`, so we
+    /// derive the job_id from `resp.invocation_id` — stripping any
+    /// `:suffix` the worker appends for streaming invocations. tenant_id
+    /// comes from `AGNT5_TENANT_ID` which PULL workers always set.
     async fn handle_polled_job_response(&self, service_message: ServiceMessage) {
-        // Extract all data from the inner FunctionResponse (DispatchComponentResponse).
-        // The _job_id and _tenant_id metadata tags flow through the handler:
-        //   DispatchComponentRequest.metadata → handler → DispatchComponentResponse.metadata
-        let (job_id, tenant_id, success, output_data, error_message, error_code) =
+        let (job_id, success, output_data, error_message, error_code) =
             match &service_message.message_type {
                 Some(crate::pb::service_message::MessageType::FunctionResponse(resp)) => {
-                    let jid = match resp.metadata.get("_job_id") {
-                        Some(id) => id.clone(),
-                        None => return,
+                    // Derive job_id from invocation_id (strip streaming suffix).
+                    let jid = if let Some(idx) = resp.invocation_id.find(':') {
+                        resp.invocation_id[..idx].to_string()
+                    } else {
+                        resp.invocation_id.clone()
                     };
-                    let tid = resp
-                        .metadata
-                        .get("_tenant_id")
-                        .cloned()
-                        .unwrap_or_default();
+                    if jid.is_empty() {
+                        warn!("Polled job response missing invocation_id; dropping");
+                        return;
+                    }
                     let output = match &resp.result {
                         Some(crate::pb::dispatch_component_response::Result::OutputData(data)) => {
                             data.clone()
@@ -2026,7 +2132,6 @@ impl Worker {
                     };
                     (
                         jid,
-                        tid,
                         resp.success,
                         output,
                         resp.error_message.clone(),
@@ -2041,6 +2146,10 @@ impl Worker {
                     return;
                 }
             };
+
+        // Phase 8: PULL workers derive tenant_id from the same env var the
+        // poll task uses for the PollJobs request.
+        let tenant_id = std::env::var("AGNT5_TENANT_ID").unwrap_or_default();
 
         // Call CompleteJob RPC
         let endpoint = self.config.resolved_coordinator_endpoint();
