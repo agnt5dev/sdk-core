@@ -794,7 +794,7 @@ impl StreamingState {
 fn build_responses_stream(
     response: reqwest::Response,
     response_format: ResponseFormat,
-    timeout_secs: u64,
+    _timeout_secs: u64,
 ) -> SdkResult<Pin<Box<dyn Stream<Item = SdkResult<StreamChunk>> + Send>>> {
     let bytes_stream = response.bytes_stream();
 
