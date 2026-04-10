@@ -165,11 +165,15 @@ impl SandboxRegistry {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(300);
 
+            let api_prefix = std::env::var("AGNT5_SANDBOX_API_PREFIX")
+                .unwrap_or_default();
+
             let config = RemoteSandboxConfig {
                 endpoint,
                 sandbox_id,
                 auth,
                 timeout: std::time::Duration::from_secs(timeout_secs),
+                api_prefix,
             };
             let remote = RemoteSandbox::new(config)?;
             self.register("remote".to_string(), Arc::new(remote));

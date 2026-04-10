@@ -38,6 +38,11 @@ pub struct RemoteSandboxConfig {
     pub auth: SandboxAuth,
     /// Default timeout for HTTP requests.
     pub timeout: Duration,
+    /// Optional path prefix prepended to all API routes.
+    /// Empty by default (external providers use root-level paths like `/execute`).
+    /// Set to `/v1/sandbox` to target the AGNT5 Go platform gateway.
+    /// Env: `AGNT5_SANDBOX_API_PREFIX`
+    pub api_prefix: String,
 }
 
 // ── RemoteSandbox ───────────────────────────────────────────────
@@ -57,7 +62,13 @@ pub struct RemoteSandbox {
 impl RemoteSandbox {
     /// Create a new RemoteSandbox client.
     pub fn new(config: RemoteSandboxConfig) -> Result<Self> {
-        let base_url = config.endpoint.trim_end_matches('/').to_string();
+        let endpoint = config.endpoint.trim_end_matches('/');
+        let prefix = config.api_prefix.trim_matches('/');
+        let base_url = if prefix.is_empty() {
+            endpoint.to_string()
+        } else {
+            format!("{}/{}", endpoint, prefix)
+        };
 
         let mut headers = reqwest::header::HeaderMap::new();
         match &config.auth {

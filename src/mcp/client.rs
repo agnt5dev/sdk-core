@@ -228,12 +228,49 @@ impl McpClient {
         Ok(conn.tools.clone())
     }
 
-    /// Call a tool on a specific server
+    /// Reconnect a specific server using its stored config.
+    /// Drops the old connection and establishes a new one.
+    pub async fn reconnect_server(&self, name: &str) -> McpResult<()> {
+        let config = self
+            .server_configs
+            .get(name)
+            .ok_or_else(|| McpError::Server(format!("No config for server: {}", name)))?
+            .clone();
+
+        // Drop old connection
+        {
+            let mut connections = self.connections.write().await;
+            if let Some(conn) = connections.remove(name) {
+                let _ = conn.transport.close().await;
+            }
+        }
+
+        self.connect_server(name, config).await
+    }
+
+    /// Call a tool on a specific server. Retries once after reconnecting
+    /// if the connection is lost.
     pub async fn call_tool(
         &self,
         server: &str,
         tool_name: &str,
         arguments: serde_json::Value,
+    ) -> McpResult<CallToolResult> {
+        match self.call_tool_inner(server, tool_name, &arguments).await {
+            Err(McpError::ConnectionClosed) | Err(McpError::Timeout) => {
+                tracing::warn!("MCP server {} disconnected, attempting reconnect", server);
+                self.reconnect_server(server).await?;
+                self.call_tool_inner(server, tool_name, &arguments).await
+            }
+            other => other,
+        }
+    }
+
+    async fn call_tool_inner(
+        &self,
+        server: &str,
+        tool_name: &str,
+        arguments: &serde_json::Value,
     ) -> McpResult<CallToolResult> {
         let connections = self.connections.read().await;
         let conn = connections
@@ -250,7 +287,7 @@ impl McpClient {
             arguments: if arguments.is_null() {
                 None
             } else {
-                Some(arguments)
+                Some(arguments.clone())
             },
         };
 
@@ -266,29 +303,30 @@ impl McpClient {
         Ok(result)
     }
 
-    /// Call a tool by finding it across all servers
+    /// Call a tool by finding it across all servers.
+    /// Returns an error if the tool name is ambiguous (present on multiple servers).
     pub async fn call_tool_auto(
         &self,
         tool_name: &str,
         arguments: serde_json::Value,
     ) -> McpResult<CallToolResult> {
-        // Find the server that has this tool
-        let server_name = {
+        let matching_servers: Vec<String> = {
             let connections = self.connections.read().await;
-            let mut found_server = None;
-            for (name, conn) in connections.iter() {
-                if conn.tools.iter().any(|t| t.name == tool_name) {
-                    found_server = Some(name.clone());
-                    break;
-                }
-            }
-            found_server
+            connections
+                .iter()
+                .filter(|(_, conn)| conn.tools.iter().any(|t| t.name == tool_name))
+                .map(|(name, _)| name.clone())
+                .collect()
         };
 
-        if let Some(server) = server_name {
-            self.call_tool(&server, tool_name, arguments).await
-        } else {
-            Err(McpError::ToolNotFound(tool_name.to_string()))
+        match matching_servers.len() {
+            0 => Err(McpError::ToolNotFound(tool_name.to_string())),
+            1 => self.call_tool(&matching_servers[0], tool_name, arguments).await,
+            _ => Err(McpError::Server(format!(
+                "ambiguous tool '{}': found on servers [{}]. Use call_tool() with an explicit server name.",
+                tool_name,
+                matching_servers.join(", ")
+            ))),
         }
     }
 
