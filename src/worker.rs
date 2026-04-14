@@ -273,6 +273,15 @@ impl Worker {
         }
     }
 
+    fn clear_owner_endpoint_hint(&self) -> bool {
+        if let Ok(mut guard) = self.owner_endpoint_hint.lock() {
+            let had_hint = guard.is_some();
+            *guard = None;
+            return had_hint;
+        }
+        false
+    }
+
     /// Queue a journal event for delivery to the platform
     ///
     /// This is the unified method for queueing all event types. Events are classified as:
@@ -984,6 +993,12 @@ impl Worker {
                             endpoint, message
                         );
                         continue;
+                    }
+
+                    if self.clear_owner_endpoint_hint() {
+                        warn!(
+                            "Cleared redirected owner coordinator hint after connection failure; retrying through configured routing"
+                        );
                     }
 
                     // Check if we had a working session (Connected) that dropped,

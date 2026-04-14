@@ -4,7 +4,7 @@
 //! 1. Fresh membership snapshot from control plane (if `AGNT5_CONTROL_PLANE_URL` is set)
 //! 2. Cached snapshot from a previous fetch
 //! 3. Static `AGNT5_COORDINATOR_MEMBERSHIP` env var
-//! 4. Plain `AGNT5_COORDINATOR_ENDPOINT` (no rendezvous routing)
+//! 4. Plain `AGNT5_COORDINATOR_ENDPOINT` (no owner routing)
 
 use serde::Deserialize;
 use std::sync::RwLock;
@@ -37,6 +37,8 @@ struct SnapshotCoordinator {
     coordinator_id: String,
     grpc_endpoint: String,
     status: String,
+    #[serde(default)]
+    ready: Option<bool>,
 }
 
 impl CoordinatorRouting {
@@ -77,16 +79,21 @@ impl CoordinatorRouting {
     }
 
     pub fn owner_for_worker(&self, worker_id: &str) -> Option<&CoordinatorMember> {
-        self.members
-            .iter()
-            .max_by_key(|member| rendezvous_score(worker_id, &member.id))
+        self.owner_for_key(worker_id)
+    }
+
+    fn owner_for_key(&self, key: &str) -> Option<&CoordinatorMember> {
+        if self.members.is_empty() {
+            return None;
+        }
+        let lookup = build_maglev_lookup(&self.members);
+        let idx = (fnv1a64(key.as_bytes()) as usize) % lookup.len();
+        self.members.get(lookup[idx])
     }
 
     /// Resolve the coordinator endpoint for a worker.
     ///
-    /// Uses the ranking from rendezvous hashing. If the primary owner is
-    /// unreachable, callers can use `ranked_endpoints_for_worker` to try
-    /// the next coordinator in the ranking.
+    /// Uses the same Maglev owner selection as the coordinator.
     pub fn endpoint_for_worker(&self, worker_id: &str, fallback: &str) -> String {
         match self.owner_for_worker(worker_id) {
             Some(owner) => normalize_address(&owner.address),
@@ -94,19 +101,21 @@ impl CoordinatorRouting {
         }
     }
 
-    /// Return all coordinator endpoints ranked by rendezvous score (best first).
+    /// Return coordinator endpoints with the Maglev owner first.
     /// Useful for failover: if the primary owner is unreachable, try the next one.
     pub fn ranked_endpoints_for_worker(&self, worker_id: &str) -> Vec<String> {
-        let mut scored: Vec<_> = self
-            .members
-            .iter()
-            .map(|m| (rendezvous_score(worker_id, &m.id), &m.address))
-            .collect();
-        scored.sort_by(|a, b| b.0.cmp(&a.0)); // descending score
-        scored
-            .into_iter()
-            .map(|(_, addr)| normalize_address(addr))
-            .collect()
+        let Some(owner) = self.owner_for_worker(worker_id) else {
+            return Vec::new();
+        };
+        let mut endpoints = Vec::with_capacity(self.members.len());
+        endpoints.push(normalize_address(&owner.address));
+        endpoints.extend(
+            self.members
+                .iter()
+                .filter(|member| member.id != owner.id)
+                .map(|member| normalize_address(&member.address)),
+        );
+        endpoints
     }
 
     /// Resolve routing with the full priority chain:
@@ -164,7 +173,7 @@ impl CoordinatorRouting {
                 let members: Vec<CoordinatorMember> = snapshot
                     .coordinators
                     .into_iter()
-                    .filter(|c| c.status == "active")
+                    .filter(|c| c.status == "active" && c.ready.unwrap_or(true))
                     .map(|c| CoordinatorMember {
                         id: c.coordinator_id,
                         address: c.grpc_endpoint,
@@ -201,21 +210,54 @@ impl CoordinatorRouting {
     }
 }
 
-fn rendezvous_score(worker_id: &str, member_id: &str) -> u64 {
-    fn fnv1a64(bytes: &[u8]) -> u64 {
-        let mut hash = 0xcbf29ce484222325u64;
-        for byte in bytes {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        hash
+const MAGLEV_TABLE_SIZE: usize = 65_537;
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn build_maglev_lookup(members: &[CoordinatorMember]) -> Vec<usize> {
+    if members.is_empty() {
+        return Vec::new();
     }
 
-    let mut key = Vec::with_capacity(worker_id.len() + member_id.len() + 1);
-    key.extend_from_slice(worker_id.as_bytes());
-    key.push(b':');
-    key.extend_from_slice(member_id.as_bytes());
-    fnv1a64(&key)
+    let m = MAGLEV_TABLE_SIZE;
+    let mut next = vec![0usize; members.len()];
+    let permutations: Vec<(usize, usize)> = members
+        .iter()
+        .map(|member| maglev_permutation(&member.id, m))
+        .collect();
+    let mut entry = vec![usize::MAX; m];
+    let mut filled = 0usize;
+
+    while filled < m {
+        for (backend, (offset, skip)) in permutations.iter().enumerate() {
+            let mut c = (*offset + next[backend] * *skip) % m;
+            while entry[c] != usize::MAX {
+                next[backend] += 1;
+                c = (*offset + next[backend] * *skip) % m;
+            }
+            entry[c] = backend;
+            next[backend] += 1;
+            filled += 1;
+            if filled == m {
+                break;
+            }
+        }
+    }
+
+    entry
+}
+
+fn maglev_permutation(member_id: &str, table_size: usize) -> (usize, usize) {
+    let offset = (fnv1a64(format!("{member_id}:offset").as_bytes()) as usize) % table_size;
+    let skip = ((fnv1a64(format!("{member_id}:skip").as_bytes()) as usize) % (table_size - 1)) + 1;
+    (offset, skip)
 }
 
 fn normalize_address(address: &str) -> String {
@@ -231,13 +273,24 @@ mod tests {
     use super::CoordinatorRouting;
 
     #[test]
-    fn endpoint_resolution_uses_rendezvous_owner() {
+    fn endpoint_resolution_uses_maglev_owner() {
         let routing = CoordinatorRouting::from_membership(
             "node-a=runtime-1:34182,node-b=runtime-2:34182,node-c=http://runtime-3:34182",
         );
         let endpoint = routing.endpoint_for_worker("worker-abc", "http://lb:34182");
         assert!(endpoint.starts_with("http://"));
         assert_ne!(endpoint, "http://lb:34182");
+    }
+
+    #[test]
+    fn maglev_owner_matches_coordinator_algorithm_for_known_worker() {
+        let routing = CoordinatorRouting::from_membership(
+            "node-a=runtime-1:34182,node-b=runtime-2:34182,node-c=runtime-3:34182",
+        );
+        assert_eq!(
+            routing.owner_for_worker("worker-123").map(|m| m.id.as_str()),
+            Some("node-c")
+        );
     }
 
     #[test]
