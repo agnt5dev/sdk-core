@@ -137,6 +137,33 @@ pub fn collect_agnt5_env_vars() -> HashMap<String, String> {
     metadata
 }
 
+fn canonical_project_id_from_metadata(metadata: &HashMap<String, String>) -> Option<String> {
+    metadata
+        .get("project_id")
+        .cloned()
+        .or_else(|| metadata.get("tenant_id").cloned())
+}
+
+fn canonical_project_id_from_env() -> String {
+    std::env::var("AGNT5_PROJECT_ID")
+        .ok()
+        .or_else(|| std::env::var("AGNT5_TENANT_ID").ok())
+        .unwrap_or_default()
+}
+
+fn with_project_metadata(mut metadata: HashMap<String, String>, project_id: &str) -> HashMap<String, String> {
+    if !project_id.is_empty() {
+        metadata
+            .entry("project_id".to_string())
+            .or_insert_with(|| project_id.to_string());
+        // Legacy compatibility for coordinator/engine paths that still expect tenant_id.
+        metadata
+            .entry("tenant_id".to_string())
+            .or_insert_with(|| project_id.to_string());
+    }
+    metadata
+}
+
 #[derive(Clone)]
 pub struct Worker {
     config: WorkerConfig,
@@ -313,7 +340,7 @@ impl Worker {
         correlation_id: String,
         parent_correlation_id: String,
     ) -> Result<()> {
-        let tenant_id = metadata.get("tenant_id").cloned();
+        let tenant_id = canonical_project_id_from_metadata(&metadata);
         let event = JournalEventMessage {
             run_id: invocation_id,
             event_type: checkpoint_type,
@@ -440,8 +467,8 @@ impl Worker {
             if event_type == "run.completed" || event_type == "run.failed" {
                 let pending = self.journal_queue.drain_run_events(&run_id);
                 if !pending.is_empty() {
-                    let tenant_id = metadata.get("tenant_id").cloned()
-                        .or_else(|| self.metadata.get("tenant_id").cloned())
+                    let tenant_id = canonical_project_id_from_metadata(&metadata)
+                        .or_else(|| canonical_project_id_from_metadata(&self.metadata))
                         .unwrap_or_default();
                     let records: Vec<_> = pending.iter().map(|e| {
                         client::build_engine_record(
@@ -470,9 +497,14 @@ impl Worker {
                     merged_metadata.insert(k.clone(), v.clone());
                 }
             }
+            let canonical_project_id = canonical_project_id_from_metadata(&merged_metadata).unwrap_or_default();
+            merged_metadata = with_project_metadata(merged_metadata, &canonical_project_id);
             let correlation_id = merged_metadata.remove("cid").unwrap_or_default();
             let parent_event_id = merged_metadata.remove("pcid").unwrap_or_default();
-            let tenant_id = merged_metadata.remove("tenant_id").unwrap_or_default();
+            let tenant_id = merged_metadata
+                .remove("project_id")
+                .or_else(|| merged_metadata.remove("tenant_id"))
+                .unwrap_or_default();
             let experiment_id = merged_metadata.get("experiment_id").cloned();
 
             let record = client::build_engine_record(
@@ -550,7 +582,8 @@ impl Worker {
                             data: event.data.clone(),
                             trace_id: String::new(),
                             span_id: String::new(),
-                            tenant_id: event.metadata.get("tenant_id").cloned().unwrap_or_default(),
+                            tenant_id: canonical_project_id_from_metadata(&event.metadata)
+                                .unwrap_or_default(),
                             source_timestamp_ns: event.source_timestamp_ns,
                             worker_id: self.config.worker_id.clone(),
                         };
@@ -617,6 +650,8 @@ impl Worker {
                 merged_metadata.insert(k.clone(), v.clone());
             }
         }
+        let canonical_project_id = canonical_project_id_from_metadata(&merged_metadata).unwrap_or_default();
+        merged_metadata = with_project_metadata(merged_metadata, &canonical_project_id);
 
         // Extract correlation/parent IDs from metadata
         let correlation_id = merged_metadata.remove("cid").unwrap_or_default();
@@ -631,7 +666,7 @@ impl Worker {
             checkpoint_data: event_data,
             sequence_number,
             trace_id: String::new(),
-            tenant_id: merged_metadata.get("tenant_id").cloned().unwrap_or_default(),
+            tenant_id: canonical_project_id,
             source_timestamp_ns,
             correlation_id,
             parent_event_id,
@@ -809,7 +844,13 @@ impl Worker {
                     }
                     let cid = merged.remove("cid").unwrap_or_default();
                     let pcid = merged.remove("pcid").unwrap_or_default();
-                    let tenant_id = merged.remove("tenant_id").unwrap_or_default();
+                    let canonical_project_id =
+                        canonical_project_id_from_metadata(&merged).unwrap_or_default();
+                    let mut merged = with_project_metadata(merged, &canonical_project_id);
+                    let tenant_id = merged
+                        .remove("project_id")
+                        .or_else(|| merged.remove("tenant_id"))
+                        .unwrap_or_default();
 
                     client::build_engine_record(
                         tenant_id, run_id, event_type, data, ts,
@@ -846,7 +887,7 @@ impl Worker {
         parent_correlation_id: String,
     ) -> Result<()> {
         let is_sse_only = JournalEventMessage::is_sse_only_event_type(&event_type);
-        let tenant_id = metadata.get("tenant_id").cloned();
+        let tenant_id = canonical_project_id_from_metadata(&metadata);
 
         let event = JournalEventMessage {
             run_id: invocation_id,
@@ -1608,8 +1649,9 @@ impl Worker {
         let ee_endpoint = self.config.ee_endpoint.clone();
         let engine_endpoint = self.config.engine_endpoint.clone();
 
-        // Cache tenant_id and deployment_id to avoid repeated env lookups per event
-        let cached_tenant_id = std::env::var("AGNT5_TENANT_ID").unwrap_or_default();
+        // Cache project_id/deployment_id to avoid repeated env lookups per event.
+        // `tenant_id` remains a legacy alias for compatibility with engine/EE APIs.
+        let cached_project_id = canonical_project_id_from_env();
         let cached_deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").unwrap_or_default();
 
         tokio::spawn(async move {
@@ -1659,7 +1701,7 @@ impl Worker {
                         let tenant = if let Some(ref tid) = e.tenant_id {
                             tid.clone()
                         } else {
-                            cached_tenant_id.clone()
+                            cached_project_id.clone()
                         };
                         client::build_engine_record(
                             tenant,
@@ -1728,7 +1770,7 @@ impl Worker {
                                 data: event.data.clone(),
                                 trace_id: String::new(),
                                 span_id: String::new(),
-                                tenant_id: cached_tenant_id.clone(),
+                                tenant_id: cached_project_id.clone(),
                                 source_timestamp_ns: event.source_timestamp_ns,
                                 worker_id: worker_id.clone(),
                             };
@@ -1747,9 +1789,7 @@ impl Worker {
                         }
                         // No EventStream or EventStream failed — fallback to dispatch stream for SSE-only
                         let mut metadata = event.metadata.clone();
-                        if !cached_tenant_id.is_empty() {
-                            metadata.insert("tenant_id".to_string(), cached_tenant_id.clone());
-                        }
+                        metadata = with_project_metadata(metadata, &cached_project_id);
                         if !cached_deployment_id.is_empty() {
                             metadata.insert("deployment_id".to_string(), cached_deployment_id.clone());
                         }
@@ -1799,13 +1839,14 @@ impl Worker {
 
                     // Boundary event — collect for batch WriteJournalEventsBatch to EE
                     let mut metadata = event.metadata.clone();
-                    if !cached_tenant_id.is_empty() {
-                        metadata.entry("tenant_id".to_string()).or_insert_with(|| cached_tenant_id.clone());
-                    }
+                    metadata = with_project_metadata(metadata, &cached_project_id);
                     if !cached_deployment_id.is_empty() {
                         metadata.entry("deployment_id".to_string()).or_insert_with(|| cached_deployment_id.clone());
                     }
-                    let tenant_id = metadata.remove("tenant_id").unwrap_or_default();
+                    let tenant_id = metadata
+                        .remove("project_id")
+                        .or_else(|| metadata.remove("tenant_id"))
+                        .unwrap_or_default();
 
                     let req = crate::pb::WriteJournalEventRequest {
                         run_id: event.run_id.clone(),
@@ -1938,7 +1979,7 @@ impl Worker {
             .iter()
             .map(|c| c.name.clone())
             .collect();
-        let tenant_id = std::env::var("AGNT5_TENANT_ID").unwrap_or_default();
+        let project_id = canonical_project_id_from_env();
         let deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").ok();
         let streaming_runs = self.streaming_runs.clone();
 
@@ -1953,9 +1994,9 @@ impl Worker {
             .unwrap_or(30000);
 
         tokio::spawn(async move {
-            // Skip polling if no tenant_id (not in managed mode)
-            if tenant_id.is_empty() {
-                eprintln!("[INFO] Job queue polling disabled (AGNT5_TENANT_ID not set)");
+            // Skip polling if no project context (not in managed mode).
+            if project_id.is_empty() {
+                eprintln!("[INFO] Job queue polling disabled (AGNT5_PROJECT_ID / AGNT5_TENANT_ID not set)");
                 return;
             }
 
@@ -1977,7 +2018,7 @@ impl Worker {
             eprintln!(
                 "[INFO] Job queue polling started ({} components, tenant={})",
                 component_ids.len(),
-                tenant_id
+                project_id
             );
 
             let mut backoff = Duration::from_millis(initial_backoff_ms);
@@ -2009,7 +2050,7 @@ impl Worker {
                         worker_id: worker_id.clone(),
                         component_ids: component_ids.clone(),
                         max_jobs,
-                        tenant_id: tenant_id.clone(),
+                        tenant_id: project_id.clone(),
                         deployment_id: deployment_id.clone(),
                         claim_timeout_ms: 300_000,
                     })
@@ -2039,7 +2080,8 @@ impl Worker {
                             // `handle_polled_job_response` derives job_id from
                             // `resp.invocation_id` (which equals run_id which
                             // equals job_id on the coordinator's poll path)
-                            // and tenant_id from `AGNT5_TENANT_ID`.
+                            // and project identity from `AGNT5_PROJECT_ID`
+                            // (falling back to legacy `AGNT5_TENANT_ID`).
                             let mut metadata = job.metadata.clone();
                             if !job.trace_id.is_empty() {
                                 metadata.insert("trace_id".to_string(), job.trace_id.clone());
@@ -2134,8 +2176,8 @@ impl Worker {
     /// Called from the dispatch loop on PULL workers (mode-based routing,
     /// Phase 8). On the coordinator's poll path `job_id == run_id`, so we
     /// derive the job_id from `resp.invocation_id` — stripping any
-    /// `:suffix` the worker appends for streaming invocations. tenant_id
-    /// comes from `AGNT5_TENANT_ID` which PULL workers always set.
+    /// `:suffix` the worker appends for streaming invocations. Project identity
+    /// comes from `AGNT5_PROJECT_ID`, falling back to legacy `AGNT5_TENANT_ID`.
     async fn handle_polled_job_response(&self, service_message: ServiceMessage) {
         let (job_id, success, output_data, error_message, error_code) =
             match &service_message.message_type {
@@ -2175,7 +2217,7 @@ impl Worker {
 
         // Phase 8: PULL workers derive tenant_id from the same env var the
         // poll task uses for the PollJobs request.
-        let tenant_id = std::env::var("AGNT5_TENANT_ID").unwrap_or_default();
+        let tenant_id = canonical_project_id_from_env();
 
         // Call CompleteJob RPC
         let endpoint = self.config.resolved_coordinator_endpoint();
