@@ -150,7 +150,12 @@ impl WorkerCoordinatorClient {
                             } else {
                                 format!("http://{owner_endpoint}")
                             };
-                            error!(
+                            // Redirects are an expected control-plane response, not an
+                            // error — the worker.rs reconnect loop handles them. Logged
+                            // at debug only so we don't alarm users on every cold start.
+                            // See dev/bugs/coordinator-redirect-leaks-pod-dns.md for the
+                            // upstream fix that should make redirects unnecessary.
+                            debug!(
                                 "Registration redirected to owner coordinator {}: {}",
                                 endpoint, resp.error
                             );

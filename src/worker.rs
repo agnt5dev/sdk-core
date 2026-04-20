@@ -936,21 +936,30 @@ impl Worker {
                 let delay_secs = delay.as_secs_f64();
 
                 // User-friendly reconnection messages (printed directly, not via tracing,
-                // since these are user-facing status and should always be visible)
-                if retry_count == 1 {
-                    eprintln!(
-                        "[WARN] Connection lost, reconnecting in {:.1}s...",
-                        delay_secs
-                    );
-                } else if infinite_retry {
-                    eprintln!(
-                        "[WARN] Reconnecting in {:.1}s... (attempt {})",
-                        delay_secs, retry_count
-                    );
+                // since these are user-facing status and should always be visible).
+                //
+                // Suppress the first two retries — most transient failures (notably
+                // registration redirects per dev/bugs/coordinator-redirect-leaks-pod-dns.md,
+                // brief network blips) recover within one retry. Surfacing them as
+                // "[WARN] Connection lost" alarms users on every cold start.
+                // Below the threshold, log at debug only.
+                const QUIET_RETRY_THRESHOLD: u32 = 3;
+                if retry_count >= QUIET_RETRY_THRESHOLD {
+                    if infinite_retry {
+                        eprintln!(
+                            "[WARN] Reconnecting in {:.1}s... (attempt {})",
+                            delay_secs, retry_count
+                        );
+                    } else {
+                        eprintln!(
+                            "[WARN] Reconnecting in {:.1}s... (attempt {}/{})",
+                            delay_secs, retry_count, max_retries
+                        );
+                    }
                 } else {
-                    eprintln!(
-                        "[WARN] Reconnecting in {:.1}s... (attempt {}/{})",
-                        delay_secs, retry_count, max_retries
+                    debug!(
+                        retry = retry_count,
+                        delay_secs, "Reconnecting silently before user-visible warning"
                     );
                 }
 
@@ -988,7 +997,9 @@ impl Worker {
                     if let crate::error::SdkError::RegistrationRedirect { endpoint, message } = &e
                     {
                         self.set_owner_endpoint_hint(Some(endpoint.clone()));
-                        warn!(
+                        // Redirect is an expected control-plane response — the loop
+                        // handles it. Debug only. See dev/bugs/coordinator-redirect-leaks-pod-dns.md.
+                        debug!(
                             "Registration redirected to owner coordinator {}: {}",
                             endpoint, message
                         );
@@ -996,7 +1007,7 @@ impl Worker {
                     }
 
                     if self.clear_owner_endpoint_hint() {
-                        warn!(
+                        debug!(
                             "Cleared redirected owner coordinator hint after connection failure; retrying through configured routing"
                         );
                     }
