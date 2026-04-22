@@ -326,8 +326,19 @@ fn init_telemetry_inner(service_name: &str, service_version: &str) -> Result<(),
     });
     let otel_filter = EnvFilter::new(&otel_directive);
 
-    // Create custom fmt layer with clean output (no file paths or line numbers)
+    // Create custom fmt layer with clean output (no file paths or line numbers).
+    //
+    // Gate ANSI on TTY + NO_COLOR so worker logs stay parseable when stdout is
+    // captured — e.g. by `agnt5 dev`, Claude Code, Codex, or CI. Without this
+    // guard, tracing-subscriber unconditionally colors its output (dim
+    // timestamp, colored level) and every log line leaks bytes like
+    // `\x1b[2m...\x1b[33m WARN\x1b[0m` into the captured stream.
+    use std::io::IsTerminal;
+    let use_ansi =
+        std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+
     let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_ansi(use_ansi)
         .with_target(false)
         .with_thread_ids(false)
         .with_thread_names(false)
