@@ -79,7 +79,7 @@ http = "1.1"
 
 # Vector Database Dependencies
 # Qdrant vector database client
-qdrant-client = "1.10"
+qdrant-client = { version = "1.10", optional = true }
 
 # PostgreSQL with pgvector support
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres"], optional = true }
@@ -98,9 +98,25 @@ hex = "0.4"
 hmac = "0.12"
 sha2 = "0.10"
 
+# Base64 encoding for sandbox file operations
+base64 = "0.22"
+
+# Bytes for WASI pipe types
+bytes = "1"
+
+# System info for worker metadata
+hostname = "0.4"
+
+# Sandbox - Wasmtime (optional, behind wasm-sandbox feature)
+wasmtime = { version = "29", optional = true }
+wasmtime-wasi = { version = "29", optional = true }
+tempfile = { version = "3", optional = true }
+
 [features]
 default = []
+qdrant = ["dep:qdrant-client"]
 pgvector = ["dep:sqlx", "dep:pgvector"]
+wasm-sandbox = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:tempfile"]
 
 # Build dependencies
 [build-dependencies]

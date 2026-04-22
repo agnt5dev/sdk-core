@@ -6,11 +6,11 @@ pub mod types;
 
 // Re-export core types
 pub use providers::{
-    agnt5::{Agnt5Provider, Agnt5ProviderConfig},
     pgvector::PgVectorProvider,
     pinecone::PineconeProvider,
-    qdrant::QdrantProvider,
 };
+#[cfg(feature = "qdrant")]
+pub use providers::qdrant::QdrantProvider;
 pub use types::{
     Collection, DistanceMetric, SearchQuery, SearchResult, VectorEntry, VectorFilter,
     VectorMetadata,
@@ -133,41 +133,28 @@ impl VectorDbRegistry {
 
     /// Load providers from environment variables
     /// Detection order:
-    /// 1. AGNT5 Platform (default) - uses platform's backend (SQLite/PostgreSQL/CockroachDB+Qdrant)
-    /// 2. QDRANT_URL - direct connection to user's Qdrant
-    /// 3. POSTGRES_URL - direct connection to user's PostgreSQL with pgvector
+    /// 1. QDRANT_URL - direct connection to user's Qdrant
+    /// 2. PINECONE_API_KEY + PINECONE_HOST - Pinecone cloud
+    /// 3. POSTGRES_URL - user's PostgreSQL with pgvector
     pub async fn load_from_environment(&mut self) -> Result<()> {
         let mut loaded_count = 0;
 
-        // AGNT5 Platform (default provider)
-        // Always available - uses platform gateway for vector operations
-        match Agnt5Provider::from_env() {
-            Ok(provider) => {
-                self.register_provider("agnt5".to_string(), std::sync::Arc::new(provider));
-                loaded_count += 1;
+        #[cfg(feature = "qdrant")]
+        {
+            // Qdrant (user's own instance)
+            if let Ok(url) = std::env::var("QDRANT_URL") {
+                match QdrantProvider::new(&url, None).await {
+                    Ok(provider) => {
+                        self.register_provider("qdrant".to_string(), std::sync::Arc::new(provider));
+                        loaded_count += 1;
 
-                // AGNT5 is the default provider
-                self.default_provider = Some("agnt5".to_string());
-            }
-            Err(e) => {
-                tracing::debug!("AGNT5 provider not available: {}", e);
-            }
-        }
-
-        // Qdrant (user's own instance)
-        if let Ok(url) = std::env::var("QDRANT_URL") {
-            match QdrantProvider::new(&url, None).await {
-                Ok(provider) => {
-                    self.register_provider("qdrant".to_string(), std::sync::Arc::new(provider));
-                    loaded_count += 1;
-
-                    // If no default yet, use Qdrant
-                    if self.default_provider.is_none() {
-                        self.default_provider = Some("qdrant".to_string());
+                        if self.default_provider.is_none() {
+                            self.default_provider = Some("qdrant".to_string());
+                        }
                     }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to connect to Qdrant at {}: {}", url, e);
+                    Err(e) => {
+                        tracing::warn!("Failed to connect to Qdrant at {}: {}", url, e);
+                    }
                 }
             }
         }
@@ -209,21 +196,8 @@ impl VectorDbRegistry {
         }
 
         if loaded_count == 0 {
-            tracing::warn!(
-                "No vector database providers loaded. AGNT5 platform provider will be used by default."
-            );
-            // Try to create AGNT5 provider with defaults even if from_env failed
-            let config = Agnt5ProviderConfig::new("http://localhost:34183");
-            if let Ok(provider) = Agnt5Provider::new(config) {
-                self.register_provider("agnt5".to_string(), std::sync::Arc::new(provider));
-                self.default_provider = Some("agnt5".to_string());
-                loaded_count = 1;
-            }
-        }
-
-        if loaded_count == 0 {
             return Err(crate::error::SdkError::Other(anyhow::anyhow!(
-                "No vector database providers available"
+                "No vector database providers available. Set a supported provider environment variable such as PINECONE_API_KEY+PINECONE_HOST or POSTGRES_URL."
             )));
         }
 

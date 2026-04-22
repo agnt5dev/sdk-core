@@ -1,20 +1,32 @@
 use crate::error::{Result, SdkError};
 use crate::pb::{
+    engine_service_client::EngineServiceClient,
     execution_engine_service_client::ExecutionEngineServiceClient,
-    worker_coordinator_service_client::WorkerCoordinatorServiceClient, CheckpointRequest,
-    CheckpointType, CompleteJobRequest, CompleteJobResponse, DurableStepCheckpoint,
-    EventStreamMessage, GetMemoizedStepRequest, PollJobsRequest, PollJobsResponse,
-    RegisterService, RuntimeMessage, ServiceMessage,
+    worker_coordinator_service_client::WorkerCoordinatorServiceClient, AppendBatchRequest,
+    AppendRequest, CheckpointRequest, CheckpointType, CompleteJobRequest, CompleteJobResponse,
+    DurableStepCheckpoint, EventStreamMessage, FindByStepKeyRequest, PollJobsRequest,
+    PollJobsResponse, Record, RegisterService, RuntimeMessage, ServiceMessage,
 };
 use std::collections::HashMap;
 use std::time::Duration;
 use tonic::transport::Channel;
 use tracing::{debug, error};
 
-/// Simple client for communicating with the Worker Coordinator service
+/// Simple client for communicating with the Worker Coordinator service.
+///
+/// Holds two gRPC clients multiplexed over the same `tonic::Channel`:
+/// - `client`: WorkerCoordinatorService (worker registration, dispatch streaming)
+/// - `engine_client`: EngineService (durable execution: checkpoint, event stream,
+///   job queue poll/complete, memoization lookup via find_by_step_key)
+///
+/// The durable execution RPCs used to live on WorkerCoordinatorService and moved
+/// to EngineService as part of the journal-owner consolidation. Both clients
+/// share one HTTP/2 connection since `tonic::Channel` is cheap to clone and
+/// multiplexes streams.
 #[derive(Debug, Clone)]
 pub struct WorkerCoordinatorClient {
     client: WorkerCoordinatorServiceClient<Channel>,
+    engine_client: EngineServiceClient<Channel>,
 }
 
 impl WorkerCoordinatorClient {
@@ -39,9 +51,13 @@ impl WorkerCoordinatorClient {
                 e
             })?;
 
-        let client = WorkerCoordinatorServiceClient::new(channel);
+        let client = WorkerCoordinatorServiceClient::new(channel.clone());
+        let engine_client = EngineServiceClient::new(channel);
 
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            engine_client,
+        })
     }
 
     /// Create a worker stream with immediate registration (based on working pattern)
@@ -124,6 +140,30 @@ impl WorkerCoordinatorClient {
             match &runtime_message.message_data {
                 Some(crate::pb::runtime_message::MessageData::RegisterServiceResponse(resp)) => {
                     if !resp.ack {
+                        if let Some(owner_endpoint) =
+                            runtime_message.metadata.get("owner_coordinator_address")
+                        {
+                            let endpoint = if owner_endpoint.starts_with("http://")
+                                || owner_endpoint.starts_with("https://")
+                            {
+                                owner_endpoint.clone()
+                            } else {
+                                format!("http://{owner_endpoint}")
+                            };
+                            // Redirects are an expected control-plane response, not an
+                            // error — the worker.rs reconnect loop handles them. Logged
+                            // at debug only so we don't alarm users on every cold start.
+                            // See dev/bugs/coordinator-redirect-leaks-pod-dns.md for the
+                            // upstream fix that should make redirects unnecessary.
+                            debug!(
+                                "Registration redirected to owner coordinator {}: {}",
+                                endpoint, resp.error
+                            );
+                            return Err(SdkError::RegistrationRedirect {
+                                endpoint,
+                                message: resp.error.clone(),
+                            });
+                        }
                         error!("Registration failed: {}", resp.error);
                         return Err(SdkError::Connection {
                             message: format!("Registration failed: {}", resp.error),
@@ -192,7 +232,8 @@ impl WorkerCoordinatorClient {
             }
         };
 
-        let mut client = self.client.clone();
+        // EventStream now lives on EngineService (moved from WorkerCoordinatorService).
+        let mut client = self.engine_client.clone();
         tokio::spawn(async move {
             match client.event_stream(stream).await {
                 Ok(response) => {
@@ -219,6 +260,7 @@ impl WorkerCoordinatorClient {
     ///
     /// # Arguments
     ///
+    /// * `tenant_id` - Tenant the run belongs to (required for engine lookups)
     /// * `run_id` - The workflow run ID
     /// * `step_key` - Unique key for this step (e.g., "step:greet:0")
     /// * `step_name` - Human-readable step name
@@ -234,6 +276,7 @@ impl WorkerCoordinatorClient {
     /// `CheckpointResult` containing memoization status and cached output if available
     pub async fn checkpoint(
         &mut self,
+        tenant_id: String,
         run_id: String,
         step_key: String,
         step_name: String,
@@ -245,8 +288,8 @@ impl WorkerCoordinatorClient {
         latency_ms: Option<i64>,
     ) -> Result<CheckpointResult> {
         debug!(
-            "Sending checkpoint: run_id={}, step_key={}, type={:?}",
-            run_id, step_key, checkpoint_type
+            "Sending checkpoint: tenant_id={}, run_id={}, step_key={}, type={:?}",
+            tenant_id, run_id, step_key, checkpoint_type
         );
 
         let checkpoint = DurableStepCheckpoint {
@@ -268,14 +311,16 @@ impl WorkerCoordinatorClient {
 
         let request = CheckpointRequest {
             checkpoint: Some(checkpoint),
+            tenant_id,
         };
 
+        // Checkpoint moved from WorkerCoordinatorService → EngineService.
         let response = self
-            .client
+            .engine_client
             .checkpoint(request)
             .await
             .map_err(|e| {
-                error!("Checkpoint RPC failed: {}", e);
+                debug!("Checkpoint RPC failed: {}", e);
                 SdkError::Connection {
                     message: format!("Checkpoint failed: {}", e),
                     code: crate::error::ErrorCode::ConnectionFailed,
@@ -300,56 +345,71 @@ impl WorkerCoordinatorClient {
         })
     }
 
-    /// Check if a step result is memoized without sending a full checkpoint
+    /// Check if a step result is memoized without sending a full checkpoint.
     ///
-    /// Use this for quick memoization lookups before executing expensive steps.
+    /// Uses `EngineService.FindByStepKey` as the canonical memoization lookup
+    /// (replaces the legacy `WorkerCoordinatorService.GetMemoizedStep` RPC,
+    /// which has been removed).
     ///
     /// # Arguments
     ///
-    /// * `run_id` - The workflow run ID
-    /// * `step_key` - Unique key for this step
+    /// * `tenant_id` - The tenant that owns the run (required by the engine's
+    ///   `(tenant_id, run_id)` cache key).
+    /// * `run_id` - The workflow run ID.
+    /// * `step_key` - Unique key for this step.
     ///
     /// # Returns
     ///
-    /// `Some(output)` if the step is memoized, `None` otherwise
+    /// `Some(output)` if the step is memoized, `None` otherwise. Returns the
+    /// record's `data` field (the completed step's journal payload).
     pub async fn get_memoized_step(
         &mut self,
+        tenant_id: String,
         run_id: String,
         step_key: String,
     ) -> Result<Option<Vec<u8>>> {
         debug!(
-            "Checking memoization: run_id={}, step_key={}",
-            run_id, step_key
+            "Checking memoization: tenant_id={}, run_id={}, step_key={}",
+            tenant_id, run_id, step_key
         );
 
-        let request = GetMemoizedStepRequest { run_id, step_key };
+        let request = FindByStepKeyRequest {
+            tenant_id,
+            run_id,
+            step_key,
+        };
 
         let response = self
-            .client
-            .get_memoized_step(request)
+            .engine_client
+            .find_by_step_key(request)
             .await
             .map_err(|e| {
-                error!("GetMemoizedStep RPC failed: {}", e);
+                debug!("FindByStepKey RPC failed: {}", e);
                 SdkError::Connection {
-                    message: format!("GetMemoizedStep failed: {}", e),
+                    message: format!("FindByStepKey failed: {}", e),
                     code: crate::error::ErrorCode::ConnectionFailed,
                     source: None,
                 }
             })?
             .into_inner();
 
-        if response.found && !response.output.is_empty() {
-            Ok(Some(response.output))
-        } else {
-            Ok(None)
+        if response.found {
+            if let Some(record) = response.record {
+                if !record.data.is_empty() {
+                    return Ok(Some(record.data));
+                }
+            }
         }
+        Ok(None)
     }
 
     /// Poll for available jobs from the durable queue (managed edition).
     /// Workers call this with exponential backoff to claim pending jobs.
+    ///
+    /// PollJobs now lives on EngineService (moved from WorkerCoordinatorService).
     pub async fn poll_jobs(&mut self, req: PollJobsRequest) -> Result<PollJobsResponse> {
         let response = self
-            .client
+            .engine_client
             .poll_jobs(req)
             .await
             .map_err(|e| {
@@ -365,11 +425,13 @@ impl WorkerCoordinatorClient {
         Ok(response)
     }
 
-    /// Report the result of a polled job back to the coordinator.
+    /// Report the result of a polled job back to the engine.
     /// Updates job_queue, run status, journal, and batch counters.
+    ///
+    /// CompleteJob now lives on EngineService (moved from WorkerCoordinatorService).
     pub async fn complete_job(&mut self, req: CompleteJobRequest) -> Result<CompleteJobResponse> {
         let response = self
-            .client
+            .engine_client
             .complete_job(req)
             .await
             .map_err(|e| {
@@ -423,6 +485,144 @@ pub async fn create_ee_event_stream(
 
     debug!("EE EventStream opened for worker {}", worker_id);
     Ok(tx)
+}
+
+// =============================================================================
+// Engine Client — routes events to the AGNT5 Rust engine (Append/AppendBatch)
+// =============================================================================
+
+/// Pool size for engine gRPC connections.
+/// Each connection is an independent h2 session, distributing load to avoid
+/// the h2 PoisonError that occurs when 100+ concurrent requests share one connection.
+const ENGINE_POOL_SIZE: usize = 8;
+
+/// Client for communicating with the AGNT5 Engine.
+///
+/// Uses a pool of N independent gRPC connections with round-robin selection.
+/// This prevents the h2 PoisonError that occurs when many concurrent checkpoint
+/// events are routed through a single HTTP/2 connection.
+#[derive(Debug, Clone)]
+pub struct EngineClient {
+    clients: Vec<EngineServiceClient<Channel>>,
+    next: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl EngineClient {
+    /// Connect to the engine at the given endpoint with a pool of connections.
+    pub async fn connect(endpoint: &str) -> Result<Self> {
+        debug!("Connecting to Engine at {} (pool_size={})", endpoint, ENGINE_POOL_SIZE);
+
+        let uri = if endpoint.contains("://") {
+            endpoint.to_string()
+        } else {
+            format!("http://{}", endpoint)
+        };
+
+        let mut clients = Vec::with_capacity(ENGINE_POOL_SIZE);
+        for i in 0..ENGINE_POOL_SIZE {
+            let channel = Channel::from_shared(uri.clone())
+                .map_err(|e| SdkError::Connection {
+                    message: format!("Invalid engine endpoint {}: {}", endpoint, e),
+                    code: crate::error::ErrorCode::ConnectionFailed,
+                    source: None,
+                })?
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(30))
+                .http2_adaptive_window(true)
+                .connect()
+                .await
+                .map_err(|e| {
+                    debug!("Engine connection {} to {} failed: {:?}", i, endpoint, e);
+                    SdkError::Connection {
+                        message: format!("Engine connection failed: {}", e),
+                        code: crate::error::ErrorCode::ConnectionFailed,
+                        source: None,
+                    }
+                })?;
+            clients.push(EngineServiceClient::new(channel));
+        }
+
+        debug!("Engine client pool connected ({} connections)", ENGINE_POOL_SIZE);
+        Ok(Self {
+            clients,
+            next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        })
+    }
+
+    /// Get the next client from the pool (round-robin).
+    fn next_client(&mut self) -> &mut EngineServiceClient<Channel> {
+        let idx = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.clients.len();
+        &mut self.clients[idx]
+    }
+
+    /// Append a single record to the engine.
+    pub async fn append(&mut self, record: Record) -> Result<(u64, i64)> {
+        let response = self
+            .next_client()
+            .append(AppendRequest {
+                record: Some(record),
+            })
+            .await
+            .map_err(|e| {
+                debug!("Engine Append failed: {}", e);
+                SdkError::Connection {
+                    message: format!("Engine Append failed: {}", e),
+                    code: crate::error::ErrorCode::ConnectionFailed,
+                    source: None,
+                }
+            })?
+            .into_inner();
+
+        Ok((response.offset, response.timestamp_ns))
+    }
+
+    /// Append a batch of records to the engine.
+    pub async fn append_batch(&mut self, records: Vec<Record>) -> Result<i32> {
+        let response = self
+            .next_client()
+            .append_batch(AppendBatchRequest { records })
+            .await
+            .map_err(|e| {
+                debug!("Engine AppendBatch failed: {}", e);
+                SdkError::Connection {
+                    message: format!("Engine AppendBatch failed: {}", e),
+                    code: crate::error::ErrorCode::ConnectionFailed,
+                    source: None,
+                }
+            })?
+            .into_inner();
+
+        Ok(response.written_count)
+    }
+}
+
+/// Build an engine `Record` from SDK event fields.
+pub fn build_engine_record(
+    tenant_id: String,
+    run_id: String,
+    event_type: String,
+    data: Vec<u8>,
+    timestamp_ns: i64,
+    step_key: String,
+    correlation_id: String,
+    parent_event_id: String,
+    metadata: HashMap<String, String>,
+) -> Record {
+    Record {
+        offset: 0, // Assigned by engine
+        tenant_id,
+        run_id,
+        event_type,
+        data,
+        timestamp_ns,
+        step_key,
+        correlation_id,
+        parent_event_id,
+        metadata,
+        data_type: "json".to_string(),
+        data_checksum: vec![],
+        data_compressed: false,
+    }
 }
 
 /// Result of a checkpoint operation

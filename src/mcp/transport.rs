@@ -302,8 +302,8 @@ pub struct SseTransport {
     request_id: AtomicU64,
     /// Session ID (assigned by server)
     session_id: Arc<Mutex<Option<String>>>,
-    /// Connected state
-    connected: AtomicBool,
+    /// Connected state (shared with background SSE reader task)
+    connected_shared: Arc<AtomicBool>,
     /// Pending responses
     pending_responses: Arc<Mutex<HashMap<u64, mpsc::Sender<JsonRpcResponse>>>>,
 }
@@ -332,7 +332,7 @@ impl SseTransport {
             client,
             request_id: AtomicU64::new(1),
             session_id: Arc::new(Mutex::new(None)),
-            connected: AtomicBool::new(false),
+            connected_shared: Arc::new(AtomicBool::new(false)),
             pending_responses: Arc::new(Mutex::new(HashMap::new())),
         };
 
@@ -361,8 +361,7 @@ impl SseTransport {
 
         let pending_clone = Arc::clone(&self.pending_responses);
         let session_clone = Arc::clone(&self.session_id);
-        let connected_flag = Arc::new(AtomicBool::new(true));
-        let connected_clone = Arc::clone(&connected_flag);
+        let connected_clone = Arc::clone(&self.connected_shared);
 
         // Start background SSE reader
         tokio::spawn(async move {
@@ -406,7 +405,7 @@ impl SseTransport {
             }
         });
 
-        self.connected.store(true, Ordering::SeqCst);
+        self.connected_shared.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -515,12 +514,12 @@ impl Transport for SseTransport {
     }
 
     async fn close(&self) -> McpResult<()> {
-        self.connected.store(false, Ordering::SeqCst);
+        self.connected_shared.store(false, Ordering::SeqCst);
         Ok(())
     }
 
     fn is_connected(&self) -> bool {
-        self.connected.load(Ordering::SeqCst)
+        self.connected_shared.load(Ordering::SeqCst)
     }
 }
 

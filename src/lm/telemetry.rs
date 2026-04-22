@@ -471,12 +471,14 @@ pub fn create_gen_ai_span(
     span.set_attribute(KeyValue::new(attributes::PROVIDER_NAME, provider.to_string()));
     span.set_attribute(KeyValue::new(attributes::REQUEST_MODEL, model.to_string()));
 
-    // Add tenant_id and deployment_id from global config
-    if let Some(tid) = crate::telemetry::get_tenant_id() {
-        span.set_attribute(KeyValue::new("tenant.id", tid.to_string()));
+    if let Some(pid) = crate::telemetry::get_project_id() {
+        span.set_attribute(KeyValue::new("agnt5.project.id", pid.to_string()));
+    }
+    if let Some(wid) = crate::telemetry::get_workspace_id() {
+        span.set_attribute(KeyValue::new("agnt5.workspace.id", wid.to_string()));
     }
     if let Some(did) = crate::telemetry::get_deployment_id() {
-        span.set_attribute(KeyValue::new("deployment.id", did.to_string()));
+        span.set_attribute(KeyValue::new("agnt5.deployment.id", did.to_string()));
     }
 
     span
@@ -774,9 +776,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_should_capture_content_default_false() {
-        // Without env var set, should return false
-        assert!(!should_capture_content());
+    fn test_should_capture_content_default_true() {
+        // Content capture is enabled by default (see docstring on
+        // `should_capture_content`). Setting `AGNT5_LLM_CAPTURE_CONTENT=false`
+        // or `=0` is the opt-out path.
+        //
+        // This test assumes the env var is unset; if another test sets it
+        // and doesn't clean up, this test becomes order-dependent. Run the
+        // tests with `--test-threads=1` if that happens.
+        std::env::remove_var("AGNT5_LLM_CAPTURE_CONTENT");
+        assert!(should_capture_content());
     }
 
     #[test]
@@ -794,7 +803,13 @@ mod tests {
     }
 
     #[test]
-    fn test_serialize_input_messages() {
+    fn test_serialize_input_messages_excludes_system_prompt() {
+        // Per the docstring on `serialize_input_messages`, system
+        // instructions are NOT included — they're serialized separately
+        // via `serialize_system_instructions()` and live in the
+        // `gen_ai.system_instructions` attribute, not in `input.messages`.
+        // So the returned array should only contain the conversation
+        // messages (the user turn in this case).
         let request = GenerateRequest::new("gpt-4")
             .system_prompt("You are helpful")
             .user_message("Hello");
@@ -803,8 +818,13 @@ mod tests {
         assert!(serialized.is_array());
 
         let array = serialized.as_array().unwrap();
-        assert_eq!(array.len(), 2);
-        assert_eq!(array[0]["role"], "system");
-        assert_eq!(array[1]["role"], "user");
+        assert_eq!(array.len(), 1);
+        assert_eq!(array[0]["role"], "user");
+
+        // The system prompt is available through the separate serializer.
+        let system = serialize_system_instructions("You are helpful");
+        assert!(system.is_array());
+        assert_eq!(system.as_array().unwrap().len(), 1);
+        assert_eq!(system[0]["content"], "You are helpful");
     }
 }

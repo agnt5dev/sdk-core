@@ -13,22 +13,49 @@ use opentelemetry_sdk::{
     trace::SdkTracerProvider,
     Resource,
 };
-use std::sync::OnceLock;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use tracing_subscriber::{fmt::format::Writer, layer::SubscriberExt, Layer as _, EnvFilter, Registry};
 
-// Global storage for tenant_id and deployment_id (set at init time)
+// Global storage for legacy engine routing identity and worker resource attrs
+// (set at init time).
 static TENANT_ID: OnceLock<Option<String>> = OnceLock::new();
+static PROJECT_ID: OnceLock<Option<String>> = OnceLock::new();
 static DEPLOYMENT_ID: OnceLock<Option<String>> = OnceLock::new();
+static WORKSPACE_ID: OnceLock<Option<String>> = OnceLock::new();
+static AGNT5_ENVIRONMENT: OnceLock<Option<String>> = OnceLock::new();
+static AGNT5_USER_ID: OnceLock<Option<String>> = OnceLock::new();
+static TELEMETRY_INIT_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+const PLATFORM_WORKER_SERVICE_NAME: &str = "agnt5-worker";
+const PLATFORM_SERVICE_NAMESPACE: &str = "agnt5";
 
-/// Get the configured tenant_id (set from AGNT5_TENANT_ID env var)
+/// Get the configured legacy engine routing key.
+///
+/// On worker/runtime paths this currently carries project identity and is
+/// populated from `AGNT5_TENANT_ID` for backward compatibility.
 pub fn get_tenant_id() -> Option<&'static str> {
     TENANT_ID.get().and_then(|opt| opt.as_deref())
+}
+
+pub fn get_project_id() -> Option<&'static str> {
+    PROJECT_ID.get().and_then(|opt| opt.as_deref())
 }
 
 /// Get the configured deployment_id (set from AGNT5_DEPLOYMENT_ID env var)
 pub fn get_deployment_id() -> Option<&'static str> {
     DEPLOYMENT_ID.get().and_then(|opt| opt.as_deref())
+}
+
+pub fn get_workspace_id() -> Option<&'static str> {
+    WORKSPACE_ID.get().and_then(|opt| opt.as_deref())
+}
+
+pub fn get_agnt5_environment() -> Option<&'static str> {
+    AGNT5_ENVIRONMENT.get().and_then(|opt| opt.as_deref())
+}
+
+pub fn get_agnt5_user_id() -> Option<&'static str> {
+    AGNT5_USER_ID.get().and_then(|opt| opt.as_deref())
 }
 
 // Newtype wrapper to implement Extractor trait for HashMap (avoids orphan rule)
@@ -44,7 +71,7 @@ impl<'a> Extractor for HashMapExtractor<'a> {
     }
 }
 
-/// Custom field formatter that prioritizes run.id in log output
+/// Custom field formatter that prioritizes agnt5.run.id in log output
 struct RunFieldFormatter;
 
 impl<'writer> tracing_subscriber::fmt::format::FormatFields<'writer> for RunFieldFormatter {
@@ -64,7 +91,7 @@ impl<'writer> tracing_subscriber::fmt::format::FormatFields<'writer> for RunFiel
 
         impl<'a> Visit for FieldVisitor<'a> {
             fn record_str(&mut self, field: &Field, value: &str) {
-                if field.name() == "run.id" {
+                if field.name() == "agnt5.run.id" {
                     self.run_id = Some(value.to_string());
                 } else {
                     self.other_fields
@@ -74,7 +101,7 @@ impl<'writer> tracing_subscriber::fmt::format::FormatFields<'writer> for RunFiel
 
             fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
                 let formatted = format!("{:?}", value);
-                if field.name() == "run.id" {
+                if field.name() == "agnt5.run.id" {
                     self.run_id = Some(formatted);
                 } else {
                     self.other_fields
@@ -92,9 +119,9 @@ impl<'writer> tracing_subscriber::fmt::format::FormatFields<'writer> for RunFiel
 
         fields.record(&mut visitor);
 
-        // Write run.id first if present
+        // Write agnt5.run.id first if present
         if let Some(run_id) = visitor.run_id {
-            write!(visitor.writer, "run.id={} ", run_id)?;
+            write!(visitor.writer, "agnt5.run.id={} ", run_id)?;
         }
 
         // Write other fields
@@ -110,8 +137,17 @@ impl<'writer> tracing_subscriber::fmt::format::FormatFields<'writer> for RunFiel
 
 /// Initialize OpenTelemetry with OTLP exporter and structured logging
 pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), SdkError> {
+    match TELEMETRY_INIT_RESULT.get_or_init(|| {
+        init_telemetry_inner(service_name, service_version).map_err(|e| e.to_string())
+    }) {
+        Ok(()) => Ok(()),
+        Err(e) => Err(SdkError::Other(anyhow::anyhow!(e.clone()))),
+    }
+}
+
+fn init_telemetry_inner(service_name: &str, service_version: &str) -> Result<(), SdkError> {
     let otel_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-        .unwrap_or_else(|_| "http://localhost:4317".to_string());
+        .unwrap_or_else(|_| "https://grpc.agnt5.com:3418".to_string());
 
     tracing::debug!(
         "Initializing OpenTelemetry: endpoint={}, service={}",
@@ -123,27 +159,53 @@ pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), S
     // These are set by the control plane when deploying workers
     let deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").ok();
     let tenant_id = std::env::var("AGNT5_TENANT_ID").ok();
+    let project_id = std::env::var("AGNT5_PROJECT_ID").ok().or_else(|| tenant_id.clone());
+    let workspace_id = std::env::var("AGNT5_WORKSPACE_ID").ok();
+    let agnt5_environment = std::env::var("AGNT5_ENV").ok();
+    let agnt5_user_id = std::env::var("AGNT5_USER_ID").ok();
 
     // Store globally for use in span/metric/log creation
     let _ = TENANT_ID.set(tenant_id.clone());
+    let _ = PROJECT_ID.set(project_id.clone());
     let _ = DEPLOYMENT_ID.set(deployment_id.clone());
+    let _ = WORKSPACE_ID.set(workspace_id.clone());
+    let _ = AGNT5_ENVIRONMENT.set(agnt5_environment.clone());
+    let _ = AGNT5_USER_ID.set(agnt5_user_id.clone());
 
     // Create resource attributes
     let mut resource_attributes = vec![
         KeyValue::new("service.version", service_version.to_string()),
     ];
 
+    if let Some(ref project_id) = project_id {
+        resource_attributes.push(KeyValue::new("agnt5.project.id", project_id.clone()));
+    }
+    if let Some(ref workspace_id) = workspace_id {
+        resource_attributes.push(KeyValue::new("agnt5.workspace.id", workspace_id.clone()));
+    }
     if let Some(ref deployment_id) = deployment_id {
-        resource_attributes.push(KeyValue::new("deployment.id", deployment_id.clone()));
+        resource_attributes.push(KeyValue::new("agnt5.deployment.id", deployment_id.clone()));
+    }
+    if let Some(ref environment) = agnt5_environment {
+        resource_attributes.push(KeyValue::new("agnt5.environment", environment.clone()));
+    }
+    if let Some(ref user_id) = agnt5_user_id {
+        resource_attributes.push(KeyValue::new("agnt5.user", user_id.clone()));
     }
 
-    if let Some(ref tenant_id) = tenant_id {
-        resource_attributes.push(KeyValue::new("tenant.id", tenant_id.clone()));
+    resource_attributes.push(KeyValue::new("service.namespace", PLATFORM_SERVICE_NAMESPACE));
+    resource_attributes.push(KeyValue::new("agnt5.app_name", service_name.to_string()));
+
+    if let Ok(worker_id) = std::env::var("AGNT5_WORKER_ID") {
+        if !worker_id.is_empty() {
+            resource_attributes.push(KeyValue::new("agnt5.worker.id", worker_id.clone()));
+            resource_attributes.push(KeyValue::new("service.instance.id", worker_id));
+        }
     }
 
     // Create resource with service information and deployment/tenant IDs
     let resource = Resource::builder()
-        .with_service_name(service_name.to_string())
+        .with_service_name(PLATFORM_WORKER_SERVICE_NAME.to_string())
         .with_attributes(resource_attributes)
         .build();
 
@@ -175,9 +237,9 @@ pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), S
         .with_resource(resource.clone())
         .with_batch_exporter(filtering_exporter);
 
-    // NOTE: Journal export for real-time SSE streaming is NOT done via the tracer provider.
-    // Instead, the worker code directly calls export_span_to_journal() after streaming spans end.
-    // This avoids BatchSpanProcessor delays and Tokio runtime issues, providing true real-time delivery.
+    // NOTE: Real-time SSE streaming events go through the unified JournalEventQueue.
+    // The flush task routes SSE-only events via EventStream and boundary events via
+    // WriteJournalEventsBatch — both directly to EE, bypassing the dispatch stream.
 
     // Build tracer provider
     let trace_provider = trace_provider_builder.build();
@@ -238,12 +300,14 @@ pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), S
         .map(|v| v == "1" || v.to_lowercase() == "true")
         .unwrap_or(false);
 
-    // Console filter: controlled by RUST_LOG / AGNT5_DEBUG, keeps output clean in production
+    // Console filter: controlled by RUST_LOG / AGNT5_DEBUG, keeps output clean in production.
+    // opentelemetry*=warn surfaces OTLP exporter failures (unreachable collector, TLS
+    // errors, etc.) that the SDK would otherwise swallow silently.
     let console_directive = std::env::var("RUST_LOG").unwrap_or_else(|_| {
         if debug_enabled {
-            "agnt5=debug,agnt5_sdk_python=debug,h2=error,hyper=error,tonic=warn,tower=warn".to_string()
+            "agnt5=debug,agnt5_sdk_python=debug,h2=error,hyper=error,tonic=warn,tower=warn,opentelemetry=warn,opentelemetry_sdk=warn,opentelemetry_otlp=warn".to_string()
         } else {
-            "agnt5=warn,agnt5_sdk_python=warn,h2=error,hyper=error,tonic=error,tower=error".to_string()
+            "agnt5=warn,agnt5_sdk_python=warn,h2=error,hyper=error,tonic=error,tower=error,opentelemetry=warn,opentelemetry_sdk=warn,opentelemetry_otlp=warn".to_string()
         }
     });
     let console_filter = EnvFilter::new(&console_directive);
@@ -251,11 +315,13 @@ pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), S
     // OTLP filter: user application logs (agnt5_sdk_python, agnt5_sdk_typescript) always
     // exported at all levels, so the control plane can query them by log_source="application" + run_id.
     // Platform-internal logs stay at warn. Override with AGNT5_OTEL_LOG_FILTER.
+    // Note: opentelemetry* is excluded here to avoid feedback loops (export failures
+    // being logged to the exporter that's failing).
     let otel_directive = std::env::var("AGNT5_OTEL_LOG_FILTER").unwrap_or_else(|_| {
         if debug_enabled {
-            "agnt5=debug,agnt5_sdk_python=trace,agnt5_sdk_typescript=trace,h2=error,hyper=error,tonic=warn,tower=warn".to_string()
+            "agnt5=debug,agnt5_sdk_python=trace,agnt5_sdk_typescript=trace,h2=error,hyper=error,tonic=warn,tower=warn,opentelemetry=off,opentelemetry_sdk=off,opentelemetry_otlp=off".to_string()
         } else {
-            "agnt5=warn,agnt5_sdk_python=trace,agnt5_sdk_typescript=trace,h2=error,hyper=error,tonic=error,tower=error".to_string()
+            "agnt5=warn,agnt5_sdk_python=trace,agnt5_sdk_typescript=trace,h2=error,hyper=error,tonic=error,tower=error,opentelemetry=off,opentelemetry_sdk=off,opentelemetry_otlp=off".to_string()
         }
     });
     let otel_filter = EnvFilter::new(&otel_directive);
@@ -345,17 +411,22 @@ pub fn create_component_span(
     let mut attributes = vec![
         KeyValue::new("component.name", component_name.to_string()),
         KeyValue::new("component.type", component_type.to_string()),
-        KeyValue::new("service.name", service_name.to_string()),
-        KeyValue::new("worker.id", worker_id.to_string()),
-        KeyValue::new("run.id", run_id.to_string()),
+        KeyValue::new("service.name", PLATFORM_WORKER_SERVICE_NAME),
+        KeyValue::new("service.namespace", PLATFORM_SERVICE_NAMESPACE),
+        KeyValue::new("agnt5.app_name", service_name.to_string()),
+        KeyValue::new("agnt5.worker.id", worker_id.to_string()),
+        KeyValue::new("service.instance.id", worker_id.to_string()),
+        KeyValue::new("agnt5.run.id", run_id.to_string()),
     ];
 
-    // Add tenant_id and deployment_id from global config
-    if let Some(tid) = get_tenant_id() {
-        attributes.push(KeyValue::new("tenant.id", tid.to_string()));
+    if let Some(pid) = get_project_id() {
+        attributes.push(KeyValue::new("agnt5.project.id", pid.to_string()));
+    }
+    if let Some(wid) = get_workspace_id() {
+        attributes.push(KeyValue::new("agnt5.workspace.id", wid.to_string()));
     }
     if let Some(did) = get_deployment_id() {
-        attributes.push(KeyValue::new("deployment.id", did.to_string()));
+        attributes.push(KeyValue::new("agnt5.deployment.id", did.to_string()));
     }
 
     // Extract baggage items as span attributes if parent context exists
@@ -374,8 +445,13 @@ pub fn create_component_span(
         for (key, value) in meta.iter() {
             // Map known keys to their canonical names
             let attr_key = match key.as_str() {
-                "tenant_id" => "tenant.id".to_string(),
-                "run_id" => "run.id".to_string(),
+                "tenant_id" => "agnt5.project.id".to_string(),
+                "sub_tenant" => "agnt5.tenant.id".to_string(),
+                "customer_tenant_id" => "agnt5.tenant.id".to_string(),
+                "project_id" => "agnt5.project.id".to_string(),
+                "workspace_id" => "agnt5.workspace.id".to_string(),
+                "deployment_id" => "agnt5.deployment.id".to_string(),
+                "run_id" => "agnt5.run.id".to_string(),
                 "step_name" => "function.step_name".to_string(),
                 "attempt" | "attempt_number" | "step_attempt" => {
                     // Try to parse as integer for step_attempt
@@ -448,12 +524,14 @@ pub fn create_tool_execution_span(
         KeyValue::new("gen_ai.tool.name", tool_name.to_string()),
     ];
 
-    // Add tenant_id and deployment_id from global config
-    if let Some(tid) = get_tenant_id() {
-        attributes.push(KeyValue::new("tenant.id", tid.to_string()));
+    if let Some(pid) = get_project_id() {
+        attributes.push(KeyValue::new("agnt5.project.id", pid.to_string()));
+    }
+    if let Some(wid) = get_workspace_id() {
+        attributes.push(KeyValue::new("agnt5.workspace.id", wid.to_string()));
     }
     if let Some(did) = get_deployment_id() {
-        attributes.push(KeyValue::new("deployment.id", did.to_string()));
+        attributes.push(KeyValue::new("agnt5.deployment.id", did.to_string()));
     }
 
     // Optional attributes
@@ -507,6 +585,61 @@ pub fn record_tool_success(span: &mut BoxedSpan, result: Option<&str>) {
 pub fn record_tool_error(span: &mut BoxedSpan, error_msg: &str) {
     span.set_attribute(KeyValue::new("gen_ai.tool.status", "error"));
     span.set_attribute(KeyValue::new("gen_ai.tool.error", error_msg.to_string()));
+    span.set_status(Status::error(error_msg.to_string()));
+}
+
+/// Create a span for sandbox execution
+pub fn create_sandbox_span(
+    operation: &str,
+    backend: &str,
+    language: Option<&str>,
+) -> BoxedSpan {
+    let tracer = global::tracer("agnt5-sdk-core");
+    let span_name = format!("sandbox.{}", operation);
+
+    let mut attributes = vec![
+        KeyValue::new("sandbox.operation", operation.to_string()),
+        KeyValue::new("sandbox.backend", backend.to_string()),
+    ];
+
+    if let Some(lang) = language {
+        attributes.push(KeyValue::new("sandbox.language", lang.to_string()));
+    }
+
+    if let Some(pid) = get_project_id() {
+        attributes.push(KeyValue::new("agnt5.project.id", pid.to_string()));
+    }
+    if let Some(wid) = get_workspace_id() {
+        attributes.push(KeyValue::new("agnt5.workspace.id", wid.to_string()));
+    }
+    if let Some(did) = get_deployment_id() {
+        attributes.push(KeyValue::new("agnt5.deployment.id", did.to_string()));
+    }
+
+    // Sandbox execution is INTERNAL for wasm, CLIENT for remote
+    let kind = if backend == "remote" {
+        SpanKind::Client
+    } else {
+        SpanKind::Internal
+    };
+
+    tracer
+        .span_builder(span_name)
+        .with_kind(kind)
+        .with_attributes(attributes)
+        .start(&tracer)
+}
+
+/// Record sandbox execution success
+pub fn record_sandbox_success(span: &mut BoxedSpan, exit_code: i32, execution_time_ms: u64) {
+    span.set_attribute(KeyValue::new("sandbox.exit_code", exit_code as i64));
+    span.set_attribute(KeyValue::new("sandbox.execution_time_ms", execution_time_ms as i64));
+    span.set_status(Status::Ok);
+}
+
+/// Record sandbox execution error
+pub fn record_sandbox_error(span: &mut BoxedSpan, error_msg: &str) {
+    span.set_attribute(KeyValue::new("sandbox.error", error_msg.to_string()));
     span.set_status(Status::error(error_msg.to_string()));
 }
 
@@ -582,12 +715,14 @@ pub fn record_execution_request(component_name: &str, component_type: &str) {
         KeyValue::new("component.type", component_type.to_string()),
     ];
 
-    // Add tenant_id and deployment_id from global config
-    if let Some(tid) = get_tenant_id() {
-        attrs.push(KeyValue::new("tenant.id", tid.to_string()));
+    if let Some(pid) = get_project_id() {
+        attrs.push(KeyValue::new("agnt5.project.id", pid.to_string()));
+    }
+    if let Some(wid) = get_workspace_id() {
+        attrs.push(KeyValue::new("agnt5.workspace.id", wid.to_string()));
     }
     if let Some(did) = get_deployment_id() {
-        attrs.push(KeyValue::new("deployment.id", did.to_string()));
+        attrs.push(KeyValue::new("agnt5.deployment.id", did.to_string()));
     }
 
     counter.add(1, &attrs);
@@ -605,12 +740,14 @@ pub fn record_execution_request_with_attrs(
         KeyValue::new("component.type", component_type.to_string()),
     ];
 
-    // Add tenant_id and deployment_id from global config
-    if let Some(tid) = get_tenant_id() {
-        attrs.push(KeyValue::new("tenant.id", tid.to_string()));
+    if let Some(pid) = get_project_id() {
+        attrs.push(KeyValue::new("agnt5.project.id", pid.to_string()));
+    }
+    if let Some(wid) = get_workspace_id() {
+        attrs.push(KeyValue::new("agnt5.workspace.id", wid.to_string()));
     }
     if let Some(did) = get_deployment_id() {
-        attrs.push(KeyValue::new("deployment.id", did.to_string()));
+        attrs.push(KeyValue::new("agnt5.deployment.id", did.to_string()));
     }
 
     attrs.extend_from_slice(additional_attrs);
@@ -666,11 +803,14 @@ fn get_connection_state_gauge() -> &'static Gauge<i64> {
 /// Build common attributes for reconnection metrics
 fn reconnection_attrs() -> Vec<KeyValue> {
     let mut attrs = Vec::new();
-    if let Some(tid) = get_tenant_id() {
-        attrs.push(KeyValue::new("tenant.id", tid.to_string()));
+    if let Some(pid) = get_project_id() {
+        attrs.push(KeyValue::new("agnt5.project.id", pid.to_string()));
+    }
+    if let Some(wid) = get_workspace_id() {
+        attrs.push(KeyValue::new("agnt5.workspace.id", wid.to_string()));
     }
     if let Some(did) = get_deployment_id() {
-        attrs.push(KeyValue::new("deployment.id", did.to_string()));
+        attrs.push(KeyValue::new("agnt5.deployment.id", did.to_string()));
     }
     attrs
 }
@@ -743,11 +883,14 @@ pub fn record_checkpoint(
         KeyValue::new("success", success),
     ];
 
-    if let Some(tid) = get_tenant_id() {
-        attrs.push(KeyValue::new("tenant.id", tid.to_string()));
+    if let Some(pid) = get_project_id() {
+        attrs.push(KeyValue::new("agnt5.project.id", pid.to_string()));
+    }
+    if let Some(wid) = get_workspace_id() {
+        attrs.push(KeyValue::new("agnt5.workspace.id", wid.to_string()));
     }
     if let Some(did) = get_deployment_id() {
-        attrs.push(KeyValue::new("deployment.id", did.to_string()));
+        attrs.push(KeyValue::new("agnt5.deployment.id", did.to_string()));
     }
     if let Some(eid) = experiment_id {
         attrs.push(KeyValue::new("experiment.id", eid.to_string()));
@@ -761,9 +904,11 @@ pub fn record_checkpoint(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_telemetry_init() {
-        // Simple test to ensure init function works
+    #[tokio::test]
+    async fn test_telemetry_init() {
+        // `init_telemetry` constructs an OTLP exporter which uses a
+        // tonic/hyper client under the hood and therefore needs a live
+        // Tokio reactor — hence `#[tokio::test]`, not `#[test]`.
         assert!(init_telemetry("test-service", "1.0.0").is_ok());
     }
 }

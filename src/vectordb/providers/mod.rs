@@ -1,11 +1,15 @@
 // Vector database provider implementations
-pub mod agnt5;
 pub mod pgvector;
 pub mod pinecone;
+#[cfg(feature = "qdrant")]
 pub mod qdrant;
 
 // Re-export provider types for convenience
-pub use agnt5::{Agnt5Provider, Agnt5ProviderConfig};
 pub use pgvector::PgVectorProvider;
 pub use pinecone::PineconeProvider;
+#[cfg(feature = "qdrant")]
 pub use qdrant::QdrantProvider;
+
+// Note: Agnt5Provider (platform gateway proxy) was removed — it targeted
+// the old Go gateway which no longer exists in the Rust runtime.
+// Users should use direct providers (Qdrant, Pinecone, pgvector) instead.

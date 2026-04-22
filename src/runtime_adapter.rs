@@ -375,4 +375,195 @@ impl EntityStateManager {
             ))),
         }
     }
+
+    // -------------------------------------------------------------------
+    // Session / Message operations (Phase 2 — conversation memory)
+    // -------------------------------------------------------------------
+
+    /// Send a message to a conversation thread
+    pub async fn send_message(
+        &self,
+        correlation_id: String,
+        message_type: String,
+        payload: Vec<u8>,
+        from_service: String,
+    ) -> Result<String> {
+        use crate::pb::{runtime_service_request, MessageSendRequest, RuntimeServiceRequest, ServiceMessage};
+
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let (response_tx, response_rx) = oneshot::channel();
+        self.pending_requests.lock().await.insert(request_id.clone(), response_tx);
+
+        let request = RuntimeServiceRequest {
+            request_id: request_id.clone(),
+            session_id: self.session_id.clone(),
+            operation: Some(runtime_service_request::Operation::MessageSend(
+                MessageSendRequest {
+                    correlation_id,
+                    message_type,
+                    payload,
+                    from_service,
+                }
+            )),
+        };
+
+        let message = ServiceMessage {
+            worker_id: String::new(),
+            metadata: HashMap::new(),
+            message_type: Some(crate::pb::service_message::MessageType::RuntimeService(request)),
+        };
+
+        self.stream_sender.send_async(message).await
+            .map_err(|e| crate::error::SdkError::Connection {
+                message: format!("Failed to send message request: {}", e),
+                code: crate::error::ErrorCode::ConnectionFailed,
+                source: None,
+            })?;
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            response_rx
+        ).await
+            .map_err(|_| crate::error::SdkError::Other(anyhow::anyhow!("Message send timeout")))?
+            .map_err(|_| crate::error::SdkError::Other(anyhow::anyhow!("Response channel closed")))?;
+
+        if !response.success {
+            return Err(crate::error::SdkError::Other(anyhow::anyhow!(
+                "Message send failed: {}", response.error_message
+            )));
+        }
+
+        match response.result {
+            Some(crate::pb::runtime_service_response::Result::MessageSend(result)) => {
+                Ok(result.message_id)
+            }
+            _ => Err(crate::error::SdkError::Other(anyhow::anyhow!(
+                "Unexpected response type for message send"
+            ))),
+        }
+    }
+
+    /// List messages in a conversation by correlation ID
+    pub async fn list_messages(
+        &self,
+        correlation_id: String,
+        limit: i32,
+    ) -> Result<Vec<Vec<u8>>> {
+        use crate::pb::{runtime_service_request, MessageListRequest, RuntimeServiceRequest, ServiceMessage};
+
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let (response_tx, response_rx) = oneshot::channel();
+        self.pending_requests.lock().await.insert(request_id.clone(), response_tx);
+
+        let request = RuntimeServiceRequest {
+            request_id: request_id.clone(),
+            session_id: self.session_id.clone(),
+            operation: Some(runtime_service_request::Operation::MessageList(
+                MessageListRequest {
+                    correlation_id,
+                    limit,
+                    after_message_id: String::new(),
+                }
+            )),
+        };
+
+        let message = ServiceMessage {
+            worker_id: String::new(),
+            metadata: HashMap::new(),
+            message_type: Some(crate::pb::service_message::MessageType::RuntimeService(request)),
+        };
+
+        self.stream_sender.send_async(message).await
+            .map_err(|e| crate::error::SdkError::Connection {
+                message: format!("Failed to send message list request: {}", e),
+                code: crate::error::ErrorCode::ConnectionFailed,
+                source: None,
+            })?;
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            response_rx
+        ).await
+            .map_err(|_| crate::error::SdkError::Other(anyhow::anyhow!("Message list timeout")))?
+            .map_err(|_| crate::error::SdkError::Other(anyhow::anyhow!("Response channel closed")))?;
+
+        if !response.success {
+            return Err(crate::error::SdkError::Other(anyhow::anyhow!(
+                "Message list failed: {}", response.error_message
+            )));
+        }
+
+        match response.result {
+            Some(crate::pb::runtime_service_response::Result::MessageList(result)) => {
+                Ok(result.messages)
+            }
+            _ => Err(crate::error::SdkError::Other(anyhow::anyhow!(
+                "Unexpected response type for message list"
+            ))),
+        }
+    }
+
+    /// Create a session
+    pub async fn create_session(
+        &self,
+        session_id: String,
+        component_name: String,
+        session_type: String,
+    ) -> Result<String> {
+        use crate::pb::{runtime_service_request, SessionCreateRequest, RuntimeServiceRequest, ServiceMessage};
+
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let (response_tx, response_rx) = oneshot::channel();
+        self.pending_requests.lock().await.insert(request_id.clone(), response_tx);
+
+        let request = RuntimeServiceRequest {
+            request_id: request_id.clone(),
+            session_id: self.session_id.clone(),
+            operation: Some(runtime_service_request::Operation::SessionCreate(
+                SessionCreateRequest {
+                    session_id,
+                    component_name,
+                    session_type,
+                    state: vec![],
+                    metadata: vec![],
+                    expires_at_ns: 0,
+                }
+            )),
+        };
+
+        let message = ServiceMessage {
+            worker_id: String::new(),
+            metadata: HashMap::new(),
+            message_type: Some(crate::pb::service_message::MessageType::RuntimeService(request)),
+        };
+
+        self.stream_sender.send_async(message).await
+            .map_err(|e| crate::error::SdkError::Connection {
+                message: format!("Failed to send session create request: {}", e),
+                code: crate::error::ErrorCode::ConnectionFailed,
+                source: None,
+            })?;
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            response_rx
+        ).await
+            .map_err(|_| crate::error::SdkError::Other(anyhow::anyhow!("Session create timeout")))?
+            .map_err(|_| crate::error::SdkError::Other(anyhow::anyhow!("Response channel closed")))?;
+
+        if !response.success {
+            return Err(crate::error::SdkError::Other(anyhow::anyhow!(
+                "Session create failed: {}", response.error_message
+            )));
+        }
+
+        match response.result {
+            Some(crate::pb::runtime_service_response::Result::SessionCreate(result)) => {
+                Ok(result.session_id)
+            }
+            _ => Err(crate::error::SdkError::Other(anyhow::anyhow!(
+                "Unexpected response type for session create"
+            ))),
+        }
+    }
 }

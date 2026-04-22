@@ -42,6 +42,12 @@ pub enum ErrorCode {
     // Internal errors
     InternalError,
     NotImplemented,
+
+    // Sandbox errors
+    SandboxExecutionFailed,
+    SandboxUnavailable,
+    UnsupportedLanguage,
+    UnsupportedOperation,
 }
 
 #[derive(Error, Debug)]
@@ -72,6 +78,12 @@ pub enum SdkError {
     Registration {
         message: String,
         code: ErrorCode,
+    },
+
+    #[error("Worker registration redirected to {endpoint}: {message}")]
+    RegistrationRedirect {
+        endpoint: String,
+        message: String,
     },
 
     #[error("Invalid configuration: {message}")]
@@ -148,6 +160,13 @@ pub enum SdkError {
         message: String,
         request_id: Option<String>,
     },
+
+    #[error("Sandbox error ({operation}): {message}")]
+    Sandbox {
+        message: String,
+        operation: String,
+        code: ErrorCode,
+    },
 }
 
 impl SdkError {
@@ -157,6 +176,7 @@ impl SdkError {
             Self::Transport(_) | Self::Status(_) => ErrorCode::ConnectionFailed,
             Self::Connection { code, .. } => *code,
             Self::Registration { code, .. } => *code,
+            Self::RegistrationRedirect { .. } => ErrorCode::ConnectionFailed,
             Self::Configuration { .. } => ErrorCode::InvalidConfiguration,
             Self::Invocation { .. } => ErrorCode::ExecutionFailed,
             Self::State { code, .. } => *code,
@@ -178,6 +198,7 @@ impl SdkError {
                 500 | 502 | 503 | 504 | 529 => ErrorCode::ServiceUnavailable,
                 _ => ErrorCode::InvalidInput,
             },
+            Self::Sandbox { code, .. } => *code,
         }
     }
 
@@ -193,6 +214,7 @@ impl SdkError {
                 }
                 _ => RetryHint::NotRetryable,
             },
+            Self::RegistrationRedirect { .. } => RetryHint::Retryable,
 
             // Service unavailable is retryable
             Self::Unavailable { .. } => RetryHint::RetryableWithBackoff,
@@ -232,6 +254,12 @@ impl SdkError {
             // LM API errors: retry on transient HTTP status codes
             Self::LmApiError { status, .. } => match *status {
                 408 | 429 | 500 | 502 | 503 | 504 | 529 => RetryHint::RetryableWithBackoff,
+                _ => RetryHint::NotRetryable,
+            },
+
+            // Sandbox errors
+            Self::Sandbox { code, .. } => match code {
+                ErrorCode::SandboxUnavailable => RetryHint::RetryableWithBackoff,
                 _ => RetryHint::NotRetryable,
             },
         }

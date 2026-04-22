@@ -1,4 +1,4 @@
-use crate::client::WorkerCoordinatorClient;
+use crate::client::{self, EngineClient, WorkerCoordinatorClient};
 use crate::error::Result;
 use crate::journal_queue::{JournalEventMessage, JournalEventQueue, JournalQueueConfig};
 use crate::pb::{
@@ -14,6 +14,8 @@ use tokio::sync::Mutex as TokioMutex;
 use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+use crate::coordinator_routing::CoordinatorRouting;
 
 /// Connection states for tracking worker status
 #[derive(Debug, Clone, PartialEq)]
@@ -43,6 +45,12 @@ pub struct WorkerConfig {
     /// 0 = infinite retry (worker never exits due to connection issues)
     /// Default: 5
     pub max_retries: u32,
+
+    /// AGNT5 Engine endpoint for direct event writes.
+    /// When set, all event paths (checkpoints, boundary, SSE-only) route to the engine's
+    /// Append/AppendBatch RPCs instead of the Go Execution Engine.
+    /// Env: AGNT5_ENGINE_URL. None = use Go EE (default).
+    pub engine_endpoint: Option<String>,
 }
 
 impl WorkerConfig {
@@ -65,6 +73,9 @@ impl WorkerConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(5);
 
+        // Engine endpoint — when set, bypasses Go EE for all event writes.
+        let engine_endpoint = std::env::var("AGNT5_ENGINE_URL").ok();
+
         Self {
             service_name,
             service_version,
@@ -73,7 +84,13 @@ impl WorkerConfig {
             coordinator_endpoint,
             ee_endpoint,
             max_retries,
+            engine_endpoint,
         }
+    }
+
+    pub fn resolved_coordinator_endpoint(&self) -> String {
+        let routing = CoordinatorRouting::from_env();
+        routing.endpoint_for_worker(&self.worker_id, &self.coordinator_endpoint)
     }
 }
 
@@ -100,13 +117,49 @@ pub fn is_sensitive_env_var(key: &str) -> bool {
 }
 
 /// Collect all AGNT5_* environment variables for registration metadata
-/// Excludes sensitive variables based on blacklist patterns
+/// Excludes sensitive variables based on blacklist patterns.
+/// Also injects system info (hostname, OS, arch) as AGNT5_SYS_* keys.
 pub fn collect_agnt5_env_vars() -> HashMap<String, String> {
     let mut metadata = HashMap::new();
     for (key, value) in std::env::vars() {
         if key.starts_with("AGNT5_") && !is_sensitive_env_var(&key) {
             metadata.insert(key, value);
         }
+    }
+
+    // System info — always set, not overridable by env vars
+    if let Ok(h) = hostname::get() {
+        metadata.insert("AGNT5_SYS_HOSTNAME".into(), h.to_string_lossy().into_owned());
+    }
+    metadata.insert("AGNT5_SYS_OS".into(), std::env::consts::OS.into());
+    metadata.insert("AGNT5_SYS_ARCH".into(), std::env::consts::ARCH.into());
+
+    metadata
+}
+
+fn canonical_project_id_from_metadata(metadata: &HashMap<String, String>) -> Option<String> {
+    metadata
+        .get("project_id")
+        .cloned()
+        .or_else(|| metadata.get("tenant_id").cloned())
+}
+
+fn canonical_project_id_from_env() -> String {
+    std::env::var("AGNT5_PROJECT_ID")
+        .ok()
+        .or_else(|| std::env::var("AGNT5_TENANT_ID").ok())
+        .unwrap_or_default()
+}
+
+fn with_project_metadata(mut metadata: HashMap<String, String>, project_id: &str) -> HashMap<String, String> {
+    if !project_id.is_empty() {
+        metadata
+            .entry("project_id".to_string())
+            .or_insert_with(|| project_id.to_string());
+        // Legacy compatibility for coordinator/engine paths that still expect tenant_id.
+        metadata
+            .entry("tenant_id".to_string())
+            .or_insert_with(|| project_id.to_string());
     }
     metadata
 }
@@ -129,12 +182,23 @@ pub struct Worker {
     /// Tracks which run_ids have is_streaming=true. Ephemeral events are skipped
     /// for non-streaming runs since nobody is listening via SSE.
     streaming_runs: Arc<std::sync::Mutex<HashMap<String, bool>>>,
+    /// Phase 5: lease_id stash keyed by invocation_id. Populated on
+    /// DispatchComponentRequest receipt (when req.lease_id is non-empty) and
+    /// drained on response forward so the echoed lease_id lands in
+    /// DispatchComponentResponse.lease_id without requiring language bindings
+    /// to thread the value through their handler code.
+    pending_lease_ids: Arc<std::sync::Mutex<HashMap<String, String>>>,
     /// EventStream sender for SSE-only events (EE path). Set during run().
     event_stream_tx: Arc<std::sync::Mutex<Option<flume::Sender<EventStreamMessage>>>>,
     /// Dispatch stream sender (bidirectional gRPC to WC). Used by emit_checkpoint_sync
     /// to flush pending SSE-only events before terminal checkpoints, ensuring they
     /// arrive while the invocation is still tracked in pendingStreamInvocations.
     dispatch_tx: Arc<std::sync::Mutex<Option<flume::Sender<ServiceMessage>>>>,
+    /// Sticky owner endpoint learned from a registration redirect.
+    owner_endpoint_hint: Arc<std::sync::Mutex<Option<String>>>,
+    /// Lazily-connected Engine gRPC client. When AGNT5_ENGINE_URL is set, all event paths
+    /// route through this client instead of the Go EE.
+    engine_client: Arc<TokioMutex<Option<EngineClient>>>,
 }
 
 // Implement Debug manually to avoid requiring Debug on JournalEventQueue's internals
@@ -175,8 +239,11 @@ impl Worker {
             ee_client: Arc::new(TokioMutex::new(None)),
             tokio_handle: Arc::new(std::sync::Mutex::new(None)),
             streaming_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            pending_lease_ids: Arc::new(std::sync::Mutex::new(HashMap::new())),
             event_stream_tx: Arc::new(std::sync::Mutex::new(None)),
             dispatch_tx: Arc::new(std::sync::Mutex::new(None)),
+            owner_endpoint_hint: Arc::new(std::sync::Mutex::new(None)),
+            engine_client: Arc::new(TokioMutex::new(None)),
         }
     }
 
@@ -218,6 +285,30 @@ impl Worker {
         *guard = state;
     }
 
+    fn preferred_coordinator_endpoint(&self) -> String {
+        if let Ok(guard) = self.owner_endpoint_hint.lock() {
+            if let Some(endpoint) = guard.clone() {
+                return endpoint;
+            }
+        }
+        self.config.resolved_coordinator_endpoint()
+    }
+
+    fn set_owner_endpoint_hint(&self, endpoint: Option<String>) {
+        if let Ok(mut guard) = self.owner_endpoint_hint.lock() {
+            *guard = endpoint;
+        }
+    }
+
+    fn clear_owner_endpoint_hint(&self) -> bool {
+        if let Ok(mut guard) = self.owner_endpoint_hint.lock() {
+            let had_hint = guard.is_some();
+            *guard = None;
+            return had_hint;
+        }
+        false
+    }
+
     /// Queue a journal event for delivery to the platform
     ///
     /// This is the unified method for queueing all event types. Events are classified as:
@@ -249,6 +340,7 @@ impl Worker {
         correlation_id: String,
         parent_correlation_id: String,
     ) -> Result<()> {
+        let tenant_id = canonical_project_id_from_metadata(&metadata);
         let event = JournalEventMessage {
             run_id: invocation_id,
             event_type: checkpoint_type,
@@ -258,6 +350,7 @@ impl Worker {
             source_timestamp_ns,
             correlation_id,
             parent_correlation_id,
+            tenant_id,
             is_sse_only: false, // Checkpoints are boundary events (persisted)
             queued_at: std::time::Instant::now(),
             ..Default::default()
@@ -319,6 +412,26 @@ impl Worker {
         Ok(client)
     }
 
+    /// Ensure the Engine gRPC client is connected, lazily creating it on first use.
+    /// Returns None if AGNT5_ENGINE_URL is not configured.
+    async fn ensure_engine_client(&self) -> Result<Option<EngineClient>> {
+        let endpoint = match &self.config.engine_endpoint {
+            Some(ep) => ep.clone(),
+            None => return Ok(None),
+        };
+
+        let mut guard = self.engine_client.lock().await;
+        if let Some(ref client) = *guard {
+            return Ok(Some(client.clone()));
+        }
+
+        debug!("Connecting Engine client to {}", endpoint);
+        let client = EngineClient::connect(&endpoint).await?;
+        *guard = Some(client.clone());
+        debug!("Engine client connected to {}", endpoint);
+        Ok(Some(client))
+    }
+
     /// Emit a checkpoint event synchronously and wait for acknowledgement.
     ///
     /// Sends a WriteCheckpoint unary RPC directly to the Execution Engine.
@@ -347,6 +460,109 @@ impl Worker {
         source_timestamp_ns: i64,
         timeout_ms: u64,
     ) -> Result<()> {
+        // ── Engine path: when AGNT5_ENGINE_URL is set, route directly to engine ──
+        if let Some(mut engine) = self.ensure_engine_client().await? {
+            // Before terminal checkpoints, flush any pending events for this run
+            // directly to the engine via AppendBatch.
+            if event_type == "run.completed" || event_type == "run.failed" {
+                let pending = self.journal_queue.drain_run_events(&run_id);
+                if !pending.is_empty() {
+                    let tenant_id = canonical_project_id_from_metadata(&metadata)
+                        .or_else(|| canonical_project_id_from_metadata(&self.metadata))
+                        .unwrap_or_default();
+                    let records: Vec<_> = pending.iter().map(|e| {
+                        client::build_engine_record(
+                            tenant_id.clone(),
+                            e.run_id.clone(),
+                            e.event_type.clone(),
+                            e.data.clone(),
+                            e.source_timestamp_ns,
+                            String::new(),
+                            e.correlation_id.clone(),
+                            e.parent_correlation_id.clone(),
+                            e.metadata.clone(),
+                        )
+                    }).collect();
+                    if let Err(e) = engine.append_batch(records).await {
+                        warn!("Engine: failed to flush {} pre-checkpoint events for run_id={}: {}", pending.len(), run_id, e);
+                    } else {
+                        debug!("Engine: flushed {} events before {} for run_id={}", pending.len(), event_type, run_id);
+                    }
+                }
+            }
+
+            let mut merged_metadata = metadata;
+            for (k, v) in &self.metadata {
+                if !merged_metadata.contains_key(k) {
+                    merged_metadata.insert(k.clone(), v.clone());
+                }
+            }
+            let canonical_project_id = canonical_project_id_from_metadata(&merged_metadata).unwrap_or_default();
+            merged_metadata = with_project_metadata(merged_metadata, &canonical_project_id);
+            let correlation_id = merged_metadata.remove("cid").unwrap_or_default();
+            let parent_event_id = merged_metadata.remove("pcid").unwrap_or_default();
+            let tenant_id = merged_metadata
+                .remove("project_id")
+                .or_else(|| merged_metadata.remove("tenant_id"))
+                .unwrap_or_default();
+            let experiment_id = merged_metadata.get("experiment_id").cloned();
+
+            let record = client::build_engine_record(
+                tenant_id,
+                run_id.clone(),
+                event_type.clone(),
+                event_data,
+                source_timestamp_ns,
+                String::new(), // step_key — checkpoints don't set this directly
+                correlation_id,
+                parent_event_id,
+                merged_metadata,
+            );
+
+            let timeout = Duration::from_millis(timeout_ms);
+            let start = Instant::now();
+            let result = match tokio::time::timeout(timeout, engine.append(record)).await {
+                Ok(Ok((_offset, _ts))) => {
+                    debug!(
+                        "Engine checkpoint persisted: run_id={} event_type={} seq={}",
+                        run_id, event_type, sequence_number
+                    );
+                    Ok(())
+                }
+                Ok(Err(e)) => {
+                    warn!(
+                        "Engine Append failed: run_id={} event_type={} seq={} error={}",
+                        run_id, event_type, sequence_number, e
+                    );
+                    // Clear cached client for reconnection
+                    {
+                        let mut guard = self.engine_client.lock().await;
+                        *guard = None;
+                    }
+                    Err(e)
+                }
+                Err(_) => {
+                    warn!(
+                        "Engine Append timeout after {}ms: run_id={} event_type={} seq={}",
+                        timeout_ms, run_id, event_type, sequence_number
+                    );
+                    Ok(()) // Graceful degradation
+                }
+            };
+
+            let duration_secs = start.elapsed().as_secs_f64();
+            crate::telemetry::record_checkpoint(
+                &event_type,
+                duration_secs,
+                result.is_ok(),
+                experiment_id.as_deref(),
+            );
+
+            return result;
+        }
+
+        // ── Legacy EE path (AGNT5_ENGINE_URL not set) ──
+
         // Before sending terminal checkpoints (run.completed/run.failed), flush any
         // pending SSE-only events (logs, deltas) for this run.
         // Route through EventStream (EE) which is the single SSE publisher.
@@ -366,7 +582,8 @@ impl Worker {
                             data: event.data.clone(),
                             trace_id: String::new(),
                             span_id: String::new(),
-                            tenant_id: event.metadata.get("tenant_id").cloned().unwrap_or_default(),
+                            tenant_id: canonical_project_id_from_metadata(&event.metadata)
+                                .unwrap_or_default(),
                             source_timestamp_ns: event.source_timestamp_ns,
                             worker_id: self.config.worker_id.clone(),
                         };
@@ -383,6 +600,14 @@ impl Worker {
                             meta.insert("pcid".to_string(), event.parent_correlation_id.clone());
                         }
 
+                        // Phase 5: look up stashed lease_id for this invocation so
+                        // SSE passthrough events carry the fence token. Intermediate
+                        // events don't drain the entry — terminal ack still needs it.
+                        let stashed_lease_id = if let Ok(map) = self.pending_lease_ids.lock() {
+                            map.get(&event.run_id).cloned().unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
                         let response = DispatchComponentResponse {
                             invocation_id: event.run_id.clone(),
                             success: true,
@@ -398,6 +623,7 @@ impl Worker {
                             sequence: event.sequence,
                             attempt: 0,
                             source_timestamp_ns: event.source_timestamp_ns,
+                            lease_id: stashed_lease_id,
                         };
 
                         let service_message = ServiceMessage {
@@ -424,6 +650,8 @@ impl Worker {
                 merged_metadata.insert(k.clone(), v.clone());
             }
         }
+        let canonical_project_id = canonical_project_id_from_metadata(&merged_metadata).unwrap_or_default();
+        merged_metadata = with_project_metadata(merged_metadata, &canonical_project_id);
 
         // Extract correlation/parent IDs from metadata
         let correlation_id = merged_metadata.remove("cid").unwrap_or_default();
@@ -438,7 +666,7 @@ impl Worker {
             checkpoint_data: event_data,
             sequence_number,
             trace_id: String::new(),
-            tenant_id: merged_metadata.get("tenant_id").cloned().unwrap_or_default(),
+            tenant_id: canonical_project_id,
             source_timestamp_ns,
             correlation_id,
             parent_event_id,
@@ -591,6 +819,57 @@ impl Worker {
         }
     }
 
+    /// Emit a batch of events in a single AppendBatch RPC.
+    ///
+    /// Used for non-terminal events (e.g., run.started + function.started) that
+    /// can be batched to reduce gRPC overhead. Each event tuple contains:
+    /// (run_id, event_type, data, sequence, metadata, timestamp_ns)
+    pub async fn emit_checkpoint_batch(
+        &self,
+        events: Vec<(String, String, Vec<u8>, i64, HashMap<String, String>, i64)>,
+    ) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(mut engine) = self.ensure_engine_client().await? {
+            let records: Vec<_> = events
+                .into_iter()
+                .map(|(run_id, event_type, data, _seq, metadata, ts)| {
+                    let mut merged = metadata;
+                    for (k, v) in &self.metadata {
+                        if !merged.contains_key(k) {
+                            merged.insert(k.clone(), v.clone());
+                        }
+                    }
+                    let cid = merged.remove("cid").unwrap_or_default();
+                    let pcid = merged.remove("pcid").unwrap_or_default();
+                    let canonical_project_id =
+                        canonical_project_id_from_metadata(&merged).unwrap_or_default();
+                    let mut merged = with_project_metadata(merged, &canonical_project_id);
+                    let tenant_id = merged
+                        .remove("project_id")
+                        .or_else(|| merged.remove("tenant_id"))
+                        .unwrap_or_default();
+
+                    client::build_engine_record(
+                        tenant_id, run_id, event_type, data, ts,
+                        String::new(), cid, pcid, merged,
+                    )
+                })
+                .collect();
+
+            let count = records.len();
+            engine.append_batch(records).await?;
+            debug!("Engine batch checkpoint: {} events persisted", count);
+            return Ok(());
+        }
+
+        // Legacy EE path doesn't support batch — fall back to individual emits
+        warn!("emit_checkpoint_batch requires AGNT5_ENGINE_URL, events will be dropped");
+        Ok(())
+    }
+
     /// Queue a streaming delta for real-time delivery to clients (legacy API)
     ///
     /// This method wraps the unified queue_event for backward compatibility.
@@ -608,6 +887,7 @@ impl Worker {
         parent_correlation_id: String,
     ) -> Result<()> {
         let is_sse_only = JournalEventMessage::is_sse_only_event_type(&event_type);
+        let tenant_id = canonical_project_id_from_metadata(&metadata);
 
         let event = JournalEventMessage {
             run_id: invocation_id,
@@ -619,6 +899,7 @@ impl Worker {
             source_timestamp_ns,
             correlation_id,
             parent_correlation_id,
+            tenant_id,
             is_sse_only,
             queued_at: std::time::Instant::now(),
             ..Default::default()
@@ -696,21 +977,30 @@ impl Worker {
                 let delay_secs = delay.as_secs_f64();
 
                 // User-friendly reconnection messages (printed directly, not via tracing,
-                // since these are user-facing status and should always be visible)
-                if retry_count == 1 {
-                    eprintln!(
-                        "[WARN] Connection lost, reconnecting in {:.1}s...",
-                        delay_secs
-                    );
-                } else if infinite_retry {
-                    eprintln!(
-                        "[WARN] Reconnecting in {:.1}s... (attempt {})",
-                        delay_secs, retry_count
-                    );
+                // since these are user-facing status and should always be visible).
+                //
+                // Suppress the first two retries — most transient failures (notably
+                // registration redirects per dev/bugs/coordinator-redirect-leaks-pod-dns.md,
+                // brief network blips) recover within one retry. Surfacing them as
+                // "[WARN] Connection lost" alarms users on every cold start.
+                // Below the threshold, log at debug only.
+                const QUIET_RETRY_THRESHOLD: u32 = 3;
+                if retry_count >= QUIET_RETRY_THRESHOLD {
+                    if infinite_retry {
+                        eprintln!(
+                            "[WARN] Reconnecting in {:.1}s... (attempt {})",
+                            delay_secs, retry_count
+                        );
+                    } else {
+                        eprintln!(
+                            "[WARN] Reconnecting in {:.1}s... (attempt {}/{})",
+                            delay_secs, retry_count, max_retries
+                        );
+                    }
                 } else {
-                    eprintln!(
-                        "[WARN] Reconnecting in {:.1}s... (attempt {}/{})",
-                        delay_secs, retry_count, max_retries
+                    debug!(
+                        retry = retry_count,
+                        delay_secs, "Reconnecting silently before user-visible warning"
                     );
                 }
 
@@ -745,6 +1035,24 @@ impl Worker {
                     return Ok(());
                 }
                 Err(e) => {
+                    if let crate::error::SdkError::RegistrationRedirect { endpoint, message } = &e
+                    {
+                        self.set_owner_endpoint_hint(Some(endpoint.clone()));
+                        // Redirect is an expected control-plane response — the loop
+                        // handles it. Debug only. See dev/bugs/coordinator-redirect-leaks-pod-dns.md.
+                        debug!(
+                            "Registration redirected to owner coordinator {}: {}",
+                            endpoint, message
+                        );
+                        continue;
+                    }
+
+                    if self.clear_owner_endpoint_hint() {
+                        debug!(
+                            "Cleared redirected owner coordinator hint after connection failure; retrying through configured routing"
+                        );
+                    }
+
                     // Check if we had a working session (Connected) that dropped,
                     // vs. failing to connect in the first place.
                     let was_connected = matches!(
@@ -811,13 +1119,50 @@ impl Worker {
         F: Fn(RuntimeMessage, flume::Sender<ServiceMessage>) -> Fut + Send + Clone + 'static,
         Fut: std::future::Future<Output = Result<Option<ServiceMessage>>> + Send + 'static,
     {
-        let mut client =
-            WorkerCoordinatorClient::connect(self.config.coordinator_endpoint.clone()).await?;
+        // On reconnect, refresh membership from control plane before choosing endpoint.
+        // On first connect, use the preferred endpoint (which may already include
+        // a redirect hint from a previous NACK).
+        let coordinator_endpoint = if is_reconnect {
+            CoordinatorRouting::resolve(
+                &self.config.worker_id,
+                &self.config.coordinator_endpoint,
+            )
+            .await
+        } else {
+            self.preferred_coordinator_endpoint()
+        };
+        let mut client = WorkerCoordinatorClient::connect(coordinator_endpoint.clone()).await?;
 
         // Create registration message with components
         // Merge user-provided metadata with auto-collected AGNT5_* env vars
         let mut metadata = self.metadata.clone();
         metadata.extend(collect_agnt5_env_vars());
+
+        // Phase 6: declare data-path mode at registration. Default PUSH;
+        // `AGNT5_WORKER_MODE=pull` opts into PULL (worker calls PollJobs
+        // instead of receiving dispatches over the bidirectional stream).
+        let is_pull_mode = matches!(
+            std::env::var("AGNT5_WORKER_MODE").ok().as_deref(),
+            Some("pull") | Some("PULL")
+        );
+        let mode = if is_pull_mode {
+            crate::pb::WorkerMode::Pull as i32
+        } else {
+            crate::pb::WorkerMode::Push as i32
+        };
+        // Phase 6: stamp deployment_id from env so the coordinator's
+        // proto-field path picks it up. Falls back to metadata key on
+        // older coordinators that haven't been rebuilt yet.
+        let deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").unwrap_or_default();
+
+        // Phase 7a: declare concurrency budget so the coordinator can
+        // size headroom reservations per priority class. Hoisted out of
+        // the worker pool setup below so a single env read drives both
+        // the local pool size and the registration field.
+        let max_concurrency: u32 = std::env::var("AGNT5_MAX_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100);
 
         let registration = RegisterService {
             service_name: self.config.service_name.clone(),
@@ -825,6 +1170,9 @@ impl Worker {
             service_type: self.config.service_type.clone(),
             components: self.components.clone(),
             metadata,
+            mode,
+            deployment_id,
+            max_concurrency,
         };
 
         // Use the working pattern - create stream with immediate registration
@@ -832,15 +1180,17 @@ impl Worker {
             .create_worker_stream_with_registration(self.config.worker_id.clone(), registration)
             .await?;
 
+        self.set_owner_endpoint_hint(Some(coordinator_endpoint.clone()));
+
         if is_reconnect {
             eprintln!(
                 "[INFO] Reconnected to coordinator ({})",
-                self.config.coordinator_endpoint
+                coordinator_endpoint
             );
         } else {
             eprintln!(
                 "[INFO] Connected to coordinator ({})",
-                self.config.coordinator_endpoint
+                coordinator_endpoint
             );
         }
         debug!(
@@ -896,11 +1246,11 @@ impl Worker {
         // Start unified journal event flush task (replaces checkpoint, delta, span, log flush tasks)
         let journal_flush_task = self.spawn_journal_flush_task(tx.clone(), event_stream_tx.clone());
 
-        // Get concurrency configuration
-        let max_concurrency = std::env::var("AGNT5_MAX_CONCURRENCY")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(100);
+        // Reuse the concurrency budget computed for the registration
+        // message above so the local pool size and the value reported
+        // to the coordinator stay in lock-step. `usize` cast for the
+        // pool channel + spawn loop below.
+        let max_concurrency = max_concurrency as usize;
 
         debug!(
             "Worker {} starting with concurrency limit: {}",
@@ -945,13 +1295,10 @@ impl Worker {
             worker_handles.push(handle);
         }
 
-        // Spawn poll task for durable job queue (managed edition)
-        // Check AGNT5_POLL_ENABLED env var (default: true)
-        let poll_enabled = std::env::var("AGNT5_POLL_ENABLED")
-            .map(|v| v != "false" && v != "0")
-            .unwrap_or(true);
-
-        let poll_task = if poll_enabled {
+        // Phase 8: PULL workers own the poll task; PUSH workers never
+        // spawn it. The legacy `AGNT5_POLL_ENABLED` env gate has been
+        // removed — mode declared at registration is now the only switch.
+        let poll_task = if is_pull_mode {
             let poll_shutdown = shutdown_rx.resubscribe();
             Some(self.spawn_poll_task(
                 task_tx.clone(),
@@ -976,6 +1323,19 @@ impl Worker {
                                 continue;
                             }
 
+                            // WORKER_REPLACED: another connection registered with our
+                            // worker_id. Shut down permanently — do NOT reconnect.
+                            if runtime_message.message_type == RuntimeMessageType::WorkerReplaced as i32 {
+                                warn!(
+                                    "Worker {} received WORKER_REPLACED — another instance took over. Shutting down.",
+                                    self.config.worker_id
+                                );
+                                eprintln!(
+                                    "[WARN] Another worker instance connected with the same worker ID. This worker is shutting down."
+                                );
+                                break Ok(());
+                            }
+
                             // Track is_streaming per run for ephemeral event gating
                             if let Some(ref msg_data) = runtime_message.message_data {
                                 if let crate::pb::runtime_message::MessageData::DispatchComponent(ref req) = msg_data {
@@ -989,6 +1349,14 @@ impl Worker {
                                             map.insert(run_id, true);
                                         }
                                     }
+                                    // Phase 5: stash lease_id keyed by invocation_id so we
+                                    // can echo it on the outbound response. This keeps
+                                    // language bindings unaware of the fence token.
+                                    if !req.lease_id.is_empty() {
+                                        if let Ok(mut map) = self.pending_lease_ids.lock() {
+                                            map.insert(req.invocation_id.clone(), req.lease_id.clone());
+                                        }
+                                    }
                                 }
                             }
 
@@ -999,6 +1367,16 @@ impl Worker {
                                     if req.component_type == 10 {
                                         if let Some(result) = crate::eval::builtin_scorer::execute(&req.component_name, &req.input_data) {
                                             let output_data = serde_json::to_vec(&result).unwrap_or_default();
+                                            // Phase 5: drain stashed lease_id so the fast path
+                                            // acks under the same fence as the request.
+                                            let lease_id = if !req.lease_id.is_empty() {
+                                                if let Ok(mut map) = self.pending_lease_ids.lock() {
+                                                    map.remove(&req.invocation_id);
+                                                }
+                                                req.lease_id.clone()
+                                            } else {
+                                                String::new()
+                                            };
                                             let response = DispatchComponentResponse {
                                                 invocation_id: req.invocation_id.clone(),
                                                 success: true,
@@ -1012,6 +1390,7 @@ impl Worker {
                                                 sequence: 0,
                                                 attempt: 0,
                                                 source_timestamp_ns: 0,
+                                                lease_id,
                                             };
                                             let service_message = ServiceMessage {
                                                 worker_id: self.config.worker_id.clone(),
@@ -1095,15 +1474,26 @@ impl Worker {
                 // Forward responses from worker pool to coordinator
                 response = response_rx.recv_async() => {
                     match response {
-                        Ok(service_message) => {
-                            // Check if this is a polled job response by looking inside
-                            // the FunctionResponse metadata (not ServiceMessage.metadata,
-                            // which is always empty). The _job_id tag was placed into
-                            // DispatchComponentRequest.metadata by spawn_poll_task, and
-                            // language handlers preserve it through to the response.
+                        Ok(mut service_message) => {
+                            // Phase 5: stamp the stashed lease_id onto the response
+                            // so the coordinator's fencing check passes. On terminal
+                            // events we drain the map entry; on intermediate streaming
+                            // events we leave it so the terminal ack still finds it.
                             // Clean up streaming_runs tracking for terminal events
-                            if let Some(crate::pb::service_message::MessageType::FunctionResponse(ref resp)) = service_message.message_type {
-                                if resp.event_type == "run.completed" || resp.event_type == "run.failed" {
+                            if let Some(crate::pb::service_message::MessageType::FunctionResponse(ref mut resp)) = service_message.message_type {
+                                let is_terminal = resp.event_type == "run.completed" || resp.event_type == "run.failed";
+                                if resp.lease_id.is_empty() {
+                                    if let Ok(mut map) = self.pending_lease_ids.lock() {
+                                        if is_terminal {
+                                            if let Some(lease_id) = map.remove(&resp.invocation_id) {
+                                                resp.lease_id = lease_id;
+                                            }
+                                        } else if let Some(lease_id) = map.get(&resp.invocation_id) {
+                                            resp.lease_id = lease_id.clone();
+                                        }
+                                    }
+                                }
+                                if is_terminal {
                                     let run_id = if let Some(idx) = resp.invocation_id.find(':') {
                                         resp.invocation_id[..idx].to_string()
                                     } else {
@@ -1115,18 +1505,16 @@ impl Worker {
                                 }
                             }
 
-                            let is_polled_job = match &service_message.message_type {
-                                Some(crate::pb::service_message::MessageType::FunctionResponse(resp)) => {
-                                    resp.metadata.contains_key("_job_id")
-                                }
-                                _ => false,
-                            };
-
-                            if is_polled_job {
-                                // Polled job - route to CompleteJob RPC
+                            // Phase 8: route by declared worker mode, not by
+                            // per-response metadata tagging. A PULL worker
+                            // always acks via `CompleteJob`; a PUSH worker
+                            // always responds over the bidirectional stream.
+                            // Phase 7b's scheduler guarantees PULL workers
+                            // never receive push dispatches, so the stream
+                            // carries only control/heartbeat traffic for them.
+                            if is_pull_mode {
                                 self.handle_polled_job_response(service_message).await;
                             } else {
-                                // Streamed invocation - send via bidirectional stream
                                 if let Err(e) = tx.send_async(service_message).await {
                                     error!("Failed to send response to coordinator: {}", e);
                                     break Err(crate::error::SdkError::Connection {
@@ -1240,15 +1628,16 @@ impl Worker {
 
     /// Spawn unified journal event flush task
     ///
-    /// This task periodically flushes all buffered events to the coordinator.
+    /// This task periodically flushes all buffered events to EE.
     /// Events are routed based on type:
     /// - SSE-only events (output.delta, log, etc.): Sent via EventStream for real-time SSE delivery
-    /// - Boundary events (workflow.*, agent.*, lm.call.*): Sent as DispatchComponentResponse on dispatch stream
+    /// - Boundary events (workflow.*, agent.*, lm.call.*): Sent via WriteJournalEventsBatch to EE for durable persistence + SSE
     ///
-    /// If EventStream is not available, all events fall back to the dispatch stream.
+    /// All events go directly to EE — the dispatch stream is only used as a fallback
+    /// for SSE-only events when EventStream is unavailable.
     fn spawn_journal_flush_task(
         &self,
-        tx: flume::Sender<ServiceMessage>,
+        dispatch_tx: flume::Sender<ServiceMessage>,
         event_stream_tx: Option<flume::Sender<EventStreamMessage>>,
     ) -> tokio::task::JoinHandle<()> {
         let worker_id = self.config.worker_id.clone();
@@ -1256,14 +1645,25 @@ impl Worker {
         let flush_interval_ms = journal_queue.flush_interval_ms();
         let batch_size = journal_queue.batch_size();
         let streaming_runs = self.streaming_runs.clone();
+        let pending_lease_ids = self.pending_lease_ids.clone();
+        let ee_endpoint = self.config.ee_endpoint.clone();
+        let engine_endpoint = self.config.engine_endpoint.clone();
 
-        // Cache tenant_id and deployment_id to avoid repeated env lookups per event
-        let cached_tenant_id = std::env::var("AGNT5_TENANT_ID").unwrap_or_default();
+        // Cache project_id/deployment_id to avoid repeated env lookups per event.
+        // `tenant_id` remains a legacy alias for compatibility with engine/EE APIs.
+        let cached_project_id = canonical_project_id_from_env();
         let cached_deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").unwrap_or_default();
 
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(Duration::from_millis(flush_interval_ms));
+
+            // Lazily-connected EE client for boundary event writes.
+            // Separate from the Worker's ee_client to avoid lock contention with emit_checkpoint_sync.
+            let mut ee_client: Option<ExecutionEngineServiceClient<Channel>> = None;
+
+            // Lazily-connected Engine client (when AGNT5_ENGINE_URL is set).
+            let mut engine: Option<EngineClient> = None;
 
             loop {
                 interval.tick().await;
@@ -1274,8 +1674,76 @@ impl Worker {
                     continue;
                 }
 
+                // ── Engine path: send ALL events via AppendBatch ──
+                if let Some(ref ep) = engine_endpoint {
+                    // Ensure engine client is connected
+                    if engine.is_none() {
+                        match EngineClient::connect(ep).await {
+                            Ok(c) => {
+                                debug!("Flush task: Engine client connected to {}", ep);
+                                engine = Some(c);
+                            }
+                            Err(e) => {
+                                warn!("Flush task: failed to connect to Engine {}: {}", ep, e);
+                                // Re-queue all events for next flush
+                                for event in batch.into_iter().rev() {
+                                    journal_queue.push_front(event).ok();
+                                }
+                                journal_queue.record_error();
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Convert ALL events to engine Records (no SSE-only/boundary split)
+                    let originals: Vec<JournalEventMessage> = batch;
+                    let records: Vec<_> = originals.iter().map(|e| {
+                        let tenant = if let Some(ref tid) = e.tenant_id {
+                            tid.clone()
+                        } else {
+                            cached_project_id.clone()
+                        };
+                        client::build_engine_record(
+                            tenant,
+                            e.run_id.clone(),
+                            e.event_type.clone(),
+                            e.data.clone(),
+                            e.source_timestamp_ns,
+                            String::new(),
+                            e.correlation_id.clone(),
+                            e.parent_correlation_id.clone(),
+                            e.metadata.clone(),
+                        )
+                    }).collect();
+
+                    if let Some(ref mut eng) = engine {
+                        match eng.append_batch(records).await {
+                            Ok(written) => {
+                                journal_queue.record_sent_batch(written as usize, 0);
+                                debug!(
+                                    "Flush task: wrote {} events to Engine (queue_size={})",
+                                    written, journal_queue.len()
+                                );
+                            }
+                            Err(e) => {
+                                warn!("Flush task: Engine AppendBatch failed: {}", e);
+                                engine = None; // Clear for reconnection
+                                for event in originals.into_iter().rev() {
+                                    journal_queue.push_front(event).ok();
+                                }
+                                journal_queue.record_error();
+                            }
+                        }
+                    }
+                    continue; // Skip EE path entirely
+                }
+
+                // ── Legacy EE path (AGNT5_ENGINE_URL not set) ──
+
                 let mut sent_count = 0;
                 let mut sse_only_count = 0;
+                let mut boundary_events: Vec<(usize, crate::pb::WriteJournalEventRequest)> = Vec::new();
+                let mut boundary_originals: Vec<JournalEventMessage> = Vec::new();
 
                 for event in batch {
                     let is_sse_only = event.is_sse_only;
@@ -1285,8 +1753,7 @@ impl Worker {
                     if is_sse_only {
                         let is_run_streaming = match streaming_runs.lock() {
                             Ok(map) => {
-                                let val = map.get(&event.run_id).copied().unwrap_or(false);
-                                val
+                                map.get(&event.run_id).copied().unwrap_or(false)
                             },
                             Err(poisoned) => {
                                 warn!("streaming_runs mutex poisoned, assuming non-streaming for run_id={}", event.run_id);
@@ -1303,88 +1770,184 @@ impl Worker {
                                 data: event.data.clone(),
                                 trace_id: String::new(),
                                 span_id: String::new(),
-                                tenant_id: cached_tenant_id.clone(),
+                                tenant_id: cached_project_id.clone(),
                                 source_timestamp_ns: event.source_timestamp_ns,
                                 worker_id: worker_id.clone(),
                             };
 
                             if let Err(e) = es_tx.send_async(es_msg).await {
-                                // EventStream channel closed — fall through to dispatch stream
                                 warn!(
                                     "EventStream send failed, falling back to dispatch stream: type={} run_id={} error={}",
                                     event.event_type, event.run_id, e
                                 );
-                                // Fall through to send via dispatch stream below
+                                // Fall through to dispatch stream fallback below
                             } else {
                                 sse_only_count += 1;
                                 sent_count += 1;
                                 continue; // Successfully sent via EventStream
                             }
                         }
-                        // No EventStream available — fall through to dispatch stream
-                    }
-
-                    // Send via dispatch stream (boundary events, or SSE-only fallback)
-                    // Build metadata with cid, pcid, tenant_id, and deployment_id
-                    let mut metadata = event.metadata.clone();
-                    if !event.correlation_id.is_empty() {
-                        metadata.insert("cid".to_string(), event.correlation_id.clone());
-                    }
-                    if !event.parent_correlation_id.is_empty() {
-                        metadata.insert("pcid".to_string(), event.parent_correlation_id.clone());
-                    }
-                    if !cached_tenant_id.is_empty() {
-                        metadata.insert("tenant_id".to_string(), cached_tenant_id.clone());
-                    }
-                    if !cached_deployment_id.is_empty() {
-                        metadata.insert("deployment_id".to_string(), cached_deployment_id.clone());
-                    }
-
-                    let response = DispatchComponentResponse {
-                        invocation_id: event.run_id.clone(),
-                        success: true,
-                        result: Some(
-                            crate::pb::dispatch_component_response::Result::OutputData(
-                                event.data.clone(),
-                            ),
-                        ),
-                        error_message: String::new(),
-                        metadata,
-                        event_type: event.event_type.clone(),
-                        content_index: event.content_index,
-                        sequence: event.sequence,
-                        attempt: 0,
-                        source_timestamp_ns: event.source_timestamp_ns,
-                    };
-
-                    let service_message = ServiceMessage {
-                        worker_id: worker_id.clone(),
-                        metadata: std::collections::HashMap::new(),
-                        message_type: Some(
-                            crate::pb::service_message::MessageType::FunctionResponse(response),
-                        ),
-                    };
-
-                    // Send event - if it fails, re-queue and exit
-                    if let Err(e) = tx.send_async(service_message).await {
-                        warn!(
-                            "Failed to send journal event, re-queuing: type={} run_id={} error={}",
-                            event.event_type, event.run_id, e
-                        );
-
-                        // Re-queue at front to preserve order
-                        if let Err(e) = journal_queue.push_front(event) {
-                            error!("Failed to re-queue journal event: {}", e);
+                        // No EventStream or EventStream failed — fallback to dispatch stream for SSE-only
+                        let mut metadata = event.metadata.clone();
+                        metadata = with_project_metadata(metadata, &cached_project_id);
+                        if !cached_deployment_id.is_empty() {
+                            metadata.insert("deployment_id".to_string(), cached_deployment_id.clone());
                         }
-
-                        journal_queue.record_error();
-                        break; // Channel closed, exit task
+                        // Phase 5: stamp stashed lease_id on SSE-only fallback responses.
+                        let stashed_lease_id = match pending_lease_ids.lock() {
+                            Ok(map) => map.get(&event.run_id).cloned().unwrap_or_default(),
+                            Err(poisoned) => poisoned
+                                .into_inner()
+                                .get(&event.run_id)
+                                .cloned()
+                                .unwrap_or_default(),
+                        };
+                        let response = DispatchComponentResponse {
+                            invocation_id: event.run_id.clone(),
+                            success: true,
+                            result: Some(
+                                crate::pb::dispatch_component_response::Result::OutputData(
+                                    event.data.clone(),
+                                ),
+                            ),
+                            error_message: String::new(),
+                            metadata,
+                            event_type: event.event_type.clone(),
+                            content_index: event.content_index,
+                            sequence: event.sequence,
+                            attempt: 0,
+                            source_timestamp_ns: event.source_timestamp_ns,
+                            lease_id: stashed_lease_id,
+                        };
+                        let service_message = ServiceMessage {
+                            worker_id: worker_id.clone(),
+                            metadata: std::collections::HashMap::new(),
+                            message_type: Some(
+                                crate::pb::service_message::MessageType::FunctionResponse(response),
+                            ),
+                        };
+                        if let Err(e) = dispatch_tx.send_async(service_message).await {
+                            warn!("Failed to send SSE-only event via dispatch fallback: type={} run_id={} error={}", event.event_type, event.run_id, e);
+                            journal_queue.push_front(event).ok();
+                            journal_queue.record_error();
+                            break;
+                        }
+                        sse_only_count += 1;
+                        sent_count += 1;
+                        continue;
                     }
 
-                    if is_sse_only {
-                        sse_only_count += 1; // SSE-only that fell back to dispatch stream
+                    // Boundary event — collect for batch WriteJournalEventsBatch to EE
+                    let mut metadata = event.metadata.clone();
+                    metadata = with_project_metadata(metadata, &cached_project_id);
+                    if !cached_deployment_id.is_empty() {
+                        metadata.entry("deployment_id".to_string()).or_insert_with(|| cached_deployment_id.clone());
                     }
-                    sent_count += 1;
+                    let tenant_id = metadata
+                        .remove("project_id")
+                        .or_else(|| metadata.remove("tenant_id"))
+                        .unwrap_or_default();
+
+                    let req = crate::pb::WriteJournalEventRequest {
+                        run_id: event.run_id.clone(),
+                        event_type: event.event_type.clone(),
+                        data: event.data.clone(),
+                        trace_id: String::new(),
+                        span_id: String::new(),
+                        tenant_id,
+                        source_timestamp_ns: event.source_timestamp_ns,
+                        correlation_id: event.correlation_id.clone(),
+                        parent_event_id: event.parent_correlation_id.clone(),
+                        metadata,
+                    };
+
+                    boundary_events.push((boundary_originals.len(), req));
+                    boundary_originals.push(event);
+                }
+
+                // Send boundary events to EE via WriteJournalEventsBatch
+                if !boundary_events.is_empty() {
+                    let requests: Vec<crate::pb::WriteJournalEventRequest> =
+                        boundary_events.into_iter().map(|(_, req)| req).collect();
+                    let batch_count = requests.len();
+
+                    // Ensure EE client is connected
+                    if ee_client.is_none() {
+                        match Channel::from_shared(ee_endpoint.clone()) {
+                            Ok(ch) => {
+                                match ch.connect_timeout(Duration::from_secs(10))
+                                    .timeout(Duration::from_secs(30))
+                                    .connect()
+                                    .await
+                                {
+                                    Ok(channel) => {
+                                        debug!("Flush task: EE client connected to {}", ee_endpoint);
+                                        ee_client = Some(ExecutionEngineServiceClient::new(channel));
+                                    }
+                                    Err(e) => {
+                                        warn!("Flush task: failed to connect to EE {}: {}", ee_endpoint, e);
+                                        // Re-queue all boundary events for next flush
+                                        for event in boundary_originals.into_iter().rev() {
+                                            journal_queue.push_front(event).ok();
+                                        }
+                                        journal_queue.record_error();
+                                        // Continue — SSE-only events were already sent
+                                        if sent_count > 0 {
+                                            journal_queue.record_sent_batch(sent_count, sse_only_count);
+                                        }
+                                        continue;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("Flush task: invalid EE endpoint {}: {}", ee_endpoint, e);
+                                for event in boundary_originals.into_iter().rev() {
+                                    journal_queue.push_front(event).ok();
+                                }
+                                journal_queue.record_error();
+                                if sent_count > 0 {
+                                    journal_queue.record_sent_batch(sent_count, sse_only_count);
+                                }
+                                continue;
+                            }
+                        }
+                    }
+
+                    if let Some(ref mut client) = ee_client {
+                        let batch_req = crate::pb::WriteJournalEventsBatchRequest {
+                            events: requests,
+                        };
+                        match client.write_journal_events_batch(batch_req).await {
+                            Ok(resp) => {
+                                let r = resp.into_inner();
+                                sent_count += r.written_count as usize;
+                                if !r.errors.is_empty() {
+                                    warn!(
+                                        "Flush task: {} boundary events had errors (written={})",
+                                        r.errors.len(), r.written_count
+                                    );
+                                    for err in &r.errors {
+                                        warn!("  event[{}]: {}", err.index, err.error_message);
+                                    }
+                                } else {
+                                    debug!(
+                                        "Flush task: wrote {} boundary events to EE",
+                                        batch_count
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Flush task: WriteJournalEventsBatch failed: {}", e);
+                                // Clear client for reconnection
+                                ee_client = None;
+                                // Re-queue boundary events for next flush
+                                for event in boundary_originals.into_iter().rev() {
+                                    journal_queue.push_front(event).ok();
+                                }
+                                journal_queue.record_error();
+                            }
+                        }
+                    }
                 }
 
                 if sent_count > 0 {
@@ -1410,13 +1973,13 @@ impl Worker {
         max_concurrency: usize,
     ) -> tokio::task::JoinHandle<()> {
         let worker_id = self.config.worker_id.clone();
-        let endpoint = self.config.coordinator_endpoint.clone();
+        let endpoint = self.config.resolved_coordinator_endpoint();
         let component_ids: Vec<String> = self
             .components
             .iter()
             .map(|c| c.name.clone())
             .collect();
-        let tenant_id = std::env::var("AGNT5_TENANT_ID").unwrap_or_default();
+        let project_id = canonical_project_id_from_env();
         let deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").ok();
         let streaming_runs = self.streaming_runs.clone();
 
@@ -1431,9 +1994,9 @@ impl Worker {
             .unwrap_or(30000);
 
         tokio::spawn(async move {
-            // Skip polling if no tenant_id (not in managed mode)
-            if tenant_id.is_empty() {
-                eprintln!("[INFO] Job queue polling disabled (AGNT5_TENANT_ID not set)");
+            // Skip polling if no project context (not in managed mode).
+            if project_id.is_empty() {
+                eprintln!("[INFO] Job queue polling disabled (AGNT5_PROJECT_ID / AGNT5_TENANT_ID not set)");
                 return;
             }
 
@@ -1455,7 +2018,7 @@ impl Worker {
             eprintln!(
                 "[INFO] Job queue polling started ({} components, tenant={})",
                 component_ids.len(),
-                tenant_id
+                project_id
             );
 
             let mut backoff = Duration::from_millis(initial_backoff_ms);
@@ -1487,18 +2050,18 @@ impl Worker {
                         worker_id: worker_id.clone(),
                         component_ids: component_ids.clone(),
                         max_jobs,
-                        tenant_id: tenant_id.clone(),
+                        tenant_id: project_id.clone(),
                         deployment_id: deployment_id.clone(),
                         claim_timeout_ms: 300_000,
                     })
                     .await
                 {
                     Ok(resp) if resp.jobs.is_empty() => {
-                        // No work — increase backoff
-                        if backoff.as_millis() <= initial_backoff_ms as u128 {
-                            // Log only on first empty poll to avoid spam
-                            eprintln!("[INFO] Job queue: no jobs available, polling with backoff");
-                        }
+                        // No work — log the current backoff so empty-poll behavior is visible.
+                        eprintln!(
+                            "[INFO] Job queue: no jobs available, next poll in {}ms",
+                            backoff.as_millis()
+                        );
                         backoff = std::cmp::min(backoff * 2, max_backoff);
                     }
                     Ok(resp) => {
@@ -1508,18 +2071,34 @@ impl Worker {
                         eprintln!("[INFO] Job queue: claimed {} jobs", job_count);
 
                         for job in resp.jobs {
-                            // Convert JobAssignment → RuntimeMessage (DispatchComponentRequest)
-                            // Tag with _source=poll and _job_id for response routing
+                            // Convert JobAssignment → RuntimeMessage (DispatchComponentRequest).
+                            //
+                            // Phase 8: the legacy `_source=poll`/`_job_id`/
+                            // `_tenant_id` synthetic metadata tags are gone.
+                            // The dispatch loop now routes responses by worker
+                            // mode (PULL → CompleteJob, PUSH → stream), and
+                            // `handle_polled_job_response` derives job_id from
+                            // `resp.invocation_id` (which equals run_id which
+                            // equals job_id on the coordinator's poll path)
+                            // and project identity from `AGNT5_PROJECT_ID`
+                            // (falling back to legacy `AGNT5_TENANT_ID`).
                             let mut metadata = job.metadata.clone();
-                            metadata.insert("_source".to_string(), "poll".to_string());
-                            metadata.insert("_job_id".to_string(), job.job_id.clone());
-                            metadata.insert("_tenant_id".to_string(), tenant_id.clone());
                             if !job.trace_id.is_empty() {
                                 metadata.insert("trace_id".to_string(), job.trace_id.clone());
                             }
 
                             // Check stream_mode before metadata is moved into the struct
                             let is_streaming = metadata.get("stream_mode").map_or(false, |m| m == "full");
+
+                            // Phase 5: extract lease/priority/deployment from metadata
+                            // (PULL path: coordinator stuffs lease info into JobAssignment.metadata).
+                            let lease_id = metadata.get("lease_id").cloned().unwrap_or_default();
+                            let deployment_id =
+                                metadata.get("deployment_id").cloned().unwrap_or_default();
+                            let priority = metadata
+                                .get("priority")
+                                .and_then(|v| v.parse::<i32>().ok())
+                                .unwrap_or(0);
 
                             // Use invocation_id = run_id (this is how the WC dispatches)
                             let runtime_message = RuntimeMessage {
@@ -1547,6 +2126,14 @@ impl Worker {
                                             session_id: String::new(),
                                             user_id: String::new(),
                                             is_streaming,
+                                            priority,
+                                            deployment_id,
+                                            lease_id,
+                                            // Phase 7f: polled jobs inherit the policy the
+                                            // orchestrator already stamped on the run's
+                                            // `run.queued` metadata; the worker-side path
+                                            // never reads `retry_policy` so None is fine.
+                                            retry_policy: None,
                                         },
                                     ),
                                 ),
@@ -1571,12 +2158,11 @@ impl Worker {
                         eprintln!("[INFO] Job queue: dispatched {} jobs to worker pool", job_count);
                     }
                     Err(e) => {
-                        // Check if this is an Unimplemented error (not managed edition)
-                        let err_msg = format!("{}", e);
-                        if err_msg.contains("Unimplemented") || err_msg.contains("UNIMPLEMENTED") {
-                            eprintln!("[INFO] Job queue polling disabled (not managed edition)");
-                            return;
-                        }
+                        // Phase 8: the Unimplemented fallback is gone — the
+                        // coordinator always implements PollJobs/CompleteJob
+                        // now that managed-edition gating has been removed.
+                        // Any error here is a real transport/server problem,
+                        // so back off and retry instead of silently stopping.
                         eprintln!("[WARN] Job queue poll error: {}", e);
                         backoff = std::cmp::min(backoff * 2, max_backoff);
                     }
@@ -1586,23 +2172,26 @@ impl Worker {
     }
 
     /// Handle a polled job response by calling CompleteJob RPC.
-    /// Called from the dispatch loop when a FunctionResponse has _job_id in its metadata.
+    ///
+    /// Called from the dispatch loop on PULL workers (mode-based routing,
+    /// Phase 8). On the coordinator's poll path `job_id == run_id`, so we
+    /// derive the job_id from `resp.invocation_id` — stripping any
+    /// `:suffix` the worker appends for streaming invocations. Project identity
+    /// comes from `AGNT5_PROJECT_ID`, falling back to legacy `AGNT5_TENANT_ID`.
     async fn handle_polled_job_response(&self, service_message: ServiceMessage) {
-        // Extract all data from the inner FunctionResponse (DispatchComponentResponse).
-        // The _job_id and _tenant_id metadata tags flow through the handler:
-        //   DispatchComponentRequest.metadata → handler → DispatchComponentResponse.metadata
-        let (job_id, tenant_id, success, output_data, error_message, error_code) =
+        let (job_id, success, output_data, error_message, error_code) =
             match &service_message.message_type {
                 Some(crate::pb::service_message::MessageType::FunctionResponse(resp)) => {
-                    let jid = match resp.metadata.get("_job_id") {
-                        Some(id) => id.clone(),
-                        None => return,
+                    // Derive job_id from invocation_id (strip streaming suffix).
+                    let jid = if let Some(idx) = resp.invocation_id.find(':') {
+                        resp.invocation_id[..idx].to_string()
+                    } else {
+                        resp.invocation_id.clone()
                     };
-                    let tid = resp
-                        .metadata
-                        .get("_tenant_id")
-                        .cloned()
-                        .unwrap_or_default();
+                    if jid.is_empty() {
+                        warn!("Polled job response missing invocation_id; dropping");
+                        return;
+                    }
                     let output = match &resp.result {
                         Some(crate::pb::dispatch_component_response::Result::OutputData(data)) => {
                             data.clone()
@@ -1611,7 +2200,6 @@ impl Worker {
                     };
                     (
                         jid,
-                        tid,
                         resp.success,
                         output,
                         resp.error_message.clone(),
@@ -1627,8 +2215,12 @@ impl Worker {
                 }
             };
 
+        // Phase 8: PULL workers derive tenant_id from the same env var the
+        // poll task uses for the PollJobs request.
+        let tenant_id = canonical_project_id_from_env();
+
         // Call CompleteJob RPC
-        let endpoint = self.config.coordinator_endpoint.clone();
+        let endpoint = self.config.resolved_coordinator_endpoint();
         let worker_id = self.config.worker_id.clone();
 
         // Spawn a task to avoid blocking the dispatch loop
