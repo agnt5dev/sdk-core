@@ -13,12 +13,12 @@ use serde_json::{self, json, Value as JsonValue};
 
 use crate::error::{Result as SdkResult, SdkError};
 
+use super::http;
 use super::interface::{
     generate as generate_via_model, stream as stream_via_model, ContentBlockType, GenerateRequest,
     GenerateResponse, GenerationConfig, LanguageModel, Message, MessageRole, ResponseFormat,
     StreamChunk, StreamHandle, StreamRequest, TokenUsage, ToolChoice, ToolDefinition,
 };
-use super::http;
 use super::telemetry;
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -63,11 +63,10 @@ impl AnthropicConfig {
     }
 
     pub fn from_env() -> SdkResult<Self> {
-        let api_key = env::var("ANTHROPIC_API_KEY")
-            .map_err(|_| SdkError::Configuration {
-                message: "ANTHROPIC_API_KEY must be set".to_string(),
-                field: Some("ANTHROPIC_API_KEY".to_string()),
-            })?;
+        let api_key = env::var("ANTHROPIC_API_KEY").map_err(|_| SdkError::Configuration {
+            message: "ANTHROPIC_API_KEY must be set".to_string(),
+            field: Some("ANTHROPIC_API_KEY".to_string()),
+        })?;
 
         let mut config = AnthropicConfig::new(api_key);
 
@@ -138,7 +137,11 @@ impl AnthropicProvider {
 impl LanguageModel for AnthropicProvider {
     async fn generate(&self, request: GenerateRequest) -> SdkResult<GenerateResponse> {
         // Create OpenTelemetry span for this LLM call as child of the current execution span
-        let mut span = telemetry::create_gen_ai_span("anthropic", &request.model, request.otel_context.clone());
+        let mut span = telemetry::create_gen_ai_span(
+            "anthropic",
+            &request.model,
+            request.otel_context.clone(),
+        );
 
         // Set request configuration attributes
         telemetry::set_request_attributes(&mut span, &request);
@@ -181,12 +184,12 @@ impl LanguageModel for AnthropicProvider {
             .await?;
 
             let metadata = http::extract_metadata(&response);
-            let parsed: MessagesResponse = response
-                .json()
-                .await
-                .map_err(|err| SdkError::Other(anyhow!("failed to parse Anthropic response: {err}")))?;
+            let parsed: MessagesResponse = response.json().await.map_err(|err| {
+                SdkError::Other(anyhow!("failed to parse Anthropic response: {err}"))
+            })?;
 
-            let mut result = parsed.into_generate_response(request.config.response_format.clone())?;
+            let mut result =
+                parsed.into_generate_response(request.config.response_format.clone())?;
             result.metadata = Some(metadata);
             Ok(result)
         }
@@ -201,7 +204,9 @@ impl LanguageModel for AnthropicProvider {
 
                 // Calculate and set cost if token usage is available
                 if let Some(usage) = &response.usage {
-                    if let (Some(input_tokens), Some(output_tokens)) = (usage.prompt_tokens, usage.completion_tokens) {
+                    if let (Some(input_tokens), Some(output_tokens)) =
+                        (usage.prompt_tokens, usage.completion_tokens)
+                    {
                         // TODO: Extract cached tokens when TokenUsage struct is extended
                         // For now, calculate cost without cache discount
                         if let Some(cost) = telemetry::calculate_cost(
@@ -229,7 +234,11 @@ impl LanguageModel for AnthropicProvider {
 
     async fn stream(&self, request: StreamRequest) -> SdkResult<StreamHandle> {
         // Create OpenTelemetry span for streaming LLM call
-        let mut span = telemetry::create_gen_ai_span("anthropic", &request.model, request.otel_context.clone());
+        let mut span = telemetry::create_gen_ai_span(
+            "anthropic",
+            &request.model,
+            request.otel_context.clone(),
+        );
 
         telemetry::set_request_attributes(&mut span, &request);
         span.set_attribute(opentelemetry::KeyValue::new("llm.streaming", true));
@@ -264,7 +273,11 @@ impl LanguageModel for AnthropicProvider {
             validate_request(&request)?;
             let payload = MessagesPayload::from_request(&request, true)?;
             let response = http::send_with_retry(
-                || self.request().header("accept", "text/event-stream").json(&payload),
+                || {
+                    self.request()
+                        .header("accept", "text/event-stream")
+                        .json(&payload)
+                },
                 &self.config.retry_config,
                 "anthropic",
                 request.config.timeout,
@@ -308,14 +321,16 @@ fn validate_request(request: &GenerateRequest) -> SdkResult<()> {
         .all(|message| message.role == MessageRole::System)
     {
         return Err(SdkError::Configuration {
-            message: "at least one non-system message is required for Anthropic requests".to_string(),
+            message: "at least one non-system message is required for Anthropic requests"
+                .to_string(),
             field: None,
         });
     }
 
     if request.system_prompt.is_none() && request.messages.is_empty() {
         return Err(SdkError::Configuration {
-            message: "at least a system prompt or one message is required for Anthropic requests".to_string(),
+            message: "at least a system prompt or one message is required for Anthropic requests"
+                .to_string(),
             field: None,
         });
     }
@@ -473,7 +488,6 @@ fn build_stream(
     Box::pin(stream)
 }
 
-
 #[derive(Serialize)]
 struct MessagesPayload {
     model: String,
@@ -567,8 +581,8 @@ impl AnthropicMessage {
 
             // Add tool_use blocks for each tool call
             for tc in tool_calls {
-                let input: JsonValue = serde_json::from_str(&tc.arguments)
-                    .unwrap_or_else(|_| json!({}));
+                let input: JsonValue =
+                    serde_json::from_str(&tc.arguments).unwrap_or_else(|_| json!({}));
                 content.push(ContentBlock::ToolUse {
                     id: tc.id.clone(),
                     name: tc.name.clone(),
@@ -599,9 +613,7 @@ impl AnthropicMessage {
 #[serde(tag = "type")]
 enum ContentBlock {
     #[serde(rename = "text")]
-    Text {
-        text: String,
-    },
+    Text { text: String },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,

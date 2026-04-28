@@ -7,11 +7,11 @@ use reqwest::Client;
 
 use crate::error::{Result as SdkResult, SdkError};
 
+use super::http;
 use super::interface::{
     generate as generate_via_model, stream as stream_via_model, GenerateRequest, GenerateResponse,
     LanguageModel, StreamHandle, StreamRequest,
 };
-use super::http;
 use super::openai_common::{
     stream_handle_from_response, ChatCompletionPayload, ChatCompletionResponse,
 };
@@ -90,11 +90,10 @@ impl OpenAiChatConfig {
     }
 
     pub fn from_env() -> SdkResult<Self> {
-        let api_key = env::var("OPENAI_API_KEY")
-            .map_err(|_| SdkError::Configuration {
-                message: "OPENAI_API_KEY must be set".to_string(),
-                field: Some("OPENAI_API_KEY".to_string()),
-            })?;
+        let api_key = env::var("OPENAI_API_KEY").map_err(|_| SdkError::Configuration {
+            message: "OPENAI_API_KEY must be set".to_string(),
+            field: Some("OPENAI_API_KEY".to_string()),
+        })?;
 
         let mut config = OpenAiChatConfig::new(api_key);
 
@@ -230,7 +229,11 @@ impl OpenAiChatProvider {
 impl LanguageModel for OpenAiChatProvider {
     async fn generate(&self, request: GenerateRequest) -> SdkResult<GenerateResponse> {
         // Create OpenTelemetry span for this LLM call as child of the current execution span
-        let mut span = telemetry::create_gen_ai_span("openai_chat", &request.model, request.otel_context.clone());
+        let mut span = telemetry::create_gen_ai_span(
+            "openai_chat",
+            &request.model,
+            request.otel_context.clone(),
+        );
 
         // Set request configuration attributes
         telemetry::set_request_attributes(&mut span, &request);
@@ -282,7 +285,8 @@ impl LanguageModel for OpenAiChatProvider {
                 .await
                 .map_err(|err| http::classify_reqwest_error(err, "openai_chat"))?;
 
-            let mut result = parsed.into_generate_response(request.config.response_format.clone())?;
+            let mut result =
+                parsed.into_generate_response(request.config.response_format.clone())?;
             result.metadata = Some(metadata);
             Ok(result)
         }
@@ -299,7 +303,9 @@ impl LanguageModel for OpenAiChatProvider {
 
                 // Calculate and set cost if token usage is available
                 if let Some(usage) = &response.usage {
-                    if let (Some(input_tokens), Some(output_tokens)) = (usage.prompt_tokens, usage.completion_tokens) {
+                    if let (Some(input_tokens), Some(output_tokens)) =
+                        (usage.prompt_tokens, usage.completion_tokens)
+                    {
                         // TODO: Extract cached tokens when TokenUsage struct is extended
                         // For now, calculate cost without cache discount
                         if let Some(cost) = telemetry::calculate_cost(
@@ -327,7 +333,11 @@ impl LanguageModel for OpenAiChatProvider {
 
     async fn stream(&self, request: StreamRequest) -> SdkResult<StreamHandle> {
         // Create OpenTelemetry span for this streaming LLM call
-        let mut span = telemetry::create_gen_ai_span("openai_chat", &request.model, request.otel_context.clone());
+        let mut span = telemetry::create_gen_ai_span(
+            "openai_chat",
+            &request.model,
+            request.otel_context.clone(),
+        );
 
         // Set request configuration attributes
         telemetry::set_request_attributes(&mut span, &request);
@@ -369,13 +379,21 @@ impl LanguageModel for OpenAiChatProvider {
             let payload = ChatCompletionPayload::from_request(&request, model, true);
 
             let response = http::send_with_retry(
-                || self.request().header("Accept", "text/event-stream").json(&payload),
+                || {
+                    self.request()
+                        .header("Accept", "text/event-stream")
+                        .json(&payload)
+                },
                 &self.config.retry_config,
                 "openai_chat",
                 request.config.timeout,
             )
             .await?;
-            stream_handle_from_response(response, request.config.response_format.clone(), self.config.timeout.as_secs())
+            stream_handle_from_response(
+                response,
+                request.config.response_format.clone(),
+                self.config.timeout.as_secs(),
+            )
         }
         .await;
 
@@ -404,10 +422,10 @@ impl LanguageModel for OpenAiChatProvider {
 fn validate_request(request: &GenerateRequest) -> SdkResult<()> {
     if request.system_prompt.is_none() && request.messages.is_empty() {
         return Err(SdkError::Configuration {
-            message: "at least a system prompt or one message is required for OpenAI Chat requests".to_string(),
+            message: "at least a system prompt or one message is required for OpenAI Chat requests"
+                .to_string(),
             field: None,
         });
     }
     Ok(())
 }
-

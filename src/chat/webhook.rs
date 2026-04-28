@@ -127,13 +127,9 @@ mod tests {
 
         let mut headers = HashMap::new();
         headers.insert("x-slack-request-timestamp".to_string(), timestamp);
-        headers.insert(
-            "x-slack-signature".to_string(),
-            "v0=deadbeef".to_string(),
-        );
+        headers.insert("x-slack-signature".to_string(), "v0=deadbeef".to_string());
 
-        let result =
-            verify_webhook(&Platform::Slack, "secret", &headers, b"body").unwrap();
+        let result = verify_webhook(&Platform::Slack, "secret", &headers, b"body").unwrap();
         assert!(!result);
     }
 

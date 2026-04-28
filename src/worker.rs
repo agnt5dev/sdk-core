@@ -64,8 +64,8 @@ impl WorkerConfig {
 
         // EE endpoint defaults to coordinator endpoint (works with Envoy routing).
         // In standalone/dev mode, set AGNT5_EE_ENDPOINT to the EE port (e.g., http://localhost:34185).
-        let ee_endpoint = std::env::var("AGNT5_EE_ENDPOINT")
-            .unwrap_or_else(|_| coordinator_endpoint.clone());
+        let ee_endpoint =
+            std::env::var("AGNT5_EE_ENDPOINT").unwrap_or_else(|_| coordinator_endpoint.clone());
 
         // Parse max retries from environment (0 = infinite, default: 5)
         let max_retries = std::env::var("AGNT5_MAX_RETRIES")
@@ -129,7 +129,10 @@ pub fn collect_agnt5_env_vars() -> HashMap<String, String> {
 
     // System info — always set, not overridable by env vars
     if let Ok(h) = hostname::get() {
-        metadata.insert("AGNT5_SYS_HOSTNAME".into(), h.to_string_lossy().into_owned());
+        metadata.insert(
+            "AGNT5_SYS_HOSTNAME".into(),
+            h.to_string_lossy().into_owned(),
+        );
     }
     metadata.insert("AGNT5_SYS_OS".into(), std::env::consts::OS.into());
     metadata.insert("AGNT5_SYS_ARCH".into(), std::env::consts::ARCH.into());
@@ -151,7 +154,10 @@ fn canonical_project_id_from_env() -> String {
         .unwrap_or_default()
 }
 
-fn with_project_metadata(mut metadata: HashMap<String, String>, project_id: &str) -> HashMap<String, String> {
+fn with_project_metadata(
+    mut metadata: HashMap<String, String>,
+    project_id: &str,
+) -> HashMap<String, String> {
     if !project_id.is_empty() {
         metadata
             .entry("project_id".to_string())
@@ -470,23 +476,36 @@ impl Worker {
                     let tenant_id = canonical_project_id_from_metadata(&metadata)
                         .or_else(|| canonical_project_id_from_metadata(&self.metadata))
                         .unwrap_or_default();
-                    let records: Vec<_> = pending.iter().map(|e| {
-                        client::build_engine_record(
-                            tenant_id.clone(),
-                            e.run_id.clone(),
-                            e.event_type.clone(),
-                            e.data.clone(),
-                            e.source_timestamp_ns,
-                            String::new(),
-                            e.correlation_id.clone(),
-                            e.parent_correlation_id.clone(),
-                            e.metadata.clone(),
-                        )
-                    }).collect();
+                    let records: Vec<_> = pending
+                        .iter()
+                        .map(|e| {
+                            client::build_engine_record(
+                                tenant_id.clone(),
+                                e.run_id.clone(),
+                                e.event_type.clone(),
+                                e.data.clone(),
+                                e.source_timestamp_ns,
+                                String::new(),
+                                e.correlation_id.clone(),
+                                e.parent_correlation_id.clone(),
+                                e.metadata.clone(),
+                            )
+                        })
+                        .collect();
                     if let Err(e) = engine.append_batch(records).await {
-                        warn!("Engine: failed to flush {} pre-checkpoint events for run_id={}: {}", pending.len(), run_id, e);
+                        warn!(
+                            "Engine: failed to flush {} pre-checkpoint events for run_id={}: {}",
+                            pending.len(),
+                            run_id,
+                            e
+                        );
                     } else {
-                        debug!("Engine: flushed {} events before {} for run_id={}", pending.len(), event_type, run_id);
+                        debug!(
+                            "Engine: flushed {} events before {} for run_id={}",
+                            pending.len(),
+                            event_type,
+                            run_id
+                        );
                     }
                 }
             }
@@ -497,7 +516,8 @@ impl Worker {
                     merged_metadata.insert(k.clone(), v.clone());
                 }
             }
-            let canonical_project_id = canonical_project_id_from_metadata(&merged_metadata).unwrap_or_default();
+            let canonical_project_id =
+                canonical_project_id_from_metadata(&merged_metadata).unwrap_or_default();
             merged_metadata = with_project_metadata(merged_metadata, &canonical_project_id);
             let correlation_id = merged_metadata.remove("cid").unwrap_or_default();
             let parent_event_id = merged_metadata.remove("pcid").unwrap_or_default();
@@ -639,7 +659,12 @@ impl Worker {
                         }
                     }
                 }
-                debug!("Flushed {} SSE-only events before {}: run_id={}", pending.len(), event_type, run_id);
+                debug!(
+                    "Flushed {} SSE-only events before {}: run_id={}",
+                    pending.len(),
+                    event_type,
+                    run_id
+                );
             }
         }
 
@@ -650,7 +675,8 @@ impl Worker {
                 merged_metadata.insert(k.clone(), v.clone());
             }
         }
-        let canonical_project_id = canonical_project_id_from_metadata(&merged_metadata).unwrap_or_default();
+        let canonical_project_id =
+            canonical_project_id_from_metadata(&merged_metadata).unwrap_or_default();
         merged_metadata = with_project_metadata(merged_metadata, &canonical_project_id);
 
         // Extract correlation/parent IDs from metadata
@@ -678,7 +704,8 @@ impl Worker {
 
         let timeout = Duration::from_millis(timeout_ms);
         let start = Instant::now();
-        let result = match tokio::time::timeout(timeout, ee_client.write_checkpoint(request)).await {
+        let result = match tokio::time::timeout(timeout, ee_client.write_checkpoint(request)).await
+        {
             Ok(Ok(response)) => {
                 let resp = response.into_inner();
                 if resp.success {
@@ -791,16 +818,15 @@ impl Worker {
             // Use the stored handle captured in run()
             let handle = {
                 let guard = self.tokio_handle.lock().map_err(|e| {
-                    crate::error::SdkError::Internal(format!(
-                        "Failed to lock tokio_handle: {}",
-                        e
-                    ))
+                    crate::error::SdkError::Internal(format!("Failed to lock tokio_handle: {}", e))
                 })?;
-                guard.clone().ok_or_else(|| crate::error::SdkError::Connection {
-                    message: "Worker not running, cannot emit checkpoint".to_string(),
-                    code: crate::error::ErrorCode::ConnectionFailed,
-                    source: None,
-                })?
+                guard
+                    .clone()
+                    .ok_or_else(|| crate::error::SdkError::Connection {
+                        message: "Worker not running, cannot emit checkpoint".to_string(),
+                        code: crate::error::ErrorCode::ConnectionFailed,
+                        source: None,
+                    })?
             };
 
             handle.block_on(async move {
@@ -853,8 +879,15 @@ impl Worker {
                         .unwrap_or_default();
 
                     client::build_engine_record(
-                        tenant_id, run_id, event_type, data, ts,
-                        String::new(), cid, pcid, merged,
+                        tenant_id,
+                        run_id,
+                        event_type,
+                        data,
+                        ts,
+                        String::new(),
+                        cid,
+                        pcid,
+                        merged,
                     )
                 })
                 .collect();
@@ -1026,7 +1059,12 @@ impl Worker {
             let shutdown_rx_inner = shutdown_tx.subscribe();
 
             match self
-                .try_connect_and_run(message_handler.clone(), shutdown_rx_inner, was_reconnecting, disconnect_instant)
+                .try_connect_and_run(
+                    message_handler.clone(),
+                    shutdown_rx_inner,
+                    was_reconnecting,
+                    disconnect_instant,
+                )
                 .await
             {
                 Ok(()) => {
@@ -1035,8 +1073,7 @@ impl Worker {
                     return Ok(());
                 }
                 Err(e) => {
-                    if let crate::error::SdkError::RegistrationRedirect { endpoint, message } = &e
-                    {
+                    if let crate::error::SdkError::RegistrationRedirect { endpoint, message } = &e {
                         self.set_owner_endpoint_hint(Some(endpoint.clone()));
                         // Redirect is an expected control-plane response — the loop
                         // handles it. Debug only. See dev/bugs/coordinator-redirect-leaks-pod-dns.md.
@@ -1055,10 +1092,8 @@ impl Worker {
 
                     // Check if we had a working session (Connected) that dropped,
                     // vs. failing to connect in the first place.
-                    let was_connected = matches!(
-                        self.connection_state(),
-                        ConnectionState::Connected
-                    );
+                    let was_connected =
+                        matches!(self.connection_state(), ConnectionState::Connected);
 
                     // Record failed reconnection attempt (only for actual connect failures,
                     // not for an active session that dropped)
@@ -1067,11 +1102,8 @@ impl Worker {
                     }
 
                     // Store error for state tracking (used internally)
-                    let error_msg = format!(
-                        "Connection failed (attempt {}): {}",
-                        retry_count + 1,
-                        e
-                    );
+                    let error_msg =
+                        format!("Connection failed (attempt {}): {}", retry_count + 1, e);
                     debug!("{}", error_msg);
                     self.set_connection_state(ConnectionState::Error(error_msg));
                     crate::telemetry::update_connection_state(0); // 0 = disconnected
@@ -1089,10 +1121,7 @@ impl Worker {
                     // Check if we've exceeded max retries (skip check for infinite retry mode)
                     if !infinite_retry && retry_count >= max_retries {
                         // After max retries, exit instead of infinite loop
-                        error!(
-                            "Failed to connect after {} attempts, exiting",
-                            max_retries
-                        );
+                        error!("Failed to connect after {} attempts, exiting", max_retries);
                         self.set_connection_state(ConnectionState::Error(format!(
                             "Failed to connect after {} attempts",
                             max_retries
@@ -1100,7 +1129,8 @@ impl Worker {
                         return Err(anyhow::anyhow!(
                             "Worker failed to connect to coordinator after {} attempts",
                             max_retries
-                        ).into());
+                        )
+                        .into());
                     }
                 }
             }
@@ -1123,11 +1153,8 @@ impl Worker {
         // On first connect, use the preferred endpoint (which may already include
         // a redirect hint from a previous NACK).
         let coordinator_endpoint = if is_reconnect {
-            CoordinatorRouting::resolve(
-                &self.config.worker_id,
-                &self.config.coordinator_endpoint,
-            )
-            .await
+            CoordinatorRouting::resolve(&self.config.worker_id, &self.config.coordinator_endpoint)
+                .await
         } else {
             self.preferred_coordinator_endpoint()
         };
@@ -1188,15 +1215,9 @@ impl Worker {
                 coordinator_endpoint
             );
         } else {
-            eprintln!(
-                "[INFO] Connected to coordinator ({})",
-                coordinator_endpoint
-            );
+            eprintln!("[INFO] Connected to coordinator ({})", coordinator_endpoint);
         }
-        debug!(
-            "Worker {} registered successfully",
-            self.config.worker_id
-        );
+        debug!("Worker {} registered successfully", self.config.worker_id);
         self.set_connection_state(ConnectionState::Connected);
         crate::telemetry::update_connection_state(2); // 2 = connected
 
@@ -1207,7 +1228,9 @@ impl Worker {
         if is_reconnect {
             crate::telemetry::record_reconnection_attempt(true);
             if let Some(disc_instant) = disconnect_instant {
-                crate::telemetry::record_reconnection_duration(disc_instant.elapsed().as_secs_f64());
+                crate::telemetry::record_reconnection_duration(
+                    disc_instant.elapsed().as_secs_f64(),
+                );
             }
         }
 
@@ -1215,7 +1238,12 @@ impl Worker {
         // EE is the single SSE publisher — WC no longer publishes to Centrifuge.
         let event_stream_tx = match self.ensure_ee_client().await {
             Ok(mut ee_client) => {
-                match crate::client::create_ee_event_stream(&mut ee_client, self.config.worker_id.clone()).await {
+                match crate::client::create_ee_event_stream(
+                    &mut ee_client,
+                    self.config.worker_id.clone(),
+                )
+                .await
+                {
                     Ok(es_tx) => {
                         debug!("EE EventStream opened for SSE-only events");
                         Some(es_tx)
@@ -1272,7 +1300,6 @@ impl Worker {
             let worker_name = format!("{}-{}", self.config.worker_id, worker_id);
 
             let handle = tokio::spawn(async move {
-
                 while let Ok(runtime_message) = task_rx.recv_async().await {
                     let tx_clone = response_tx.clone();
                     match handler(runtime_message, tx_clone).await {
@@ -1300,11 +1327,7 @@ impl Worker {
         // removed — mode declared at registration is now the only switch.
         let poll_task = if is_pull_mode {
             let poll_shutdown = shutdown_rx.resubscribe();
-            Some(self.spawn_poll_task(
-                task_tx.clone(),
-                poll_shutdown,
-                max_concurrency,
-            ))
+            Some(self.spawn_poll_task(task_tx.clone(), poll_shutdown, max_concurrency))
         } else {
             None
         };
@@ -1655,8 +1678,7 @@ impl Worker {
         let cached_deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").unwrap_or_default();
 
         tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(Duration::from_millis(flush_interval_ms));
+            let mut interval = tokio::time::interval(Duration::from_millis(flush_interval_ms));
 
             // Lazily-connected EE client for boundary event writes.
             // Separate from the Worker's ee_client to avoid lock contention with emit_checkpoint_sync.
@@ -1697,24 +1719,27 @@ impl Worker {
 
                     // Convert ALL events to engine Records (no SSE-only/boundary split)
                     let originals: Vec<JournalEventMessage> = batch;
-                    let records: Vec<_> = originals.iter().map(|e| {
-                        let tenant = if let Some(ref tid) = e.tenant_id {
-                            tid.clone()
-                        } else {
-                            cached_project_id.clone()
-                        };
-                        client::build_engine_record(
-                            tenant,
-                            e.run_id.clone(),
-                            e.event_type.clone(),
-                            e.data.clone(),
-                            e.source_timestamp_ns,
-                            String::new(),
-                            e.correlation_id.clone(),
-                            e.parent_correlation_id.clone(),
-                            e.metadata.clone(),
-                        )
-                    }).collect();
+                    let records: Vec<_> = originals
+                        .iter()
+                        .map(|e| {
+                            let tenant = if let Some(ref tid) = e.tenant_id {
+                                tid.clone()
+                            } else {
+                                cached_project_id.clone()
+                            };
+                            client::build_engine_record(
+                                tenant,
+                                e.run_id.clone(),
+                                e.event_type.clone(),
+                                e.data.clone(),
+                                e.source_timestamp_ns,
+                                String::new(),
+                                e.correlation_id.clone(),
+                                e.parent_correlation_id.clone(),
+                                e.metadata.clone(),
+                            )
+                        })
+                        .collect();
 
                     if let Some(ref mut eng) = engine {
                         match eng.append_batch(records).await {
@@ -1722,7 +1747,8 @@ impl Worker {
                                 journal_queue.record_sent_batch(written as usize, 0);
                                 debug!(
                                     "Flush task: wrote {} events to Engine (queue_size={})",
-                                    written, journal_queue.len()
+                                    written,
+                                    journal_queue.len()
                                 );
                             }
                             Err(e) => {
@@ -1742,7 +1768,8 @@ impl Worker {
 
                 let mut sent_count = 0;
                 let mut sse_only_count = 0;
-                let mut boundary_events: Vec<(usize, crate::pb::WriteJournalEventRequest)> = Vec::new();
+                let mut boundary_events: Vec<(usize, crate::pb::WriteJournalEventRequest)> =
+                    Vec::new();
                 let mut boundary_originals: Vec<JournalEventMessage> = Vec::new();
 
                 for event in batch {
@@ -1752,12 +1779,14 @@ impl Worker {
                     // Skip ephemeral events for non-streaming runs — nobody is listening via SSE.
                     if is_sse_only {
                         let is_run_streaming = match streaming_runs.lock() {
-                            Ok(map) => {
-                                map.get(&event.run_id).copied().unwrap_or(false)
-                            },
+                            Ok(map) => map.get(&event.run_id).copied().unwrap_or(false),
                             Err(poisoned) => {
                                 warn!("streaming_runs mutex poisoned, assuming non-streaming for run_id={}", event.run_id);
-                                poisoned.into_inner().get(&event.run_id).copied().unwrap_or(false)
+                                poisoned
+                                    .into_inner()
+                                    .get(&event.run_id)
+                                    .copied()
+                                    .unwrap_or(false)
                             }
                         };
                         if !is_run_streaming {
@@ -1791,7 +1820,8 @@ impl Worker {
                         let mut metadata = event.metadata.clone();
                         metadata = with_project_metadata(metadata, &cached_project_id);
                         if !cached_deployment_id.is_empty() {
-                            metadata.insert("deployment_id".to_string(), cached_deployment_id.clone());
+                            metadata
+                                .insert("deployment_id".to_string(), cached_deployment_id.clone());
                         }
                         // Phase 5: stamp stashed lease_id on SSE-only fallback responses.
                         let stashed_lease_id = match pending_lease_ids.lock() {
@@ -1841,7 +1871,9 @@ impl Worker {
                     let mut metadata = event.metadata.clone();
                     metadata = with_project_metadata(metadata, &cached_project_id);
                     if !cached_deployment_id.is_empty() {
-                        metadata.entry("deployment_id".to_string()).or_insert_with(|| cached_deployment_id.clone());
+                        metadata
+                            .entry("deployment_id".to_string())
+                            .or_insert_with(|| cached_deployment_id.clone());
                     }
                     let tenant_id = metadata
                         .remove("project_id")
@@ -1875,17 +1907,25 @@ impl Worker {
                     if ee_client.is_none() {
                         match Channel::from_shared(ee_endpoint.clone()) {
                             Ok(ch) => {
-                                match ch.connect_timeout(Duration::from_secs(10))
+                                match ch
+                                    .connect_timeout(Duration::from_secs(10))
                                     .timeout(Duration::from_secs(30))
                                     .connect()
                                     .await
                                 {
                                     Ok(channel) => {
-                                        debug!("Flush task: EE client connected to {}", ee_endpoint);
-                                        ee_client = Some(ExecutionEngineServiceClient::new(channel));
+                                        debug!(
+                                            "Flush task: EE client connected to {}",
+                                            ee_endpoint
+                                        );
+                                        ee_client =
+                                            Some(ExecutionEngineServiceClient::new(channel));
                                     }
                                     Err(e) => {
-                                        warn!("Flush task: failed to connect to EE {}: {}", ee_endpoint, e);
+                                        warn!(
+                                            "Flush task: failed to connect to EE {}: {}",
+                                            ee_endpoint, e
+                                        );
                                         // Re-queue all boundary events for next flush
                                         for event in boundary_originals.into_iter().rev() {
                                             journal_queue.push_front(event).ok();
@@ -1893,7 +1933,8 @@ impl Worker {
                                         journal_queue.record_error();
                                         // Continue — SSE-only events were already sent
                                         if sent_count > 0 {
-                                            journal_queue.record_sent_batch(sent_count, sse_only_count);
+                                            journal_queue
+                                                .record_sent_batch(sent_count, sse_only_count);
                                         }
                                         continue;
                                     }
@@ -1914,9 +1955,8 @@ impl Worker {
                     }
 
                     if let Some(ref mut client) = ee_client {
-                        let batch_req = crate::pb::WriteJournalEventsBatchRequest {
-                            events: requests,
-                        };
+                        let batch_req =
+                            crate::pb::WriteJournalEventsBatchRequest { events: requests };
                         match client.write_journal_events_batch(batch_req).await {
                             Ok(resp) => {
                                 let r = resp.into_inner();
@@ -1924,7 +1964,8 @@ impl Worker {
                                 if !r.errors.is_empty() {
                                     warn!(
                                         "Flush task: {} boundary events had errors (written={})",
-                                        r.errors.len(), r.written_count
+                                        r.errors.len(),
+                                        r.written_count
                                     );
                                     for err in &r.errors {
                                         warn!("  event[{}]: {}", err.index, err.error_message);
@@ -1974,11 +2015,7 @@ impl Worker {
     ) -> tokio::task::JoinHandle<()> {
         let worker_id = self.config.worker_id.clone();
         let endpoint = self.config.resolved_coordinator_endpoint();
-        let component_ids: Vec<String> = self
-            .components
-            .iter()
-            .map(|c| c.name.clone())
-            .collect();
+        let component_ids: Vec<String> = self.components.iter().map(|c| c.name.clone()).collect();
         let project_id = canonical_project_id_from_env();
         let deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").ok();
         let streaming_runs = self.streaming_runs.clone();
@@ -2088,7 +2125,11 @@ impl Worker {
                             }
 
                             // Check stream_mode before metadata is moved into the struct
-                            let is_streaming = metadata.get("stream_mode").map_or(false, |m| m == "full");
+                            let is_streaming =
+                                metadata.get("stream_mode").map_or(false, |m| m == "full");
+                            let session_id =
+                                metadata.get("session_id").cloned().unwrap_or_default();
+                            let user_id = metadata.get("user_id").cloned().unwrap_or_default();
 
                             // Phase 5: extract lease/priority/deployment from metadata
                             // (PULL path: coordinator stuffs lease info into JobAssignment.metadata).
@@ -2123,8 +2164,8 @@ impl Worker {
                                             state_snapshot: Vec::new(),
                                             journal_position: 0,
                                             step_checkpoints: Vec::new(),
-                                            session_id: String::new(),
-                                            user_id: String::new(),
+                                            session_id,
+                                            user_id,
                                             is_streaming,
                                             priority,
                                             deployment_id,
@@ -2155,7 +2196,10 @@ impl Worker {
                             }
                         }
 
-                        eprintln!("[INFO] Job queue: dispatched {} jobs to worker pool", job_count);
+                        eprintln!(
+                            "[INFO] Job queue: dispatched {} jobs to worker pool",
+                            job_count
+                        );
                     }
                     Err(e) => {
                         // Phase 8: the Unimplemented fallback is gone — the
@@ -2203,10 +2247,7 @@ impl Worker {
                         resp.success,
                         output,
                         resp.error_message.clone(),
-                        resp.metadata
-                            .get("error_code")
-                            .cloned()
-                            .unwrap_or_default(),
+                        resp.metadata.get("error_code").cloned().unwrap_or_default(),
                     )
                 }
                 _ => {
@@ -2228,7 +2269,10 @@ impl Worker {
             let mut client = match WorkerCoordinatorClient::connect(endpoint).await {
                 Ok(c) => c,
                 Err(e) => {
-                    error!("Failed to connect for CompleteJob: job_id={} error={}", job_id, e);
+                    error!(
+                        "Failed to connect for CompleteJob: job_id={} error={}",
+                        job_id, e
+                    );
                     return;
                 }
             };
@@ -2259,8 +2303,7 @@ impl Worker {
     /// Write a health marker file so the K8s readiness probe passes.
     /// The file is written to `$AGNT5_HEALTH_DIR/worker_{id}.txt`.
     fn write_health_marker(&self) {
-        let health_dir =
-            std::env::var("AGNT5_HEALTH_DIR").unwrap_or_else(|_| "/tmp/health".into());
+        let health_dir = std::env::var("AGNT5_HEALTH_DIR").unwrap_or_else(|_| "/tmp/health".into());
         if let Err(e) = std::fs::create_dir_all(&health_dir) {
             warn!("Failed to create health dir {}: {}", health_dir, e);
             return;
@@ -2275,8 +2318,7 @@ impl Worker {
 
     /// Remove the health marker file so the K8s readiness probe fails.
     fn remove_health_marker(&self) {
-        let health_dir =
-            std::env::var("AGNT5_HEALTH_DIR").unwrap_or_else(|_| "/tmp/health".into());
+        let health_dir = std::env::var("AGNT5_HEALTH_DIR").unwrap_or_else(|_| "/tmp/health".into());
         let path = format!("{}/worker_{}.txt", health_dir, self.config.worker_id);
         if let Err(e) = std::fs::remove_file(&path) {
             // Not an error if the file doesn't exist (e.g., first connect failed before marker was written)

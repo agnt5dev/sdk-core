@@ -36,11 +36,10 @@ impl DeepSeekConfig {
     }
 
     pub fn from_env() -> SdkResult<Self> {
-        let api_key = env::var("DEEPSEEK_API_KEY")
-            .map_err(|_| SdkError::Configuration {
-                message: "DEEPSEEK_API_KEY must be set".to_string(),
-                field: Some("DEEPSEEK_API_KEY".to_string()),
-            })?;
+        let api_key = env::var("DEEPSEEK_API_KEY").map_err(|_| SdkError::Configuration {
+            message: "DEEPSEEK_API_KEY must be set".to_string(),
+            field: Some("DEEPSEEK_API_KEY".to_string()),
+        })?;
 
         let mut config = DeepSeekConfig::new(api_key);
 

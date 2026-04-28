@@ -36,11 +36,10 @@ impl XaiConfig {
     }
 
     pub fn from_env() -> SdkResult<Self> {
-        let api_key = env::var("XAI_API_KEY")
-            .map_err(|_| SdkError::Configuration {
-                message: "XAI_API_KEY must be set".to_string(),
-                field: Some("XAI_API_KEY".to_string()),
-            })?;
+        let api_key = env::var("XAI_API_KEY").map_err(|_| SdkError::Configuration {
+            message: "XAI_API_KEY must be set".to_string(),
+            field: Some("XAI_API_KEY".to_string()),
+        })?;
 
         let mut config = XaiConfig::new(api_key);
 

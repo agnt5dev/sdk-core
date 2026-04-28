@@ -45,11 +45,10 @@ impl OpenRouterConfig {
     }
 
     pub fn from_env() -> SdkResult<Self> {
-        let api_key = env::var("OPENROUTER_API_KEY")
-            .map_err(|_| SdkError::Configuration {
-                message: "OPENROUTER_API_KEY must be set".to_string(),
-                field: Some("OPENROUTER_API_KEY".to_string()),
-            })?;
+        let api_key = env::var("OPENROUTER_API_KEY").map_err(|_| SdkError::Configuration {
+            message: "OPENROUTER_API_KEY must be set".to_string(),
+            field: Some("OPENROUTER_API_KEY".to_string()),
+        })?;
 
         let mut config = OpenRouterConfig::new(api_key);
 
@@ -87,7 +86,7 @@ impl OpenRouterProvider {
         // We explicitly set model_prefix to None so models are passed as-is
         let mut inner_config = OpenAiChatConfig::new(config.api_key)
             .with_base_url(config.base_url)
-            .with_model_prefix(None::<String>);  // Explicitly remove the default "openai" prefix
+            .with_model_prefix(None::<String>); // Explicitly remove the default "openai" prefix
 
         if let Some(referer) = config.referer {
             inner_config = inner_config.with_header("HTTP-Referer", referer);

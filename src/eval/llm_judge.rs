@@ -145,7 +145,10 @@ fn parse_llm_judge_response(content: &str) -> ScorerResult {
                 .and_then(|p| p.as_bool())
                 .unwrap_or(score >= 0.7);
 
-            let explanation = v.get("explanation").and_then(|e| e.as_str()).map(String::from);
+            let explanation = v
+                .get("explanation")
+                .and_then(|e| e.as_str())
+                .map(String::from);
 
             let label = v.get("label").and_then(|l| l.as_str()).map(String::from);
 
@@ -161,10 +164,7 @@ fn parse_llm_judge_response(content: &str) -> ScorerResult {
             score: 0.0,
             passed: Some(false),
             label: Some("parse_error".into()),
-            explanation: Some(format!(
-                "Could not parse LLM response as JSON: {}",
-                content
-            )),
+            explanation: Some(format!("Could not parse LLM response as JSON: {}", content)),
             metadata: None,
         },
     }

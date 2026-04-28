@@ -75,16 +75,10 @@ pub enum SdkError {
     },
 
     #[error("Worker registration failed: {message}")]
-    Registration {
-        message: String,
-        code: ErrorCode,
-    },
+    Registration { message: String, code: ErrorCode },
 
     #[error("Worker registration redirected to {endpoint}: {message}")]
-    RegistrationRedirect {
-        endpoint: String,
-        message: String,
-    },
+    RegistrationRedirect { endpoint: String, message: String },
 
     #[error("Invalid configuration: {message}")]
     Configuration {
@@ -99,10 +93,7 @@ pub enum SdkError {
     },
 
     #[error("State management error: {message}")]
-    State {
-        message: String,
-        code: ErrorCode,
-    },
+    State { message: String, code: ErrorCode },
 
     #[error("Timeout error: {message}")]
     Timeout {
@@ -118,10 +109,7 @@ pub enum SdkError {
     },
 
     #[error("Execution suspended: {message}")]
-    SuspendedExecution {
-        message: String,
-        reason: String,
-    },
+    SuspendedExecution { message: String, reason: String },
 
     #[error("Replay error: {message}")]
     ReplayError {
@@ -130,10 +118,7 @@ pub enum SdkError {
     },
 
     #[error("Service call error: {message}")]
-    ServiceCallError {
-        message: String,
-        service: String,
-    },
+    ServiceCallError { message: String, service: String },
 
     #[error("Telemetry error: {0}")]
     TelemetryError(String),
@@ -224,9 +209,10 @@ impl SdkError {
             Self::Timeout { .. } => RetryHint::Retryable,
 
             // Resource exhaustion might be retryable after backoff
-            Self::State { code: ErrorCode::ResourceExhausted, .. } => {
-                RetryHint::RetryableWithBackoff
-            }
+            Self::State {
+                code: ErrorCode::ResourceExhausted,
+                ..
+            } => RetryHint::RetryableWithBackoff,
 
             // Configuration, validation, and internal errors are not retryable
             Self::Configuration { .. }

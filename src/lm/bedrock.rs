@@ -42,19 +42,16 @@ pub struct BedrockConfig {
 
 impl BedrockConfig {
     pub fn from_env() -> SdkResult<Self> {
-        let access_key = env::var("AWS_ACCESS_KEY_ID").map_err(|_| {
-            SdkError::Configuration {
-                message: "AWS_ACCESS_KEY_ID must be set for Bedrock requests".to_string(),
-                field: Some("AWS_ACCESS_KEY_ID".to_string()),
-            }
+        let access_key = env::var("AWS_ACCESS_KEY_ID").map_err(|_| SdkError::Configuration {
+            message: "AWS_ACCESS_KEY_ID must be set for Bedrock requests".to_string(),
+            field: Some("AWS_ACCESS_KEY_ID".to_string()),
         })?;
 
-        let secret_key = env::var("AWS_SECRET_ACCESS_KEY").map_err(|_| {
-            SdkError::Configuration {
+        let secret_key =
+            env::var("AWS_SECRET_ACCESS_KEY").map_err(|_| SdkError::Configuration {
                 message: "AWS_SECRET_ACCESS_KEY must be set for Bedrock requests".to_string(),
                 field: Some("AWS_SECRET_ACCESS_KEY".to_string()),
-            }
-        })?;
+            })?;
 
         let session_token = env::var("AWS_SESSION_TOKEN").ok();
         let default_region = env::var("AWS_REGION").ok();
@@ -171,7 +168,8 @@ fn extract_region_and_model<'a>(
     if let Some((region, model_id)) = rest.split_once('/') {
         if region.trim().is_empty() || model_id.trim().is_empty() {
             return Err(SdkError::Configuration {
-                message: "Bedrock model id must be in the form `bedrock/<region>/<model>`".to_string(),
+                message: "Bedrock model id must be in the form `bedrock/<region>/<model>`"
+                    .to_string(),
                 field: Some("model".to_string()),
             });
         }
@@ -180,7 +178,8 @@ fn extract_region_and_model<'a>(
         Ok((region, rest.trim()))
     } else {
         Err(SdkError::Configuration {
-            message: "Bedrock model id must include a region (bedrock/<region>/<model>)".to_string(),
+            message: "Bedrock model id must include a region (bedrock/<region>/<model>)"
+                .to_string(),
             field: Some("model".to_string()),
         })
     }
@@ -191,7 +190,9 @@ fn build_bedrock_payload(request: &GenerateRequest, model_id: &str) -> SdkResult
         build_anthropic_payload(request)
     } else {
         Err(SdkError::Configuration {
-            message: format!("Bedrock provider currently supports anthropic models only; got `{model_id}`"),
+            message: format!(
+                "Bedrock provider currently supports anthropic models only; got `{model_id}`"
+            ),
             field: Some("model".to_string()),
         })
     }
@@ -220,7 +221,8 @@ fn build_anthropic_payload(request: &GenerateRequest) -> SdkResult<Value> {
 
     if messages.is_empty() {
         return Err(SdkError::Configuration {
-            message: "Bedrock anthropic requests require at least one user or assistant message".to_string(),
+            message: "Bedrock anthropic requests require at least one user or assistant message"
+                .to_string(),
             field: None,
         });
     }
@@ -415,7 +417,7 @@ impl BedrockAnthropicResponse {
             finish_reason: self.stop_reason,
             usage: self.usage.and_then(|usage| usage.into_token_usage()),
             text,
-            tool_calls: None,  // Bedrock tool calls not yet supported
+            tool_calls: None, // Bedrock tool calls not yet supported
             object,
             raw: None,
             metadata: None,

@@ -37,11 +37,10 @@ impl MistralConfig {
     }
 
     pub fn from_env() -> SdkResult<Self> {
-        let api_key = env::var("MISTRAL_API_KEY")
-            .map_err(|_| SdkError::Configuration {
-                message: "MISTRAL_API_KEY must be set".to_string(),
-                field: Some("MISTRAL_API_KEY".to_string()),
-            })?;
+        let api_key = env::var("MISTRAL_API_KEY").map_err(|_| SdkError::Configuration {
+            message: "MISTRAL_API_KEY must be set".to_string(),
+            field: Some("MISTRAL_API_KEY".to_string()),
+        })?;
 
         let mut config = MistralConfig::new(api_key);
 

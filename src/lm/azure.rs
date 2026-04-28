@@ -6,11 +6,11 @@ use reqwest::Client;
 
 use crate::error::{Result as SdkResult, SdkError};
 
+use super::http;
 use super::interface::{
     generate as generate_via_model, stream as stream_via_model, GenerateRequest, GenerateResponse,
     LanguageModel, StreamHandle, StreamRequest,
 };
-use super::http;
 use super::openai_common::{
     stream_handle_from_response, ChatCompletionPayload, ChatCompletionResponse,
 };
@@ -50,17 +50,14 @@ impl AzureOpenAiConfig {
     }
 
     pub fn from_env() -> SdkResult<Self> {
-        let api_key = env::var("AZURE_OPENAI_API_KEY")
-            .map_err(|_| SdkError::Configuration {
-                message: "AZURE_OPENAI_API_KEY must be set".to_string(),
-                field: Some("AZURE_OPENAI_API_KEY".to_string()),
-            })?;
+        let api_key = env::var("AZURE_OPENAI_API_KEY").map_err(|_| SdkError::Configuration {
+            message: "AZURE_OPENAI_API_KEY must be set".to_string(),
+            field: Some("AZURE_OPENAI_API_KEY".to_string()),
+        })?;
 
-        let endpoint = env::var("AZURE_OPENAI_ENDPOINT").map_err(|_| {
-            SdkError::Configuration {
-                message: "AZURE_OPENAI_ENDPOINT must be set".to_string(),
-                field: Some("AZURE_OPENAI_ENDPOINT".to_string()),
-            }
+        let endpoint = env::var("AZURE_OPENAI_ENDPOINT").map_err(|_| SdkError::Configuration {
+            message: "AZURE_OPENAI_ENDPOINT must be set".to_string(),
+            field: Some("AZURE_OPENAI_ENDPOINT".to_string()),
         })?;
 
         let mut config = AzureOpenAiConfig::new(api_key, endpoint);
@@ -124,7 +121,8 @@ impl AzureOpenAiProvider {
             let deployment = rest.trim();
             if deployment.is_empty() {
                 return Err(SdkError::Configuration {
-                    message: "Azure model id must include deployment after `azure/` prefix".to_string(),
+                    message: "Azure model id must include deployment after `azure/` prefix"
+                        .to_string(),
                     field: Some("model".to_string()),
                 });
             }
@@ -162,9 +160,10 @@ impl LanguageModel for AzureOpenAiProvider {
         .await?;
 
         let metadata = http::extract_metadata(&response);
-        let parsed: ChatCompletionResponse = response.json().await.map_err(|err| {
-            http::classify_reqwest_error(err, "azure")
-        })?;
+        let parsed: ChatCompletionResponse = response
+            .json()
+            .await
+            .map_err(|err| http::classify_reqwest_error(err, "azure"))?;
 
         let mut result = parsed.into_generate_response(request.config.response_format.clone())?;
         result.metadata = Some(metadata);
@@ -177,23 +176,32 @@ impl LanguageModel for AzureOpenAiProvider {
         let payload = ChatCompletionPayload::from_request(&request, deployment.clone(), true);
 
         let response = http::send_with_retry(
-            || self.request(&deployment).header("Accept", "text/event-stream").json(&payload),
+            || {
+                self.request(&deployment)
+                    .header("Accept", "text/event-stream")
+                    .json(&payload)
+            },
             &self.config.retry_config,
             "azure",
             request.config.timeout,
         )
         .await?;
-        stream_handle_from_response(response, request.config.response_format.clone(), self.config.timeout.as_secs())
+        stream_handle_from_response(
+            response,
+            request.config.response_format.clone(),
+            self.config.timeout.as_secs(),
+        )
     }
 }
 
 fn validate_request(request: &GenerateRequest) -> SdkResult<()> {
     if request.system_prompt.is_none() && request.messages.is_empty() {
         return Err(SdkError::Configuration {
-            message: "at least a system prompt or one message is required for Azure OpenAI requests".to_string(),
+            message:
+                "at least a system prompt or one message is required for Azure OpenAI requests"
+                    .to_string(),
             field: None,
         });
     }
     Ok(())
 }
-

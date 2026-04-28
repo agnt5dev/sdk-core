@@ -6,6 +6,7 @@ mod embedder;
 mod google;
 mod groq;
 pub(crate) mod http;
+mod huggingface;
 mod interface;
 mod mistral;
 mod ollama;
@@ -15,7 +16,6 @@ mod openai_common;
 mod openrouter;
 mod telemetry;
 mod xai;
-mod huggingface;
 
 pub use anthropic::{AnthropicConfig, AnthropicProvider};
 pub use azure::{AzureOpenAiConfig, AzureOpenAiProvider};
@@ -26,6 +26,8 @@ pub use embedder::{
 };
 pub use google::{GoogleConfig, GoogleProvider};
 pub use groq::{GroqConfig, GroqProvider};
+pub use http::RetryConfig;
+pub use huggingface::{HuggingFaceConfig, HuggingFaceProvider};
 pub use interface::{
     generate, stream, BuiltInTool, ContentBlockType, GenerateRequest, GenerateResponse,
     GenerationConfig, JsonSchemaFormat, LanguageModel, Message, MessageRole, Modality,
@@ -38,5 +40,3 @@ pub use openai::{OpenAiConfig, OpenAiProvider};
 pub use openai_chat::{OpenAiChatConfig, OpenAiChatProvider};
 pub use openrouter::{OpenRouterConfig, OpenRouterProvider};
 pub use xai::{XaiConfig, XaiProvider};
-pub use http::RetryConfig;
-pub use huggingface::{HuggingFaceConfig, HuggingFaceProvider};

@@ -41,7 +41,11 @@ pub fn exact_match(input: &ScorerInput, config: &ExactMatchConfig) -> ScorerResu
     ScorerResult {
         score: if matches { 1.0 } else { 0.0 },
         passed: Some(matches),
-        label: Some(if matches { "match".into() } else { "mismatch".into() }),
+        label: Some(if matches {
+            "match".into()
+        } else {
+            "mismatch".into()
+        }),
         explanation: None,
         metadata: None,
     }
@@ -79,7 +83,11 @@ pub fn contains(input: &ScorerInput, config: &ContainsConfig) -> ScorerResult {
     ScorerResult {
         score: if found { 1.0 } else { 0.0 },
         passed: Some(found),
-        label: Some(if found { "found".into() } else { "not_found".into() }),
+        label: Some(if found {
+            "found".into()
+        } else {
+            "not_found".into()
+        }),
         explanation: None,
         metadata: None,
     }
@@ -104,7 +112,11 @@ pub fn json_valid(input: &ScorerInput) -> ScorerResult {
     ScorerResult {
         score: if valid { 1.0 } else { 0.0 },
         passed: Some(valid),
-        label: Some(if valid { "valid".into() } else { "invalid".into() }),
+        label: Some(if valid {
+            "valid".into()
+        } else {
+            "invalid".into()
+        }),
         explanation: None,
         metadata: None,
     }

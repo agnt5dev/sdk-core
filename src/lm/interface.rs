@@ -304,7 +304,10 @@ impl Message {
     }
 
     /// Create an assistant message with tool calls
-    pub fn assistant_with_tool_calls(content: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
+    pub fn assistant_with_tool_calls(
+        content: impl Into<String>,
+        tool_calls: Vec<ToolCall>,
+    ) -> Self {
         Self {
             role: MessageRole::Assistant,
             content: content.into(),

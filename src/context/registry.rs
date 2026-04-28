@@ -114,14 +114,12 @@ impl FunctionRegistry {
             handlers.get(&key).cloned()
         };
 
-        let callback = handler.ok_or_else(|| {
-            SdkError::InvalidArgument {
-                message: format!(
-                    "no function registered for {}::{}",
-                    call.target_service, call.handler
-                ),
-                argument: Some("handler".to_string()),
-            }
+        let callback = handler.ok_or_else(|| SdkError::InvalidArgument {
+            message: format!(
+                "no function registered for {}::{}",
+                call.target_service, call.handler
+            ),
+            argument: Some("handler".to_string()),
         })?;
 
         callback(call, ctx).await

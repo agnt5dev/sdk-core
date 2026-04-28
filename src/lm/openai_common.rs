@@ -464,7 +464,7 @@ impl PartialResponse {
             finish_reason: self.finish_reason,
             usage: usage_from_api(self.usage),
             text,
-            tool_calls: None,  // Streaming doesn't support tool calls yet
+            tool_calls: None, // Streaming doesn't support tool calls yet
             object,
             raw: None,
             metadata: None,
@@ -626,4 +626,3 @@ fn build_stream(
 
     Ok(Box::pin(stream))
 }
-

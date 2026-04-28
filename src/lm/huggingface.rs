@@ -1,7 +1,7 @@
 use std::env;
 
-use async_trait::async_trait;
 use crate::error::{Result as SdkResult, SdkError};
+use async_trait::async_trait;
 
 use super::openai_chat::{OpenAiChatConfig, OpenAiChatProvider};
 
@@ -16,7 +16,6 @@ pub struct HuggingFaceConfig {
     pub api_key: String,
     pub base_url: String,
 }
-
 
 impl HuggingFaceConfig {
     pub fn new(api_key: impl Into<String>) -> Self {
@@ -51,19 +50,16 @@ impl HuggingFaceConfig {
     }
 }
 
-
 #[derive(Clone)]
 pub struct HuggingFaceProvider {
     inner: OpenAiChatProvider,
 }
 
-
 impl HuggingFaceProvider {
     pub fn new(config: HuggingFaceConfig) -> SdkResult<Self> {
-        
         let inner_config = OpenAiChatConfig::new(config.api_key)
             .with_base_url(config.base_url)
-            .with_model_prefix(None::<String>);  
+            .with_model_prefix(None::<String>);
 
         let inner_provider = OpenAiChatProvider::new(inner_config)?;
 
@@ -109,5 +105,4 @@ impl LanguageModel for HuggingFaceProvider {
         };
         self.inner.stream(normalized_request).await
     }
-
 }

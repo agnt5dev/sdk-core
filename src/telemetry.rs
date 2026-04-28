@@ -15,7 +15,9 @@ use opentelemetry_sdk::{
 };
 use std::collections::HashMap;
 use std::sync::OnceLock;
-use tracing_subscriber::{fmt::format::Writer, layer::SubscriberExt, Layer as _, EnvFilter, Registry};
+use tracing_subscriber::{
+    fmt::format::Writer, layer::SubscriberExt, EnvFilter, Layer as _, Registry,
+};
 
 // Global storage for legacy engine routing identity and worker resource attrs
 // (set at init time).
@@ -159,7 +161,9 @@ fn init_telemetry_inner(service_name: &str, service_version: &str) -> Result<(),
     // These are set by the control plane when deploying workers
     let deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").ok();
     let tenant_id = std::env::var("AGNT5_TENANT_ID").ok();
-    let project_id = std::env::var("AGNT5_PROJECT_ID").ok().or_else(|| tenant_id.clone());
+    let project_id = std::env::var("AGNT5_PROJECT_ID")
+        .ok()
+        .or_else(|| tenant_id.clone());
     let workspace_id = std::env::var("AGNT5_WORKSPACE_ID").ok();
     let agnt5_environment = std::env::var("AGNT5_ENV").ok();
     let agnt5_user_id = std::env::var("AGNT5_USER_ID").ok();
@@ -173,9 +177,10 @@ fn init_telemetry_inner(service_name: &str, service_version: &str) -> Result<(),
     let _ = AGNT5_USER_ID.set(agnt5_user_id.clone());
 
     // Create resource attributes
-    let mut resource_attributes = vec![
-        KeyValue::new("service.version", service_version.to_string()),
-    ];
+    let mut resource_attributes = vec![KeyValue::new(
+        "service.version",
+        service_version.to_string(),
+    )];
 
     if let Some(ref project_id) = project_id {
         resource_attributes.push(KeyValue::new("agnt5.project.id", project_id.clone()));
@@ -193,7 +198,10 @@ fn init_telemetry_inner(service_name: &str, service_version: &str) -> Result<(),
         resource_attributes.push(KeyValue::new("agnt5.user", user_id.clone()));
     }
 
-    resource_attributes.push(KeyValue::new("service.namespace", PLATFORM_SERVICE_NAMESPACE));
+    resource_attributes.push(KeyValue::new(
+        "service.namespace",
+        PLATFORM_SERVICE_NAMESPACE,
+    ));
     resource_attributes.push(KeyValue::new("agnt5.app_name", service_name.to_string()));
 
     if let Ok(worker_id) = std::env::var("AGNT5_WORKER_ID") {
@@ -334,8 +342,7 @@ fn init_telemetry_inner(service_name: &str, service_version: &str) -> Result<(),
     // timestamp, colored level) and every log line leaks bytes like
     // `\x1b[2m...\x1b[33m WARN\x1b[0m` into the captured stream.
     use std::io::IsTerminal;
-    let use_ansi =
-        std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    let use_ansi = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
 
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_ansi(use_ansi)
@@ -349,8 +356,8 @@ fn init_telemetry_inner(service_name: &str, service_version: &str) -> Result<(),
 
     let subscriber = Registry::default()
         .with(telemetry_layer)
-        .with(log_appender.with_filter(otel_filter))  // OTLP logs: all user levels, platform at warn
-        .with(fmt_layer);  // Filtered console output
+        .with(log_appender.with_filter(otel_filter)) // OTLP logs: all user levels, platform at warn
+        .with(fmt_layer); // Filtered console output
 
     // Set as global default subscriber
     tracing::subscriber::set_global_default(subscriber)
@@ -376,7 +383,9 @@ pub fn extract_context_from_runtime_message(metadata: &HashMap<String, String>) 
     let span = ctx.span();
     let span_context = span.span_context();
     if !span_context.is_valid() {
-        tracing::warn!("⚠️  Failed to extract valid trace context from metadata - will create new root trace");
+        tracing::warn!(
+            "⚠️  Failed to extract valid trace context from metadata - will create new root trace"
+        );
     }
 
     // Then extract baggage using the trace context
@@ -551,14 +560,21 @@ pub fn create_tool_execution_span(
     }
 
     if let Some(description) = tool_description {
-        attributes.push(KeyValue::new("gen_ai.tool.description", description.to_string()));
+        attributes.push(KeyValue::new(
+            "gen_ai.tool.description",
+            description.to_string(),
+        ));
     }
 
     // Capture tool arguments if provided (typically JSON string)
     if let Some(args) = arguments {
         // Truncate to prevent huge span attributes
         let truncated = if args.len() > 2000 {
-            format!("{}... [truncated {} bytes]", &args[..2000], args.len() - 2000)
+            format!(
+                "{}... [truncated {} bytes]",
+                &args[..2000],
+                args.len() - 2000
+            )
         } else {
             args.to_string()
         };
@@ -600,11 +616,7 @@ pub fn record_tool_error(span: &mut BoxedSpan, error_msg: &str) {
 }
 
 /// Create a span for sandbox execution
-pub fn create_sandbox_span(
-    operation: &str,
-    backend: &str,
-    language: Option<&str>,
-) -> BoxedSpan {
+pub fn create_sandbox_span(operation: &str, backend: &str, language: Option<&str>) -> BoxedSpan {
     let tracer = global::tracer("agnt5-sdk-core");
     let span_name = format!("sandbox.{}", operation);
 
@@ -644,7 +656,10 @@ pub fn create_sandbox_span(
 /// Record sandbox execution success
 pub fn record_sandbox_success(span: &mut BoxedSpan, exit_code: i32, execution_time_ms: u64) {
     span.set_attribute(KeyValue::new("sandbox.exit_code", exit_code as i64));
-    span.set_attribute(KeyValue::new("sandbox.execution_time_ms", execution_time_ms as i64));
+    span.set_attribute(KeyValue::new(
+        "sandbox.execution_time_ms",
+        execution_time_ms as i64,
+    ));
     span.set_status(Status::Ok);
 }
 
@@ -785,7 +800,9 @@ fn get_reconnection_duration_histogram() -> &'static Histogram<f64> {
             .f64_histogram("agnt5.worker.reconnection.duration.seconds")
             .with_description("Time from disconnect to successful reconnect")
             .with_unit("s")
-            .with_boundaries(vec![0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0])
+            .with_boundaries(vec![
+                0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
+            ])
             .build()
     })
 }
@@ -806,7 +823,9 @@ fn get_connection_state_gauge() -> &'static Gauge<i64> {
         let meter = global::meter("agnt5-sdk-core");
         meter
             .i64_gauge("agnt5.worker.connection.state")
-            .with_description("Current connection state (0=disconnected, 1=connecting, 2=connected)")
+            .with_description(
+                "Current connection state (0=disconnected, 1=connecting, 2=connected)",
+            )
             .build()
     })
 }
@@ -862,7 +881,9 @@ fn get_checkpoint_duration_histogram() -> &'static Histogram<f64> {
         let meter = global::meter("agnt5-sdk-core");
         meter
             .f64_histogram("agnt5.worker.checkpoint.duration.seconds")
-            .with_description("Round-trip duration of checkpoint gRPC calls from worker to platform")
+            .with_description(
+                "Round-trip duration of checkpoint gRPC calls from worker to platform",
+            )
             .with_unit("s")
             .with_boundaries(vec![
                 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,

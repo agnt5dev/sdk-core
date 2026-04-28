@@ -85,10 +85,7 @@ impl McpClient {
         command: impl Into<String>,
         args: Vec<String>,
     ) {
-        self.add_server(
-            name,
-            ServerConfig::Stdio(StdioConfig::new(command, args)),
-        );
+        self.add_server(name, ServerConfig::Stdio(StdioConfig::new(command, args)));
     }
 
     /// Add an SSE server (convenience method)
@@ -123,21 +120,14 @@ impl McpClient {
 
         // Create transport based on config
         let transport: Box<dyn Transport> = match config {
-            ServerConfig::Stdio(stdio_config) => {
-                Box::new(StdioTransport::new(stdio_config).await?)
-            }
-            ServerConfig::Sse(sse_config) => {
-                Box::new(SseTransport::new(sse_config).await?)
-            }
+            ServerConfig::Stdio(stdio_config) => Box::new(StdioTransport::new(stdio_config).await?),
+            ServerConfig::Sse(sse_config) => Box::new(SseTransport::new(sse_config).await?),
         };
 
         // Initialize the connection
         let init_params = InitializeParams::default();
-        let init_req = JsonRpcRequest::new(
-            "initialize",
-            Some(serde_json::to_value(&init_params)?),
-            0,
-        );
+        let init_req =
+            JsonRpcRequest::new("initialize", Some(serde_json::to_value(&init_params)?), 0);
 
         let init_response = transport.request(init_req).await?;
         let init_result: InitializeResult = serde_json::from_value(
@@ -171,11 +161,7 @@ impl McpClient {
             Vec::new()
         };
 
-        tracing::info!(
-            "MCP server {} has {} tools available",
-            name,
-            tools.len()
-        );
+        tracing::info!("MCP server {} has {} tools available", name, tools.len());
 
         // Store connection
         let connection = ServerConnection {
@@ -386,7 +372,11 @@ mod tests {
     #[test]
     fn test_add_servers() {
         let mut client = McpClient::new("test");
-        client.add_stdio_server("wikipedia", "npx", vec!["-y".into(), "wikipedia-mcp".into()]);
+        client.add_stdio_server(
+            "wikipedia",
+            "npx",
+            vec!["-y".into(), "wikipedia-mcp".into()],
+        );
         client.add_sse_server("remote", "https://example.com/mcp");
 
         assert_eq!(client.server_configs.len(), 2);

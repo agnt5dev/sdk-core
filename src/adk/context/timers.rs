@@ -23,11 +23,9 @@ impl TimerControls {
     }
 
     fn state(&self) -> Result<Arc<ContextRuntimeState>> {
-        self.state.clone().ok_or_else(|| {
-            SdkError::Unavailable {
-                message: "durable timer controls unavailable in this context".into(),
-                service: None,
-            }
+        self.state.clone().ok_or_else(|| SdkError::Unavailable {
+            message: "durable timer controls unavailable in this context".into(),
+            service: None,
         })
     }
 
@@ -38,12 +36,11 @@ impl TimerControls {
         }
 
         let state = self.state()?;
-        let delay_ms = i64::try_from(duration.as_millis()).map_err(|_| {
-            SdkError::InvalidArgument {
+        let delay_ms =
+            i64::try_from(duration.as_millis()).map_err(|_| SdkError::InvalidArgument {
                 message: "timer duration exceeds maximum supported range".into(),
                 argument: Some("duration".to_string()),
-            }
-        })?;
+            })?;
 
         let timer_key = format!("{}:sleep:{}", state.step_id, delay_ms);
         let dedupe_id = format!("{}:{}:{}", state.run_id, state.step_id, timer_key);

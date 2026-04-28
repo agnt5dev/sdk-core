@@ -10,12 +10,13 @@
 /// - Optional content capture (opt-in via environment variable)
 /// - Structured message serialization per OpenTelemetry format
 /// - Support for streaming responses with span events
-
 use opentelemetry::trace::{Span, SpanKind, Status, Tracer};
 use opentelemetry::{global, KeyValue};
 use serde_json::{json, Value};
 
-use super::interface::{GenerateRequest, GenerateResponse, MessageRole, TokenUsage, ToolDefinition};
+use super::interface::{
+    GenerateRequest, GenerateResponse, MessageRole, TokenUsage, ToolDefinition,
+};
 
 /// Semantic convention attribute names for Gen AI operations
 pub mod attributes {
@@ -61,7 +62,10 @@ pub struct ModelPricing {
 /// Returns None if pricing is not available for the model.
 /// Prices are in USD per 1M tokens (as of January 2025).
 pub fn get_model_pricing(provider: &str, model: &str) -> Option<ModelPricing> {
-    match (provider.to_lowercase().as_str(), model.to_lowercase().as_str()) {
+    match (
+        provider.to_lowercase().as_str(),
+        model.to_lowercase().as_str(),
+    ) {
         // ============================================================
         // OpenAI Models
         // ============================================================
@@ -77,16 +81,24 @@ pub fn get_model_pricing(provider: &str, model: &str) -> Option<ModelPricing> {
         }),
 
         // OpenAI GPT-4 Turbo
-        ("openai", m) if m.contains("gpt-4-turbo") || m == "gpt-4-1106-preview" || m == "gpt-4-0125-preview" => Some(ModelPricing {
-            input_per_1m: 10.00,
-            output_per_1m: 30.00,
-        }),
+        ("openai", m)
+            if m.contains("gpt-4-turbo")
+                || m == "gpt-4-1106-preview"
+                || m == "gpt-4-0125-preview" =>
+        {
+            Some(ModelPricing {
+                input_per_1m: 10.00,
+                output_per_1m: 30.00,
+            })
+        }
 
         // OpenAI GPT-4
-        ("openai", m) if m.starts_with("gpt-4") && !m.contains("turbo") && !m.contains("o") => Some(ModelPricing {
-            input_per_1m: 30.00,
-            output_per_1m: 60.00,
-        }),
+        ("openai", m) if m.starts_with("gpt-4") && !m.contains("turbo") && !m.contains("o") => {
+            Some(ModelPricing {
+                input_per_1m: 30.00,
+                output_per_1m: 60.00,
+            })
+        }
 
         // OpenAI GPT-3.5 Turbo
         ("openai", m) if m.contains("gpt-3.5-turbo") => Some(ModelPricing {
@@ -122,16 +134,20 @@ pub fn get_model_pricing(provider: &str, model: &str) -> Option<ModelPricing> {
         // ============================================================
 
         // Anthropic Claude 4 Opus
-        ("anthropic", m) if m.contains("claude-opus-4") || m.contains("claude-4-opus") => Some(ModelPricing {
-            input_per_1m: 15.00,
-            output_per_1m: 75.00,
-        }),
+        ("anthropic", m) if m.contains("claude-opus-4") || m.contains("claude-4-opus") => {
+            Some(ModelPricing {
+                input_per_1m: 15.00,
+                output_per_1m: 75.00,
+            })
+        }
 
         // Anthropic Claude 4 Sonnet
-        ("anthropic", m) if m.contains("claude-sonnet-4") || m.contains("claude-4-sonnet") => Some(ModelPricing {
-            input_per_1m: 3.00,
-            output_per_1m: 15.00,
-        }),
+        ("anthropic", m) if m.contains("claude-sonnet-4") || m.contains("claude-4-sonnet") => {
+            Some(ModelPricing {
+                input_per_1m: 3.00,
+                output_per_1m: 15.00,
+            })
+        }
 
         // Anthropic Claude 3.5 Sonnet
         ("anthropic", m) if m.contains("claude-3-5-sonnet") => Some(ModelPricing {
@@ -152,16 +168,20 @@ pub fn get_model_pricing(provider: &str, model: &str) -> Option<ModelPricing> {
         }),
 
         // Anthropic Claude 3 Sonnet
-        ("anthropic", m) if m.contains("claude-3-sonnet") && !m.contains("3-5") => Some(ModelPricing {
-            input_per_1m: 3.00,
-            output_per_1m: 15.00,
-        }),
+        ("anthropic", m) if m.contains("claude-3-sonnet") && !m.contains("3-5") => {
+            Some(ModelPricing {
+                input_per_1m: 3.00,
+                output_per_1m: 15.00,
+            })
+        }
 
         // Anthropic Claude 3 Haiku
-        ("anthropic", m) if m.contains("claude-3-haiku") && !m.contains("3-5") => Some(ModelPricing {
-            input_per_1m: 0.25,
-            output_per_1m: 1.25,
-        }),
+        ("anthropic", m) if m.contains("claude-3-haiku") && !m.contains("3-5") => {
+            Some(ModelPricing {
+                input_per_1m: 0.25,
+                output_per_1m: 1.25,
+            })
+        }
 
         // ============================================================
         // Google Gemini Models
@@ -186,26 +206,32 @@ pub fn get_model_pricing(provider: &str, model: &str) -> Option<ModelPricing> {
         }),
 
         // Gemini 1.0 Pro
-        ("google", m) if m.contains("gemini-1.0-pro") || m.contains("gemini-pro") => Some(ModelPricing {
-            input_per_1m: 0.50,
-            output_per_1m: 1.50,
-        }),
+        ("google", m) if m.contains("gemini-1.0-pro") || m.contains("gemini-pro") => {
+            Some(ModelPricing {
+                input_per_1m: 0.50,
+                output_per_1m: 1.50,
+            })
+        }
 
         // ============================================================
         // DeepSeek Models
         // ============================================================
 
         // DeepSeek V3 (exceptionally cost-effective)
-        ("deepseek", m) if m.contains("deepseek-chat") || m.contains("deepseek-v3") => Some(ModelPricing {
-            input_per_1m: 0.27,
-            output_per_1m: 1.10,
-        }),
+        ("deepseek", m) if m.contains("deepseek-chat") || m.contains("deepseek-v3") => {
+            Some(ModelPricing {
+                input_per_1m: 0.27,
+                output_per_1m: 1.10,
+            })
+        }
 
         // DeepSeek R1 (reasoning model)
-        ("deepseek", m) if m.contains("deepseek-reasoner") || m.contains("deepseek-r1") => Some(ModelPricing {
-            input_per_1m: 0.55,
-            output_per_1m: 2.19,
-        }),
+        ("deepseek", m) if m.contains("deepseek-reasoner") || m.contains("deepseek-r1") => {
+            Some(ModelPricing {
+                input_per_1m: 0.55,
+                output_per_1m: 2.19,
+            })
+        }
 
         // DeepSeek Coder
         ("deepseek", m) if m.contains("deepseek-coder") => Some(ModelPricing {
@@ -288,22 +314,28 @@ pub fn get_model_pricing(provider: &str, model: &str) -> Option<ModelPricing> {
         }),
 
         // Open Mixtral 8x22B
-        ("mistral", m) if m.contains("mixtral-8x22b") || m.contains("open-mixtral-8x22b") => Some(ModelPricing {
-            input_per_1m: 2.00,
-            output_per_1m: 6.00,
-        }),
+        ("mistral", m) if m.contains("mixtral-8x22b") || m.contains("open-mixtral-8x22b") => {
+            Some(ModelPricing {
+                input_per_1m: 2.00,
+                output_per_1m: 6.00,
+            })
+        }
 
         // Open Mixtral 8x7B
-        ("mistral", m) if m.contains("mixtral-8x7b") || m.contains("open-mixtral-8x7b") => Some(ModelPricing {
-            input_per_1m: 0.70,
-            output_per_1m: 0.70,
-        }),
+        ("mistral", m) if m.contains("mixtral-8x7b") || m.contains("open-mixtral-8x7b") => {
+            Some(ModelPricing {
+                input_per_1m: 0.70,
+                output_per_1m: 0.70,
+            })
+        }
 
         // Open Mistral 7B
-        ("mistral", m) if m.contains("open-mistral-7b") || m.contains("mistral-7b") => Some(ModelPricing {
-            input_per_1m: 0.25,
-            output_per_1m: 0.25,
-        }),
+        ("mistral", m) if m.contains("open-mistral-7b") || m.contains("mistral-7b") => {
+            Some(ModelPricing {
+                input_per_1m: 0.25,
+                output_per_1m: 0.25,
+            })
+        }
 
         // ============================================================
         // Groq Models (hosted inference)
@@ -340,10 +372,12 @@ pub fn get_model_pricing(provider: &str, model: &str) -> Option<ModelPricing> {
         }),
 
         // Llama 3 70B
-        ("groq", m) if m.contains("llama3-70b") || m.contains("llama-3-70b") => Some(ModelPricing {
-            input_per_1m: 0.59,
-            output_per_1m: 0.79,
-        }),
+        ("groq", m) if m.contains("llama3-70b") || m.contains("llama-3-70b") => {
+            Some(ModelPricing {
+                input_per_1m: 0.59,
+                output_per_1m: 0.79,
+            })
+        }
 
         // Llama 3 8B
         ("groq", m) if m.contains("llama3-8b") || m.contains("llama-3-8b") => Some(ModelPricing {
@@ -468,7 +502,10 @@ pub fn create_gen_ai_span(
 
     // Required attributes per OpenTelemetry Gen AI conventions
     span.set_attribute(KeyValue::new(attributes::OPERATION_NAME, "chat"));
-    span.set_attribute(KeyValue::new(attributes::PROVIDER_NAME, provider.to_string()));
+    span.set_attribute(KeyValue::new(
+        attributes::PROVIDER_NAME,
+        provider.to_string(),
+    ));
     span.set_attribute(KeyValue::new(attributes::REQUEST_MODEL, model.to_string()));
 
     if let Some(pid) = crate::telemetry::get_project_id() {
@@ -495,10 +532,7 @@ pub fn set_request_attributes(span: &mut impl Span, request: &GenerateRequest) {
     }
 
     if let Some(top_p) = request.config.top_p {
-        span.set_attribute(KeyValue::new(
-            attributes::REQUEST_TOP_P,
-            top_p as f64,
-        ));
+        span.set_attribute(KeyValue::new(attributes::REQUEST_TOP_P, top_p as f64));
     }
 
     if let Some(max_tokens) = request.config.max_output_tokens {
@@ -743,7 +777,11 @@ pub fn serialize_tool_definitions(tools: &[ToolDefinition]) -> Value {
 }
 
 /// Set tool-related request attributes on the span
-pub fn set_tool_request_attributes(span: &mut impl Span, request: &GenerateRequest, capture_content: bool) {
+pub fn set_tool_request_attributes(
+    span: &mut impl Span,
+    request: &GenerateRequest,
+    capture_content: bool,
+) {
     if !request.tools.is_empty() {
         // Always capture tool count
         span.set_attribute(KeyValue::new(
@@ -764,10 +802,7 @@ pub fn set_tool_request_attributes(span: &mut impl Span, request: &GenerateReque
     // Capture tool choice if specified
     if let Some(tool_choice) = &request.tool_choice {
         let choice_str = format!("{:?}", tool_choice);
-        span.set_attribute(KeyValue::new(
-            "gen_ai.request.tool_choice",
-            choice_str,
-        ));
+        span.set_attribute(KeyValue::new("gen_ai.request.tool_choice", choice_str));
     }
 }
 

@@ -287,9 +287,10 @@ impl PineconeProvider {
             request = request.json(&body);
         }
 
-        let response = request.send().await.map_err(|e| {
-            SdkError::Other(anyhow::anyhow!("Pinecone request failed: {}", e))
-        })?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| SdkError::Other(anyhow::anyhow!("Pinecone request failed: {}", e)))?;
 
         let status = response.status();
 
@@ -492,9 +493,7 @@ impl VectorDatabase for PineconeProvider {
             urlencoding::encode(collection_name)
         );
 
-        let response: FetchResponse = self
-            .request(reqwest::Method::GET, &url, None::<()>)
-            .await?;
+        let response: FetchResponse = self.request(reqwest::Method::GET, &url, None::<()>).await?;
 
         Ok(response.vectors.get(id).map(|v| VectorEntry {
             id: v.id.clone(),

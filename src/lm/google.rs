@@ -213,12 +213,12 @@ impl LanguageModel for GoogleProvider {
             .await?;
 
             let metadata = http::extract_metadata(&response);
-            let parsed: GeminiResponse = response
-                .json()
-                .await
-                .map_err(|err| SdkError::Other(anyhow!("failed to parse Google response: {err}")))?;
+            let parsed: GeminiResponse = response.json().await.map_err(|err| {
+                SdkError::Other(anyhow!("failed to parse Google response: {err}"))
+            })?;
 
-            let mut result = parsed.into_generate_response(&model, request.config.response_format.clone())?;
+            let mut result =
+                parsed.into_generate_response(&model, request.config.response_format.clone())?;
             result.metadata = Some(metadata);
             Ok(result)
         }
@@ -292,7 +292,11 @@ impl LanguageModel for GoogleProvider {
             let url = self.stream_endpoint(&model);
 
             let response = http::send_with_retry(
-                || self.request(&url).header("accept", "text/event-stream").json(&payload),
+                || {
+                    self.request(&url)
+                        .header("accept", "text/event-stream")
+                        .json(&payload)
+                },
                 &self.config.retry_config,
                 "google",
                 request.config.timeout,
@@ -561,8 +565,8 @@ impl GeminiContent {
 
             // Add function calls
             for tc in tool_calls {
-                let args: JsonValue = serde_json::from_str(&tc.arguments)
-                    .unwrap_or_else(|_| json!({}));
+                let args: JsonValue =
+                    serde_json::from_str(&tc.arguments).unwrap_or_else(|_| json!({}));
                 parts.push(GeminiPart {
                     text: None,
                     function_call: Some(GeminiFunctionCall {
@@ -760,9 +764,7 @@ impl GeminiResponse {
 
         let object = match &response_format {
             ResponseFormat::Text => None,
-            ResponseFormat::Json | ResponseFormat::JsonSchema(_) => {
-                Some(parse_json_value(&text)?)
-            }
+            ResponseFormat::Json | ResponseFormat::JsonSchema(_) => Some(parse_json_value(&text)?),
         };
 
         let usage = self.usage_metadata.map(|u| TokenUsage {

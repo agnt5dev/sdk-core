@@ -87,10 +87,7 @@ pub fn slack_add_reaction(
 /// Helper to build a Slack API request.
 fn slack_request(token: &str, method: &str, payload: serde_json::Value) -> PlatformRequest {
     let mut headers = HashMap::new();
-    headers.insert(
-        "Authorization".to_string(),
-        format!("Bearer {}", token),
-    );
+    headers.insert("Authorization".to_string(), format!("Bearer {}", token));
     headers.insert("Content-Type".to_string(), "application/json".to_string());
 
     PlatformRequest {

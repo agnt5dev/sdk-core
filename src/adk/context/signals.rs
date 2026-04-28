@@ -23,11 +23,9 @@ impl SignalControls {
     }
 
     fn state(&self) -> Result<Arc<ContextRuntimeState>> {
-        self.state.clone().ok_or_else(|| {
-            SdkError::Unavailable {
-                message: "durable signal controls unavailable in this context".into(),
-                service: None,
-            }
+        self.state.clone().ok_or_else(|| SdkError::Unavailable {
+            message: "durable signal controls unavailable in this context".into(),
+            service: None,
         })
     }
 

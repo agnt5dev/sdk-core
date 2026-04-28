@@ -162,12 +162,7 @@ impl CoordinatorRouting {
             .build()
             .ok()?;
 
-        match client
-            .get(&url)
-            .header("X-API-Key", &api_key)
-            .send()
-            .await
-        {
+        match client.get(&url).header("X-API-Key", &api_key).send().await {
             Ok(resp) if resp.status().is_success() => {
                 let snapshot: MembershipSnapshot = resp.json().await.ok()?;
                 let members: Vec<CoordinatorMember> = snapshot
@@ -288,7 +283,9 @@ mod tests {
             "node-a=runtime-1:34182,node-b=runtime-2:34182,node-c=runtime-3:34182",
         );
         assert_eq!(
-            routing.owner_for_worker("worker-123").map(|m| m.id.as_str()),
+            routing
+                .owner_for_worker("worker-123")
+                .map(|m| m.id.as_str()),
             Some("node-c")
         );
     }

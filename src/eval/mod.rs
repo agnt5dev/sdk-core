@@ -196,8 +196,8 @@ impl TraceEvent {
 
 // Re-export commonly used items
 pub use deterministic::{
-    contains, exact_match, json_valid, levenshtein, regex_match, ContainsConfig,
-    ExactMatchConfig, LevenshteinConfig, RegexConfig,
+    contains, exact_match, json_valid, levenshtein, regex_match, ContainsConfig, ExactMatchConfig,
+    LevenshteinConfig, RegexConfig,
 };
 pub use llm_judge::{llm_judge, LlmJudgeConfig};
 pub use trace::{trace_score, TraceAssertion};

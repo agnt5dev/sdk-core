@@ -13,12 +13,12 @@ use serde_json::Value;
 
 use crate::error::{Result as SdkResult, SdkError};
 
+use super::http;
 use super::interface::{
     generate as generate_via_model, stream as stream_via_model, BuiltInTool, ContentBlockType,
     GenerateRequest, GenerateResponse, LanguageModel, Modality, ReasoningEffort, ResponseFormat,
     StreamChunk, StreamHandle, StreamRequest, TokenUsage,
 };
-use super::http;
 use super::telemetry;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -93,11 +93,10 @@ impl OpenAiConfig {
     }
 
     pub fn from_env() -> SdkResult<Self> {
-        let api_key = env::var("OPENAI_API_KEY")
-            .map_err(|_| SdkError::Configuration {
-                message: "OPENAI_API_KEY must be set".to_string(),
-                field: Some("OPENAI_API_KEY".to_string()),
-            })?;
+        let api_key = env::var("OPENAI_API_KEY").map_err(|_| SdkError::Configuration {
+            message: "OPENAI_API_KEY must be set".to_string(),
+            field: Some("OPENAI_API_KEY".to_string()),
+        })?;
 
         let mut config = OpenAiConfig::new(api_key);
 
@@ -254,10 +253,7 @@ pub enum InputItem {
     },
     /// Function call output (tool result)
     #[serde(rename = "function_call_output")]
-    FunctionCallOutput {
-        call_id: String,
-        output: String,
-    },
+    FunctionCallOutput { call_id: String, output: String },
 }
 
 /// Message format for Responses API
@@ -494,9 +490,8 @@ impl ResponsesApiRequest {
         // Check if this is a reasoning model that doesn't support temperature
         // Reasoning models (gpt-5, o1, o3 series) don't support temperature, top_p parameters
         // Note: gpt-4o DOES support temperature, only gpt-5 and o-series don't
-        let is_reasoning_model = model.starts_with("gpt-5")
-            || model.starts_with("o1-")
-            || model.starts_with("o3-");
+        let is_reasoning_model =
+            model.starts_with("gpt-5") || model.starts_with("o1-") || model.starts_with("o3-");
 
         // Store responses when tools are provided (for agentic continuation)
         // or when explicitly continuing a conversation with previous_response_id.
@@ -510,9 +505,17 @@ impl ResponsesApiRequest {
             instructions,
             previous_response_id: req.previous_response_id.clone(),
             store: Some(should_store),
-            stream: None,       // Set to Some(true) for streaming
-            temperature: if is_reasoning_model { None } else { req.config.temperature },
-            top_p: if is_reasoning_model { None } else { req.config.top_p },
+            stream: None, // Set to Some(true) for streaming
+            temperature: if is_reasoning_model {
+                None
+            } else {
+                req.config.temperature
+            },
+            top_p: if is_reasoning_model {
+                None
+            } else {
+                req.config.top_p
+            },
             max_output_tokens: req.config.max_output_tokens,
             tools,
             tool_choice,
@@ -541,9 +544,7 @@ pub struct ContentItem {
 #[serde(tag = "type")]
 pub enum OutputItem {
     #[serde(rename = "message")]
-    Message {
-        content: Vec<ContentItem>,
-    },
+    Message { content: Vec<ContentItem> },
     #[serde(rename = "function_call")]
     FunctionCall {
         arguments: String,
@@ -597,7 +598,9 @@ impl ResponsesApiResponse {
                 OutputItem::Message { content, .. } => {
                     for content_item in content {
                         // Check for both "output_text" (Responses API) and "text" (legacy)
-                        if content_item.content_type == "output_text" || content_item.content_type == "text" {
+                        if content_item.content_type == "output_text"
+                            || content_item.content_type == "text"
+                        {
                             if let Some(text) = &content_item.text {
                                 text_parts.push(text.clone());
                             }
@@ -685,7 +688,11 @@ impl ResponsesSseDecoder {
         // Process complete events (separated by double newlines)
         while let Some(idx) = self.find_event_delimiter() {
             let (event_block, remaining) = self.buffer.split_at(idx);
-            let delimiter_len = if remaining.starts_with("\r\n\r\n") { 4 } else { 2 };
+            let delimiter_len = if remaining.starts_with("\r\n\r\n") {
+                4
+            } else {
+                2
+            };
             let event_block = event_block.to_string();
             self.buffer = remaining[delimiter_len..].to_string();
 
@@ -711,7 +718,9 @@ impl ResponsesSseDecoder {
     }
 
     fn find_event_delimiter(&self) -> Option<usize> {
-        self.buffer.find("\n\n").or_else(|| self.buffer.find("\r\n\r\n"))
+        self.buffer
+            .find("\n\n")
+            .or_else(|| self.buffer.find("\r\n\r\n"))
     }
 }
 
@@ -755,7 +764,10 @@ struct StreamingState {
 }
 
 impl StreamingState {
-    fn into_generate_response(self, response_format: ResponseFormat) -> SdkResult<GenerateResponse> {
+    fn into_generate_response(
+        self,
+        response_format: ResponseFormat,
+    ) -> SdkResult<GenerateResponse> {
         let text = self.text_aggregate;
 
         let object = match response_format {
@@ -942,7 +954,9 @@ fn responses_stream_handle(
 fn validate_request(request: &GenerateRequest) -> SdkResult<()> {
     if request.system_prompt.is_none() && request.messages.is_empty() {
         return Err(SdkError::Configuration {
-            message: "at least a system prompt or one message is required for OpenAI Responses requests".to_string(),
+            message:
+                "at least a system prompt or one message is required for OpenAI Responses requests"
+                    .to_string(),
             field: None,
         });
     }
@@ -1012,9 +1026,13 @@ impl LanguageModel for OpenAiProvider {
 
             tracing::debug!("OpenAI Responses API raw response: {}", response_text);
 
-            let parsed: ResponsesApiResponse = serde_json::from_str(&response_text)
-                .map_err(|err| {
-                    tracing::error!("Failed to parse OpenAI Responses response. Error: {}, Response body: {}", err, response_text);
+            let parsed: ResponsesApiResponse =
+                serde_json::from_str(&response_text).map_err(|err| {
+                    tracing::error!(
+                        "Failed to parse OpenAI Responses response. Error: {}, Response body: {}",
+                        err,
+                        response_text
+                    );
                     SdkError::Other(anyhow!("failed to parse OpenAI Responses response: {err}"))
                 })?;
 
@@ -1035,7 +1053,9 @@ impl LanguageModel for OpenAiProvider {
 
                 // Calculate and set cost if token usage is available
                 if let Some(usage) = &response.usage {
-                    if let (Some(input_tokens), Some(output_tokens)) = (usage.prompt_tokens, usage.completion_tokens) {
+                    if let (Some(input_tokens), Some(output_tokens)) =
+                        (usage.prompt_tokens, usage.completion_tokens)
+                    {
                         // TODO: Extract cached tokens when TokenUsage struct is extended
                         // For now, calculate cost without cache discount
                         if let Some(cost) = telemetry::calculate_cost(
@@ -1110,13 +1130,21 @@ impl LanguageModel for OpenAiProvider {
             payload.stream = Some(true);
 
             let response = http::send_with_retry(
-                || self.request().header("Accept", "text/event-stream").json(&payload),
+                || {
+                    self.request()
+                        .header("Accept", "text/event-stream")
+                        .json(&payload)
+                },
                 &self.config.retry_config,
                 "openai",
                 request.config.timeout,
             )
             .await?;
-            responses_stream_handle(response, request.config.response_format.clone(), self.config.timeout.as_secs())
+            responses_stream_handle(
+                response,
+                request.config.response_format.clone(),
+                self.config.timeout.as_secs(),
+            )
         }
         .await;
 
@@ -1223,7 +1251,8 @@ mod tests {
     #[test]
     fn test_sse_decoder_multiline_data() {
         let mut decoder = ResponsesSseDecoder::default();
-        let chunk = b"event: response.completed\ndata: {\"response\":\ndata:  {\"id\": \"123\"}}\n\n";
+        let chunk =
+            b"event: response.completed\ndata: {\"response\":\ndata:  {\"id\": \"123\"}}\n\n";
 
         let events = decoder.ingest(chunk).unwrap();
 
@@ -1380,7 +1409,10 @@ mod tests {
         let payload = ResponsesApiRequest::from_request(&request, "gpt-4o-mini".to_string());
 
         assert_eq!(payload.model, "gpt-4o-mini");
-        assert_eq!(payload.instructions, Some("You are a helpful assistant.".to_string()));
+        assert_eq!(
+            payload.instructions,
+            Some("You are a helpful assistant.".to_string())
+        );
         assert_eq!(payload.store, Some(false));
         assert!(payload.stream.is_none()); // Not set by from_request
     }

@@ -479,9 +479,7 @@ impl EmbedderRegistry {
             tracing::warn!(
                 "No embedder providers loaded from environment. Set OPENAI_API_KEY for embeddings."
             );
-            return Err(SdkError::Other(anyhow!(
-                "No embedder providers available"
-            )));
+            return Err(SdkError::Other(anyhow!("No embedder providers available")));
         }
 
         tracing::info!(

@@ -180,8 +180,7 @@ where
     for attempt in 0..=retry_config.max_retries {
         // Backoff before retry attempts (skip for the first attempt).
         if attempt > 0 {
-            let delay =
-                calculate_retry_delay(retry_config, attempt, last_retry_after.take());
+            let delay = calculate_retry_delay(retry_config, attempt, last_retry_after.take());
             tracing::warn!(
                 provider = provider,
                 attempt = attempt,
@@ -297,7 +296,9 @@ pub(crate) fn extract_metadata(response: &reqwest::Response) -> ResponseMetadata
         .and_then(|v| v.to_str().ok())
         .and_then(|v| {
             // Try parsing as seconds (float or integer)
-            v.parse::<f64>().ok().map(|secs| Duration::from_secs_f64(secs))
+            v.parse::<f64>()
+                .ok()
+                .map(|secs| Duration::from_secs_f64(secs))
         });
 
     ResponseMetadata {

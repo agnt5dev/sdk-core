@@ -77,16 +77,23 @@ impl StdioTransport {
 
         // Spawn the process
         let mut child = cmd.spawn().map_err(|e| {
-            McpError::ProcessSpawn(format!("{} {}: {}", config.command, config.args.join(" "), e))
+            McpError::ProcessSpawn(format!(
+                "{} {}: {}",
+                config.command,
+                config.args.join(" "),
+                e
+            ))
         })?;
 
-        let stdin = child.stdin.take().ok_or_else(|| {
-            McpError::Transport("Failed to get stdin handle".to_string())
-        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| McpError::Transport("Failed to get stdin handle".to_string()))?;
 
-        let stdout = child.stdout.take().ok_or_else(|| {
-            McpError::Transport("Failed to get stdout handle".to_string())
-        })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| McpError::Transport("Failed to get stdout handle".to_string()))?;
 
         let pending_responses: Arc<Mutex<HashMap<u64, mpsc::Sender<JsonRpcResponse>>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -378,13 +385,17 @@ impl SseTransport {
                                 // Try to parse as JSON
                                 if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
                                     // Check for session ID
-                                    if let Some(session) = value.get("session").and_then(|v| v.as_str()) {
+                                    if let Some(session) =
+                                        value.get("session").and_then(|v| v.as_str())
+                                    {
                                         let mut session_guard = session_clone.lock().await;
                                         *session_guard = Some(session.to_string());
                                     }
 
                                     // Check for JSON-RPC response
-                                    if let Ok(response) = serde_json::from_value::<JsonRpcResponse>(value) {
+                                    if let Ok(response) =
+                                        serde_json::from_value::<JsonRpcResponse>(value)
+                                    {
                                         if let Some(id) = extract_response_id(&response) {
                                             let mut pending = pending_clone.lock().await;
                                             if let Some(sender) = pending.remove(&id) {
@@ -447,17 +458,15 @@ impl Transport for SseTransport {
         }
 
         // Send request via POST
-        let response = self
-            .client
-            .post(&url)
-            .json(&req)
-            .send()
-            .await?;
+        let response = self.client.post(&url).json(&req).send().await?;
 
         if !response.status().is_success() {
             let mut pending = self.pending_responses.lock().await;
             pending.remove(&id);
-            return Err(McpError::Http(format!("Request failed: {}", response.status())));
+            return Err(McpError::Http(format!(
+                "Request failed: {}",
+                response.status()
+            )));
         }
 
         // Wait for response via SSE or HTTP response body
@@ -544,6 +553,9 @@ mod tests {
         let config = SseConfig::new("https://example.com/mcp/sse").with_api_key("test-key");
 
         assert_eq!(config.url, "https://example.com/mcp/sse");
-        assert_eq!(config.headers.get("X-API-KEY"), Some(&"test-key".to_string()));
+        assert_eq!(
+            config.headers.get("X-API-KEY"),
+            Some(&"test-key".to_string())
+        );
     }
 }

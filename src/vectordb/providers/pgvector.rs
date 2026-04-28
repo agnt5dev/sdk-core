@@ -3,12 +3,12 @@
 
 use async_trait::async_trait;
 
+#[cfg(feature = "pgvector")]
+use super::super::DistanceMetric;
 use super::super::{
     Collection, CollectionInfo, SearchQuery, SearchResult, VectorDatabase, VectorEntry,
     VectorFilter,
 };
-#[cfg(feature = "pgvector")]
-use super::super::DistanceMetric;
 use crate::error::{Result, SdkError};
 
 #[cfg(feature = "pgvector")]
@@ -116,7 +116,9 @@ impl VectorDatabase for PgVectorProvider {
         sqlx::query("SELECT 1")
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| SdkError::Other(anyhow::anyhow!("PostgreSQL health check failed: {}", e)))?;
+            .map_err(|e| {
+                SdkError::Other(anyhow::anyhow!("PostgreSQL health check failed: {}", e))
+            })?;
         Ok(())
     }
 
@@ -159,10 +161,14 @@ impl VectorDatabase for PgVectorProvider {
             table, table
         );
 
-        sqlx::query(&index_sql).execute(&self.pool).await.map_err(|e| {
-            // Index creation may fail if table is empty, which is fine
-            tracing::debug!("Index creation note: {}", e);
-        }).ok();
+        sqlx::query(&index_sql)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                // Index creation may fail if table is empty, which is fine
+                tracing::debug!("Index creation note: {}", e);
+            })
+            .ok();
 
         // Store collection metadata
         let meta_sql = r#"
@@ -283,7 +289,11 @@ impl VectorDatabase for PgVectorProvider {
                 .execute(&self.pool)
                 .await
                 .map_err(|e| {
-                    SdkError::Other(anyhow::anyhow!("Failed to upsert vector {}: {}", entry.id, e))
+                    SdkError::Other(anyhow::anyhow!(
+                        "Failed to upsert vector {}: {}",
+                        entry.id,
+                        e
+                    ))
                 })?;
         }
 
@@ -308,9 +318,8 @@ impl VectorDatabase for PgVectorProvider {
         query: SearchQuery,
     ) -> Result<Vec<SearchResult>> {
         let table = Self::table_name(collection_name);
-        let operator = Self::distance_to_operator(
-            query.distance_metric.unwrap_or(DistanceMetric::Cosine),
-        );
+        let operator =
+            Self::distance_to_operator(query.distance_metric.unwrap_or(DistanceMetric::Cosine));
 
         let query_vector = Vector::from(query.vector);
 
@@ -438,10 +447,7 @@ impl VectorDatabase for PgVectorProvider {
                 serde_json::Value::String(s) => s.clone(),
                 other => other.to_string(),
             };
-            conditions.push(format!(
-                "metadata->>'{}' = ${}",
-                condition.field, param_idx
-            ));
+            conditions.push(format!("metadata->>'{}' = ${}", condition.field, param_idx));
             params.push(value_str);
         }
 
@@ -449,11 +455,7 @@ impl VectorDatabase for PgVectorProvider {
             return Ok(());
         }
 
-        let sql = format!(
-            "DELETE FROM {} WHERE {}",
-            table,
-            conditions.join(" AND ")
-        );
+        let sql = format!("DELETE FROM {} WHERE {}", table, conditions.join(" AND "));
 
         let mut query = sqlx::query(&sql);
         for param in &params {
@@ -478,10 +480,7 @@ impl VectorDatabase for PgVectorProvider {
     async fn get_vector(&self, collection_name: &str, id: &str) -> Result<Option<VectorEntry>> {
         let table = Self::table_name(collection_name);
 
-        let sql = format!(
-            "SELECT id, vector, metadata FROM {} WHERE id = $1",
-            table
-        );
+        let sql = format!("SELECT id, vector, metadata FROM {} WHERE id = $1", table);
 
         let row = sqlx::query(&sql)
             .bind(id)
@@ -517,7 +516,9 @@ impl VectorDatabase for PgVectorProvider {
         let count_row = sqlx::query(&count_sql)
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| SdkError::Other(anyhow::anyhow!("Failed to get collection info: {}", e)))?;
+            .map_err(|e| {
+                SdkError::Other(anyhow::anyhow!("Failed to get collection info: {}", e))
+            })?;
 
         let vector_count: i64 = count_row.get("count");
 

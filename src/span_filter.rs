@@ -1,6 +1,6 @@
+use opentelemetry_sdk::error::OTelSdkError;
 /// Span filtering exporter to remove internal h2/HTTP2 spans from traces
 use opentelemetry_sdk::trace::{SpanData, SpanExporter};
-use opentelemetry_sdk::error::OTelSdkError;
 use std::fmt;
 
 /// FilteringSpanExporter wraps another span exporter and filters out h2/HTTP2 internal spans
@@ -39,7 +39,7 @@ impl<E: SpanExporter> FilteringSpanExporter<E> {
             "connection flow",
             "poll_ready",
             "poll_next",
-            "poll",                          // Generic poll operations
+            "poll", // Generic poll operations
             "reserve_capacity",
             "try_assign_capacity",
             "prioritize::queue_frame",
@@ -52,12 +52,17 @@ impl<E: SpanExporter> FilteringSpanExporter<E> {
             "decode_frame",
         ];
 
-        filter_patterns.iter().any(|pattern| name_lower.contains(pattern))
+        filter_patterns
+            .iter()
+            .any(|pattern| name_lower.contains(pattern))
     }
 }
 
 impl<E: SpanExporter + fmt::Debug> SpanExporter for FilteringSpanExporter<E> {
-    fn export(&self, batch: Vec<SpanData>) -> impl std::future::Future<Output = Result<(), OTelSdkError>> + Send {
+    fn export(
+        &self,
+        batch: Vec<SpanData>,
+    ) -> impl std::future::Future<Output = Result<(), OTelSdkError>> + Send {
         // Filter out h2 spans before exporting
         let filtered_batch: Vec<SpanData> = batch
             .into_iter()
@@ -79,16 +84,44 @@ mod tests {
 
     #[test]
     fn test_should_filter_h2_spans() {
-        assert!(FilteringSpanExporter::<opentelemetry_otlp::SpanExporter>::should_filter_span("try_reclaim_frame"));
-        assert!(FilteringSpanExporter::<opentelemetry_otlp::SpanExporter>::should_filter_span("FramedWrite::flush"));
-        assert!(FilteringSpanExporter::<opentelemetry_otlp::SpanExporter>::should_filter_span("updating stream flow"));
-        assert!(FilteringSpanExporter::<opentelemetry_otlp::SpanExporter>::should_filter_span("hpack::decode"));
+        assert!(
+            FilteringSpanExporter::<opentelemetry_otlp::SpanExporter>::should_filter_span(
+                "try_reclaim_frame"
+            )
+        );
+        assert!(
+            FilteringSpanExporter::<opentelemetry_otlp::SpanExporter>::should_filter_span(
+                "FramedWrite::flush"
+            )
+        );
+        assert!(
+            FilteringSpanExporter::<opentelemetry_otlp::SpanExporter>::should_filter_span(
+                "updating stream flow"
+            )
+        );
+        assert!(
+            FilteringSpanExporter::<opentelemetry_otlp::SpanExporter>::should_filter_span(
+                "hpack::decode"
+            )
+        );
     }
 
     #[test]
     fn test_should_not_filter_user_spans() {
-        assert!(!FilteringSpanExporter::<opentelemetry_otlp::SpanExporter>::should_filter_span("function.greet_user"));
-        assert!(!FilteringSpanExporter::<opentelemetry_otlp::SpanExporter>::should_filter_span("GET /api/users"));
-        assert!(!FilteringSpanExporter::<opentelemetry_otlp::SpanExporter>::should_filter_span("workflow.process_data"));
+        assert!(
+            !FilteringSpanExporter::<opentelemetry_otlp::SpanExporter>::should_filter_span(
+                "function.greet_user"
+            )
+        );
+        assert!(
+            !FilteringSpanExporter::<opentelemetry_otlp::SpanExporter>::should_filter_span(
+                "GET /api/users"
+            )
+        );
+        assert!(
+            !FilteringSpanExporter::<opentelemetry_otlp::SpanExporter>::should_filter_span(
+                "workflow.process_data"
+            )
+        );
     }
 }

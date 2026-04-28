@@ -125,9 +125,7 @@ pub enum ChatEvent {
         payload: Vec<u8>,
     },
     /// URL verification challenge (Slack sends this during webhook setup).
-    UrlVerification {
-        challenge: String,
-    },
+    UrlVerification { challenge: String },
 }
 
 impl ChatEvent {

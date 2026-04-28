@@ -5,12 +5,9 @@ pub mod providers;
 pub mod types;
 
 // Re-export core types
-pub use providers::{
-    pgvector::PgVectorProvider,
-    pinecone::PineconeProvider,
-};
 #[cfg(feature = "qdrant")]
 pub use providers::qdrant::QdrantProvider;
+pub use providers::{pgvector::PgVectorProvider, pinecone::PineconeProvider};
 pub use types::{
     Collection, DistanceMetric, SearchQuery, SearchResult, VectorEntry, VectorFilter,
     VectorMetadata,

@@ -137,19 +137,23 @@ impl WasmSandbox {
         })?;
 
         // Try to pre-compile QuickJS module
-        let quickjs_path = config
-            .quickjs_wasm_path
-            .clone()
-            .or_else(|| std::env::var("AGNT5_QUICKJS_WASM_PATH").ok().map(PathBuf::from));
+        let quickjs_path = config.quickjs_wasm_path.clone().or_else(|| {
+            std::env::var("AGNT5_QUICKJS_WASM_PATH")
+                .ok()
+                .map(PathBuf::from)
+        });
 
         let quickjs_module = if let Some(path) = quickjs_path {
             if path.exists() {
-                let module =
-                    Module::from_file(&engine, &path).map_err(|e| SdkError::Sandbox {
-                        message: format!("failed to compile QuickJS module from {}: {}", path.display(), e),
-                        operation: "new".to_string(),
-                        code: ErrorCode::SandboxExecutionFailed,
-                    })?;
+                let module = Module::from_file(&engine, &path).map_err(|e| SdkError::Sandbox {
+                    message: format!(
+                        "failed to compile QuickJS module from {}: {}",
+                        path.display(),
+                        e
+                    ),
+                    operation: "new".to_string(),
+                    code: ErrorCode::SandboxExecutionFailed,
+                })?;
                 tracing::info!("QuickJS WASI module loaded from {}", path.display());
                 Some(module)
             } else {
@@ -199,11 +203,14 @@ impl WasmSandbox {
     /// the filesystem, then verifies the result stays within the workspace.
     fn resolve_path(&self, path: &str) -> Result<PathBuf> {
         // Canonicalize the workspace first (resolves symlinks like /tmp → /private/tmp)
-        let workspace_canonical = self.workspace.canonicalize().map_err(|e| SdkError::Sandbox {
-            message: format!("workspace path error: {}", e),
-            operation: "resolve_path".to_string(),
-            code: ErrorCode::SandboxExecutionFailed,
-        })?;
+        let workspace_canonical = self
+            .workspace
+            .canonicalize()
+            .map_err(|e| SdkError::Sandbox {
+                message: format!("workspace path error: {}", e),
+                operation: "resolve_path".to_string(),
+                code: ErrorCode::SandboxExecutionFailed,
+            })?;
 
         let raw = if path.starts_with('/') {
             workspace_canonical.join(path.trim_start_matches('/'))
@@ -320,11 +327,14 @@ impl SandboxExecutor for WasmSandbox {
 
             let start_time = Instant::now();
 
-            let instance = linker.instantiate(&mut store, &module).map_err(|e| SdkError::Sandbox {
-                message: format!("failed to instantiate module: {}", e),
-                operation: "execute_code".to_string(),
-                code: ErrorCode::SandboxExecutionFailed,
-            })?;
+            let instance =
+                linker
+                    .instantiate(&mut store, &module)
+                    .map_err(|e| SdkError::Sandbox {
+                        message: format!("failed to instantiate module: {}", e),
+                        operation: "execute_code".to_string(),
+                        code: ErrorCode::SandboxExecutionFailed,
+                    })?;
 
             let start_func = instance
                 .get_typed_func::<(), ()>(&mut store, "_start")
@@ -340,11 +350,16 @@ impl SandboxExecutor for WasmSandbox {
                     if let Some(trap) = e.downcast_ref::<wasmtime::Trap>() {
                         if matches!(trap, wasmtime::Trap::OutOfFuel) {
                             return Ok(ExecuteCodeResult {
-                                stdout: String::from_utf8_lossy(&stdout_clone.contents()).to_string(),
-                                stderr: String::from_utf8_lossy(&stderr_clone.contents()).to_string(),
+                                stdout: String::from_utf8_lossy(&stdout_clone.contents())
+                                    .to_string(),
+                                stderr: String::from_utf8_lossy(&stderr_clone.contents())
+                                    .to_string(),
                                 exit_code: -1,
                                 execution_time_ms: start_time.elapsed().as_millis() as u64,
-                                error: Some(format!("execution timed out ({}ms limit)", timeout_ms)),
+                                error: Some(format!(
+                                    "execution timed out ({}ms limit)",
+                                    timeout_ms
+                                )),
                             });
                         }
                     }
@@ -398,11 +413,13 @@ impl SandboxWorkspace for WasmSandbox {
         let resolved = self.resolve_path(&req.path)?;
 
         if let Some(parent) = resolved.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| SdkError::Sandbox {
-                message: format!("failed to create parent directory: {}", e),
-                operation: "write_file".to_string(),
-                code: ErrorCode::SandboxExecutionFailed,
-            })?;
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| SdkError::Sandbox {
+                    message: format!("failed to create parent directory: {}", e),
+                    operation: "write_file".to_string(),
+                    code: ErrorCode::SandboxExecutionFailed,
+                })?;
         }
 
         tokio::fs::write(&resolved, &req.content)
@@ -431,17 +448,21 @@ impl SandboxWorkspace for WasmSandbox {
     async fn read_file(&self, path: &str) -> Result<ReadFileResult> {
         let resolved = self.resolve_path(path)?;
 
-        let metadata = tokio::fs::metadata(&resolved).await.map_err(|e| SdkError::Sandbox {
-            message: format!("file not found: {}", e),
-            operation: "read_file".to_string(),
-            code: ErrorCode::SandboxExecutionFailed,
-        })?;
+        let metadata = tokio::fs::metadata(&resolved)
+            .await
+            .map_err(|e| SdkError::Sandbox {
+                message: format!("file not found: {}", e),
+                operation: "read_file".to_string(),
+                code: ErrorCode::SandboxExecutionFailed,
+            })?;
 
-        let content = tokio::fs::read(&resolved).await.map_err(|e| SdkError::Sandbox {
-            message: format!("failed to read file: {}", e),
-            operation: "read_file".to_string(),
-            code: ErrorCode::SandboxExecutionFailed,
-        })?;
+        let content = tokio::fs::read(&resolved)
+            .await
+            .map_err(|e| SdkError::Sandbox {
+                message: format!("failed to read file: {}", e),
+                operation: "read_file".to_string(),
+                code: ErrorCode::SandboxExecutionFailed,
+            })?;
 
         let mode = {
             #[cfg(unix)]
@@ -521,11 +542,13 @@ async fn collect_files(
     recursive: bool,
     out: &mut Vec<FileInfo>,
 ) -> Result<()> {
-    let mut entries = tokio::fs::read_dir(dir).await.map_err(|e| SdkError::Sandbox {
-        message: format!("failed to read directory: {}", e),
-        operation: "list_files".to_string(),
-        code: ErrorCode::SandboxExecutionFailed,
-    })?;
+    let mut entries = tokio::fs::read_dir(dir)
+        .await
+        .map_err(|e| SdkError::Sandbox {
+            message: format!("failed to read directory: {}", e),
+            operation: "list_files".to_string(),
+            code: ErrorCode::SandboxExecutionFailed,
+        })?;
 
     while let Some(entry) = entries.next_entry().await.map_err(|e| SdkError::Sandbox {
         message: format!("failed to read directory entry: {}", e),
@@ -690,11 +713,14 @@ mod tests {
     /// Requires AGNT5_QUICKJS_WASM_PATH to be set (skipped otherwise).
     #[tokio::test]
     async fn test_wasm_sandbox_execute_js() {
-        let quickjs_path = std::env::var("AGNT5_QUICKJS_WASM_PATH").ok()
-            .or_else(|| {
-                let default = std::path::PathBuf::from("/tmp/qjs-wasi.wasm");
-                if default.exists() { Some(default.to_string_lossy().to_string()) } else { None }
-            });
+        let quickjs_path = std::env::var("AGNT5_QUICKJS_WASM_PATH").ok().or_else(|| {
+            let default = std::path::PathBuf::from("/tmp/qjs-wasi.wasm");
+            if default.exists() {
+                Some(default.to_string_lossy().to_string())
+            } else {
+                None
+            }
+        });
 
         let Some(path) = quickjs_path else {
             eprintln!("SKIP: AGNT5_QUICKJS_WASM_PATH not set and /tmp/qjs-wasi.wasm not found");
@@ -708,7 +734,10 @@ mod tests {
         let sandbox = WasmSandbox::new(config).unwrap();
 
         // Verify capabilities now include Javascript
-        assert!(sandbox.capabilities().languages.contains(&Language::Javascript));
+        assert!(sandbox
+            .capabilities()
+            .languages
+            .contains(&Language::Javascript));
 
         // Simple console.log
         let result = sandbox
@@ -723,7 +752,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.exit_code, 0);
-        assert!(result.stdout.contains("hello from wasm"), "stdout was: {}", result.stdout);
+        assert!(
+            result.stdout.contains("hello from wasm"),
+            "stdout was: {}",
+            result.stdout
+        );
         assert!(result.error.is_none());
 
         // Math expression
@@ -754,7 +787,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.exit_code, 0);
-        assert!(result.stdout.contains(r#""name":"agnt5""#), "stdout was: {}", result.stdout);
+        assert!(
+            result.stdout.contains(r#""name":"agnt5""#),
+            "stdout was: {}",
+            result.stdout
+        );
 
         // Error case — should capture stderr and non-zero exit
         let result = sandbox

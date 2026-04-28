@@ -5,8 +5,8 @@
 //! for operations that only make sense with a real OS: shell commands, git, preview URLs.
 
 use crate::error::{ErrorCode, Result, SdkError};
-use crate::sandbox::{SandboxExecutor, SandboxWorkspace};
 use crate::sandbox::types::*;
+use crate::sandbox::{SandboxExecutor, SandboxWorkspace};
 use async_trait::async_trait;
 use std::time::Duration;
 
@@ -87,11 +87,12 @@ impl RemoteSandbox {
             SandboxAuth::BearerToken(token) => {
                 headers.insert(
                     reqwest::header::AUTHORIZATION,
-                    reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token))
-                        .map_err(|e| SdkError::Configuration {
+                    reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)).map_err(
+                        |e| SdkError::Configuration {
                             message: format!("invalid bearer token header value: {}", e),
                             field: Some("auth".to_string()),
-                        })?,
+                        },
+                    )?,
                 );
             }
             SandboxAuth::CustomHeader { name, value } => {
@@ -201,16 +202,15 @@ impl RemoteSandbox {
     pub async fn run_command(&self, req: RunCommandRequest) -> Result<RunCommandResult> {
         self.send_request(
             "run_command",
-            self.client.post(format!("{}/command", self.base_url)).json(&req),
+            self.client
+                .post(format!("{}/command", self.base_url))
+                .json(&req),
         )
         .await
     }
 
     /// Run a command with streaming output via SSE.
-    pub async fn run_command_stream(
-        &self,
-        req: RunCommandRequest,
-    ) -> Result<Vec<StreamEvent>> {
+    pub async fn run_command_stream(&self, req: RunCommandRequest) -> Result<Vec<StreamEvent>> {
         // FIXME: Return a proper async Stream instead of collecting all events.
         // For now, collect all SSE events and return them.
         let resp = self
@@ -252,7 +252,9 @@ impl RemoteSandbox {
     pub async fn git_clone(&self, req: GitCloneRequest) -> Result<GitCloneResult> {
         self.send_request(
             "git_clone",
-            self.client.post(format!("{}/git/clone", self.base_url)).json(&req),
+            self.client
+                .post(format!("{}/git/clone", self.base_url))
+                .json(&req),
         )
         .await
     }
@@ -270,7 +272,9 @@ impl RemoteSandbox {
     pub async fn git_commit(&self, req: GitCommitRequest) -> Result<GitCommitResult> {
         self.send_request(
             "git_commit",
-            self.client.post(format!("{}/git/commit", self.base_url)).json(&req),
+            self.client
+                .post(format!("{}/git/commit", self.base_url))
+                .json(&req),
         )
         .await
     }
@@ -279,7 +283,9 @@ impl RemoteSandbox {
     pub async fn git_push(&self, req: GitPushRequest) -> Result<GitPushResult> {
         self.send_request(
             "git_push",
-            self.client.post(format!("{}/git/push", self.base_url)).json(&req),
+            self.client
+                .post(format!("{}/git/push", self.base_url))
+                .json(&req),
         )
         .await
     }
@@ -338,7 +344,9 @@ impl SandboxExecutor for RemoteSandbox {
     async fn execute_code(&self, req: ExecuteCodeRequest) -> Result<ExecuteCodeResult> {
         self.send_request(
             "execute_code",
-            self.client.post(format!("{}/execute", self.base_url)).json(&req),
+            self.client
+                .post(format!("{}/execute", self.base_url))
+                .json(&req),
         )
         .await
     }

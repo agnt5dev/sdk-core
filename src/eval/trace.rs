@@ -88,7 +88,10 @@ impl TraceAssertion {
             TraceAssertion::Custom { name, description } => AssertionResult {
                 name: name.clone(),
                 passed: false,
-                explanation: format!("Custom assertion '{}' must be evaluated externally", description),
+                explanation: format!(
+                    "Custom assertion '{}' must be evaluated externally",
+                    description
+                ),
             },
         }
     }
@@ -223,15 +226,15 @@ fn check_duration_under(trace: &[TraceEvent], max_ms: u64) -> AssertionResult {
 }
 
 fn check_event_count(trace: &[TraceEvent], event_type: &str, min: u32) -> AssertionResult {
-    let count = trace
-        .iter()
-        .filter(|e| e.event_type == event_type)
-        .count() as u32;
+    let count = trace.iter().filter(|e| e.event_type == event_type).count() as u32;
 
     AssertionResult {
         name: format!("event_count({}, min={})", event_type, min),
         passed: count >= min,
-        explanation: format!("Event '{}' occurred {} times (min: {})", event_type, count, min),
+        explanation: format!(
+            "Event '{}' occurred {} times (min: {})",
+            event_type, count, min
+        ),
     }
 }
 
@@ -290,7 +293,11 @@ pub fn trace_score(input: &ScorerInput, assertions: &[TraceAssertion]) -> Scorer
     ScorerResult {
         score,
         passed: Some(all_passed),
-        label: Some(if all_passed { "pass".into() } else { "fail".into() }),
+        label: Some(if all_passed {
+            "pass".into()
+        } else {
+            "fail".into()
+        }),
         explanation: Some(explanation),
         metadata: None,
     }
@@ -382,11 +389,9 @@ mod tests {
         assert!(result.passed);
 
         // Should fail - wrong order
-        let result = TraceAssertion::event_sequence(vec![
-            "run.completed".into(),
-            "run.started".into(),
-        ])
-        .check(&trace);
+        let result =
+            TraceAssertion::event_sequence(vec!["run.completed".into(), "run.started".into()])
+                .check(&trace);
         assert!(!result.passed);
 
         // Should fail - missing event

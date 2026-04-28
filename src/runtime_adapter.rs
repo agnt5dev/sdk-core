@@ -191,7 +191,8 @@ pub struct EntityStateSaveResult {
 /// Implements bulk load/save pattern for entity state operations
 pub struct EntityStateManager {
     stream_sender: flume::Sender<crate::pb::ServiceMessage>,
-    pending_requests: Arc<Mutex<HashMap<String, oneshot::Sender<crate::pb::RuntimeServiceResponse>>>>,
+    pending_requests:
+        Arc<Mutex<HashMap<String, oneshot::Sender<crate::pb::RuntimeServiceResponse>>>>,
     _tenant_id: String,
     session_id: String,
 }
@@ -228,7 +229,9 @@ impl EntityStateManager {
         entity_type: String,
         entity_key: String,
     ) -> Result<EntityStateLoadResult> {
-        use crate::pb::{runtime_service_request, EntityStateLoadRequest, RuntimeServiceRequest, ServiceMessage};
+        use crate::pb::{
+            runtime_service_request, EntityStateLoadRequest, RuntimeServiceRequest, ServiceMessage,
+        };
 
         // Generate unique request ID
         let request_id = uuid::Uuid::new_v4().to_string();
@@ -237,7 +240,10 @@ impl EntityStateManager {
         let (response_tx, response_rx) = oneshot::channel();
 
         // Store in pending requests
-        self.pending_requests.lock().await.insert(request_id.clone(), response_tx);
+        self.pending_requests
+            .lock()
+            .await
+            .insert(request_id.clone(), response_tx);
 
         // Create RuntimeServiceRequest
         let request = RuntimeServiceRequest {
@@ -249,7 +255,7 @@ impl EntityStateManager {
                     entity_key,
                     scope: String::new(),    // Default to global scope
                     scope_id: String::new(), // Empty for global scope
-                }
+                },
             )),
         };
 
@@ -257,23 +263,28 @@ impl EntityStateManager {
         let message = ServiceMessage {
             worker_id: String::new(), // Will be filled by worker
             metadata: HashMap::new(),
-            message_type: Some(crate::pb::service_message::MessageType::RuntimeService(request)),
+            message_type: Some(crate::pb::service_message::MessageType::RuntimeService(
+                request,
+            )),
         };
 
-        self.stream_sender.send_async(message).await
-            .map_err(|e| crate::error::SdkError::Connection {
+        self.stream_sender.send_async(message).await.map_err(|e| {
+            crate::error::SdkError::Connection {
                 message: format!("Failed to send load request: {}", e),
                 code: crate::error::ErrorCode::ConnectionFailed,
                 source: None,
-            })?;
+            }
+        })?;
 
         // Wait for response with timeout
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            response_rx
-        ).await
-            .map_err(|_| crate::error::SdkError::Other(anyhow::anyhow!("Entity state load timeout")))?
-            .map_err(|_| crate::error::SdkError::Other(anyhow::anyhow!("Response channel closed")))?;
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), response_rx)
+            .await
+            .map_err(|_| {
+                crate::error::SdkError::Other(anyhow::anyhow!("Entity state load timeout"))
+            })?
+            .map_err(|_| {
+                crate::error::SdkError::Other(anyhow::anyhow!("Response channel closed"))
+            })?;
 
         // Check if request succeeded
         if !response.success {
@@ -306,7 +317,9 @@ impl EntityStateManager {
         state_json: Vec<u8>,
         expected_version: i64,
     ) -> Result<EntityStateSaveResult> {
-        use crate::pb::{runtime_service_request, EntityStateSaveRequest, RuntimeServiceRequest, ServiceMessage};
+        use crate::pb::{
+            runtime_service_request, EntityStateSaveRequest, RuntimeServiceRequest, ServiceMessage,
+        };
 
         // Generate unique request ID
         let request_id = uuid::Uuid::new_v4().to_string();
@@ -315,7 +328,10 @@ impl EntityStateManager {
         let (response_tx, response_rx) = oneshot::channel();
 
         // Store in pending requests
-        self.pending_requests.lock().await.insert(request_id.clone(), response_tx);
+        self.pending_requests
+            .lock()
+            .await
+            .insert(request_id.clone(), response_tx);
 
         // Create RuntimeServiceRequest
         let request = RuntimeServiceRequest {
@@ -329,7 +345,7 @@ impl EntityStateManager {
                     expected_version,
                     scope: String::new(),    // Default to global scope
                     scope_id: String::new(), // Empty for global scope
-                }
+                },
             )),
         };
 
@@ -337,23 +353,28 @@ impl EntityStateManager {
         let message = ServiceMessage {
             worker_id: String::new(), // Will be filled by worker
             metadata: HashMap::new(),
-            message_type: Some(crate::pb::service_message::MessageType::RuntimeService(request)),
+            message_type: Some(crate::pb::service_message::MessageType::RuntimeService(
+                request,
+            )),
         };
 
-        self.stream_sender.send_async(message).await
-            .map_err(|e| crate::error::SdkError::Connection {
+        self.stream_sender.send_async(message).await.map_err(|e| {
+            crate::error::SdkError::Connection {
                 message: format!("Failed to send save request: {}", e),
                 code: crate::error::ErrorCode::ConnectionFailed,
                 source: None,
-            })?;
+            }
+        })?;
 
         // Wait for response with timeout
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            response_rx
-        ).await
-            .map_err(|_| crate::error::SdkError::Other(anyhow::anyhow!("Entity state save timeout")))?
-            .map_err(|_| crate::error::SdkError::Other(anyhow::anyhow!("Response channel closed")))?;
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), response_rx)
+            .await
+            .map_err(|_| {
+                crate::error::SdkError::Other(anyhow::anyhow!("Entity state save timeout"))
+            })?
+            .map_err(|_| {
+                crate::error::SdkError::Other(anyhow::anyhow!("Response channel closed"))
+            })?;
 
         // Check if request succeeded
         if !response.success {
@@ -388,11 +409,16 @@ impl EntityStateManager {
         payload: Vec<u8>,
         from_service: String,
     ) -> Result<String> {
-        use crate::pb::{runtime_service_request, MessageSendRequest, RuntimeServiceRequest, ServiceMessage};
+        use crate::pb::{
+            runtime_service_request, MessageSendRequest, RuntimeServiceRequest, ServiceMessage,
+        };
 
         let request_id = uuid::Uuid::new_v4().to_string();
         let (response_tx, response_rx) = oneshot::channel();
-        self.pending_requests.lock().await.insert(request_id.clone(), response_tx);
+        self.pending_requests
+            .lock()
+            .await
+            .insert(request_id.clone(), response_tx);
 
         let request = RuntimeServiceRequest {
             request_id: request_id.clone(),
@@ -403,33 +429,37 @@ impl EntityStateManager {
                     message_type,
                     payload,
                     from_service,
-                }
+                },
             )),
         };
 
         let message = ServiceMessage {
             worker_id: String::new(),
             metadata: HashMap::new(),
-            message_type: Some(crate::pb::service_message::MessageType::RuntimeService(request)),
+            message_type: Some(crate::pb::service_message::MessageType::RuntimeService(
+                request,
+            )),
         };
 
-        self.stream_sender.send_async(message).await
-            .map_err(|e| crate::error::SdkError::Connection {
+        self.stream_sender.send_async(message).await.map_err(|e| {
+            crate::error::SdkError::Connection {
                 message: format!("Failed to send message request: {}", e),
                 code: crate::error::ErrorCode::ConnectionFailed,
                 source: None,
-            })?;
+            }
+        })?;
 
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            response_rx
-        ).await
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), response_rx)
+            .await
             .map_err(|_| crate::error::SdkError::Other(anyhow::anyhow!("Message send timeout")))?
-            .map_err(|_| crate::error::SdkError::Other(anyhow::anyhow!("Response channel closed")))?;
+            .map_err(|_| {
+                crate::error::SdkError::Other(anyhow::anyhow!("Response channel closed"))
+            })?;
 
         if !response.success {
             return Err(crate::error::SdkError::Other(anyhow::anyhow!(
-                "Message send failed: {}", response.error_message
+                "Message send failed: {}",
+                response.error_message
             )));
         }
 
@@ -444,16 +474,17 @@ impl EntityStateManager {
     }
 
     /// List messages in a conversation by correlation ID
-    pub async fn list_messages(
-        &self,
-        correlation_id: String,
-        limit: i32,
-    ) -> Result<Vec<Vec<u8>>> {
-        use crate::pb::{runtime_service_request, MessageListRequest, RuntimeServiceRequest, ServiceMessage};
+    pub async fn list_messages(&self, correlation_id: String, limit: i32) -> Result<Vec<Vec<u8>>> {
+        use crate::pb::{
+            runtime_service_request, MessageListRequest, RuntimeServiceRequest, ServiceMessage,
+        };
 
         let request_id = uuid::Uuid::new_v4().to_string();
         let (response_tx, response_rx) = oneshot::channel();
-        self.pending_requests.lock().await.insert(request_id.clone(), response_tx);
+        self.pending_requests
+            .lock()
+            .await
+            .insert(request_id.clone(), response_tx);
 
         let request = RuntimeServiceRequest {
             request_id: request_id.clone(),
@@ -463,33 +494,37 @@ impl EntityStateManager {
                     correlation_id,
                     limit,
                     after_message_id: String::new(),
-                }
+                },
             )),
         };
 
         let message = ServiceMessage {
             worker_id: String::new(),
             metadata: HashMap::new(),
-            message_type: Some(crate::pb::service_message::MessageType::RuntimeService(request)),
+            message_type: Some(crate::pb::service_message::MessageType::RuntimeService(
+                request,
+            )),
         };
 
-        self.stream_sender.send_async(message).await
-            .map_err(|e| crate::error::SdkError::Connection {
+        self.stream_sender.send_async(message).await.map_err(|e| {
+            crate::error::SdkError::Connection {
                 message: format!("Failed to send message list request: {}", e),
                 code: crate::error::ErrorCode::ConnectionFailed,
                 source: None,
-            })?;
+            }
+        })?;
 
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            response_rx
-        ).await
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), response_rx)
+            .await
             .map_err(|_| crate::error::SdkError::Other(anyhow::anyhow!("Message list timeout")))?
-            .map_err(|_| crate::error::SdkError::Other(anyhow::anyhow!("Response channel closed")))?;
+            .map_err(|_| {
+                crate::error::SdkError::Other(anyhow::anyhow!("Response channel closed"))
+            })?;
 
         if !response.success {
             return Err(crate::error::SdkError::Other(anyhow::anyhow!(
-                "Message list failed: {}", response.error_message
+                "Message list failed: {}",
+                response.error_message
             )));
         }
 
@@ -510,11 +545,16 @@ impl EntityStateManager {
         component_name: String,
         session_type: String,
     ) -> Result<String> {
-        use crate::pb::{runtime_service_request, SessionCreateRequest, RuntimeServiceRequest, ServiceMessage};
+        use crate::pb::{
+            runtime_service_request, RuntimeServiceRequest, ServiceMessage, SessionCreateRequest,
+        };
 
         let request_id = uuid::Uuid::new_v4().to_string();
         let (response_tx, response_rx) = oneshot::channel();
-        self.pending_requests.lock().await.insert(request_id.clone(), response_tx);
+        self.pending_requests
+            .lock()
+            .await
+            .insert(request_id.clone(), response_tx);
 
         let request = RuntimeServiceRequest {
             request_id: request_id.clone(),
@@ -527,33 +567,37 @@ impl EntityStateManager {
                     state: vec![],
                     metadata: vec![],
                     expires_at_ns: 0,
-                }
+                },
             )),
         };
 
         let message = ServiceMessage {
             worker_id: String::new(),
             metadata: HashMap::new(),
-            message_type: Some(crate::pb::service_message::MessageType::RuntimeService(request)),
+            message_type: Some(crate::pb::service_message::MessageType::RuntimeService(
+                request,
+            )),
         };
 
-        self.stream_sender.send_async(message).await
-            .map_err(|e| crate::error::SdkError::Connection {
+        self.stream_sender.send_async(message).await.map_err(|e| {
+            crate::error::SdkError::Connection {
                 message: format!("Failed to send session create request: {}", e),
                 code: crate::error::ErrorCode::ConnectionFailed,
                 source: None,
-            })?;
+            }
+        })?;
 
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            response_rx
-        ).await
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), response_rx)
+            .await
             .map_err(|_| crate::error::SdkError::Other(anyhow::anyhow!("Session create timeout")))?
-            .map_err(|_| crate::error::SdkError::Other(anyhow::anyhow!("Response channel closed")))?;
+            .map_err(|_| {
+                crate::error::SdkError::Other(anyhow::anyhow!("Response channel closed"))
+            })?;
 
         if !response.success {
             return Err(crate::error::SdkError::Other(anyhow::anyhow!(
-                "Session create failed: {}", response.error_message
+                "Session create failed: {}",
+                response.error_message
             )));
         }
 

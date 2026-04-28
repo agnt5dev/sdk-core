@@ -166,7 +166,7 @@ impl JournalEventMessage {
             || event_type.starts_with("lm.thinking.")
             || event_type.starts_with("lm.tool_call.")  // LLM tool call content blocks (transient deltas)
             || event_type.starts_with("progress.")
-            || event_type.starts_with("log")  // log, log.info, log.warn, log.error, etc.
+            || event_type.starts_with("log") // log, log.info, log.warn, log.error, etc.
     }
 
     /// Check if this event type is a checkpoint event that requires sync acknowledgement
@@ -185,11 +185,7 @@ impl JournalEventMessage {
     }
 
     /// Create with automatic is_sse_only detection based on event_type
-    pub fn new(
-        run_id: String,
-        event_type: String,
-        data: Vec<u8>,
-    ) -> Self {
+    pub fn new(run_id: String, event_type: String, data: Vec<u8>) -> Self {
         let is_sse_only = Self::is_sse_only_event_type(&event_type);
         Self {
             run_id,
@@ -254,9 +250,10 @@ impl JournalEventQueue {
     ///
     /// If the queue is at capacity, the oldest event is dropped (FIFO).
     pub fn push(&self, event: JournalEventMessage) -> Result<(), String> {
-        let mut queue = self.queue.lock().map_err(|e| {
-            format!("Failed to lock journal queue for push: {}", e)
-        })?;
+        let mut queue = self
+            .queue
+            .lock()
+            .map_err(|e| format!("Failed to lock journal queue for push: {}", e))?;
 
         // Check if buffer is full
         if queue.len() >= self.config.max_size {
@@ -302,9 +299,10 @@ impl JournalEventQueue {
 
     /// Re-queue an event at the front (used when send fails)
     pub fn push_front(&self, event: JournalEventMessage) -> Result<(), String> {
-        let mut queue = self.queue.lock().map_err(|e| {
-            format!("Failed to lock journal queue for push_front: {}", e)
-        })?;
+        let mut queue = self
+            .queue
+            .lock()
+            .map_err(|e| format!("Failed to lock journal queue for push_front: {}", e))?;
 
         log::debug!(
             "Re-queuing event at front: type={} run_id={}",
@@ -441,10 +439,7 @@ impl JournalEventQueue {
 
     /// Get current metrics snapshot
     pub fn metrics(&self) -> JournalQueueMetrics {
-        self.metrics
-            .lock()
-            .map(|m| m.clone())
-            .unwrap_or_default()
+        self.metrics.lock().map(|m| m.clone()).unwrap_or_default()
     }
 
     /// Get current metrics as tuple (queued, sent, dropped, errors)
@@ -503,7 +498,9 @@ mod tests {
         });
 
         // Push event
-        queue.push(create_test_event("workflow.started", 1)).unwrap();
+        queue
+            .push(create_test_event("workflow.started", 1))
+            .unwrap();
         assert_eq!(queue.len(), 1);
 
         // Pop event
@@ -520,13 +517,21 @@ mod tests {
         });
 
         // Fill queue
-        queue.push(create_test_event("workflow.started", 1)).unwrap();
-        queue.push(create_test_event("workflow.step.started", 2)).unwrap();
-        queue.push(create_test_event("workflow.step.completed", 3)).unwrap();
+        queue
+            .push(create_test_event("workflow.started", 1))
+            .unwrap();
+        queue
+            .push(create_test_event("workflow.step.started", 2))
+            .unwrap();
+        queue
+            .push(create_test_event("workflow.step.completed", 3))
+            .unwrap();
         assert_eq!(queue.len(), 3);
 
         // Overflow - should drop oldest (seq=1)
-        queue.push(create_test_event("workflow.completed", 4)).unwrap();
+        queue
+            .push(create_test_event("workflow.completed", 4))
+            .unwrap();
         assert_eq!(queue.len(), 3);
 
         // Verify oldest was dropped
@@ -537,22 +542,44 @@ mod tests {
     #[test]
     fn test_sse_only_detection() {
         // Boundary events (persisted)
-        assert!(!JournalEventMessage::is_sse_only_event_type("workflow.started"));
-        assert!(!JournalEventMessage::is_sse_only_event_type("agent.completed"));
-        assert!(!JournalEventMessage::is_sse_only_event_type("lm.call.started"));
-        assert!(!JournalEventMessage::is_sse_only_event_type("tool.call.completed"));
+        assert!(!JournalEventMessage::is_sse_only_event_type(
+            "workflow.started"
+        ));
+        assert!(!JournalEventMessage::is_sse_only_event_type(
+            "agent.completed"
+        ));
+        assert!(!JournalEventMessage::is_sse_only_event_type(
+            "lm.call.started"
+        ));
+        assert!(!JournalEventMessage::is_sse_only_event_type(
+            "tool.call.completed"
+        ));
 
         // SSE-only events (not persisted)
         assert!(JournalEventMessage::is_sse_only_event_type("output.delta"));
         assert!(JournalEventMessage::is_sse_only_event_type("output.start"));
         assert!(JournalEventMessage::is_sse_only_event_type("output.stop"));
-        assert!(JournalEventMessage::is_sse_only_event_type("lm.stream.delta"));
-        assert!(JournalEventMessage::is_sse_only_event_type("lm.message.delta"));
-        assert!(JournalEventMessage::is_sse_only_event_type("lm.thinking.delta"));
-        assert!(JournalEventMessage::is_sse_only_event_type("lm.tool_call.start"));
-        assert!(JournalEventMessage::is_sse_only_event_type("lm.tool_call.delta"));
-        assert!(JournalEventMessage::is_sse_only_event_type("lm.tool_call.stop"));
-        assert!(JournalEventMessage::is_sse_only_event_type("progress.update"));
+        assert!(JournalEventMessage::is_sse_only_event_type(
+            "lm.stream.delta"
+        ));
+        assert!(JournalEventMessage::is_sse_only_event_type(
+            "lm.message.delta"
+        ));
+        assert!(JournalEventMessage::is_sse_only_event_type(
+            "lm.thinking.delta"
+        ));
+        assert!(JournalEventMessage::is_sse_only_event_type(
+            "lm.tool_call.start"
+        ));
+        assert!(JournalEventMessage::is_sse_only_event_type(
+            "lm.tool_call.delta"
+        ));
+        assert!(JournalEventMessage::is_sse_only_event_type(
+            "lm.tool_call.stop"
+        ));
+        assert!(JournalEventMessage::is_sse_only_event_type(
+            "progress.update"
+        ));
         assert!(JournalEventMessage::is_sse_only_event_type("log"));
         assert!(JournalEventMessage::is_sse_only_event_type("log.info"));
         assert!(JournalEventMessage::is_sse_only_event_type("log.warn"));
@@ -562,28 +589,68 @@ mod tests {
     #[test]
     fn test_checkpoint_event_detection() {
         // Checkpoint events (require sync ack) - inverse of SSE-only
-        assert!(JournalEventMessage::is_checkpoint_event_type("workflow.started"));
-        assert!(JournalEventMessage::is_checkpoint_event_type("workflow.completed"));
-        assert!(JournalEventMessage::is_checkpoint_event_type("workflow.failed"));
-        assert!(JournalEventMessage::is_checkpoint_event_type("workflow.paused"));
-        assert!(JournalEventMessage::is_checkpoint_event_type("workflow.step.started"));
-        assert!(JournalEventMessage::is_checkpoint_event_type("workflow.step.completed"));
-        assert!(JournalEventMessage::is_checkpoint_event_type("workflow.step.paused"));
-        assert!(JournalEventMessage::is_checkpoint_event_type("agent.started"));
-        assert!(JournalEventMessage::is_checkpoint_event_type("agent.completed"));
-        assert!(JournalEventMessage::is_checkpoint_event_type("approval.requested"));
-        assert!(JournalEventMessage::is_checkpoint_event_type("approval.resolved"));
-        assert!(JournalEventMessage::is_checkpoint_event_type("lm.call.started"));
-        assert!(JournalEventMessage::is_checkpoint_event_type("lm.call.completed"));
-        assert!(JournalEventMessage::is_checkpoint_event_type("tool.call.started"));
-        assert!(JournalEventMessage::is_checkpoint_event_type("tool.call.completed"));
+        assert!(JournalEventMessage::is_checkpoint_event_type(
+            "workflow.started"
+        ));
+        assert!(JournalEventMessage::is_checkpoint_event_type(
+            "workflow.completed"
+        ));
+        assert!(JournalEventMessage::is_checkpoint_event_type(
+            "workflow.failed"
+        ));
+        assert!(JournalEventMessage::is_checkpoint_event_type(
+            "workflow.paused"
+        ));
+        assert!(JournalEventMessage::is_checkpoint_event_type(
+            "workflow.step.started"
+        ));
+        assert!(JournalEventMessage::is_checkpoint_event_type(
+            "workflow.step.completed"
+        ));
+        assert!(JournalEventMessage::is_checkpoint_event_type(
+            "workflow.step.paused"
+        ));
+        assert!(JournalEventMessage::is_checkpoint_event_type(
+            "agent.started"
+        ));
+        assert!(JournalEventMessage::is_checkpoint_event_type(
+            "agent.completed"
+        ));
+        assert!(JournalEventMessage::is_checkpoint_event_type(
+            "approval.requested"
+        ));
+        assert!(JournalEventMessage::is_checkpoint_event_type(
+            "approval.resolved"
+        ));
+        assert!(JournalEventMessage::is_checkpoint_event_type(
+            "lm.call.started"
+        ));
+        assert!(JournalEventMessage::is_checkpoint_event_type(
+            "lm.call.completed"
+        ));
+        assert!(JournalEventMessage::is_checkpoint_event_type(
+            "tool.call.started"
+        ));
+        assert!(JournalEventMessage::is_checkpoint_event_type(
+            "tool.call.completed"
+        ));
 
         // NOT checkpoint events (SSE-only)
-        assert!(!JournalEventMessage::is_checkpoint_event_type("output.delta"));
-        assert!(!JournalEventMessage::is_checkpoint_event_type("lm.stream.delta"));
-        assert!(!JournalEventMessage::is_checkpoint_event_type("lm.message.delta"));
-        assert!(!JournalEventMessage::is_checkpoint_event_type("lm.thinking.delta"));
-        assert!(!JournalEventMessage::is_checkpoint_event_type("progress.update"));
+        assert!(!JournalEventMessage::is_checkpoint_event_type(
+            "output.delta"
+        ));
+        assert!(!JournalEventMessage::is_checkpoint_event_type(
+            "lm.stream.delta"
+        ));
+        assert!(!JournalEventMessage::is_checkpoint_event_type(
+            "lm.message.delta"
+        ));
+        assert!(!JournalEventMessage::is_checkpoint_event_type(
+            "lm.thinking.delta"
+        ));
+        assert!(!JournalEventMessage::is_checkpoint_event_type(
+            "progress.update"
+        ));
         assert!(!JournalEventMessage::is_checkpoint_event_type("log"));
     }
 
@@ -597,7 +664,9 @@ mod tests {
 
         // Add 5 events
         for i in 1..=5 {
-            queue.push(create_test_event("workflow.step.completed", i)).unwrap();
+            queue
+                .push(create_test_event("workflow.step.completed", i))
+                .unwrap();
         }
         assert_eq!(queue.len(), 5);
 
@@ -621,8 +690,12 @@ mod tests {
     fn test_push_front() {
         let queue = JournalEventQueue::new(JournalQueueConfig::default());
 
-        queue.push(create_test_event("workflow.started", 1)).unwrap();
-        queue.push(create_test_event("workflow.completed", 2)).unwrap();
+        queue
+            .push(create_test_event("workflow.started", 1))
+            .unwrap();
+        queue
+            .push(create_test_event("workflow.completed", 2))
+            .unwrap();
 
         // Pop one
         let event = queue.pop().unwrap();
@@ -640,7 +713,9 @@ mod tests {
     fn test_metrics() {
         let queue = JournalEventQueue::new(JournalQueueConfig::default());
 
-        queue.push(create_test_event("workflow.started", 1)).unwrap();
+        queue
+            .push(create_test_event("workflow.started", 1))
+            .unwrap();
         queue.push(create_test_event("output.delta", 2)).unwrap();
 
         let (queued, sent, dropped, errors) = queue.get_metrics();
@@ -651,7 +726,7 @@ mod tests {
 
         // Record sends
         queue.record_sent(false); // boundary
-        queue.record_sent(true);  // sse-only
+        queue.record_sent(true); // sse-only
 
         let metrics = queue.metrics();
         assert_eq!(metrics.events_sent, 2);
@@ -669,7 +744,9 @@ mod tests {
 
         // Push in order
         for i in 1..=5 {
-            queue.push(create_test_event("workflow.step.completed", i)).unwrap();
+            queue
+                .push(create_test_event("workflow.step.completed", i))
+                .unwrap();
         }
 
         // Pop should be FIFO

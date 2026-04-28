@@ -149,8 +149,8 @@ impl SandboxRegistry {
     /// rather than falling back.
     pub fn load_from_environment(&mut self) -> Result<()> {
         if let Ok(endpoint) = std::env::var("AGNT5_SANDBOX_ENDPOINT") {
-            let sandbox_id = std::env::var("AGNT5_SANDBOX_ID")
-                .unwrap_or_else(|_| "default".to_string());
+            let sandbox_id =
+                std::env::var("AGNT5_SANDBOX_ID").unwrap_or_else(|_| "default".to_string());
 
             let auth = if let Ok(key) = std::env::var("AGNT5_SANDBOX_API_KEY") {
                 SandboxAuth::ApiKey(key)
@@ -165,8 +165,7 @@ impl SandboxRegistry {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(300);
 
-            let api_prefix = std::env::var("AGNT5_SANDBOX_API_PREFIX")
-                .unwrap_or_default();
+            let api_prefix = std::env::var("AGNT5_SANDBOX_API_PREFIX").unwrap_or_default();
 
             let config = RemoteSandboxConfig {
                 endpoint,

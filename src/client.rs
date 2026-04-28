@@ -100,10 +100,23 @@ impl WorkerCoordinatorClient {
             }
         };
 
+        // Expose the worker ID as gRPC metadata so L7 proxies can route
+        // reconnects consistently before reading the protobuf stream body.
+        let worker_id_header = tonic::metadata::MetadataValue::try_from(worker_id.as_str())
+            .map_err(|e| SdkError::Connection {
+                message: format!("Invalid worker_id for routing metadata: {}", e),
+                code: crate::error::ErrorCode::ConnectionFailed,
+                source: None,
+            })?;
+        let mut request = tonic::Request::new(outgoing_stream);
+        request
+            .metadata_mut()
+            .insert("x-agnt5-worker-id", worker_id_header);
+
         // Establish the gRPC stream
         let mut response_stream = self
             .client
-            .worker_stream(outgoing_stream)
+            .worker_stream(request)
             .await
             .map_err(|e| {
                 debug!("Failed to create gRPC worker stream: {}", e);

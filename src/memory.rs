@@ -63,7 +63,13 @@ impl MemoryScope {
         // Sanitize scope_id for use in collection name
         let sanitized_id: String = scope_id
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
 
         format!("{}_{}_memories", self.as_str(), sanitized_id)
@@ -238,18 +244,19 @@ impl SemanticMemory {
         // Load embedder from environment
         let embedder: Arc<dyn Embedder> = {
             let mut registry = EmbedderRegistry::new();
-            registry.load_from_environment().map_err(|_| {
-                SdkError::Configuration {
-                    message: "No embedder configured. Set OPENAI_API_KEY for embeddings.".to_string(),
+            registry
+                .load_from_environment()
+                .map_err(|_| SdkError::Configuration {
+                    message: "No embedder configured. Set OPENAI_API_KEY for embeddings."
+                        .to_string(),
                     field: Some("OPENAI_API_KEY".to_string()),
-                }
-            })?;
-            registry.get_default_provider().ok_or_else(|| {
-                SdkError::Configuration {
+                })?;
+            registry
+                .get_default_provider()
+                .ok_or_else(|| SdkError::Configuration {
                     message: "No default embedder provider available".to_string(),
                     field: None,
-                }
-            })?
+                })?
         };
 
         // Load vector database from environment
@@ -261,12 +268,12 @@ impl SemanticMemory {
                     field: None,
                 }
             })?;
-            registry.get_default_provider().ok_or_else(|| {
-                SdkError::Configuration {
+            registry
+                .get_default_provider()
+                .ok_or_else(|| SdkError::Configuration {
                     message: "No default vector database provider available".to_string(),
                     field: None,
-                }
-            })?
+                })?
         };
 
         Ok(Self::new(config, embedder, vectordb))
@@ -283,7 +290,10 @@ impl SemanticMemory {
 
     /// Ensure the collection exists (lazy initialization)
     async fn ensure_collection(&self) -> Result<()> {
-        if self.collection_initialized.load(std::sync::atomic::Ordering::Relaxed) {
+        if self
+            .collection_initialized
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return Ok(());
         }
 
@@ -331,7 +341,8 @@ impl SemanticMemory {
     /// Generates an embedding for the content and stores it in the vector database.
     /// Returns the unique ID of the stored memory.
     pub async fn store(&self, content: &str) -> Result<String> {
-        self.store_with_metadata(content, MemoryMetadata::new()).await
+        self.store_with_metadata(content, MemoryMetadata::new())
+            .await
     }
 
     /// Store multiple contents in batch (more efficient for RAG indexing)
@@ -339,7 +350,8 @@ impl SemanticMemory {
     /// Uses batch embedding and batch upsert for better performance.
     /// Returns the unique IDs of all stored memories.
     pub async fn store_batch(&self, contents: &[&str]) -> Result<Vec<String>> {
-        let metadata: Vec<MemoryMetadata> = contents.iter().map(|_| MemoryMetadata::new()).collect();
+        let metadata: Vec<MemoryMetadata> =
+            contents.iter().map(|_| MemoryMetadata::new()).collect();
         self.store_batch_with_metadata(contents, &metadata).await
     }
 
@@ -376,7 +388,10 @@ impl SemanticMemory {
 
         // Batch embed all contents
         let vectors = self.embedder.embed_batch(contents).await.map_err(|e| {
-            SdkError::Other(anyhow::anyhow!("Failed to generate batch embeddings: {}", e))
+            SdkError::Other(anyhow::anyhow!(
+                "Failed to generate batch embeddings: {}",
+                e
+            ))
         })?;
 
         // Build vector entries
@@ -429,7 +444,11 @@ impl SemanticMemory {
     }
 
     /// Store content with custom metadata
-    pub async fn store_with_metadata(&self, content: &str, metadata: MemoryMetadata) -> Result<String> {
+    pub async fn store_with_metadata(
+        &self,
+        content: &str,
+        metadata: MemoryMetadata,
+    ) -> Result<String> {
         let span = tracing::info_span!(
             "semantic_memory.store",
             otel.name = "semantic_memory.store",
@@ -444,9 +463,10 @@ impl SemanticMemory {
         self.ensure_collection().await?;
 
         // Generate embedding
-        let vector = self.embedder.embed(content).await.map_err(|e| {
-            SdkError::Other(anyhow::anyhow!("Failed to generate embedding: {}", e))
-        })?;
+        let vector =
+            self.embedder.embed(content).await.map_err(|e| {
+                SdkError::Other(anyhow::anyhow!("Failed to generate embedding: {}", e))
+            })?;
 
         // Generate unique ID
         let id = Uuid::new_v4().to_string();
