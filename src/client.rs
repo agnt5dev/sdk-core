@@ -324,7 +324,7 @@ impl WorkerCoordinatorClient {
 
         let request = CheckpointRequest {
             checkpoint: Some(checkpoint),
-            tenant_id,
+            project_id: tenant_id,
         };
 
         // Checkpoint moved from WorkerCoordinatorService → EngineService.
@@ -387,7 +387,7 @@ impl WorkerCoordinatorClient {
         );
 
         let request = FindByStepKeyRequest {
-            tenant_id,
+            project_id: tenant_id,
             run_id,
             step_key,
         };
@@ -623,7 +623,7 @@ pub fn build_engine_record(
 ) -> Record {
     Record {
         offset: 0, // Assigned by engine
-        tenant_id,
+        project_id: tenant_id,
         run_id,
         event_type,
         data,
