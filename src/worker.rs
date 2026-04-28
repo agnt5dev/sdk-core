@@ -592,7 +592,7 @@ impl Worker {
                             data: event.data.clone(),
                             trace_id: String::new(),
                             span_id: String::new(),
-                            tenant_id: canonical_project_id_from_metadata(&event.metadata)
+                            project_id: canonical_project_id_from_metadata(&event.metadata)
                                 .unwrap_or_default(),
                             source_timestamp_ns: event.source_timestamp_ns,
                             worker_id: self.config.worker_id.clone(),
@@ -682,7 +682,7 @@ impl Worker {
             checkpoint_data: event_data,
             sequence_number,
             trace_id: String::new(),
-            tenant_id: canonical_project_id,
+            project_id: canonical_project_id,
             source_timestamp_ns,
             correlation_id,
             parent_event_id,
@@ -1789,7 +1789,7 @@ impl Worker {
                                 data: event.data.clone(),
                                 trace_id: String::new(),
                                 span_id: String::new(),
-                                tenant_id: cached_project_id.clone(),
+                                project_id: cached_project_id.clone(),
                                 source_timestamp_ns: event.source_timestamp_ns,
                                 worker_id: worker_id.clone(),
                             };
@@ -1876,7 +1876,7 @@ impl Worker {
                         data: event.data.clone(),
                         trace_id: String::new(),
                         span_id: String::new(),
-                        tenant_id,
+                        project_id: tenant_id,
                         source_timestamp_ns: event.source_timestamp_ns,
                         correlation_id: event.correlation_id.clone(),
                         parent_event_id: event.parent_correlation_id.clone(),
@@ -2077,7 +2077,7 @@ impl Worker {
                         worker_id: worker_id.clone(),
                         component_ids: component_ids.clone(),
                         max_jobs,
-                        tenant_id: project_id.clone(),
+                        project_id: project_id.clone(),
                         deployment_id: deployment_id.clone(),
                         claim_timeout_ms: 300_000,
                     })
@@ -2275,7 +2275,7 @@ impl Worker {
                     error_message,
                     error_code,
                     metadata: HashMap::new(),
-                    tenant_id,
+                    project_id: tenant_id,
                 })
                 .await
             {
