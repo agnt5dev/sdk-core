@@ -31,10 +31,12 @@ static TELEMETRY_INIT_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
 const PLATFORM_WORKER_SERVICE_NAME: &str = "agnt5-worker";
 const PLATFORM_SERVICE_NAMESPACE: &str = "agnt5";
 
-/// Get the configured legacy engine routing key.
+/// Get the configured customer-facing sub-tenant default.
 ///
-/// On worker/runtime paths this currently carries project identity and is
-/// populated from `AGNT5_TENANT_ID` for backward compatibility.
+/// Populated from the `AGNT5_TENANT_ID` env var when the worker is
+/// pre-configured with a default sub-tenant for outbound calls. Returns
+/// `None` when not set — most workers don't have a static sub-tenant
+/// because sub-tenant arrives per request via dispatch metadata.
 pub fn get_tenant_id() -> Option<&'static str> {
     TENANT_ID.get().and_then(|opt| opt.as_deref())
 }
@@ -157,14 +159,18 @@ fn init_telemetry_inner(service_name: &str, service_version: &str) -> Result<(),
         service_name
     );
 
-    // Extract deployment_id and tenant_id from environment variables
-    // These are set by the control plane when deploying workers
+    // Extract identity scopes from environment variables.
+    // These are set by the control plane when deploying workers.
+    //   - AGNT5_PROJECT_ID    : execution / routing scope
+    //   - AGNT5_WORKSPACE_ID  : auth scope
+    //   - AGNT5_DEPLOYMENT_ID : env / version scope
+    //   - AGNT5_TENANT_ID     : optional default sub-tenant (customer-of-
+    //     customer). Most workers don't set this — sub-tenant arrives per
+    //     request via dispatch metadata.
     let deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").ok();
-    let tenant_id = std::env::var("AGNT5_TENANT_ID").ok();
-    let project_id = std::env::var("AGNT5_PROJECT_ID")
-        .ok()
-        .or_else(|| tenant_id.clone());
+    let project_id = std::env::var("AGNT5_PROJECT_ID").ok();
     let workspace_id = std::env::var("AGNT5_WORKSPACE_ID").ok();
+    let tenant_id = std::env::var("AGNT5_TENANT_ID").ok();
     let agnt5_environment = std::env::var("AGNT5_ENV").ok();
     let agnt5_user_id = std::env::var("AGNT5_USER_ID").ok();
 
@@ -465,9 +471,11 @@ pub fn create_component_span(
         for (key, value) in meta.iter() {
             // Map known keys to their canonical names
             let attr_key = match key.as_str() {
-                "tenant_id" => "agnt5.project.id".to_string(),
-                "sub_tenant" => "agnt5.tenant.id".to_string(),
-                "customer_tenant_id" => "agnt5.tenant.id".to_string(),
+                // `metadata["tenant_id"]` carries the customer-facing
+                // sub-tenant (Phase B of the identity cleanup). Project
+                // identity flows on `metadata["project_id"]`.
+                "tenant_id" => "tenant.id".to_string(),
+                "customer_tenant_id" => "tenant.id".to_string(),
                 "project_id" => "agnt5.project.id".to_string(),
                 "workspace_id" => "agnt5.workspace.id".to_string(),
                 "deployment_id" => "agnt5.deployment.id".to_string(),
