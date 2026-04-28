@@ -141,17 +141,11 @@ pub fn collect_agnt5_env_vars() -> HashMap<String, String> {
 }
 
 fn canonical_project_id_from_metadata(metadata: &HashMap<String, String>) -> Option<String> {
-    metadata
-        .get("project_id")
-        .cloned()
-        .or_else(|| metadata.get("tenant_id").cloned())
+    metadata.get("project_id").cloned()
 }
 
 fn canonical_project_id_from_env() -> String {
-    std::env::var("AGNT5_PROJECT_ID")
-        .ok()
-        .or_else(|| std::env::var("AGNT5_TENANT_ID").ok())
-        .unwrap_or_default()
+    std::env::var("AGNT5_PROJECT_ID").ok().unwrap_or_default()
 }
 
 fn with_project_metadata(
@@ -161,10 +155,6 @@ fn with_project_metadata(
     if !project_id.is_empty() {
         metadata
             .entry("project_id".to_string())
-            .or_insert_with(|| project_id.to_string());
-        // Legacy compatibility for coordinator/engine paths that still expect tenant_id.
-        metadata
-            .entry("tenant_id".to_string())
             .or_insert_with(|| project_id.to_string());
     }
     metadata
@@ -2033,7 +2023,7 @@ impl Worker {
         tokio::spawn(async move {
             // Skip polling if no project context (not in managed mode).
             if project_id.is_empty() {
-                eprintln!("[INFO] Job queue polling disabled (AGNT5_PROJECT_ID / AGNT5_TENANT_ID not set)");
+                eprintln!("[INFO] Job queue polling disabled (AGNT5_PROJECT_ID not set)");
                 return;
             }
 
@@ -2117,8 +2107,7 @@ impl Worker {
                             // `handle_polled_job_response` derives job_id from
                             // `resp.invocation_id` (which equals run_id which
                             // equals job_id on the coordinator's poll path)
-                            // and project identity from `AGNT5_PROJECT_ID`
-                            // (falling back to legacy `AGNT5_TENANT_ID`).
+                            // and project identity from `AGNT5_PROJECT_ID`.
                             let mut metadata = job.metadata.clone();
                             if !job.trace_id.is_empty() {
                                 metadata.insert("trace_id".to_string(), job.trace_id.clone());
@@ -2221,7 +2210,7 @@ impl Worker {
     /// Phase 8). On the coordinator's poll path `job_id == run_id`, so we
     /// derive the job_id from `resp.invocation_id` — stripping any
     /// `:suffix` the worker appends for streaming invocations. Project identity
-    /// comes from `AGNT5_PROJECT_ID`, falling back to legacy `AGNT5_TENANT_ID`.
+    /// comes from `AGNT5_PROJECT_ID`.
     async fn handle_polled_job_response(&self, service_message: ServiceMessage) {
         let (job_id, success, output_data, error_message, error_code) =
             match &service_message.message_type {
