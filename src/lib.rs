@@ -12,6 +12,7 @@ pub mod lm;
 pub mod logging;
 pub mod mcp;
 pub mod memory;
+pub mod memory_service;
 pub mod runtime_adapter;
 pub mod sandbox;
 pub mod span_filter;

@@ -31,6 +31,7 @@ async fn main() -> Result<()> {
         output_schema: None,
         config: std::collections::HashMap::new(),
         metadata: std::collections::HashMap::new(),
+        ..Default::default()
     };
 
     let worker = Worker::new(

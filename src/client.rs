@@ -523,7 +523,10 @@ pub struct EngineClient {
 impl EngineClient {
     /// Connect to the engine at the given endpoint with a pool of connections.
     pub async fn connect(endpoint: &str) -> Result<Self> {
-        debug!("Connecting to Engine at {} (pool_size={})", endpoint, ENGINE_POOL_SIZE);
+        debug!(
+            "Connecting to Engine at {} (pool_size={})",
+            endpoint, ENGINE_POOL_SIZE
+        );
 
         let uri = if endpoint.contains("://") {
             endpoint.to_string()
@@ -555,7 +558,10 @@ impl EngineClient {
             clients.push(EngineServiceClient::new(channel));
         }
 
-        debug!("Engine client pool connected ({} connections)", ENGINE_POOL_SIZE);
+        debug!(
+            "Engine client pool connected ({} connections)",
+            ENGINE_POOL_SIZE
+        );
         Ok(Self {
             clients,
             next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
