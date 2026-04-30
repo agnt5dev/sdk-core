@@ -14,7 +14,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::mcp::error::{McpError, McpResult};
-use crate::mcp::types::{JsonRpcRequest, JsonRpcResponse, SseConfig, StdioConfig};
+use crate::mcp::types::{JsonRpcRequest, JsonRpcResponse, SseConfig, StdioConfig, StreamableHttpConfig};
 
 /// Transport trait for MCP communication
 #[async_trait]
@@ -529,6 +529,245 @@ impl Transport for SseTransport {
 
     fn is_connected(&self) -> bool {
         self.connected_shared.load(Ordering::SeqCst)
+    }
+}
+
+// ============================================================================
+// Streamable HTTP Transport (MCP 2025-03-26 spec)
+// ============================================================================
+
+/// Streamable HTTP transport.
+///
+/// The 2025-03-26 MCP spec replaces HTTP+SSE's two-endpoint design with a
+/// single endpoint URL. Each client request is a POST whose response is
+/// either a single `application/json` document or a `text/event-stream`
+/// carrying one or more JSON-RPC messages. Servers may issue an
+/// `Mcp-Session-Id` on the initialize response which the client must echo
+/// on every subsequent request, plus an `MCP-Protocol-Version` header
+/// after negotiation.
+///
+/// This implementation is request/response only — it does not open the
+/// optional GET stream for server-initiated messages, since DeepWiki and
+/// most public MCP servers don't issue any. Add that path if/when a server
+/// requires it.
+pub struct StreamableHttpTransport {
+    url: String,
+    client: reqwest::Client,
+    request_id: AtomicU64,
+    /// `Mcp-Session-Id` echoed back from the server, if any.
+    session_id: Arc<Mutex<Option<String>>>,
+    /// Connected state. Streamable HTTP has no persistent connection, but
+    /// keep this for parity with the Transport trait.
+    connected: AtomicBool,
+}
+
+impl StreamableHttpTransport {
+    pub async fn new(config: StreamableHttpConfig) -> McpResult<Self> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        for (key, value) in &config.headers {
+            headers.insert(
+                reqwest::header::HeaderName::from_bytes(key.as_bytes())
+                    .map_err(|e| McpError::Transport(format!("Invalid header name: {}", e)))?,
+                reqwest::header::HeaderValue::from_str(value)
+                    .map_err(|e| McpError::Transport(format!("Invalid header value: {}", e)))?,
+            );
+        }
+
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .map_err(|e| McpError::Transport(format!("Failed to create HTTP client: {}", e)))?;
+
+        Ok(Self {
+            url: config.url,
+            client,
+            request_id: AtomicU64::new(1),
+            session_id: Arc::new(Mutex::new(None)),
+            connected: AtomicBool::new(true),
+        })
+    }
+
+    fn next_id(&self) -> u64 {
+        self.request_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Build a POST request with the right Accept header and the session
+    /// id, if we have one. Both content types are advertised so the server
+    /// can pick whichever it prefers per-call.
+    async fn build_post(
+        &self,
+        body: &JsonRpcRequest,
+    ) -> McpResult<reqwest::RequestBuilder> {
+        let mut req = self
+            .client
+            .post(&self.url)
+            .header("Accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", "2025-03-26")
+            .json(body);
+
+        let session = self.session_id.lock().await;
+        if let Some(sid) = session.as_ref() {
+            req = req.header("Mcp-Session-Id", sid);
+        }
+        Ok(req)
+    }
+
+    /// Capture the session id from a response if the server set one.
+    async fn capture_session(&self, response: &reqwest::Response) {
+        if let Some(value) = response.headers().get("mcp-session-id") {
+            if let Ok(s) = value.to_str() {
+                let mut guard = self.session_id.lock().await;
+                *guard = Some(s.to_string());
+            }
+        }
+    }
+}
+
+/// Find the JSON-RPC response with `id == target_id` inside an SSE response
+/// body. Each `data:` line is one JSON message; we ignore notifications and
+/// other-id responses.
+fn parse_sse_for_response(body: &str, target_id: u64) -> Option<JsonRpcResponse> {
+    for line in body.lines() {
+        let payload = match line.strip_prefix("data:") {
+            Some(rest) => rest.trim(),
+            None => continue,
+        };
+        if payload.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = match serde_json::from_str(payload) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let response: JsonRpcResponse = match serde_json::from_value(value) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if extract_response_id(&response) == Some(target_id) {
+            return Some(response);
+        }
+    }
+    None
+}
+
+#[async_trait]
+impl Transport for StreamableHttpTransport {
+    async fn request(&self, mut req: JsonRpcRequest) -> McpResult<JsonRpcResponse> {
+        if !self.is_connected() {
+            return Err(McpError::ConnectionClosed);
+        }
+
+        let id = self.next_id();
+        req.id = crate::mcp::types::JsonRpcId::Number(id);
+
+        let response = self.build_post(&req).await?.send().await?;
+        if !response.status().is_success() {
+            return Err(McpError::Http(format!(
+                "Streamable HTTP request failed: {}",
+                response.status()
+            )));
+        }
+
+        self.capture_session(&response).await;
+
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        let body = response.text().await?;
+
+        if content_type.starts_with("application/json") {
+            return serde_json::from_str(&body)
+                .map_err(|e| McpError::Transport(format!("Invalid JSON response: {e}")));
+        }
+        if content_type.starts_with("text/event-stream") {
+            return parse_sse_for_response(&body, id).ok_or_else(|| {
+                McpError::Transport(format!(
+                    "SSE response did not contain JSON-RPC response with id {id}"
+                ))
+            });
+        }
+        // Some servers omit content-type or send something unexpected; try
+        // JSON first, then SSE, before giving up.
+        if let Ok(parsed) = serde_json::from_str::<JsonRpcResponse>(&body) {
+            return Ok(parsed);
+        }
+        if let Some(parsed) = parse_sse_for_response(&body, id) {
+            return Ok(parsed);
+        }
+        Err(McpError::Transport(format!(
+            "Unrecognized Streamable HTTP response (content-type={content_type:?})"
+        )))
+    }
+
+    async fn notify(&self, req: JsonRpcRequest) -> McpResult<()> {
+        if !self.is_connected() {
+            return Err(McpError::ConnectionClosed);
+        }
+        let response = self.build_post(&req).await?.send().await?;
+        if !response.status().is_success() {
+            return Err(McpError::Http(format!(
+                "Streamable HTTP notification failed: {}",
+                response.status()
+            )));
+        }
+        self.capture_session(&response).await;
+        Ok(())
+    }
+
+    async fn close(&self) -> McpResult<()> {
+        self.connected.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+mod streamable_http_tests {
+    use super::parse_sse_for_response;
+
+    #[test]
+    fn parses_single_data_line_with_matching_id() {
+        let body = r#"data: {"jsonrpc":"2.0","id":7,"result":{"ok":true}}
+
+"#;
+        let resp = parse_sse_for_response(body, 7).unwrap();
+        assert!(resp.result.is_some());
+    }
+
+    #[test]
+    fn skips_unrelated_ids_and_finds_target() {
+        let body = "\
+data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"x\":1}}\n\
+data: {\"jsonrpc\":\"2.0\",\"id\":42,\"result\":{\"hit\":true}}\n\
+data: {\"jsonrpc\":\"2.0\",\"method\":\"notification\"}\n\
+\n";
+        let resp = parse_sse_for_response(body, 42).unwrap();
+        let result = resp.result.unwrap();
+        assert_eq!(result.get("hit").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[test]
+    fn returns_none_when_no_matching_id() {
+        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n";
+        assert!(parse_sse_for_response(body, 99).is_none());
+    }
+
+    #[test]
+    fn ignores_non_data_lines_and_blank_payloads() {
+        let body = "\
+event: message\n\
+id: 1\n\
+data:\n\
+data: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{}}\n";
+        assert!(parse_sse_for_response(body, 3).is_some());
     }
 }
 
