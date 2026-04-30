@@ -540,7 +540,7 @@ impl GeminiPayload {
 fn gemini_built_in_spec(tool: &BuiltInTool) -> Option<JsonValue> {
     match tool {
         BuiltInTool::WebSearch => Some(json!({"google_search": {}})),
-        BuiltInTool::CodeInterpreter | BuiltInTool::FileSearch => None,
+        BuiltInTool::CodeInterpreter | BuiltInTool::FileSearch | BuiltInTool::WebFetch => None,
     }
 }
 

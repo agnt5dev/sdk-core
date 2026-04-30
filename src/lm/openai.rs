@@ -417,6 +417,9 @@ impl ResponsesApiRequest {
                 BuiltInTool::WebSearch => "web_search_preview",
                 BuiltInTool::CodeInterpreter => "code_interpreter",
                 BuiltInTool::FileSearch => "file_search",
+                // OpenAI's web_search_preview already returns fetched content;
+                // there's no separate web_fetch built-in to wire.
+                BuiltInTool::WebFetch => continue,
             };
             let api_built_in_tool = ApiBuiltInTool {
                 tool_type: tool_type.to_string(),

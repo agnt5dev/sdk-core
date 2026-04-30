@@ -248,16 +248,21 @@ pub enum ReasoningEffort {
     High,
 }
 
-/// Built-in tools provided by OpenAI Responses API.
-/// These tools are executed server-side by OpenAI.
+/// Provider-hosted tools enabled via `Agent(built_in_tools=[...])`. Each variant
+/// maps differently per provider — OpenAI emits `web_search_preview`, Anthropic
+/// emits `web_search_20250305`, Gemini emits `google_search`, etc. Variants
+/// that a given provider doesn't host are silently skipped at request build.
 #[derive(Clone, Debug, PartialEq)]
 pub enum BuiltInTool {
-    /// Web search tool ($25-$50 per 1000 queries)
+    /// Provider-hosted web search.
     WebSearch,
-    /// Python code interpreter (included)
+    /// Python code interpreter (OpenAI Responses API only).
     CodeInterpreter,
-    /// File search over uploaded documents ($2.50 per 1000 queries)
+    /// File search over uploaded documents (OpenAI Responses API only).
     FileSearch,
+    /// Provider-hosted page fetch (Anthropic only today; OpenAI's web_search
+    /// already includes fetched content, Gemini has no separate fetch).
+    WebFetch,
 }
 
 /// Output modalities supported by the model.

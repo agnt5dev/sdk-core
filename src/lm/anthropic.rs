@@ -564,13 +564,24 @@ impl MessagesPayload {
 }
 
 /// Map a generic BuiltInTool to its Anthropic Messages-API tool spec, if any.
-/// Returns None for variants Anthropic does not host (CodeInterpreter, FileSearch
-/// are OpenAI-only today).
+/// Returns None for variants Anthropic does not host (CodeInterpreter,
+/// FileSearch are OpenAI-only today).
+///
+/// Versioning note: this defaults to the `web_search_20260209` /
+/// `web_fetch_20260209` line, which supports dynamic filtering. Those tool
+/// versions are model-gated to Mythos Preview / Opus 4.7 / Opus 4.6 / Sonnet
+/// 4.6. Older Anthropic models will reject these and need the older
+/// `web_search_20250305` / `web_fetch_20250910` versions; expose this as a
+/// per-tool config knob if older-model support becomes a requirement.
 fn anthropic_built_in_spec(tool: &BuiltInTool) -> Option<JsonValue> {
     match tool {
         BuiltInTool::WebSearch => Some(json!({
-            "type": "web_search_20250305",
+            "type": "web_search_20260209",
             "name": "web_search",
+        })),
+        BuiltInTool::WebFetch => Some(json!({
+            "type": "web_fetch_20260209",
+            "name": "web_fetch",
         })),
         BuiltInTool::CodeInterpreter | BuiltInTool::FileSearch => None,
     }
