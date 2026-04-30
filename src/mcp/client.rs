@@ -8,10 +8,11 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::mcp::error::{McpError, McpResult};
-use crate::mcp::transport::{SseTransport, StdioTransport, Transport};
+use crate::mcp::transport::{SseTransport, StdioTransport, StreamableHttpTransport, Transport};
 use crate::mcp::types::{
     CallToolParams, CallToolResult, InitializeParams, InitializeResult, JsonRpcRequest,
     ListToolsResult, McpTool, ServerCapabilities, ServerConfig, SseConfig, StdioConfig,
+    StreamableHttpConfig,
 };
 
 /// MCP Client for connecting to external MCP servers
@@ -106,6 +107,31 @@ impl McpClient {
         );
     }
 
+    /// Add a Streamable HTTP server (MCP 2025-03-26 spec).
+    pub fn add_streamable_http_server(
+        &mut self,
+        name: impl Into<String>,
+        url: impl Into<String>,
+    ) {
+        self.add_server(
+            name,
+            ServerConfig::StreamableHttp(StreamableHttpConfig::new(url)),
+        );
+    }
+
+    /// Add a Streamable HTTP server with an API key (convenience method).
+    pub fn add_streamable_http_server_with_api_key(
+        &mut self,
+        name: impl Into<String>,
+        url: impl Into<String>,
+        api_key: impl Into<String>,
+    ) {
+        self.add_server(
+            name,
+            ServerConfig::StreamableHttp(StreamableHttpConfig::new(url).with_api_key(api_key)),
+        );
+    }
+
     /// Connect to all configured servers
     pub async fn connect(&self) -> McpResult<()> {
         for (name, config) in &self.server_configs {
@@ -122,6 +148,9 @@ impl McpClient {
         let transport: Box<dyn Transport> = match config {
             ServerConfig::Stdio(stdio_config) => Box::new(StdioTransport::new(stdio_config).await?),
             ServerConfig::Sse(sse_config) => Box::new(SseTransport::new(sse_config).await?),
+            ServerConfig::StreamableHttp(http_config) => {
+                Box::new(StreamableHttpTransport::new(http_config).await?)
+            }
         };
 
         // Initialize the connection

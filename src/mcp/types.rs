@@ -338,8 +338,10 @@ pub struct ListPromptsResult {
 pub enum ServerConfig {
     /// Stdio transport (subprocess)
     Stdio(StdioConfig),
-    /// SSE transport (HTTP)
+    /// SSE transport (HTTP+SSE — older 2024-11-05 spec)
     Sse(SseConfig),
+    /// Streamable HTTP transport (single endpoint, 2025-03-26 spec)
+    StreamableHttp(StreamableHttpConfig),
 }
 
 /// Configuration for stdio transport
@@ -404,6 +406,38 @@ impl SseConfig {
     }
 
     /// Add API key header
+    pub fn with_api_key(self, key: impl Into<String>) -> Self {
+        self.with_header("X-API-KEY", key)
+    }
+}
+
+/// Configuration for Streamable HTTP transport (MCP 2025-03-26 spec).
+///
+/// Single endpoint URL: every client request is a POST whose response is
+/// either a single JSON document or a `text/event-stream` carrying one or
+/// more JSON-RPC messages. The server may issue an `Mcp-Session-Id` on
+/// initialize which the client must echo on subsequent requests.
+#[derive(Debug, Clone)]
+pub struct StreamableHttpConfig {
+    /// Server URL (e.g., "https://mcp.deepwiki.com/mcp")
+    pub url: String,
+    /// Optional HTTP headers (for authentication)
+    pub headers: HashMap<String, String>,
+}
+
+impl StreamableHttpConfig {
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            headers: HashMap::new(),
+        }
+    }
+
+    pub fn with_header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.insert(key.into(), value.into());
+        self
+    }
+
     pub fn with_api_key(self, key: impl Into<String>) -> Self {
         self.with_header("X-API-KEY", key)
     }
