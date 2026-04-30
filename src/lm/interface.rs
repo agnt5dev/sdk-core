@@ -260,6 +260,61 @@ pub enum BuiltInTool {
     FileSearch,
 }
 
+impl BuiltInTool {
+    /// Resolve a provider-side tool name back to its `BuiltInTool` variant.
+    ///
+    /// Recognizes both OpenAI Responses API names (`web_search_preview`,
+    /// `code_interpreter`, `file_search`) and the cross-provider bare names
+    /// surfaced by Anthropic in `tool_use` blocks (`web_search`, `web_fetch`).
+    /// Returns `None` for unknown names; callers decide whether that's an
+    /// error or a silent skip.
+    pub fn from_provider_name(name: &str) -> Option<Self> {
+        match name {
+            "web_search_preview" | "web_search" => Some(Self::WebSearch),
+            "code_interpreter" => Some(Self::CodeInterpreter),
+            "file_search" => Some(Self::FileSearch),
+            "web_fetch" => Some(Self::WebFetch),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod built_in_tool_tests {
+    use super::BuiltInTool;
+
+    #[test]
+    fn openai_names_map_correctly() {
+        assert_eq!(BuiltInTool::from_provider_name("web_search_preview"), Some(BuiltInTool::WebSearch));
+        assert_eq!(BuiltInTool::from_provider_name("code_interpreter"), Some(BuiltInTool::CodeInterpreter));
+        assert_eq!(BuiltInTool::from_provider_name("file_search"), Some(BuiltInTool::FileSearch));
+    }
+
+    #[test]
+    fn anthropic_bare_names_map_correctly() {
+        // Anthropic surfaces the bare `name` field of the tool spec, not the type.
+        assert_eq!(BuiltInTool::from_provider_name("web_search"), Some(BuiltInTool::WebSearch));
+        assert_eq!(BuiltInTool::from_provider_name("web_fetch"), Some(BuiltInTool::WebFetch));
+    }
+
+    #[test]
+    fn web_search_aliases_collapse_to_same_variant() {
+        // Both names must map to the same variant so the dispatch loop and the
+        // request builder agree about which provider tool is in play.
+        assert_eq!(
+            BuiltInTool::from_provider_name("web_search_preview"),
+            BuiltInTool::from_provider_name("web_search")
+        );
+    }
+
+    #[test]
+    fn unknown_name_returns_none() {
+        assert_eq!(BuiltInTool::from_provider_name("unknown_tool"), None);
+        assert_eq!(BuiltInTool::from_provider_name(""), None);
+        assert_eq!(BuiltInTool::from_provider_name("WebSearch"), None); // case-sensitive
+    }
+}
+
 /// Output modalities supported by the model.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Modality {

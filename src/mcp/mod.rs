@@ -67,11 +67,11 @@ mod types;
 // Re-export main types
 pub use client::{McpClient, McpToolWithServer};
 pub use error::{McpError, McpResult};
-pub use transport::{SseTransport, StdioTransport, Transport};
+pub use transport::{SseTransport, StdioTransport, StreamableHttpTransport, Transport};
 pub use types::{
     CallToolParams, CallToolResult, ClientCapabilities, ClientInfo, InitializeParams,
     InitializeResult, JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse, ListPromptsResult,
     ListResourcesResult, ListToolsResult, McpPrompt, McpResource, McpTool, PromptArgument,
     ResourceReference, ServerCapabilities, ServerConfig, ServerInfo, SseConfig, StdioConfig,
-    ToolContent, ToolsCapability,
+    StreamableHttpConfig, ToolContent, ToolsCapability,
 };
