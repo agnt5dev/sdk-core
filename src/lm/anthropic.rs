@@ -15,9 +15,9 @@ use crate::error::{Result as SdkResult, SdkError};
 
 use super::http;
 use super::interface::{
-    generate as generate_via_model, stream as stream_via_model, ContentBlockType, GenerateRequest,
-    GenerateResponse, GenerationConfig, LanguageModel, Message, MessageRole, ResponseFormat,
-    StreamChunk, StreamHandle, StreamRequest, TokenUsage, ToolChoice, ToolDefinition,
+    generate as generate_via_model, stream as stream_via_model, BuiltInTool, ContentBlockType,
+    GenerateRequest, GenerateResponse, GenerationConfig, LanguageModel, Message, MessageRole,
+    ResponseFormat, StreamChunk, StreamHandle, StreamRequest, TokenUsage, ToolChoice, ToolDefinition,
 };
 use super::telemetry;
 
@@ -501,8 +501,9 @@ struct MessagesPayload {
     top_p: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    // Mixed list: user-defined tools and provider-hosted built-ins (e.g. web_search_20250305).
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    tools: Vec<AnthropicTool>,
+    tools: Vec<JsonValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<JsonValue>,
 }
@@ -522,7 +523,7 @@ impl MessagesPayload {
             response_format,
             reasoning_effort: _,
             modalities: _,
-            built_in_tools: _,
+            built_in_tools,
             timeout: _,
         } = request.config.clone();
 
@@ -531,7 +532,21 @@ impl MessagesPayload {
         let model = normalize_model(&request.model)?;
 
         let system = augment_system_prompt(request.system_prompt.clone(), &response_format);
-        let tools = convert_tools(&request.tools)?;
+
+        // Build a mixed tools array: user-defined function tools + Anthropic
+        // server-side built-ins (web_search_20250305 today). The Agent loop
+        // recognizes built-in names and skips local dispatch.
+        let mut tools: Vec<JsonValue> = convert_tools(&request.tools)?
+            .into_iter()
+            .map(|t| serde_json::to_value(t).unwrap_or(JsonValue::Null))
+            .collect();
+
+        for built_in in &built_in_tools {
+            if let Some(spec) = anthropic_built_in_spec(built_in) {
+                tools.push(spec);
+            }
+        }
+
         let tool_choice = convert_tool_choice(request.tool_choice.as_ref());
 
         Ok(Self {
@@ -545,6 +560,19 @@ impl MessagesPayload {
             tools,
             tool_choice,
         })
+    }
+}
+
+/// Map a generic BuiltInTool to its Anthropic Messages-API tool spec, if any.
+/// Returns None for variants Anthropic does not host (CodeInterpreter, FileSearch
+/// are OpenAI-only today).
+fn anthropic_built_in_spec(tool: &BuiltInTool) -> Option<JsonValue> {
+    match tool {
+        BuiltInTool::WebSearch => Some(json!({
+            "type": "web_search_20250305",
+            "name": "web_search",
+        })),
+        BuiltInTool::CodeInterpreter | BuiltInTool::FileSearch => None,
     }
 }
 

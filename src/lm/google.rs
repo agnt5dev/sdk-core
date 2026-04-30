@@ -16,9 +16,9 @@ use crate::error::{Result as SdkResult, SdkError};
 use super::http;
 
 use super::interface::{
-    generate as generate_via_model, stream as stream_via_model, ContentBlockType, GenerateRequest,
-    GenerateResponse, GenerationConfig, LanguageModel, Message, MessageRole, ResponseFormat,
-    StreamChunk, StreamHandle, StreamRequest, TokenUsage, ToolChoice, ToolDefinition,
+    generate as generate_via_model, stream as stream_via_model, BuiltInTool, ContentBlockType,
+    GenerateRequest, GenerateResponse, GenerationConfig, LanguageModel, Message, MessageRole,
+    ResponseFormat, StreamChunk, StreamHandle, StreamRequest, TokenUsage, ToolChoice, ToolDefinition,
 };
 use super::telemetry;
 
@@ -464,8 +464,10 @@ struct GeminiPayload {
     system_instruction: Option<GeminiContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     generation_config: Option<GeminiGenerationConfig>,
+    // Mixed list: function-declaration tool entries and provider-hosted built-ins
+    // (e.g. `{"google_search": {}}` for Gemini 2.0+).
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    tools: Vec<GeminiTool>,
+    tools: Vec<JsonValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_config: Option<GeminiToolConfig>,
 }
@@ -495,7 +497,7 @@ impl GeminiPayload {
             response_format,
             reasoning_effort: _,
             modalities: _,
-            built_in_tools: _,
+            built_in_tools,
             timeout: _,
         } = request.config.clone();
 
@@ -507,7 +509,19 @@ impl GeminiPayload {
             response_schema: response_schema(&response_format),
         });
 
-        let tools = convert_tools(&request.tools)?;
+        // Build a mixed tools array: function-declaration tools + Gemini
+        // server-side built-ins (google_search today).
+        let mut tools: Vec<JsonValue> = convert_tools(&request.tools)?
+            .into_iter()
+            .map(|t| serde_json::to_value(t).unwrap_or(JsonValue::Null))
+            .collect();
+
+        for built_in in &built_in_tools {
+            if let Some(spec) = gemini_built_in_spec(built_in) {
+                tools.push(spec);
+            }
+        }
+
         let tool_config = convert_tool_choice(request.tool_choice.as_ref());
 
         Ok(Self {
@@ -517,6 +531,16 @@ impl GeminiPayload {
             tools,
             tool_config,
         })
+    }
+}
+
+/// Map a generic BuiltInTool to its Gemini API tool spec. Gemini 2.0+ accepts
+/// `{"google_search": {}}` to enable server-side grounding. Returns None for
+/// variants Gemini does not host server-side.
+fn gemini_built_in_spec(tool: &BuiltInTool) -> Option<JsonValue> {
+    match tool {
+        BuiltInTool::WebSearch => Some(json!({"google_search": {}})),
+        BuiltInTool::CodeInterpreter | BuiltInTool::FileSearch => None,
     }
 }
 
