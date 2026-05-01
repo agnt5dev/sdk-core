@@ -148,35 +148,14 @@ impl WorkerCoordinatorClient {
                     }
                 })?;
 
-        // Process registration response
+        // Process registration response. Note: the runtime no longer
+        // emits redirect NACKs (any serving coordinator accepts any
+        // worker), so we only need to handle ack=true and outright
+        // failures here.
         if let Some(runtime_message) = registration_response {
             match &runtime_message.message_data {
                 Some(crate::pb::runtime_message::MessageData::RegisterServiceResponse(resp)) => {
                     if !resp.ack {
-                        if let Some(owner_endpoint) =
-                            runtime_message.metadata.get("owner_coordinator_address")
-                        {
-                            let endpoint = if owner_endpoint.starts_with("http://")
-                                || owner_endpoint.starts_with("https://")
-                            {
-                                owner_endpoint.clone()
-                            } else {
-                                format!("http://{owner_endpoint}")
-                            };
-                            // Redirects are an expected control-plane response, not an
-                            // error — the worker.rs reconnect loop handles them. Logged
-                            // at debug only so we don't alarm users on every cold start.
-                            // See dev/bugs/coordinator-redirect-leaks-pod-dns.md for the
-                            // upstream fix that should make redirects unnecessary.
-                            debug!(
-                                "Registration redirected to owner coordinator {}: {}",
-                                endpoint, resp.error
-                            );
-                            return Err(SdkError::RegistrationRedirect {
-                                endpoint,
-                                message: resp.error.clone(),
-                            });
-                        }
                         error!("Registration failed: {}", resp.error);
                         return Err(SdkError::Connection {
                             message: format!("Registration failed: {}", resp.error),

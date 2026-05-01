@@ -4,7 +4,6 @@ pub mod adk;
 pub mod chat;
 pub mod client;
 pub mod context;
-pub mod coordinator_routing;
 pub mod error;
 pub mod eval;
 pub mod journal_queue;
