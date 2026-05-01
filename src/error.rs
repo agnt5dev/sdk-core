@@ -77,9 +77,6 @@ pub enum SdkError {
     #[error("Worker registration failed: {message}")]
     Registration { message: String, code: ErrorCode },
 
-    #[error("Worker registration redirected to {endpoint}: {message}")]
-    RegistrationRedirect { endpoint: String, message: String },
-
     #[error("Invalid configuration: {message}")]
     Configuration {
         message: String,
@@ -161,7 +158,6 @@ impl SdkError {
             Self::Transport(_) | Self::Status(_) => ErrorCode::ConnectionFailed,
             Self::Connection { code, .. } => *code,
             Self::Registration { code, .. } => *code,
-            Self::RegistrationRedirect { .. } => ErrorCode::ConnectionFailed,
             Self::Configuration { .. } => ErrorCode::InvalidConfiguration,
             Self::Invocation { .. } => ErrorCode::ExecutionFailed,
             Self::State { code, .. } => *code,
@@ -199,7 +195,6 @@ impl SdkError {
                 }
                 _ => RetryHint::NotRetryable,
             },
-            Self::RegistrationRedirect { .. } => RetryHint::Retryable,
 
             // Service unavailable is retryable
             Self::Unavailable { .. } => RetryHint::RetryableWithBackoff,

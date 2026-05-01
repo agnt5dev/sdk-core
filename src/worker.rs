@@ -15,7 +15,6 @@ use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::coordinator_routing::CoordinatorRouting;
 
 /// Connection states for tracking worker status
 #[derive(Debug, Clone, PartialEq)]
@@ -88,9 +87,12 @@ impl WorkerConfig {
         }
     }
 
+    /// Endpoint the worker dials. Used to be a client-side Maglev lookup
+    /// that picked the "owning" coordinator pod to skip a registration
+    /// redirect; the runtime no longer redirects, so this is just the
+    /// configured endpoint.
     pub fn resolved_coordinator_endpoint(&self) -> String {
-        let routing = CoordinatorRouting::from_env();
-        routing.endpoint_for_worker(&self.worker_id, &self.coordinator_endpoint)
+        self.coordinator_endpoint.clone()
     }
 }
 
@@ -190,8 +192,6 @@ pub struct Worker {
     /// to flush pending SSE-only events before terminal checkpoints, ensuring they
     /// arrive while the invocation is still tracked in pendingStreamInvocations.
     dispatch_tx: Arc<std::sync::Mutex<Option<flume::Sender<ServiceMessage>>>>,
-    /// Sticky owner endpoint learned from a registration redirect.
-    owner_endpoint_hint: Arc<std::sync::Mutex<Option<String>>>,
     /// Lazily-connected Engine gRPC client. When AGNT5_ENGINE_URL is set, all event paths
     /// route through this client instead of the Go EE.
     engine_client: Arc<TokioMutex<Option<EngineClient>>>,
@@ -238,7 +238,6 @@ impl Worker {
             pending_lease_ids: Arc::new(std::sync::Mutex::new(HashMap::new())),
             event_stream_tx: Arc::new(std::sync::Mutex::new(None)),
             dispatch_tx: Arc::new(std::sync::Mutex::new(None)),
-            owner_endpoint_hint: Arc::new(std::sync::Mutex::new(None)),
             engine_client: Arc::new(TokioMutex::new(None)),
         }
     }
@@ -281,29 +280,6 @@ impl Worker {
         *guard = state;
     }
 
-    fn preferred_coordinator_endpoint(&self) -> String {
-        if let Ok(guard) = self.owner_endpoint_hint.lock() {
-            if let Some(endpoint) = guard.clone() {
-                return endpoint;
-            }
-        }
-        self.config.resolved_coordinator_endpoint()
-    }
-
-    fn set_owner_endpoint_hint(&self, endpoint: Option<String>) {
-        if let Ok(mut guard) = self.owner_endpoint_hint.lock() {
-            *guard = endpoint;
-        }
-    }
-
-    fn clear_owner_endpoint_hint(&self) -> bool {
-        if let Ok(mut guard) = self.owner_endpoint_hint.lock() {
-            let had_hint = guard.is_some();
-            *guard = None;
-            return had_hint;
-        }
-        false
-    }
 
     /// Queue a journal event for delivery to the platform
     ///
@@ -1063,23 +1039,6 @@ impl Worker {
                     return Ok(());
                 }
                 Err(e) => {
-                    if let crate::error::SdkError::RegistrationRedirect { endpoint, message } = &e {
-                        self.set_owner_endpoint_hint(Some(endpoint.clone()));
-                        // Redirect is an expected control-plane response — the loop
-                        // handles it. Debug only. See dev/bugs/coordinator-redirect-leaks-pod-dns.md.
-                        debug!(
-                            "Registration redirected to owner coordinator {}: {}",
-                            endpoint, message
-                        );
-                        continue;
-                    }
-
-                    if self.clear_owner_endpoint_hint() {
-                        debug!(
-                            "Cleared redirected owner coordinator hint after connection failure; retrying through configured routing"
-                        );
-                    }
-
                     // Check if we had a working session (Connected) that dropped,
                     // vs. failing to connect in the first place.
                     let was_connected =
@@ -1147,15 +1106,12 @@ impl Worker {
         F: Fn(RuntimeMessage, flume::Sender<ServiceMessage>) -> Fut + Send + Clone + 'static,
         Fut: std::future::Future<Output = Result<Option<ServiceMessage>>> + Send + 'static,
     {
-        // On reconnect, refresh membership from control plane before choosing endpoint.
-        // On first connect, use the preferred endpoint (which may already include
-        // a redirect hint from a previous NACK).
-        let coordinator_endpoint = if is_reconnect {
-            CoordinatorRouting::resolve(&self.config.worker_id, &self.config.coordinator_endpoint)
-                .await
-        } else {
-            self.preferred_coordinator_endpoint()
-        };
+        // The runtime accepts any worker on any serving coordinator —
+        // there's no per-worker "owning" pod to route to anymore, so we
+        // dial the configured endpoint on both first connect and
+        // reconnect. The fenced routing projection inside the cluster
+        // handles dispatch authority transparently.
+        let coordinator_endpoint = self.config.resolved_coordinator_endpoint();
         // Surface the in-flight handshake so users don't stare at silence
         // during the (up to) 10s connect timeout. Pairs with the
         // "[INFO] Connected/Reconnected to coordinator" line below.
@@ -1218,8 +1174,6 @@ impl Worker {
         let (tx, rx) = client
             .create_worker_stream_with_registration(self.config.worker_id.clone(), registration)
             .await?;
-
-        self.set_owner_endpoint_hint(Some(coordinator_endpoint.clone()));
 
         if is_reconnect {
             eprintln!(
