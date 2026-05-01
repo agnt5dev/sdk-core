@@ -1094,6 +1094,14 @@ impl Worker {
                     // Store error for state tracking (used internally)
                     let error_msg =
                         format!("Connection failed (attempt {}): {}", retry_count + 1, e);
+                    // Surface the very first connect failure to the user so
+                    // misconfigurations (wrong URL, missing API key, DNS
+                    // failure) are immediately visible. Subsequent retries
+                    // stay quiet under QUIET_RETRY_THRESHOLD to avoid
+                    // alarming on transient blips during cold starts.
+                    if retry_count == 0 && !was_connected {
+                        eprintln!("[ERROR] Connection failed: {}", e);
+                    }
                     debug!("{}", error_msg);
                     self.set_connection_state(ConnectionState::Error(error_msg));
                     crate::telemetry::update_connection_state(0); // 0 = disconnected
@@ -1148,6 +1156,20 @@ impl Worker {
         } else {
             self.preferred_coordinator_endpoint()
         };
+        // Surface the in-flight handshake so users don't stare at silence
+        // during the (up to) 10s connect timeout. Pairs with the
+        // "[INFO] Connected/Reconnected to coordinator" line below.
+        if is_reconnect {
+            eprintln!(
+                "[INFO] Reconnecting to coordinator ({})...",
+                coordinator_endpoint
+            );
+        } else {
+            eprintln!(
+                "[INFO] Connecting to coordinator ({})...",
+                coordinator_endpoint
+            );
+        }
         let mut client = WorkerCoordinatorClient::connect(coordinator_endpoint.clone()).await?;
 
         // Create registration message with components
