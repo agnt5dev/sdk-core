@@ -584,14 +584,53 @@ pub struct ResponsesApiResponse {
     pub created_at: i64,
     pub model: String,
     pub status: String,
+    #[serde(default)]
     pub output: Vec<OutputItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<ApiUsage>,
+    #[serde(default)]
+    pub error: Option<Value>,
+    #[serde(default)]
+    pub incomplete_details: Option<Value>,
 }
 
 impl ResponsesApiResponse {
+    fn status_error(&self) -> Option<SdkError> {
+        if self.status == "completed" {
+            return None;
+        }
+
+        let message = match self.status.as_str() {
+            "failed" => self
+                .error
+                .as_ref()
+                .and_then(extract_openai_error_message)
+                .unwrap_or_else(|| "OpenAI Responses API response failed".to_string()),
+            "incomplete" => {
+                let details = self
+                    .incomplete_details
+                    .as_ref()
+                    .and_then(extract_openai_error_message)
+                    .unwrap_or_else(|| "unknown reason".to_string());
+                format!("OpenAI Responses API response incomplete: {details}")
+            }
+            other => format!("OpenAI Responses API returned non-completed status `{other}`"),
+        };
+
+        Some(SdkError::LmApiError {
+            status: 400,
+            provider: "openai".to_string(),
+            message,
+            request_id: None,
+        })
+    }
+
     /// Convert to GenerateResponse (unified interface)
     pub fn into_generate_response(self) -> SdkResult<GenerateResponse> {
+        if let Some(err) = self.status_error() {
+            return Err(err);
+        }
+
         // Extract text content from output items
         let mut text_parts = Vec::new();
         let mut tool_calls = Vec::new();
@@ -664,6 +703,42 @@ impl ResponsesApiResponse {
             raw: None,
             metadata: None,
         })
+    }
+}
+
+fn extract_openai_error_message(value: &Value) -> Option<String> {
+    if let Some(message) = value.get("message").and_then(Value::as_str) {
+        return Some(message.to_string());
+    }
+
+    if let Some(error) = value.get("error") {
+        if let Some(message) = extract_openai_error_message(error) {
+            return Some(message);
+        }
+    }
+
+    if let Some(reason) = value.get("reason").and_then(Value::as_str) {
+        return Some(reason.to_string());
+    }
+
+    if let Some(code) = value.get("code").and_then(Value::as_str) {
+        return Some(code.to_string());
+    }
+
+    None
+}
+
+fn openai_streaming_error(data: &str) -> SdkError {
+    let message = serde_json::from_str::<Value>(data)
+        .ok()
+        .and_then(|value| extract_openai_error_message(&value))
+        .unwrap_or_else(|| data.to_string());
+
+    SdkError::LmApiError {
+        status: 400,
+        provider: "openai".to_string(),
+        message,
+        request_id: None,
     }
 }
 
@@ -913,9 +988,32 @@ fn build_responses_stream(
                         return;
                     }
 
+                    "response.failed" | "response.incomplete" => {
+                        let event = serde_json::from_str::<ResponseCompletedEvent>(&data)
+                            .map_err(|err| {
+                                SdkError::Other(anyhow!(
+                                    "failed to parse OpenAI Responses failure event: {err}"
+                                ))
+                            })?;
+
+                        if let Some(err) = event.response.status_error() {
+                            Err(err)?;
+                        }
+
+                        Err(SdkError::LmApiError {
+                            status: 400,
+                            provider: "openai".to_string(),
+                            message: format!(
+                                "OpenAI Responses API returned {} event without error details",
+                                event_type
+                            ),
+                            request_id: None,
+                        })?;
+                    }
+
                     // Error event
                     "error" => {
-                        Err(SdkError::Other(anyhow!("OpenAI Responses API streaming error: {}", data)))?;
+                        Err(openai_streaming_error(&data))?;
                     }
 
                     // Ignore other events (response.in_progress, response.output_item.added, etc.)
@@ -1339,6 +1437,75 @@ mod tests {
         let usage = event.response.usage.unwrap();
         assert_eq!(usage.prompt_tokens, Some(10));
         assert_eq!(usage.completion_tokens, Some(5));
+    }
+
+    #[test]
+    fn test_failed_response_becomes_lm_api_error() {
+        let json = r#"{
+            "id": "resp_failed",
+            "created_at": 1700000000,
+            "model": "gpt-10-mini",
+            "status": "failed",
+            "error": {
+                "code": "model_not_found",
+                "message": "The requested model 'gpt-10-mini' does not exist."
+            }
+        }"#;
+
+        let response: ResponsesApiResponse = serde_json::from_str(json).unwrap();
+        let err = response.into_generate_response().unwrap_err();
+
+        match err {
+            SdkError::LmApiError {
+                status,
+                provider,
+                message,
+                ..
+            } => {
+                assert_eq!(status, 400);
+                assert_eq!(provider, "openai");
+                assert!(message.contains("gpt-10-mini"));
+            }
+            other => panic!("expected LmApiError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_incomplete_response_becomes_lm_api_error() {
+        let json = r#"{
+            "id": "resp_incomplete",
+            "created_at": 1700000000,
+            "model": "gpt-4o-mini",
+            "status": "incomplete",
+            "incomplete_details": {
+                "reason": "max_output_tokens"
+            }
+        }"#;
+
+        let response: ResponsesApiResponse = serde_json::from_str(json).unwrap();
+        let err = response.into_generate_response().unwrap_err();
+
+        match err {
+            SdkError::LmApiError { message, .. } => {
+                assert!(message.contains("incomplete"));
+                assert!(message.contains("max_output_tokens"));
+            }
+            other => panic!("expected LmApiError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_openai_streaming_error_extracts_message() {
+        let err = openai_streaming_error(
+            r#"{"error": {"message": "The requested model does not exist."}}"#,
+        );
+
+        match err {
+            SdkError::LmApiError { message, .. } => {
+                assert_eq!(message, "The requested model does not exist.");
+            }
+            other => panic!("expected LmApiError, got {other:?}"),
+        }
     }
 
     // ========================================================================
