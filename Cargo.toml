@@ -1,6 +1,6 @@
 [package]
 name = "agnt5-sdk-core"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["AGNT5 Team"]
 description = "High-performance Rust core for AGNT5 SDK"
