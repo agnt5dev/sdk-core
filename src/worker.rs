@@ -1629,21 +1629,43 @@ impl Worker {
         dispatch_tx: flume::Sender<ServiceMessage>,
         event_stream_tx: Option<flume::Sender<EventStreamMessage>>,
     ) -> tokio::task::JoinHandle<()> {
-        let worker_id = self.config.worker_id.clone();
-        let journal_queue = self.journal_queue.clone();
-        let flush_interval_ms = journal_queue.flush_interval_ms();
-        let batch_size = journal_queue.batch_size();
-        let streaming_runs = self.streaming_runs.clone();
-        let pending_lease_ids = self.pending_lease_ids.clone();
-        let ee_endpoint = self.config.ee_endpoint.clone();
-        let engine_endpoint = self.config.engine_endpoint.clone();
+        let worker_id_outer = self.config.worker_id.clone();
+        let journal_queue_outer = self.journal_queue.clone();
+        let streaming_runs_outer = self.streaming_runs.clone();
+        let pending_lease_ids_outer = self.pending_lease_ids.clone();
+        let ee_endpoint_outer = self.config.ee_endpoint.clone();
+        let engine_endpoint_outer = self.config.engine_endpoint.clone();
 
-        // Cache project_id/deployment_id to avoid repeated env lookups per event.
-        // `tenant_id` remains a legacy alias for compatibility with engine/EE APIs.
-        let cached_project_id = canonical_project_id_from_env();
-        let cached_deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").unwrap_or_default();
-
+        // Supervisor — restart the inner flush loop on panic with bounded
+        // backoff. h2-0.4.13 panics with PoisonError under concurrent stream
+        // contention (timeout cancels racing other polls); without this
+        // supervisor, a single h2 panic kills the flush task forever and
+        // events pile up in the queue indefinitely. The inner loop is
+        // panic-resilient at the data-handling layer (see streaming_runs
+        // mutex poison handling) — this catches the deeper transport panics.
         tokio::spawn(async move {
+            let mut backoff = std::time::Duration::from_millis(100);
+            const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+            loop {
+                // Clone per attempt so each inner task owns its capture.
+                let worker_id = worker_id_outer.clone();
+                let journal_queue = journal_queue_outer.clone();
+                let flush_interval_ms = journal_queue.flush_interval_ms();
+                let batch_size = journal_queue.batch_size();
+                let streaming_runs = streaming_runs_outer.clone();
+                let pending_lease_ids = pending_lease_ids_outer.clone();
+                let ee_endpoint = ee_endpoint_outer.clone();
+                let engine_endpoint = engine_endpoint_outer.clone();
+                let dispatch_tx = dispatch_tx.clone();
+                let event_stream_tx = event_stream_tx.clone();
+
+                // Cache project_id/deployment_id to avoid repeated env lookups per event.
+                // `tenant_id` remains a legacy alias for compatibility with engine/EE APIs.
+                let cached_project_id = canonical_project_id_from_env();
+                let cached_deployment_id =
+                    std::env::var("AGNT5_DEPLOYMENT_ID").unwrap_or_default();
+
+                let inner = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(flush_interval_ms));
 
             // Lazily-connected EE client for boundary event writes.
@@ -1966,6 +1988,41 @@ impl Worker {
                         sse_only_count,
                         journal_queue.len()
                     );
+                }
+            }
+        });
+
+                match inner.await {
+                    // Inner task ended without panic — flush loop runs
+                    // forever in normal operation, so this branch only
+                    // fires on shutdown/abort. Exit the supervisor too.
+                    Ok(()) => {
+                        debug!(
+                            worker_id = %worker_id_outer,
+                            "Journal flush task exited cleanly; supervisor shutting down"
+                        );
+                        return;
+                    }
+                    Err(e) if e.is_panic() => {
+                        error!(
+                            worker_id = %worker_id_outer,
+                            error = ?e,
+                            backoff_ms = backoff.as_millis() as u64,
+                            "Journal flush task panicked (likely h2 transport); restarting after backoff"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(MAX_BACKOFF);
+                        continue;
+                    }
+                    Err(_cancelled) => {
+                        // External cancellation — caller called .abort()
+                        // on the supervisor's JoinHandle. Exit cleanly.
+                        debug!(
+                            worker_id = %worker_id_outer,
+                            "Journal flush task cancelled; supervisor shutting down"
+                        );
+                        return;
+                    }
                 }
             }
         })
