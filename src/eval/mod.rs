@@ -1,9 +1,11 @@
 //! AGNT5 Evaluation Framework
 //!
 //! Provides scorers for evaluating AI component outputs:
-//! - Deterministic scorers (exact_match, contains, json_valid, regex_match, levenshtein)
-//! - LLM-as-judge scorers for semantic evaluation
-//! - Trace assertions for glassbox testing
+//! - Deterministic scorers: `exact_match`, `contains`, `regex_match`,
+//!   `json_valid`, `json_schema`, `numeric_range`, `levenshtein`.
+//! - LLM-as-judge (`llm_judge`) for semantic evaluation; async-only,
+//!   routed through the LM client rather than the sync fast path.
+//! - Trace assertions for glassbox testing.
 
 pub mod builtin_scorer;
 pub mod deterministic;
@@ -196,8 +198,9 @@ impl TraceEvent {
 
 // Re-export commonly used items
 pub use deterministic::{
-    contains, exact_match, json_valid, levenshtein, regex_match, ContainsConfig, ExactMatchConfig,
-    LevenshteinConfig, RegexConfig,
+    contains, exact_match, json_schema, json_valid, levenshtein, numeric_range, regex_match,
+    ContainsConfig, ExactMatchConfig, JsonSchemaConfig, LevenshteinConfig, NumericRangeConfig,
+    RegexConfig,
 };
 pub use llm_judge::{llm_judge, LlmJudgeConfig};
 pub use trace::{trace_score, TraceAssertion};

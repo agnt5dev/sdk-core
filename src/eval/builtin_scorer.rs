@@ -5,8 +5,9 @@
 //! boundary to the language SDK. Unknown scorers fall through to the language handler.
 
 use super::deterministic::{
-    contains, exact_match, json_valid, levenshtein, regex_match, ContainsConfig, ExactMatchConfig,
-    LevenshteinConfig, RegexConfig,
+    contains, exact_match, json_schema, json_valid, levenshtein, numeric_range, regex_match,
+    ContainsConfig, ExactMatchConfig, JsonSchemaConfig, LevenshteinConfig, NumericRangeConfig,
+    RegexConfig,
 };
 use super::{ScorerInput, ScorerResult};
 use serde_json::Value;
@@ -29,12 +30,20 @@ pub fn is_builtin_scorer(name: &str) -> bool {
 }
 
 /// Check if a scorer name can be executed directly in Rust (without FFI).
-/// Some built-in scorers (llm_judge, json_schema, numeric_range) are not yet
-/// implemented in the Rust fast path.
+///
+/// `llm_judge` is the only built-in NOT in the sync fast path — it's async
+/// (calls the LM client) and must be invoked via [`super::llm_judge::llm_judge`]
+/// rather than through this entry point.
 pub fn can_execute_locally(name: &str) -> bool {
     matches!(
         name,
-        "exact_match" | "contains" | "regex_match" | "json_valid" | "levenshtein"
+        "exact_match"
+            | "contains"
+            | "regex_match"
+            | "json_valid"
+            | "json_schema"
+            | "numeric_range"
+            | "levenshtein"
     )
 }
 
@@ -97,6 +106,27 @@ pub fn execute(scorer_name: &str, input_data: &[u8]) -> Option<ScorerResult> {
             Some(regex_match(&scorer_input, &cfg))
         }
         "json_valid" => Some(json_valid(&scorer_input)),
+        "json_schema" => {
+            let cfg: JsonSchemaConfig = match serde_json::from_value(config) {
+                Ok(c) => c,
+                Err(e) => {
+                    return Some(ScorerResult {
+                        score: 0.0,
+                        passed: Some(false),
+                        label: Some("config_error".into()),
+                        explanation: Some(format!(
+                            "json_schema requires `schema` in config: {e}"
+                        )),
+                        metadata: None,
+                    });
+                }
+            };
+            Some(json_schema(&scorer_input, &cfg))
+        }
+        "numeric_range" => {
+            let cfg: NumericRangeConfig = serde_json::from_value(config).unwrap_or_default();
+            Some(numeric_range(&scorer_input, &cfg))
+        }
         "levenshtein" => {
             let cfg: LevenshteinConfig = serde_json::from_value(config).unwrap_or_default();
             Some(levenshtein(&scorer_input, &cfg))
@@ -172,6 +202,116 @@ mod tests {
         });
         let result = execute("levenshtein", input.to_string().as_bytes()).unwrap();
         assert!(result.score > 0.7);
+    }
+
+    #[test]
+    fn test_json_schema_via_execute_valid() {
+        let input = json!({
+            "output": {"age": 42, "name": "Ada"},
+            "config": {
+                "schema": {
+                    "type": "object",
+                    "required": ["age", "name"],
+                    "properties": {
+                        "age": {"type": "integer", "minimum": 0},
+                        "name": {"type": "string"}
+                    }
+                }
+            }
+        });
+        let result = execute("json_schema", input.to_string().as_bytes()).unwrap();
+        assert_eq!(result.score, 1.0);
+        assert_eq!(result.passed, Some(true));
+        assert_eq!(result.label.as_deref(), Some("valid"));
+    }
+
+    #[test]
+    fn test_json_schema_via_execute_invalid() {
+        let input = json!({
+            "output": {"age": -1},
+            "config": {
+                "schema": {
+                    "type": "object",
+                    "required": ["age", "name"],
+                    "properties": {
+                        "age": {"type": "integer", "minimum": 0},
+                        "name": {"type": "string"}
+                    }
+                }
+            }
+        });
+        let result = execute("json_schema", input.to_string().as_bytes()).unwrap();
+        assert_eq!(result.score, 0.0);
+        assert_eq!(result.passed, Some(false));
+        assert_eq!(result.label.as_deref(), Some("invalid"));
+        // metadata.errors should be a non-empty array.
+        let errs = result
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("errors"))
+            .and_then(|e| e.as_array())
+            .expect("errors array present");
+        assert!(!errs.is_empty());
+    }
+
+    #[test]
+    fn test_json_schema_via_execute_string_output() {
+        // Output is a JSON string — should be parsed before validation.
+        let input = json!({
+            "output": "{\"age\": 30}",
+            "config": {
+                "schema": {"type": "object", "properties": {"age": {"type": "integer"}}}
+            }
+        });
+        let result = execute("json_schema", input.to_string().as_bytes()).unwrap();
+        assert_eq!(result.score, 1.0);
+    }
+
+    #[test]
+    fn test_numeric_range_via_execute() {
+        // In range, inclusive default.
+        let input = json!({
+            "output": 5,
+            "config": {"min": 1, "max": 10}
+        });
+        let r = execute("numeric_range", input.to_string().as_bytes()).unwrap();
+        assert_eq!(r.score, 1.0);
+        assert_eq!(r.label.as_deref(), Some("in_range"));
+
+        // On the boundary, inclusive.
+        let input = json!({"output": 10, "config": {"min": 1, "max": 10}});
+        let r = execute("numeric_range", input.to_string().as_bytes()).unwrap();
+        assert_eq!(r.score, 1.0);
+
+        // On the boundary, exclusive.
+        let input = json!({
+            "output": 10,
+            "config": {"min": 1, "max": 10, "inclusive": false}
+        });
+        let r = execute("numeric_range", input.to_string().as_bytes()).unwrap();
+        assert_eq!(r.score, 0.0);
+
+        // Out of range.
+        let input = json!({"output": 11, "config": {"min": 1, "max": 10}});
+        let r = execute("numeric_range", input.to_string().as_bytes()).unwrap();
+        assert_eq!(r.score, 0.0);
+        assert_eq!(r.label.as_deref(), Some("out_of_range"));
+
+        // String numeric output.
+        let input = json!({"output": "3.14", "config": {"min": 0, "max": 5}});
+        let r = execute("numeric_range", input.to_string().as_bytes()).unwrap();
+        assert_eq!(r.score, 1.0);
+
+        // Non-numeric output → parse_error.
+        let input = json!({"output": "not a number", "config": {"min": 0, "max": 5}});
+        let r = execute("numeric_range", input.to_string().as_bytes()).unwrap();
+        assert_eq!(r.score, 0.0);
+        assert_eq!(r.label.as_deref(), Some("parse_error"));
+
+        // Missing both bounds → config_error.
+        let input = json!({"output": 1, "config": {}});
+        let r = execute("numeric_range", input.to_string().as_bytes()).unwrap();
+        assert_eq!(r.label.as_deref(), Some("config_error"));
     }
 
     #[test]

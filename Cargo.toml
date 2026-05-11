@@ -94,6 +94,9 @@ serde_yaml = "0.9"
 # For text processing and chunking
 regex = "1.0"
 
+# JSON Schema validation (json_schema built-in scorer)
+jsonschema = { version = "0.28", default-features = false }
+
 # URL encoding for API requests
 urlencoding = "2.1"
 unicode-segmentation = "1.10"

@@ -214,6 +214,160 @@ pub fn levenshtein(input: &ScorerInput, config: &LevenshteinConfig) -> ScorerRes
     }
 }
 
+/// Configuration for json_schema scorer.
+///
+/// Validates the output against a JSON Schema (Draft 2020-12 by default).
+/// The output is parsed as JSON if it's a string; otherwise the JSON `Value`
+/// is validated directly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsonSchemaConfig {
+    /// The JSON Schema to validate against. Required.
+    pub schema: Value,
+}
+
+/// Check whether the output validates against a JSON Schema.
+///
+/// String outputs are parsed as JSON first; anything that isn't valid JSON
+/// fails with `parse_error`. Validation failures include a one-line summary
+/// of the first error in `explanation` and the full error list in
+/// `metadata.errors`.
+pub fn json_schema(input: &ScorerInput, config: &JsonSchemaConfig) -> ScorerResult {
+    // Parse the output: strings get JSON-decoded, everything else is the
+    // existing `Value` (the caller already gave us structured JSON).
+    let parsed: Value = match &input.output {
+        Value::String(s) => match serde_json::from_str(s) {
+            Ok(v) => v,
+            Err(e) => {
+                return ScorerResult {
+                    score: 0.0,
+                    passed: Some(false),
+                    label: Some("parse_error".into()),
+                    explanation: Some(format!("output is not valid JSON: {e}")),
+                    metadata: None,
+                };
+            }
+        },
+        v => v.clone(),
+    };
+
+    // Compile the schema. A bad schema is a config error, not a sample
+    // failure — report it distinctly so users notice.
+    let validator = match jsonschema::validator_for(&config.schema) {
+        Ok(v) => v,
+        Err(e) => {
+            return ScorerResult {
+                score: 0.0,
+                passed: Some(false),
+                label: Some("config_error".into()),
+                explanation: Some(format!("invalid schema: {e}")),
+                metadata: None,
+            };
+        }
+    };
+
+    let errors: Vec<String> = validator
+        .iter_errors(&parsed)
+        .map(|e| format!("{}: {}", e.instance_path, e))
+        .collect();
+
+    if errors.is_empty() {
+        ScorerResult {
+            score: 1.0,
+            passed: Some(true),
+            label: Some("valid".into()),
+            explanation: None,
+            metadata: None,
+        }
+    } else {
+        ScorerResult {
+            score: 0.0,
+            passed: Some(false),
+            label: Some("invalid".into()),
+            explanation: Some(errors[0].clone()),
+            metadata: Some(serde_json::json!({ "errors": errors })),
+        }
+    }
+}
+
+/// Configuration for numeric_range scorer.
+///
+/// At least one of `min` / `max` must be set. `inclusive` controls
+/// whether the bounds themselves are accepted (default: true).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NumericRangeConfig {
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    /// When true (default), `min ≤ x ≤ max`. When false, `min < x < max`.
+    pub inclusive: Option<bool>,
+}
+
+/// Check whether the output's numeric value falls within `[min, max]`.
+///
+/// Accepts numbers directly or numeric strings (e.g. `"42"` or `"3.14"`).
+/// Non-numeric output fails with `parse_error`. Returns 1.0 inside the
+/// range, 0.0 outside.
+pub fn numeric_range(input: &ScorerInput, config: &NumericRangeConfig) -> ScorerResult {
+    if config.min.is_none() && config.max.is_none() {
+        return ScorerResult {
+            score: 0.0,
+            passed: Some(false),
+            label: Some("config_error".into()),
+            explanation: Some("numeric_range requires at least one of `min` or `max`".into()),
+            metadata: None,
+        };
+    }
+
+    let value = match &input.output {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    };
+
+    let Some(value) = value else {
+        return ScorerResult {
+            score: 0.0,
+            passed: Some(false),
+            label: Some("parse_error".into()),
+            explanation: Some(format!(
+                "output is not numeric: {}",
+                serde_json::to_string(&input.output).unwrap_or_default()
+            )),
+            metadata: None,
+        };
+    };
+
+    let inclusive = config.inclusive.unwrap_or(true);
+    let above_min = match config.min {
+        Some(min) if inclusive => value >= min,
+        Some(min) => value > min,
+        None => true,
+    };
+    let below_max = match config.max {
+        Some(max) if inclusive => value <= max,
+        Some(max) => value < max,
+        None => true,
+    };
+    let in_range = above_min && below_max;
+
+    ScorerResult {
+        score: if in_range { 1.0 } else { 0.0 },
+        passed: Some(in_range),
+        label: Some(
+            if in_range {
+                "in_range"
+            } else {
+                "out_of_range"
+            }
+            .into(),
+        ),
+        explanation: Some(format!(
+            "value={value}, min={:?}, max={:?}, inclusive={inclusive}",
+            config.min, config.max
+        )),
+        metadata: None,
+    }
+}
+
 /// Convert a JSON Value to a string for comparison
 fn value_to_string(v: &Value) -> String {
     match v {
@@ -375,6 +529,112 @@ mod tests {
         };
         let result = levenshtein(&input, &config);
         assert_eq!(result.passed, Some(false)); // 0.8 < 0.9
+    }
+
+    #[test]
+    fn test_json_schema_valid_object() {
+        let schema = json!({
+            "type": "object",
+            "required": ["name"],
+            "properties": {"name": {"type": "string"}}
+        });
+        let input = ScorerInput::new(json!({"name": "Ada"}));
+        let result = json_schema(&input, &JsonSchemaConfig { schema });
+        assert_eq!(result.score, 1.0);
+        assert_eq!(result.label.as_deref(), Some("valid"));
+    }
+
+    #[test]
+    fn test_json_schema_invalid_object() {
+        let schema = json!({
+            "type": "object",
+            "required": ["name", "age"],
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer", "minimum": 0}
+            }
+        });
+        let input = ScorerInput::new(json!({"name": "Ada", "age": -5}));
+        let result = json_schema(&input, &JsonSchemaConfig { schema });
+        assert_eq!(result.score, 0.0);
+        assert!(result.explanation.is_some());
+    }
+
+    #[test]
+    fn test_json_schema_string_parses_json() {
+        let schema = json!({"type": "array", "items": {"type": "integer"}});
+        let input = ScorerInput::new(json!("[1, 2, 3]"));
+        let result = json_schema(&input, &JsonSchemaConfig { schema });
+        assert_eq!(result.score, 1.0);
+    }
+
+    #[test]
+    fn test_json_schema_invalid_schema_is_config_error() {
+        // Schemas must be objects/booleans, not strings.
+        let input = ScorerInput::new(json!({"x": 1}));
+        let result = json_schema(
+            &input,
+            &JsonSchemaConfig {
+                schema: json!("not a schema"),
+            },
+        );
+        assert_eq!(result.label.as_deref(), Some("config_error"));
+    }
+
+    #[test]
+    fn test_numeric_range_basics() {
+        let cfg = NumericRangeConfig {
+            min: Some(0.0),
+            max: Some(10.0),
+            inclusive: None,
+        };
+        assert_eq!(numeric_range(&ScorerInput::new(json!(5)), &cfg).score, 1.0);
+        assert_eq!(numeric_range(&ScorerInput::new(json!(0)), &cfg).score, 1.0);
+        assert_eq!(numeric_range(&ScorerInput::new(json!(10)), &cfg).score, 1.0);
+        assert_eq!(numeric_range(&ScorerInput::new(json!(-1)), &cfg).score, 0.0);
+        assert_eq!(numeric_range(&ScorerInput::new(json!(11)), &cfg).score, 0.0);
+    }
+
+    #[test]
+    fn test_numeric_range_exclusive() {
+        let cfg = NumericRangeConfig {
+            min: Some(0.0),
+            max: Some(10.0),
+            inclusive: Some(false),
+        };
+        assert_eq!(numeric_range(&ScorerInput::new(json!(0)), &cfg).score, 0.0);
+        assert_eq!(numeric_range(&ScorerInput::new(json!(10)), &cfg).score, 0.0);
+        assert_eq!(numeric_range(&ScorerInput::new(json!(5)), &cfg).score, 1.0);
+    }
+
+    #[test]
+    fn test_numeric_range_one_sided() {
+        // Lower bound only.
+        let cfg = NumericRangeConfig {
+            min: Some(100.0),
+            max: None,
+            inclusive: None,
+        };
+        assert_eq!(numeric_range(&ScorerInput::new(json!(99)), &cfg).score, 0.0);
+        assert_eq!(numeric_range(&ScorerInput::new(json!(100)), &cfg).score, 1.0);
+        assert_eq!(numeric_range(&ScorerInput::new(json!(1_000_000)), &cfg).score, 1.0);
+
+        // Upper bound only.
+        let cfg = NumericRangeConfig {
+            min: None,
+            max: Some(0.5),
+            inclusive: None,
+        };
+        assert_eq!(numeric_range(&ScorerInput::new(json!(0.4)), &cfg).score, 1.0);
+        assert_eq!(numeric_range(&ScorerInput::new(json!(0.5)), &cfg).score, 1.0);
+        assert_eq!(numeric_range(&ScorerInput::new(json!(0.6)), &cfg).score, 0.0);
+    }
+
+    #[test]
+    fn test_numeric_range_requires_a_bound() {
+        let cfg = NumericRangeConfig::default();
+        let r = numeric_range(&ScorerInput::new(json!(1)), &cfg);
+        assert_eq!(r.label.as_deref(), Some("config_error"));
     }
 
     #[test]
