@@ -87,7 +87,30 @@ pub fn execute(scorer_name: &str, input_data: &[u8]) -> Option<ScorerResult> {
             Some(exact_match(&scorer_input, &cfg))
         }
         "contains" => {
-            let cfg: ContainsConfig = serde_json::from_value(config).unwrap_or_default();
+            // Don't unwrap_or_default — a malformed config there
+            // would silently produce an empty pattern that matches
+            // every input as "true". Surface the error instead.
+            let cfg: ContainsConfig = match serde_json::from_value(config) {
+                Ok(c) => c,
+                Err(e) => {
+                    return Some(ScorerResult {
+                        score: 0.0,
+                        passed: Some(false),
+                        label: Some("config_error".into()),
+                        explanation: Some(format!("Invalid contains config: {}", e)),
+                        metadata: None,
+                    });
+                }
+            };
+            if cfg.pattern.is_empty() {
+                return Some(ScorerResult {
+                    score: 0.0,
+                    passed: Some(false),
+                    label: Some("config_error".into()),
+                    explanation: Some("contains requires a non-empty `pattern`".into()),
+                    metadata: None,
+                });
+            }
             Some(contains(&scorer_input, &cfg))
         }
         "regex_match" => {
@@ -170,6 +193,32 @@ mod tests {
         });
         let result = execute("contains", input.to_string().as_bytes()).unwrap();
         assert_eq!(result.score, 1.0);
+    }
+
+    #[test]
+    fn test_contains_empty_pattern_returns_config_error() {
+        // An empty pattern would match everything if we let it through —
+        // surface a config_error like regex_match and json_schema do.
+        let input = json!({
+            "output": "hello world",
+            "config": {"pattern": ""},
+        });
+        let result = execute("contains", input.to_string().as_bytes()).unwrap();
+        assert_eq!(result.passed, Some(false));
+        assert_eq!(result.label.as_deref(), Some("config_error"));
+    }
+
+    #[test]
+    fn test_contains_malformed_config_returns_config_error() {
+        // Wrong type for `pattern` used to fall back to
+        // ContainsConfig::default() (empty pattern, matches everything).
+        let input = json!({
+            "output": "hello world",
+            "config": {"pattern": 42},
+        });
+        let result = execute("contains", input.to_string().as_bytes()).unwrap();
+        assert_eq!(result.passed, Some(false));
+        assert_eq!(result.label.as_deref(), Some("config_error"));
     }
 
     #[test]
