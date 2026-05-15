@@ -14,7 +14,9 @@ use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::mcp::error::{McpError, McpResult};
-use crate::mcp::types::{JsonRpcRequest, JsonRpcResponse, SseConfig, StdioConfig, StreamableHttpConfig};
+use crate::mcp::types::{
+    JsonRpcRequest, JsonRpcResponse, SseConfig, StdioConfig, StreamableHttpConfig,
+};
 
 /// Transport trait for MCP communication
 #[async_trait]
@@ -595,10 +597,7 @@ impl StreamableHttpTransport {
     /// Build a POST request with the right Accept header and the session
     /// id, if we have one. Both content types are advertised so the server
     /// can pick whichever it prefers per-call.
-    async fn build_post(
-        &self,
-        body: &JsonRpcRequest,
-    ) -> McpResult<reqwest::RequestBuilder> {
+    async fn build_post(&self, body: &JsonRpcRequest) -> McpResult<reqwest::RequestBuilder> {
         let mut req = self
             .client
             .post(&self.url)
