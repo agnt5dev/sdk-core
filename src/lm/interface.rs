@@ -290,16 +290,31 @@ mod built_in_tool_tests {
 
     #[test]
     fn openai_names_map_correctly() {
-        assert_eq!(BuiltInTool::from_provider_name("web_search_preview"), Some(BuiltInTool::WebSearch));
-        assert_eq!(BuiltInTool::from_provider_name("code_interpreter"), Some(BuiltInTool::CodeInterpreter));
-        assert_eq!(BuiltInTool::from_provider_name("file_search"), Some(BuiltInTool::FileSearch));
+        assert_eq!(
+            BuiltInTool::from_provider_name("web_search_preview"),
+            Some(BuiltInTool::WebSearch)
+        );
+        assert_eq!(
+            BuiltInTool::from_provider_name("code_interpreter"),
+            Some(BuiltInTool::CodeInterpreter)
+        );
+        assert_eq!(
+            BuiltInTool::from_provider_name("file_search"),
+            Some(BuiltInTool::FileSearch)
+        );
     }
 
     #[test]
     fn anthropic_bare_names_map_correctly() {
         // Anthropic surfaces the bare `name` field of the tool spec, not the type.
-        assert_eq!(BuiltInTool::from_provider_name("web_search"), Some(BuiltInTool::WebSearch));
-        assert_eq!(BuiltInTool::from_provider_name("web_fetch"), Some(BuiltInTool::WebFetch));
+        assert_eq!(
+            BuiltInTool::from_provider_name("web_search"),
+            Some(BuiltInTool::WebSearch)
+        );
+        assert_eq!(
+            BuiltInTool::from_provider_name("web_fetch"),
+            Some(BuiltInTool::WebFetch)
+        );
     }
 
     #[test]

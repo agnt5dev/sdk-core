@@ -38,8 +38,8 @@ fn load_goldens() -> Goldens {
         .join("test-fixtures")
         .join("eval")
         .join("builtin_goldens.json");
-    let raw = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let raw =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     serde_json::from_str(&raw).expect("parse goldens JSON")
 }
 
@@ -52,7 +52,10 @@ fn builtin_scorers_match_cross_language_goldens() {
         let result = match execute(&case.scorer, payload.as_bytes()) {
             Some(r) => r,
             None => {
-                failures.push(format!("[{}] scorer {:?} returned None from execute()", case.name, case.scorer));
+                failures.push(format!(
+                    "[{}] scorer {:?} returned None from execute()",
+                    case.name, case.scorer
+                ));
                 continue;
             }
         };

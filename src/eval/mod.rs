@@ -10,6 +10,7 @@
 pub mod builtin_scorer;
 pub mod deterministic;
 pub mod llm_judge;
+pub mod normalized;
 pub mod trace;
 
 use serde::{Deserialize, Serialize};
@@ -203,6 +204,12 @@ pub use deterministic::{
     RegexConfig,
 };
 pub use llm_judge::{llm_judge, LlmJudgeConfig};
+pub use normalized::{
+    NormalizedHandoff, NormalizedLlmCall, NormalizedSession, NormalizedSessionSummary,
+    NormalizedSpan, NormalizedToolCall, NormalizedTraceError, RedactionPolicySnapshot,
+    TraceArtifactManifest, NORMALIZED_SESSION_SCHEMA, NORMALIZED_SPAN_SCHEMA,
+    TRACE_ARTIFACT_MANIFEST_SCHEMA,
+};
 pub use trace::{trace_score, TraceAssertion};
 
 #[cfg(test)]

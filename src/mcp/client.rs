@@ -108,11 +108,7 @@ impl McpClient {
     }
 
     /// Add a Streamable HTTP server (MCP 2025-03-26 spec).
-    pub fn add_streamable_http_server(
-        &mut self,
-        name: impl Into<String>,
-        url: impl Into<String>,
-    ) {
+    pub fn add_streamable_http_server(&mut self, name: impl Into<String>, url: impl Into<String>) {
         self.add_server(
             name,
             ServerConfig::StreamableHttp(StreamableHttpConfig::new(url)),
