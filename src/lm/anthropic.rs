@@ -17,7 +17,8 @@ use super::http;
 use super::interface::{
     generate as generate_via_model, stream as stream_via_model, BuiltInTool, ContentBlockType,
     GenerateRequest, GenerateResponse, GenerationConfig, LanguageModel, Message, MessageRole,
-    ResponseFormat, StreamChunk, StreamHandle, StreamRequest, TokenUsage, ToolChoice, ToolDefinition,
+    ResponseFormat, StreamChunk, StreamHandle, StreamRequest, TokenUsage, ToolChoice,
+    ToolDefinition,
 };
 use super::telemetry;
 
