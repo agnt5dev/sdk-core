@@ -17,6 +17,7 @@ pub mod sandbox;
 pub mod span_filter;
 pub mod telemetry;
 pub mod vectordb;
+pub mod webhook;
 pub mod worker;
 
 // Re-export main types
