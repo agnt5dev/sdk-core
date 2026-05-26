@@ -49,6 +49,14 @@ pub struct WorkerConfig {
     /// Append/AppendBatch RPCs instead of the Go Execution Engine.
     /// Env: AGNT5_ENGINE_URL. None = use Go EE (default).
     pub engine_endpoint: Option<String>,
+
+    /// Declared concurrency budget: the max in-flight handler invocations
+    /// this worker can serve. Sets both the local pool size and the
+    /// `max_concurrency` reported at registration (the coordinator's
+    /// per-priority headroom denominator). Language bindings can set this
+    /// directly; otherwise it falls back to the `AGNT5_MAX_CONCURRENCY` env
+    /// var and finally a default of 100. `None` = "not explicitly set".
+    pub max_concurrency: Option<u32>,
 }
 
 impl WorkerConfig {
@@ -74,6 +82,12 @@ impl WorkerConfig {
         // Engine endpoint — when set, bypasses Go EE for all event writes.
         let engine_endpoint = std::env::var("AGNT5_ENGINE_URL").ok();
 
+        // Concurrency budget: seed from the env var so existing deployments
+        // keep working; language bindings may overwrite before `run()`.
+        let max_concurrency = std::env::var("AGNT5_MAX_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse().ok());
+
         Self {
             service_name,
             service_version,
@@ -83,6 +97,7 @@ impl WorkerConfig {
             ee_endpoint,
             max_retries,
             engine_endpoint,
+            max_concurrency,
         }
     }
 
@@ -1149,13 +1164,11 @@ impl Worker {
         let deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").unwrap_or_default();
 
         // Phase 7a: declare concurrency budget so the coordinator can
-        // size headroom reservations per priority class. Hoisted out of
-        // the worker pool setup below so a single env read drives both
-        // the local pool size and the registration field.
-        let max_concurrency: u32 = std::env::var("AGNT5_MAX_CONCURRENCY")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(100);
+        // size headroom reservations per priority class. Resolved from
+        // config (set by a language binding or seeded from the
+        // `AGNT5_MAX_CONCURRENCY` env var in `WorkerConfig::new`), default
+        // 100. Drives both the local pool size and the registration field.
+        let max_concurrency: u32 = self.config.max_concurrency.unwrap_or(100);
 
         let registration = RegisterService {
             service_name: self.config.service_name.clone(),
@@ -1232,8 +1245,16 @@ impl Worker {
             *guard = Some(tx.clone());
         }
 
+        // Live in-flight counter (handler invocations the worker pool is
+        // currently executing), shared between the pool tasks and the
+        // heartbeat task. The coordinator reconciles its per-worker routing
+        // load against this authoritative value (see `HealthCheck.in_flight`)
+        // so a missed dispatch-completion decrement on its side cannot wedge
+        // routing for an idle worker.
+        let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
         // Start heartbeat task
-        let heartbeat_task = self.spawn_heartbeat_task(tx.clone());
+        let heartbeat_task = self.spawn_heartbeat_task(tx.clone(), in_flight.clone());
 
         // Start unified journal event flush task (replaces checkpoint, delta, span, log flush tasks)
         let journal_flush_task = self.spawn_journal_flush_task(tx.clone(), event_stream_tx.clone());
@@ -1255,6 +1276,22 @@ impl Worker {
         // Response collection channel (unbounded - responses must flow)
         let (response_tx, response_rx) = flume::unbounded::<ServiceMessage>();
 
+        // RAII guard so the in-flight count is decremented even if a handler
+        // panics — otherwise a single panic would permanently inflate the
+        // worker's reported load.
+        struct InFlightGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl InFlightGuard {
+            fn enter(c: &std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
+                c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                InFlightGuard(c.clone())
+            }
+        }
+        impl Drop for InFlightGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
         // Spawn worker pool
         let mut worker_handles = Vec::new();
         for worker_id in 0..max_concurrency {
@@ -1262,9 +1299,11 @@ impl Worker {
             let response_tx = response_tx.clone();
             let handler = message_handler.clone();
             let worker_name = format!("{}-{}", self.config.worker_id, worker_id);
+            let in_flight = in_flight.clone();
 
             let handle = tokio::spawn(async move {
                 while let Ok(runtime_message) = task_rx.recv_async().await {
+                    let _in_flight = InFlightGuard::enter(&in_flight);
                     let tx_clone = response_tx.clone();
                     match handler(runtime_message, tx_clone).await {
                         Ok(Some(response)) => {
@@ -1574,6 +1613,7 @@ impl Worker {
     fn spawn_heartbeat_task(
         &self,
         tx: flume::Sender<ServiceMessage>,
+        in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) -> tokio::task::JoinHandle<()> {
         let worker_id = self.config.worker_id.clone();
 
@@ -1593,6 +1633,7 @@ impl Worker {
                     status: WorkerHealthStatus::WorkerHealthHealthy.into(),
                     metrics: std::collections::HashMap::new(),
                     message: "Worker healthy".to_string(),
+                    in_flight: Some(in_flight.load(std::sync::atomic::Ordering::Relaxed) as u32),
                 };
 
                 let service_message = ServiceMessage {
