@@ -562,6 +562,12 @@ pub enum OutputItem {
     },
     #[serde(rename = "reasoning")]
     Reasoning {},
+    /// Built-in tool action items (web_search_call, code_interpreter_call,
+    /// file_search_call, image_generation_call, mcp_call, ...). OpenAI emits
+    /// these to describe tool actions it took; they carry no content we surface,
+    /// so we tolerate any unknown variant rather than failing the whole response.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Usage statistics from the API
@@ -674,6 +680,9 @@ impl ResponsesApiResponse {
                 OutputItem::Reasoning { .. } => {
                     // Reasoning items from GPT-5 models are tracked separately in usage stats
                     // We don't include them in the text output
+                }
+                OutputItem::Unknown => {
+                    // Built-in tool action items (web_search_call, etc.) — no content to surface
                 }
             }
         }
@@ -1492,6 +1501,26 @@ mod tests {
             }
             other => panic!("expected LmApiError, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_response_with_builtin_tool_output_items() {
+        // OpenAI emits web_search_call (and other built-in tool action items)
+        // alongside the message. Unknown output item types must not fail parsing.
+        let json = r#"{
+            "id": "resp_websearch",
+            "created_at": 1700000000,
+            "model": "gpt-4o-mini",
+            "status": "completed",
+            "output": [
+                {"type": "web_search_call", "id": "ws_1", "status": "completed"},
+                {"type": "message", "content": [{"type": "output_text", "text": "Done."}]}
+            ]
+        }"#;
+
+        let response: ResponsesApiResponse = serde_json::from_str(json).unwrap();
+        let generated = response.into_generate_response().unwrap();
+        assert_eq!(generated.text.trim(), "Done.");
     }
 
     #[test]
