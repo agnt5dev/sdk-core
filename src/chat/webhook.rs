@@ -1,97 +1,43 @@
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
+//! Backwards-compatible chat-flow webhook verifier.
+//!
+//! The canonical verifiers now live in [`crate::webhook`]; this module
+//! preserves the platform-keyed `verify_webhook` API for the existing
+//! chat handler. New integrations should use [`crate::webhook`]
+//! directly.
+
+use std::collections::HashMap;
 
 use super::types::Platform;
+pub use crate::webhook::WebhookError;
+use crate::webhook::{SlackVerifier, Verifier};
 
-type HmacSha256 = Hmac<Sha256>;
-
-/// Errors during webhook verification.
-#[derive(Debug, thiserror::Error)]
-pub enum WebhookError {
-    #[error("missing required header: {0}")]
-    MissingHeader(String),
-    #[error("invalid signature")]
-    InvalidSignature,
-    #[error("timestamp too old (possible replay attack)")]
-    TimestampTooOld,
-    #[error("unsupported platform: {0}")]
-    UnsupportedPlatform(String),
-}
-
-/// Verify an incoming webhook request for the given platform.
+/// Verify an incoming chat webhook for the given platform.
 ///
-/// Each platform uses different signing mechanisms:
-/// - Slack: HMAC-SHA256 with signing secret
-/// - Discord: Ed25519 (TODO: Phase 3)
-/// - Teams: RSA (TODO: Phase 4)
+/// Returns `Ok(true)` on a valid signature, `Ok(false)` on a mismatch,
+/// and `Err` on missing/malformed inputs.
 pub fn verify_webhook(
     platform: &Platform,
     secret: &str,
-    headers: &std::collections::HashMap<String, String>,
+    headers: &HashMap<String, String>,
     body: &[u8],
 ) -> Result<bool, WebhookError> {
     match platform {
-        Platform::Slack => verify_slack(secret, headers, body),
-        _ => Err(WebhookError::UnsupportedPlatform(platform.to_string())),
+        Platform::Slack => match SlackVerifier.verify(secret.as_bytes(), headers, body) {
+            Ok(_) => Ok(true),
+            Err(WebhookError::InvalidSignature) => Ok(false),
+            Err(e) => Err(e),
+        },
+        _ => Err(WebhookError::UnsupportedScheme(platform.to_string())),
     }
-}
-
-/// Verify a Slack webhook request using HMAC-SHA256.
-///
-/// Slack sends:
-/// - `x-slack-request-timestamp`: Unix timestamp of the request
-/// - `x-slack-signature`: `v0=<hex HMAC-SHA256>`
-///
-/// The signed string is: `v0:{timestamp}:{body}`
-fn verify_slack(
-    signing_secret: &str,
-    headers: &std::collections::HashMap<String, String>,
-    body: &[u8],
-) -> Result<bool, WebhookError> {
-    let timestamp = headers
-        .get("x-slack-request-timestamp")
-        .ok_or_else(|| WebhookError::MissingHeader("x-slack-request-timestamp".into()))?;
-
-    let signature = headers
-        .get("x-slack-signature")
-        .ok_or_else(|| WebhookError::MissingHeader("x-slack-signature".into()))?;
-
-    // Check timestamp is within 5 minutes to prevent replay attacks
-    if let Ok(ts) = timestamp.parse::<i64>() {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        if (now - ts).abs() > 300 {
-            return Err(WebhookError::TimestampTooOld);
-        }
-    }
-
-    // Build the base string: v0:{timestamp}:{body}
-    let body_str = std::str::from_utf8(body).unwrap_or("");
-    let base_string = format!("v0:{}:{}", timestamp, body_str);
-
-    // Compute HMAC-SHA256
-    let mut mac =
-        HmacSha256::new_from_slice(signing_secret.as_bytes()).expect("HMAC accepts any key size");
-    mac.update(base_string.as_bytes());
-    let result = mac.finalize();
-
-    // Constant-time comparison to prevent timing attacks
-    let expected = signature.strip_prefix("v0=").unwrap_or(signature);
-    let computed_hex = hex::encode(result.into_bytes());
-    Ok(expected.len() == computed_hex.len()
-        && expected
-            .bytes()
-            .zip(computed_hex.bytes())
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-            == 0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    type HmacSha256 = Hmac<Sha256>;
 
     #[test]
     fn test_verify_slack_valid() {
@@ -103,7 +49,6 @@ mod tests {
             .to_string();
         let body = b"hello world";
 
-        // Compute expected signature
         let base_string = format!("v0:{}:{}", timestamp, "hello world");
         let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
         mac.update(base_string.as_bytes());
