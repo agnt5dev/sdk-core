@@ -15,6 +15,18 @@ use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+fn take_correlation_ids(metadata: &mut HashMap<String, String>) -> (String, String) {
+    let correlation_id = metadata
+        .remove("cid")
+        .or_else(|| metadata.remove("correlation_id"))
+        .unwrap_or_default();
+    let parent_correlation_id = metadata
+        .remove("pcid")
+        .or_else(|| metadata.remove("parent_correlation_id"))
+        .unwrap_or_default();
+    (correlation_id, parent_correlation_id)
+}
+
 /// Connection states for tracking worker status
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConnectionState {
@@ -498,8 +510,7 @@ impl Worker {
             let canonical_project_id =
                 canonical_project_id_from_metadata(&merged_metadata).unwrap_or_default();
             merged_metadata = with_project_metadata(merged_metadata, &canonical_project_id);
-            let correlation_id = merged_metadata.remove("cid").unwrap_or_default();
-            let parent_event_id = merged_metadata.remove("pcid").unwrap_or_default();
+            let (correlation_id, parent_event_id) = take_correlation_ids(&mut merged_metadata);
             let tenant_id = merged_metadata
                 .remove("project_id")
                 .or_else(|| merged_metadata.remove("tenant_id"))
@@ -659,8 +670,7 @@ impl Worker {
         merged_metadata = with_project_metadata(merged_metadata, &canonical_project_id);
 
         // Extract correlation/parent IDs from metadata
-        let correlation_id = merged_metadata.remove("cid").unwrap_or_default();
-        let parent_event_id = merged_metadata.remove("pcid").unwrap_or_default();
+        let (correlation_id, parent_event_id) = take_correlation_ids(&mut merged_metadata);
 
         // Extract experiment_id before metadata is moved into the request
         let experiment_id = merged_metadata.get("experiment_id").cloned();
@@ -847,8 +857,7 @@ impl Worker {
                             merged.insert(k.clone(), v.clone());
                         }
                     }
-                    let cid = merged.remove("cid").unwrap_or_default();
-                    let pcid = merged.remove("pcid").unwrap_or_default();
+                    let (cid, pcid) = take_correlation_ids(&mut merged);
                     let canonical_project_id =
                         canonical_project_id_from_metadata(&merged).unwrap_or_default();
                     let mut merged = with_project_metadata(merged, &canonical_project_id);
@@ -2450,5 +2459,48 @@ impl Worker {
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::take_correlation_ids;
+    use std::collections::HashMap;
+
+    #[test]
+    fn take_correlation_ids_accepts_canonical_keys() {
+        let mut metadata = HashMap::from([
+            ("correlation_id".to_string(), "span-1".to_string()),
+            ("parent_correlation_id".to_string(), "parent-1".to_string()),
+            ("other".to_string(), "value".to_string()),
+        ]);
+
+        let (correlation_id, parent_correlation_id) = take_correlation_ids(&mut metadata);
+
+        assert_eq!(correlation_id, "span-1");
+        assert_eq!(parent_correlation_id, "parent-1");
+        assert!(!metadata.contains_key("correlation_id"));
+        assert!(!metadata.contains_key("parent_correlation_id"));
+        assert_eq!(metadata.get("other").map(String::as_str), Some("value"));
+    }
+
+    #[test]
+    fn take_correlation_ids_prefers_legacy_short_keys() {
+        let mut metadata = HashMap::from([
+            ("cid".to_string(), "short-span".to_string()),
+            ("pcid".to_string(), "short-parent".to_string()),
+            ("correlation_id".to_string(), "canonical-span".to_string()),
+            (
+                "parent_correlation_id".to_string(),
+                "canonical-parent".to_string(),
+            ),
+        ]);
+
+        let (correlation_id, parent_correlation_id) = take_correlation_ids(&mut metadata);
+
+        assert_eq!(correlation_id, "short-span");
+        assert_eq!(parent_correlation_id, "short-parent");
+        assert!(metadata.contains_key("correlation_id"));
+        assert!(metadata.contains_key("parent_correlation_id"));
     }
 }
