@@ -352,14 +352,7 @@ pub fn numeric_range(input: &ScorerInput, config: &NumericRangeConfig) -> Scorer
     ScorerResult {
         score: if in_range { 1.0 } else { 0.0 },
         passed: Some(in_range),
-        label: Some(
-            if in_range {
-                "in_range"
-            } else {
-                "out_of_range"
-            }
-            .into(),
-        ),
+        label: Some(if in_range { "in_range" } else { "out_of_range" }.into()),
         explanation: Some(format!(
             "value={value}, min={:?}, max={:?}, inclusive={inclusive}",
             config.min, config.max
@@ -616,8 +609,14 @@ mod tests {
             inclusive: None,
         };
         assert_eq!(numeric_range(&ScorerInput::new(json!(99)), &cfg).score, 0.0);
-        assert_eq!(numeric_range(&ScorerInput::new(json!(100)), &cfg).score, 1.0);
-        assert_eq!(numeric_range(&ScorerInput::new(json!(1_000_000)), &cfg).score, 1.0);
+        assert_eq!(
+            numeric_range(&ScorerInput::new(json!(100)), &cfg).score,
+            1.0
+        );
+        assert_eq!(
+            numeric_range(&ScorerInput::new(json!(1_000_000)), &cfg).score,
+            1.0
+        );
 
         // Upper bound only.
         let cfg = NumericRangeConfig {
@@ -625,9 +624,18 @@ mod tests {
             max: Some(0.5),
             inclusive: None,
         };
-        assert_eq!(numeric_range(&ScorerInput::new(json!(0.4)), &cfg).score, 1.0);
-        assert_eq!(numeric_range(&ScorerInput::new(json!(0.5)), &cfg).score, 1.0);
-        assert_eq!(numeric_range(&ScorerInput::new(json!(0.6)), &cfg).score, 0.0);
+        assert_eq!(
+            numeric_range(&ScorerInput::new(json!(0.4)), &cfg).score,
+            1.0
+        );
+        assert_eq!(
+            numeric_range(&ScorerInput::new(json!(0.5)), &cfg).score,
+            1.0
+        );
+        assert_eq!(
+            numeric_range(&ScorerInput::new(json!(0.6)), &cfg).score,
+            0.0
+        );
     }
 
     #[test]

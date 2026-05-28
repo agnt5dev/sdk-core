@@ -15,9 +15,9 @@ use crate::error::{Result as SdkResult, SdkError};
 
 use super::http;
 use super::interface::{
-    generate as generate_via_model, stream as stream_via_model, BuiltInTool, ContentBlockType,
-    GenerateRequest, GenerateResponse, LanguageModel, Modality, ReasoningEffort, ResponseFormat,
-    StreamChunk, StreamHandle, StreamRequest, TokenUsage,
+    BuiltInTool, ContentBlockType, GenerateRequest, GenerateResponse, LanguageModel, Modality,
+    ReasoningEffort, ResponseFormat, StreamChunk, StreamHandle, StreamRequest, TokenUsage,
+    ToolCall, generate as generate_via_model, stream as stream_via_model,
 };
 use super::telemetry;
 
@@ -639,7 +639,7 @@ impl ResponsesApiResponse {
 
         // Extract text content from output items
         let mut text_parts = Vec::new();
-        let mut tool_calls = Vec::new();
+        let tool_calls = tool_calls_from_output(&self.output);
 
         for item in &self.output {
             match item {
@@ -655,28 +655,7 @@ impl ResponsesApiResponse {
                         }
                     }
                 }
-                OutputItem::FunctionCall {
-                    call_id,
-                    name,
-                    arguments,
-                    ..
-                } => {
-                    tool_calls.push(super::interface::ToolCall {
-                        id: call_id.clone(),
-                        name: name.clone(),
-                        arguments: arguments.clone(),
-                    });
-                }
-                OutputItem::ToolCall {
-                    tool_name,
-                    arguments,
-                } => {
-                    tool_calls.push(super::interface::ToolCall {
-                        id: format!("call_{}", tool_name), // Generate a simple ID
-                        name: tool_name.clone(),
-                        arguments: arguments.to_string(),
-                    });
-                }
+                OutputItem::FunctionCall { .. } | OutputItem::ToolCall { .. } => {}
                 OutputItem::Reasoning { .. } => {
                     // Reasoning items from GPT-5 models are tracked separately in usage stats
                     // We don't include them in the text output
@@ -713,6 +692,40 @@ impl ResponsesApiResponse {
             metadata: None,
         })
     }
+}
+
+fn tool_calls_from_output(output: &[OutputItem]) -> Vec<ToolCall> {
+    let mut tool_calls = Vec::new();
+
+    for item in output {
+        match item {
+            OutputItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+                ..
+            } => {
+                tool_calls.push(ToolCall {
+                    id: call_id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                });
+            }
+            OutputItem::ToolCall {
+                tool_name,
+                arguments,
+            } => {
+                tool_calls.push(ToolCall {
+                    id: format!("call_{}", tool_name),
+                    name: tool_name.clone(),
+                    arguments: arguments.to_string(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    tool_calls
 }
 
 fn extract_openai_error_message(value: &Value) -> Option<String> {
@@ -848,6 +861,7 @@ struct StreamingState {
     model: Option<String>,
     created_at: Option<i64>,
     usage: Option<ApiUsage>,
+    tool_calls: Vec<ToolCall>,
 }
 
 impl StreamingState {
@@ -881,7 +895,11 @@ impl StreamingState {
                 total_tokens: u.total_tokens,
             }),
             finish_reason: Some("completed".to_string()),
-            tool_calls: None, // TODO: Handle tool calls in streaming
+            tool_calls: if self.tool_calls.is_empty() {
+                None
+            } else {
+                Some(self.tool_calls)
+            },
             object,
             raw: None,
             metadata: None,
@@ -979,9 +997,11 @@ fn build_responses_stream(
                     // Response completed - final event
                     "response.completed" => {
                         if let Ok(completed) = serde_json::from_str::<ResponseCompletedEvent>(&data) {
+                            let tool_calls = tool_calls_from_output(&completed.response.output);
                             state.usage = completed.response.usage;
                             state.response_id = Some(completed.response.id);
                             state.model = Some(completed.response.model);
+                            state.tool_calls = tool_calls;
                         }
 
                         // Close any open content blocks
@@ -1565,6 +1585,26 @@ mod tests {
         let usage = response.usage.unwrap();
         assert_eq!(usage.prompt_tokens, Some(10));
         assert_eq!(usage.completion_tokens, Some(5));
+    }
+
+    #[test]
+    fn test_streaming_state_preserves_tool_calls() {
+        let mut state = StreamingState::default();
+        state.response_id = Some("resp_tools".to_string());
+        state.model = Some("gpt-4o-mini".to_string());
+        state.tool_calls = vec![ToolCall {
+            id: "call_123".to_string(),
+            name: "lookup_weather".to_string(),
+            arguments: "{\"city\":\"SF\"}".to_string(),
+        }];
+
+        let response = state.into_generate_response(ResponseFormat::Text).unwrap();
+        let tool_calls = response.tool_calls.unwrap();
+
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_123");
+        assert_eq!(tool_calls[0].name, "lookup_weather");
+        assert_eq!(tool_calls[0].arguments, "{\"city\":\"SF\"}");
     }
 
     #[test]

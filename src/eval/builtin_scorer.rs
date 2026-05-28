@@ -137,9 +137,7 @@ pub fn execute(scorer_name: &str, input_data: &[u8]) -> Option<ScorerResult> {
                         score: 0.0,
                         passed: Some(false),
                         label: Some("config_error".into()),
-                        explanation: Some(format!(
-                            "json_schema requires `schema` in config: {e}"
-                        )),
+                        explanation: Some(format!("json_schema requires `schema` in config: {e}")),
                         metadata: None,
                     });
                 }

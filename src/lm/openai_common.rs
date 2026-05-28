@@ -5,13 +5,13 @@ use async_stream::try_stream;
 use futures::{Stream, StreamExt};
 use reqwest::Response;
 use serde::{Deserialize, Serialize};
-use serde_json::{self, json, Value as JsonValue};
+use serde_json::{self, Value as JsonValue, json};
 
 use crate::error::{Result as SdkResult, SdkError};
 
 use super::interface::{
     ContentBlockType, GenerateRequest, GenerateResponse, JsonSchemaFormat, Message, MessageRole,
-    ResponseFormat, StreamChunk, StreamHandle, TokenUsage, ToolChoice, ToolDefinition,
+    ResponseFormat, StreamChunk, StreamHandle, TokenUsage, ToolCall, ToolChoice, ToolDefinition,
 };
 
 #[derive(Serialize)]
@@ -419,6 +419,31 @@ pub(crate) struct ChunkDelta {
     #[allow(unused)]
     role: Option<String>,
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ApiToolCallDelta>>,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct ApiToolCallDelta {
+    index: usize,
+    id: Option<String>,
+    #[serde(rename = "type")]
+    #[allow(unused)]
+    tool_type: Option<String>,
+    function: Option<ApiToolCallFunctionDelta>,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct ApiToolCallFunctionDelta {
+    name: Option<String>,
+    arguments: Option<String>,
+}
+
+#[derive(Default, Clone)]
+struct PartialToolCall {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
 }
 
 #[derive(Default, Clone)]
@@ -428,6 +453,7 @@ struct PartialResponse {
     created: Option<u64>,
     finish_reason: Option<String>,
     usage: Option<ApiUsage>,
+    tool_calls: Vec<PartialToolCall>,
 }
 
 impl PartialResponse {
@@ -446,11 +472,57 @@ impl PartialResponse {
         }
     }
 
+    fn update_tool_calls(&mut self, deltas: Vec<ApiToolCallDelta>) {
+        for delta in deltas {
+            while self.tool_calls.len() <= delta.index {
+                self.tool_calls.push(PartialToolCall::default());
+            }
+
+            let partial = &mut self.tool_calls[delta.index];
+            if let Some(id) = delta.id {
+                partial.id = Some(id);
+            }
+            if let Some(function) = delta.function {
+                if let Some(name) = function.name {
+                    partial.name = Some(name);
+                }
+                if let Some(arguments) = function.arguments {
+                    partial.arguments.push_str(&arguments);
+                }
+            }
+        }
+    }
+
+    fn tool_calls(&self) -> Option<Vec<ToolCall>> {
+        let tool_calls = self
+            .tool_calls
+            .iter()
+            .enumerate()
+            .filter_map(|(index, partial)| {
+                partial.name.as_ref().map(|name| ToolCall {
+                    id: partial
+                        .id
+                        .clone()
+                        .unwrap_or_else(|| format!("call_{index}")),
+                    name: name.clone(),
+                    arguments: partial.arguments.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        if tool_calls.is_empty() {
+            None
+        } else {
+            Some(tool_calls)
+        }
+    }
+
     fn into_generate_response(
         self,
         text: String,
         response_format: ResponseFormat,
     ) -> SdkResult<GenerateResponse> {
+        let tool_calls = self.tool_calls();
         let object = match response_format {
             ResponseFormat::Text => None,
             ResponseFormat::Json => Some(parse_json_value(&text)?),
@@ -464,7 +536,7 @@ impl PartialResponse {
             finish_reason: self.finish_reason,
             usage: usage_from_api(self.usage),
             text,
-            tool_calls: None, // Streaming doesn't support tool calls yet
+            tool_calls,
             object,
             raw: None,
             metadata: None,
@@ -535,11 +607,13 @@ fn format_streaming_error(err: &reqwest::Error, timeout_secs: u64) -> SdkError {
         ))
     } else if err.is_connect() {
         SdkError::Other(anyhow!(
-            "OpenAI API streaming failed: Unable to connect. Check your network connection. Error: {}", err
+            "OpenAI API streaming failed: Unable to connect. Check your network connection. Error: {}",
+            err
         ))
     } else if err.is_decode() {
         SdkError::Other(anyhow!(
-            "OpenAI API streaming failed: Unable to decode response. The response may be malformed. Error: {}", err
+            "OpenAI API streaming failed: Unable to decode response. The response may be malformed. Error: {}",
+            err
         ))
     } else {
         SdkError::Other(anyhow!("OpenAI API streaming failed: {}", err))
@@ -593,6 +667,10 @@ fn build_stream(
                 partial.update(&parsed);
 
                 for choice in parsed.choices {
+                    if let Some(tool_calls) = choice.delta.tool_calls {
+                        partial.update_tool_calls(tool_calls);
+                    }
+
                     if let Some(content) = choice.delta.content {
                         if !content.is_empty() {
                             // Emit ContentBlockStart on first content
@@ -625,4 +703,43 @@ fn build_stream(
     };
 
     Ok(Box::pin(stream))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_response_accumulates_streaming_tool_call_deltas() {
+        let mut partial = PartialResponse::default();
+
+        partial.update_tool_calls(vec![ApiToolCallDelta {
+            index: 0,
+            id: Some("call_123".to_string()),
+            tool_type: Some("function".to_string()),
+            function: Some(ApiToolCallFunctionDelta {
+                name: Some("lookup_weather".to_string()),
+                arguments: Some("{\"city\"".to_string()),
+            }),
+        }]);
+        partial.update_tool_calls(vec![ApiToolCallDelta {
+            index: 0,
+            id: None,
+            tool_type: None,
+            function: Some(ApiToolCallFunctionDelta {
+                name: None,
+                arguments: Some(":\"SF\"}".to_string()),
+            }),
+        }]);
+
+        let response = partial
+            .into_generate_response(String::new(), ResponseFormat::Text)
+            .unwrap();
+        let tool_calls = response.tool_calls.unwrap();
+
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_123");
+        assert_eq!(tool_calls[0].name, "lookup_weather");
+        assert_eq!(tool_calls[0].arguments, "{\"city\":\"SF\"}");
+    }
 }
