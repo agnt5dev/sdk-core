@@ -32,6 +32,7 @@ where
 #[derive(Clone, Debug)]
 pub struct GenerateRequest {
     pub model: String,
+    pub prompt_ref: Option<PromptRef>,
     pub system_prompt: Option<String>,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDefinition>,
@@ -52,6 +53,7 @@ impl GenerateRequest {
     pub fn new(model: impl Into<String>) -> Self {
         Self {
             model: model.into(),
+            prompt_ref: None,
             system_prompt: None,
             messages: Vec::new(),
             tools: Vec::new(),
@@ -61,6 +63,11 @@ impl GenerateRequest {
             previous_response_id: None,
             otel_context: None,
         }
+    }
+
+    pub fn prompt_ref(mut self, prompt_ref: PromptRef) -> Self {
+        self.prompt_ref = Some(prompt_ref);
+        self
     }
 
     pub fn previous_response_id(mut self, id: impl Into<String>) -> Self {
@@ -133,6 +140,47 @@ impl GenerateRequest {
 }
 
 pub type StreamRequest = GenerateRequest;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PromptRef {
+    pub id: String,
+    pub version: Option<String>,
+    pub environment_id: Option<String>,
+    pub environment_ref: Option<String>,
+    pub variables: serde_json::Map<String, Value>,
+}
+
+impl PromptRef {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            version: None,
+            environment_id: None,
+            environment_ref: None,
+            variables: serde_json::Map::new(),
+        }
+    }
+
+    pub fn version(mut self, version: impl Into<String>) -> Self {
+        self.version = Some(version.into());
+        self
+    }
+
+    pub fn environment_id(mut self, environment_id: impl Into<String>) -> Self {
+        self.environment_id = Some(environment_id.into());
+        self
+    }
+
+    pub fn environment_ref(mut self, environment_ref: impl Into<String>) -> Self {
+        self.environment_ref = Some(environment_ref.into());
+        self
+    }
+
+    pub fn variable(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.variables.insert(key.into(), value.into());
+        self
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct GenerationConfig {

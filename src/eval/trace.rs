@@ -256,7 +256,7 @@ pub fn trace_score(input: &ScorerInput, assertions: &[TraceAssertion]) -> Scorer
                 label: Some("error".into()),
                 explanation: Some("No trace provided for glassbox scoring".into()),
                 metadata: None,
-            }
+            };
         }
     };
 

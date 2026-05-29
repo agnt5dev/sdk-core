@@ -114,7 +114,9 @@ impl AzureOpenAiProvider {
         if let Some((prefix, rest)) = trimmed.split_once('/') {
             if prefix != MODEL_PREFIX {
                 return Err(SdkError::Configuration {
-                    message: format!("Azure provider expects model ids prefixed with `{MODEL_PREFIX}/`; got `{prefix}`"),
+                    message: format!(
+                        "Azure provider expects model ids prefixed with `{MODEL_PREFIX}/`; got `{prefix}`"
+                    ),
                     field: Some("model".to_string()),
                 });
             }

@@ -153,7 +153,9 @@ fn extract_region_and_model<'a>(
     let rest = if let Some((prefix, rest)) = trimmed.split_once('/') {
         if prefix != MODEL_PREFIX {
             return Err(SdkError::Configuration {
-                message: format!("Bedrock provider expects model ids prefixed with `{MODEL_PREFIX}/`; got `{prefix}`"),
+                message: format!(
+                    "Bedrock provider expects model ids prefixed with `{MODEL_PREFIX}/`; got `{prefix}`"
+                ),
                 field: Some("model".to_string()),
             });
         }

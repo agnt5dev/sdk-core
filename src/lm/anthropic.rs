@@ -867,7 +867,9 @@ fn normalize_model(model: &str) -> SdkResult<String> {
         let rest = rest.trim();
         if provider != "anthropic" {
             return Err(SdkError::Configuration {
-                message: format!("Anthropic provider expects model ids prefixed with `anthropic/`; got `{provider}`"),
+                message: format!(
+                    "Anthropic provider expects model ids prefixed with `anthropic/`; got `{provider}`"
+                ),
                 field: Some("model".to_string()),
             });
         }

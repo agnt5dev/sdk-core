@@ -212,6 +212,19 @@ pub struct Worker {
     /// DispatchComponentResponse.lease_id without requiring language bindings
     /// to thread the value through their handler code.
     pending_lease_ids: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    /// Per-invocation soft-cancel channels keyed by run_id. A oneshot sender
+    /// is registered while a dispatched invocation runs; a CancelExecution
+    /// message from the coordinator fires it, the pool task's `select!` drops
+    /// the handler future (soft cancel) and frees the slot. Keyed by run_id to
+    /// match the coordinator's cancellation key.
+    cancel_tokens: Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
+    /// Optional language-registered cooperative cancel hook. When set, a
+    /// CancelExecution invokes it with the run_id so the language binding can
+    /// cancel its own task/promise (raising CancelledError / aborting the
+    /// AbortSignal), letting the handler unwind and run cleanup. When absent,
+    /// we fall back to the soft oneshot drop above (frees the slot but lets the
+    /// language coroutine run to completion).
+    cancel_hook: Arc<std::sync::Mutex<Option<Box<dyn Fn(String) + Send + Sync>>>>,
     /// EventStream sender for SSE-only events (EE path). Set during run().
     event_stream_tx: Arc<std::sync::Mutex<Option<flume::Sender<EventStreamMessage>>>>,
     /// Dispatch stream sender (bidirectional gRPC to WC). Used by emit_checkpoint_sync
@@ -234,6 +247,22 @@ impl std::fmt::Debug for Worker {
             .field("journal_queue_size", &self.journal_queue.len())
             .field("streaming_runs", &self.streaming_runs)
             .finish()
+    }
+}
+
+/// Extract the cancellation key (run_id) for a dispatched invocation, if this
+/// message carries one. Returns None for non-dispatch messages. The run_id is
+/// the part of `invocation_id` before the first `:` (sub-invocation suffix).
+fn dispatch_run_key(msg: &RuntimeMessage) -> Option<String> {
+    match &msg.message_data {
+        Some(crate::pb::runtime_message::MessageData::DispatchComponent(req)) => Some(
+            req.invocation_id
+                .split(':')
+                .next()
+                .unwrap_or(&req.invocation_id)
+                .to_string(),
+        ),
+        _ => None,
     }
 }
 
@@ -262,6 +291,8 @@ impl Worker {
             tokio_handle: Arc::new(std::sync::Mutex::new(None)),
             streaming_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pending_lease_ids: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            cancel_hook: Arc::new(std::sync::Mutex::new(None)),
             event_stream_tx: Arc::new(std::sync::Mutex::new(None)),
             dispatch_tx: Arc::new(std::sync::Mutex::new(None)),
             engine_client: Arc::new(TokioMutex::new(None)),
@@ -598,7 +629,10 @@ impl Worker {
                             worker_id: self.config.worker_id.clone(),
                         };
                         if let Err(e) = es.send_async(es_msg).await {
-                            warn!("Failed to flush pre-checkpoint event via EventStream: type={} run_id={} error={}", event.event_type, event.run_id, e);
+                            warn!(
+                                "Failed to flush pre-checkpoint event via EventStream: type={} run_id={} error={}",
+                                event.event_type, event.run_id, e
+                            );
                         }
                     } else if let Some(ref dtx) = dispatch {
                         // Fallback: dispatch stream (WC) — only works for streamed invocations
@@ -645,7 +679,10 @@ impl Worker {
                         };
 
                         if let Err(e) = dtx.send_async(service_message).await {
-                            warn!("Failed to flush pre-checkpoint event via dispatch: type={} run_id={} error={}", event.event_type, event.run_id, e);
+                            warn!(
+                                "Failed to flush pre-checkpoint event via dispatch: type={} run_id={} error={}",
+                                event.event_type, event.run_id, e
+                            );
                         }
                     }
                 }
@@ -933,6 +970,19 @@ impl Worker {
     ///
     /// The handler is now `Fn + Clone` instead of `FnMut` to enable concurrent execution.
     /// Multiple worker tasks can invoke the handler in parallel.
+    /// Register a cooperative cancel hook (see the `cancel_hook` field).
+    /// Called by language bindings before `run()`. The hook receives the
+    /// run_id of the invocation to cancel and should cancel the language-level
+    /// task/promise for it.
+    pub fn set_cancel_hook<F>(&self, hook: F)
+    where
+        F: Fn(String) + Send + Sync + 'static,
+    {
+        if let Ok(mut guard) = self.cancel_hook.lock() {
+            *guard = Some(Box::new(hook));
+        }
+    }
+
     pub async fn run<F, Fut>(&self, message_handler: F) -> Result<()>
     where
         F: Fn(RuntimeMessage, flume::Sender<ServiceMessage>) -> Fut + Send + Clone + 'static,
@@ -1235,13 +1285,19 @@ impl Worker {
                         Some(es_tx)
                     }
                     Err(e) => {
-                        warn!("Failed to open EE EventStream, SSE-only events will use dispatch stream: {}", e);
+                        warn!(
+                            "Failed to open EE EventStream, SSE-only events will use dispatch stream: {}",
+                            e
+                        );
                         None
                     }
                 }
             }
             Err(e) => {
-                warn!("Failed to get EE client for EventStream, SSE-only events will use dispatch stream: {}", e);
+                warn!(
+                    "Failed to get EE client for EventStream, SSE-only events will use dispatch stream: {}",
+                    e
+                );
                 None
             }
         };
@@ -1309,23 +1365,54 @@ impl Worker {
             let handler = message_handler.clone();
             let worker_name = format!("{}-{}", self.config.worker_id, worker_id);
             let in_flight = in_flight.clone();
+            let cancel_tokens = self.cancel_tokens.clone();
 
             let handle = tokio::spawn(async move {
                 while let Ok(runtime_message) = task_rx.recv_async().await {
                     let _in_flight = InFlightGuard::enter(&in_flight);
                     let tx_clone = response_tx.clone();
-                    match handler(runtime_message, tx_clone).await {
-                        Ok(Some(response)) => {
+
+                    // For dispatched invocations, register a soft-cancel
+                    // channel keyed by run_id and race the handler against it
+                    // so a CancelExecution can drop the in-flight work. Other
+                    // message types just run to completion.
+                    let run_key = dispatch_run_key(&runtime_message);
+                    let result = if let Some(key) = run_key.clone() {
+                        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+                        if let Ok(mut m) = cancel_tokens.lock() {
+                            m.insert(key.clone(), cancel_tx);
+                        }
+                        let outcome = tokio::select! {
+                            res = handler(runtime_message, tx_clone) => Some(res),
+                            _ = cancel_rx => None, // cancelled — handler future dropped here
+                        };
+                        if let Ok(mut m) = cancel_tokens.lock() {
+                            m.remove(&key);
+                        }
+                        outcome
+                    } else {
+                        Some(handler(runtime_message, tx_clone).await)
+                    };
+
+                    match result {
+                        Some(Ok(Some(response))) => {
                             if let Err(e) = response_tx.send_async(response).await {
                                 error!("Worker {} failed to send response: {}", worker_name, e);
                                 break;
                             }
                         }
-                        Ok(None) => {
+                        Some(Ok(None)) => {
                             // No response needed
                         }
-                        Err(e) => {
+                        Some(Err(e)) => {
                             error!("Worker {} handler error: {}", worker_name, e);
+                        }
+                        None => {
+                            // Soft-cancelled: the handler future was dropped.
+                            // The in-flight slot frees via the guard. The
+                            // run is already terminal (gateway wrote
+                            // run.cancelled), so no response is emitted.
+                            debug!("Worker {} invocation cancelled by request", worker_name);
                         }
                     }
                 }
@@ -1369,6 +1456,82 @@ impl Worker {
                                     "[WARN] Another worker instance connected with the same worker ID. This worker is shutting down."
                                 );
                                 break Ok(());
+                            }
+
+                            // COORDINATOR_DRAINING: this coordinator is leaving
+                            // service. Stop accepting new dispatches on this
+                            // stream, drain already-started work below, then
+                            // reconnect through the configured endpoint.
+                            if runtime_message.message_type == RuntimeMessageType::CoordinatorDraining as i32 {
+                                warn!(
+                                    "Worker {} received COORDINATOR_DRAINING — draining local work before reconnect.",
+                                    self.config.worker_id
+                                );
+                                eprintln!(
+                                    "[INFO] Coordinator is draining. Worker will reconnect after in-flight work completes."
+                                );
+                                break Err(crate::error::SdkError::Connection {
+                                    message: "coordinator draining".to_string(),
+                                    code: crate::error::ErrorCode::ConnectionFailed,
+                                    source: None,
+                                });
+                            }
+
+                            // CancelExecution: fire the soft-cancel channel for
+                            // the invocation if it's running locally. Handled
+                            // here (not in the pool) so it can't queue behind
+                            // the very invocation it's cancelling.
+                            if runtime_message.message_type == RuntimeMessageType::CancelExecution as i32 {
+                                if let Some(crate::pb::runtime_message::MessageData::CancelExecution(ref req)) =
+                                    runtime_message.message_data
+                                {
+                                    let run_key = req
+                                        .invocation_id
+                                        .split(':')
+                                        .next()
+                                        .unwrap_or(&req.invocation_id)
+                                        .to_string();
+                                    // Prefer cooperative cancellation via the
+                                    // language hook: it cancels the language
+                                    // task so the handler unwinds and runs
+                                    // cleanup, then the handler future resolves
+                                    // naturally and frees the slot. Without a
+                                    // hook, fall back to the soft oneshot drop.
+                                    let hooked = self
+                                        .cancel_hook
+                                        .lock()
+                                        .ok()
+                                        .and_then(|g| g.as_ref().map(|h| h(run_key.clone())))
+                                        .is_some();
+                                    if hooked {
+                                        info!(
+                                            "Worker {} cancel hook invoked for {}",
+                                            self.config.worker_id, run_key
+                                        );
+                                    } else {
+                                        let fired = self
+                                            .cancel_tokens
+                                            .lock()
+                                            .ok()
+                                            .and_then(|mut m| m.remove(&run_key))
+                                            .map(|tx| {
+                                                let _ = tx.send(());
+                                            })
+                                            .is_some();
+                                        if fired {
+                                            info!(
+                                                "Worker {} soft-cancelling invocation {}",
+                                                self.config.worker_id, run_key
+                                            );
+                                        } else {
+                                            debug!(
+                                                "Worker {} CancelExecution for {} — no in-flight invocation",
+                                                self.config.worker_id, run_key
+                                            );
+                                        }
+                                    }
+                                }
+                                continue;
                             }
 
                             // Track is_streaming per run for ephemeral event gating
@@ -1509,55 +1672,10 @@ impl Worker {
                 // Forward responses from worker pool to coordinator
                 response = response_rx.recv_async() => {
                     match response {
-                        Ok(mut service_message) => {
-                            // Phase 5: stamp the stashed lease_id onto the response
-                            // so the coordinator's fencing check passes. On terminal
-                            // events we drain the map entry; on intermediate streaming
-                            // events we leave it so the terminal ack still finds it.
-                            // Clean up streaming_runs tracking for terminal events
-                            if let Some(crate::pb::service_message::MessageType::FunctionResponse(ref mut resp)) = service_message.message_type {
-                                let is_terminal = resp.event_type == "run.completed" || resp.event_type == "run.failed";
-                                if resp.lease_id.is_empty() {
-                                    if let Ok(mut map) = self.pending_lease_ids.lock() {
-                                        if is_terminal {
-                                            if let Some(lease_id) = map.remove(&resp.invocation_id) {
-                                                resp.lease_id = lease_id;
-                                            }
-                                        } else if let Some(lease_id) = map.get(&resp.invocation_id) {
-                                            resp.lease_id = lease_id.clone();
-                                        }
-                                    }
-                                }
-                                if is_terminal {
-                                    let run_id = if let Some(idx) = resp.invocation_id.find(':') {
-                                        resp.invocation_id[..idx].to_string()
-                                    } else {
-                                        resp.invocation_id.clone()
-                                    };
-                                    if let Ok(mut map) = self.streaming_runs.lock() {
-                                        map.remove(&run_id);
-                                    }
-                                }
-                            }
-
-                            // Phase 8: route by declared worker mode, not by
-                            // per-response metadata tagging. A PULL worker
-                            // always acks via `CompleteJob`; a PUSH worker
-                            // always responds over the bidirectional stream.
-                            // Phase 7b's scheduler guarantees PULL workers
-                            // never receive push dispatches, so the stream
-                            // carries only control/heartbeat traffic for them.
-                            if is_pull_mode {
-                                self.handle_polled_job_response(service_message).await;
-                            } else {
-                                if let Err(e) = tx.send_async(service_message).await {
-                                    error!("Failed to send response to coordinator: {}", e);
-                                    break Err(crate::error::SdkError::Connection {
-                                        message: format!("Send failed: {}", e),
-                                        code: crate::error::ErrorCode::ConnectionFailed,
-                                        source: None,
-                                    });
-                                }
+                        Ok(service_message) => {
+                            if let Err(e) = self.forward_worker_response(service_message, is_pull_mode, &tx).await {
+                                error!("Failed to send response to coordinator: {}", e);
+                                break Err(e);
                             }
                         }
                         Err(e) => {
@@ -1596,9 +1714,21 @@ impl Worker {
             *guard = None;
         }
 
-        // Wait for all worker tasks to complete
+        // Wait for all worker tasks to complete. During coordinator drain this
+        // lets the old stream finish only work that had already started before
+        // reconnecting through the configured endpoint.
         for handle in worker_handles {
             let _ = handle.await;
+        }
+
+        while let Ok(service_message) = response_rx.try_recv() {
+            if let Err(e) = self
+                .forward_worker_response(service_message, is_pull_mode, &tx)
+                .await
+            {
+                warn!("Failed to flush drained worker response: {}", e);
+                break;
+            }
         }
 
         // Remove health marker file so K8s readiness probe fails
@@ -1616,6 +1746,61 @@ impl Worker {
         }
 
         dispatch_result
+    }
+
+    async fn forward_worker_response(
+        &self,
+        mut service_message: ServiceMessage,
+        is_pull_mode: bool,
+        tx: &flume::Sender<ServiceMessage>,
+    ) -> Result<()> {
+        // Phase 5: stamp the stashed lease_id onto the response so the
+        // coordinator's fencing check passes. On terminal events we drain
+        // the map entry; on intermediate streaming events we leave it so the
+        // terminal ack still finds it. Also clean up streaming_runs tracking
+        // for terminal events.
+        if let Some(crate::pb::service_message::MessageType::FunctionResponse(ref mut resp)) =
+            service_message.message_type
+        {
+            let is_terminal = resp.event_type == "run.completed" || resp.event_type == "run.failed";
+            if resp.lease_id.is_empty() {
+                if let Ok(mut map) = self.pending_lease_ids.lock() {
+                    if is_terminal {
+                        if let Some(lease_id) = map.remove(&resp.invocation_id) {
+                            resp.lease_id = lease_id;
+                        }
+                    } else if let Some(lease_id) = map.get(&resp.invocation_id) {
+                        resp.lease_id = lease_id.clone();
+                    }
+                }
+            }
+            if is_terminal {
+                let run_id = if let Some(idx) = resp.invocation_id.find(':') {
+                    resp.invocation_id[..idx].to_string()
+                } else {
+                    resp.invocation_id.clone()
+                };
+                if let Ok(mut map) = self.streaming_runs.lock() {
+                    map.remove(&run_id);
+                }
+            }
+        }
+
+        // Phase 8: route by declared worker mode, not by per-response metadata
+        // tagging. A PULL worker always acks via CompleteJob; a PUSH worker
+        // always responds over the bidirectional stream.
+        if is_pull_mode {
+            self.handle_polled_job_response(service_message).await;
+        } else {
+            tx.send_async(service_message).await.map_err(|e| {
+                crate::error::SdkError::Connection {
+                    message: format!("Send failed: {}", e),
+                    code: crate::error::ErrorCode::ConnectionFailed,
+                    source: None,
+                }
+            })?;
+        }
+        Ok(())
     }
 
     /// Spawn a simple heartbeat task that sends periodic health checks
@@ -1820,7 +2005,10 @@ impl Worker {
                                 let is_run_streaming = match streaming_runs.lock() {
                                     Ok(map) => map.get(&event.run_id).copied().unwrap_or(false),
                                     Err(poisoned) => {
-                                        warn!("streaming_runs mutex poisoned, assuming non-streaming for run_id={}", event.run_id);
+                                        warn!(
+                                            "streaming_runs mutex poisoned, assuming non-streaming for run_id={}",
+                                            event.run_id
+                                        );
                                         poisoned
                                             .into_inner()
                                             .get(&event.run_id)
@@ -1845,9 +2033,9 @@ impl Worker {
 
                                     if let Err(e) = es_tx.send_async(es_msg).await {
                                         warn!(
-                                    "EventStream send failed, falling back to dispatch stream: type={} run_id={} error={}",
-                                    event.event_type, event.run_id, e
-                                );
+                                            "EventStream send failed, falling back to dispatch stream: type={} run_id={} error={}",
+                                            event.event_type, event.run_id, e
+                                        );
                                         // Fall through to dispatch stream fallback below
                                     } else {
                                         sse_only_count += 1;
@@ -1900,7 +2088,10 @@ impl Worker {
                                     ),
                                 };
                                 if let Err(e) = dispatch_tx.send_async(service_message).await {
-                                    warn!("Failed to send SSE-only event via dispatch fallback: type={} run_id={} error={}", event.event_type, event.run_id, e);
+                                    warn!(
+                                        "Failed to send SSE-only event via dispatch fallback: type={} run_id={} error={}",
+                                        event.event_type, event.run_id, e
+                                    );
                                     journal_queue.push_front(event).ok();
                                     journal_queue.record_error();
                                     break;
@@ -2013,10 +2204,10 @@ impl Worker {
                                         sent_count += r.written_count as usize;
                                         if !r.errors.is_empty() {
                                             warn!(
-                                        "Flush task: {} boundary events had errors (written={})",
-                                        r.errors.len(),
-                                        r.written_count
-                                    );
+                                                "Flush task: {} boundary events had errors (written={})",
+                                                r.errors.len(),
+                                                r.written_count
+                                            );
                                             for err in &r.errors {
                                                 warn!(
                                                     "  event[{}]: {}",
@@ -2047,12 +2238,12 @@ impl Worker {
                         if sent_count > 0 {
                             journal_queue.record_sent_batch(sent_count, sse_only_count);
                             debug!(
-                        "Flushed {} journal events (boundary={}, sse_only={}, queue_size={})",
-                        sent_count,
-                        sent_count - sse_only_count,
-                        sse_only_count,
-                        journal_queue.len()
-                    );
+                                "Flushed {} journal events (boundary={}, sse_only={}, queue_size={})",
+                                sent_count,
+                                sent_count - sse_only_count,
+                                sse_only_count,
+                                journal_queue.len()
+                            );
                         }
                     }
                 });

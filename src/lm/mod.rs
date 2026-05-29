@@ -30,7 +30,7 @@ pub use http::RetryConfig;
 pub use huggingface::{HuggingFaceConfig, HuggingFaceProvider};
 pub use interface::{
     generate, stream, BuiltInTool, ContentBlockType, GenerateRequest, GenerateResponse,
-    GenerationConfig, JsonSchemaFormat, LanguageModel, Message, MessageRole, Modality,
+    GenerationConfig, JsonSchemaFormat, LanguageModel, Message, MessageRole, Modality, PromptRef,
     ReasoningEffort, ResponseFormat, ResponseMetadata, StreamChunk, StreamHandle, StreamRequest,
     TokenUsage, ToolCall, ToolChoice, ToolDefinition,
 };

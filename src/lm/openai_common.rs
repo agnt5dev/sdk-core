@@ -5,7 +5,7 @@ use async_stream::try_stream;
 use futures::{Stream, StreamExt};
 use reqwest::Response;
 use serde::{Deserialize, Serialize};
-use serde_json::{self, Value as JsonValue, json};
+use serde_json::{self, json, Value as JsonValue};
 
 use crate::error::{Result as SdkResult, SdkError};
 

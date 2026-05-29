@@ -332,7 +332,10 @@ impl McpClient {
 
         match matching_servers.len() {
             0 => Err(McpError::ToolNotFound(tool_name.to_string())),
-            1 => self.call_tool(&matching_servers[0], tool_name, arguments).await,
+            1 => {
+                self.call_tool(&matching_servers[0], tool_name, arguments)
+                    .await
+            }
             _ => Err(McpError::Server(format!(
                 "ambiguous tool '{}': found on servers [{}]. Use call_tool() with an explicit server name.",
                 tool_name,

@@ -171,7 +171,7 @@ impl QdrantProvider {
             _ => {
                 return Err(SdkError::Other(anyhow::anyhow!(
                     "Point missing vector data"
-                )))
+                )));
             }
         };
 

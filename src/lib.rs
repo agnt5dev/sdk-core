@@ -45,8 +45,8 @@ pub use lm::{
     GenerateResponse, GenerationConfig, GroqConfig, GroqProvider, JsonSchemaFormat, LanguageModel,
     Message, MessageRole, Modality, OpenAiChatConfig, OpenAiChatProvider, OpenAiConfig,
     OpenAiEmbedder, OpenAiEmbedderConfig, OpenAiEmbeddingModel, OpenAiProvider, OpenRouterConfig,
-    OpenRouterProvider, ReasoningEffort, ResponseFormat, StreamChunk, StreamHandle, StreamRequest,
-    TokenUsage, ToolChoice,
+    OpenRouterProvider, PromptRef, ReasoningEffort, ResponseFormat, StreamChunk, StreamHandle,
+    StreamRequest, TokenUsage, ToolChoice,
 };
 pub use logging::{clear_error_buffer, get_error_buffer, init_logging};
 pub use memory::{MemoryMetadata, MemoryResult, MemoryScope, SemanticMemory, SemanticMemoryConfig};
