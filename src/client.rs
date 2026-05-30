@@ -498,13 +498,28 @@ fn is_retryable_engine_status(status: &tonic::Status) -> bool {
             | tonic::Code::DeadlineExceeded
             | tonic::Code::Cancelled
             | tonic::Code::Unknown
-    ) || message.contains("upstream connect error")
+    ) || is_retryable_engine_message(&message)
+}
+
+fn is_retryable_engine_message(message: &str) -> bool {
+    message.contains("upstream connect error")
         || message.contains("disconnect/reset before headers")
         || message.contains("connection termination")
         || message.contains("connection refused")
         || message.contains("broken pipe")
         || message.contains("h2 protocol error")
         || message.contains("timeout expired")
+        || message.contains("no sequencer available")
+        || message.contains("this node is not the sequencer")
+        || message.contains("stale epoch")
+        || message.contains("future epoch")
+        || message.contains("epoch ahead")
+        || message.contains("not partition owner")
+        || message.contains("partition not writable")
+        || message.contains("quorum not reached")
+        || message.contains("no connected peers for quorum replication")
+        || message.contains("not connected for catch-up")
+        || message.contains("catch-up failed")
 }
 
 async fn sleep_engine_retry(attempt: usize) {
@@ -681,6 +696,28 @@ pub fn build_engine_record(
         data_type: "json".to_string(),
         data_checksum: vec![],
         data_compressed: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retryable_engine_status_includes_partition_handoff_errors() {
+        let status = tonic::Status::internal(
+            "Engine AppendBatch failed: no sequencer available after retry",
+        );
+        assert!(is_retryable_engine_status(&status));
+
+        let status = tonic::Status::failed_precondition("stale epoch on forward: 162 < 163");
+        assert!(is_retryable_engine_status(&status));
+    }
+
+    #[test]
+    fn retryable_engine_status_does_not_retry_plain_internal_errors() {
+        let status = tonic::Status::internal("serialization failed");
+        assert!(!is_retryable_engine_status(&status));
     }
 }
 
