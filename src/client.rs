@@ -1,11 +1,11 @@
 use crate::error::{Result, SdkError};
 use crate::pb::{
+    AppendBatchRequest, AppendRequest, CheckpointRequest, CheckpointType, CompleteJobRequest,
+    CompleteJobResponse, DurableStepCheckpoint, EventStreamMessage, FindByStepKeyRequest,
+    PollJobsRequest, PollJobsResponse, Record, RegisterService, RuntimeMessage, ServiceMessage,
     engine_service_client::EngineServiceClient,
     execution_engine_service_client::ExecutionEngineServiceClient,
-    worker_coordinator_service_client::WorkerCoordinatorServiceClient, AppendBatchRequest,
-    AppendRequest, CheckpointRequest, CheckpointType, CompleteJobRequest, CompleteJobResponse,
-    DurableStepCheckpoint, EventStreamMessage, FindByStepKeyRequest, PollJobsRequest,
-    PollJobsResponse, Record, RegisterService, RuntimeMessage, ServiceMessage,
+    worker_coordinator_service_client::WorkerCoordinatorServiceClient,
 };
 use std::collections::HashMap;
 use std::time::Duration;
@@ -487,6 +487,30 @@ pub async fn create_ee_event_stream(
 /// Each connection is an independent h2 session, distributing load to avoid
 /// the h2 PoisonError that occurs when 100+ concurrent requests share one connection.
 const ENGINE_POOL_SIZE: usize = 8;
+const ENGINE_RPC_RETRY_ATTEMPTS: usize = 20;
+const ENGINE_RPC_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+fn is_retryable_engine_status(status: &tonic::Status) -> bool {
+    let message = status.message().to_ascii_lowercase();
+    matches!(
+        status.code(),
+        tonic::Code::Unavailable
+            | tonic::Code::DeadlineExceeded
+            | tonic::Code::Cancelled
+            | tonic::Code::Unknown
+    ) || message.contains("upstream connect error")
+        || message.contains("disconnect/reset before headers")
+        || message.contains("connection termination")
+        || message.contains("connection refused")
+        || message.contains("broken pipe")
+        || message.contains("h2 protocol error")
+        || message.contains("timeout expired")
+}
+
+async fn sleep_engine_retry(attempt: usize) {
+    let multiplier = (attempt + 1) as u32;
+    tokio::time::sleep(ENGINE_RPC_RETRY_DELAY * multiplier).await;
+}
 
 /// Client for communicating with the AGNT5 Engine.
 ///
@@ -555,42 +579,79 @@ impl EngineClient {
 
     /// Append a single record to the engine.
     pub async fn append(&mut self, record: Record) -> Result<(u64, i64)> {
-        let response = self
-            .next_client()
-            .append(AppendRequest {
-                record: Some(record),
-            })
-            .await
-            .map_err(|e| {
-                debug!("Engine Append failed: {}", e);
-                SdkError::Connection {
-                    message: format!("Engine Append failed: {}", e),
-                    code: crate::error::ErrorCode::ConnectionFailed,
-                    source: None,
+        for attempt in 0..ENGINE_RPC_RETRY_ATTEMPTS {
+            match self
+                .next_client()
+                .append(AppendRequest {
+                    record: Some(record.clone()),
+                })
+                .await
+            {
+                Ok(response) => {
+                    let response = response.into_inner();
+                    return Ok((response.offset, response.timestamp_ns));
                 }
-            })?
-            .into_inner();
+                Err(status)
+                    if attempt + 1 < ENGINE_RPC_RETRY_ATTEMPTS
+                        && is_retryable_engine_status(&status) =>
+                {
+                    debug!(
+                        attempt = attempt + 1,
+                        max = ENGINE_RPC_RETRY_ATTEMPTS,
+                        "Engine Append hit retryable gRPC status: {}",
+                        status
+                    );
+                    sleep_engine_retry(attempt).await;
+                }
+                Err(status) => {
+                    debug!("Engine Append failed: {}", status);
+                    return Err(SdkError::Connection {
+                        message: format!("Engine Append failed: {}", status),
+                        code: crate::error::ErrorCode::ConnectionFailed,
+                        source: None,
+                    });
+                }
+            }
+        }
 
-        Ok((response.offset, response.timestamp_ns))
+        unreachable!("engine append retry loop always returns")
     }
 
     /// Append a batch of records to the engine.
     pub async fn append_batch(&mut self, records: Vec<Record>) -> Result<i32> {
-        let response = self
-            .next_client()
-            .append_batch(AppendBatchRequest { records })
-            .await
-            .map_err(|e| {
-                debug!("Engine AppendBatch failed: {}", e);
-                SdkError::Connection {
-                    message: format!("Engine AppendBatch failed: {}", e),
-                    code: crate::error::ErrorCode::ConnectionFailed,
-                    source: None,
+        for attempt in 0..ENGINE_RPC_RETRY_ATTEMPTS {
+            match self
+                .next_client()
+                .append_batch(AppendBatchRequest {
+                    records: records.clone(),
+                })
+                .await
+            {
+                Ok(response) => return Ok(response.into_inner().written_count),
+                Err(status)
+                    if attempt + 1 < ENGINE_RPC_RETRY_ATTEMPTS
+                        && is_retryable_engine_status(&status) =>
+                {
+                    debug!(
+                        attempt = attempt + 1,
+                        max = ENGINE_RPC_RETRY_ATTEMPTS,
+                        "Engine AppendBatch hit retryable gRPC status: {}",
+                        status
+                    );
+                    sleep_engine_retry(attempt).await;
                 }
-            })?
-            .into_inner();
+                Err(status) => {
+                    debug!("Engine AppendBatch failed: {}", status);
+                    return Err(SdkError::Connection {
+                        message: format!("Engine AppendBatch failed: {}", status),
+                        code: crate::error::ErrorCode::ConnectionFailed,
+                        source: None,
+                    });
+                }
+            }
+        }
 
-        Ok(response.written_count)
+        unreachable!("engine append batch retry loop always returns")
     }
 }
 

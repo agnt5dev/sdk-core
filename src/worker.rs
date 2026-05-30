@@ -2,10 +2,10 @@ use crate::client::{self, EngineClient, WorkerCoordinatorClient};
 use crate::error::Result;
 use crate::journal_queue::{JournalEventMessage, JournalEventQueue, JournalQueueConfig};
 use crate::pb::{
-    execution_engine_service_client::ExecutionEngineServiceClient, CompleteJobRequest,
-    ComponentInfo, DispatchComponentResponse, EventStreamMessage, HealthCheck, PollJobsRequest,
-    RegisterService, RuntimeMessage, RuntimeMessageType, ServiceMessage, UnregisterService,
-    WorkerHealthStatus, WriteCheckpointRequest,
+    CompleteJobRequest, ComponentInfo, DispatchComponentResponse, EventStreamMessage, HealthCheck,
+    PollJobsRequest, RegisterService, RuntimeMessage, RuntimeMessageType, ServiceMessage,
+    UnregisterService, WorkerHealthStatus, WriteCheckpointRequest,
+    execution_engine_service_client::ExecutionEngineServiceClient,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -885,9 +885,9 @@ impl Worker {
         }
 
         if let Some(mut engine) = self.ensure_engine_client().await? {
-            let records: Vec<_> = events
+            let originals: Vec<_> = events
                 .into_iter()
-                .map(|(run_id, event_type, data, _seq, metadata, ts)| {
+                .map(|(run_id, event_type, data, sequence, metadata, ts)| {
                     let mut merged = metadata;
                     for (k, v) in &self.metadata {
                         if !merged.contains_key(k) {
@@ -895,31 +895,70 @@ impl Worker {
                         }
                     }
                     let (cid, pcid) = take_correlation_ids(&mut merged);
+                    JournalEventMessage {
+                        run_id,
+                        event_type,
+                        data,
+                        correlation_id: cid,
+                        parent_correlation_id: pcid,
+                        tenant_id: None,
+                        source_timestamp_ns: ts,
+                        metadata: merged,
+                        queued_at: Instant::now(),
+                        is_streaming: false,
+                        is_sse_only: false,
+                        content_index: 0,
+                        sequence,
+                    }
+                })
+                .collect();
+
+            let records: Vec<_> = originals
+                .iter()
+                .map(|event| {
                     let canonical_project_id =
-                        canonical_project_id_from_metadata(&merged).unwrap_or_default();
-                    let mut merged = with_project_metadata(merged, &canonical_project_id);
-                    let tenant_id = merged
+                        canonical_project_id_from_metadata(&event.metadata).unwrap_or_default();
+                    let mut metadata =
+                        with_project_metadata(event.metadata.clone(), &canonical_project_id);
+                    let tenant_id = metadata
                         .remove("project_id")
-                        .or_else(|| merged.remove("tenant_id"))
+                        .or_else(|| metadata.remove("tenant_id"))
                         .unwrap_or_default();
 
                     client::build_engine_record(
                         tenant_id,
-                        run_id,
-                        event_type,
-                        data,
-                        ts,
+                        event.run_id.clone(),
+                        event.event_type.clone(),
+                        event.data.clone(),
+                        event.source_timestamp_ns,
                         String::new(),
-                        cid,
-                        pcid,
-                        merged,
+                        event.correlation_id.clone(),
+                        event.parent_correlation_id.clone(),
+                        metadata,
                     )
                 })
                 .collect();
 
-            let count = records.len();
-            engine.append_batch(records).await?;
-            debug!("Engine batch checkpoint: {} events persisted", count);
+            let count = originals.len();
+            match engine.append_batch(records).await {
+                Ok(_) => {
+                    debug!("Engine batch checkpoint: {} events persisted", count);
+                }
+                Err(e) => {
+                    warn!(
+                        "Engine batch checkpoint failed for {} non-terminal events; queued for retry: {}",
+                        count, e
+                    );
+                    {
+                        let mut guard = self.engine_client.lock().await;
+                        *guard = None;
+                    }
+                    for event in originals.into_iter().rev() {
+                        self.journal_queue.push_front(event).ok();
+                    }
+                    self.journal_queue.record_error();
+                }
+            }
             return Ok(());
         }
 
