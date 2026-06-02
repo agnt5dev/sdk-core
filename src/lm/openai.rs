@@ -562,10 +562,27 @@ pub enum OutputItem {
     },
     #[serde(rename = "reasoning")]
     Reasoning {},
-    /// Built-in tool action items (web_search_call, code_interpreter_call,
-    /// file_search_call, image_generation_call, mcp_call, ...). OpenAI emits
-    /// these to describe tool actions it took; they carry no content we surface,
-    /// so we tolerate any unknown variant rather than failing the whole response.
+    #[serde(rename = "web_search_call")]
+    WebSearchCall {
+        id: String,
+        #[serde(rename = "status", default)]
+        _status: String,
+    },
+    #[serde(rename = "code_interpreter_call")]
+    CodeInterpreterCall {
+        id: String,
+        #[serde(rename = "status", default)]
+        _status: String,
+    },
+    #[serde(rename = "file_search_call")]
+    FileSearchCall {
+        id: String,
+        #[serde(rename = "status", default)]
+        _status: String,
+    },
+    /// Future built-in tool action items (image_generation_call, mcp_call, ...).
+    /// OpenAI emits these to describe tool actions it took; tolerate unknown
+    /// variants rather than failing the whole response.
     #[serde(other)]
     Unknown,
 }
@@ -660,8 +677,13 @@ impl ResponsesApiResponse {
                     // Reasoning items from GPT-5 models are tracked separately in usage stats
                     // We don't include them in the text output
                 }
+                OutputItem::WebSearchCall { .. }
+                | OutputItem::CodeInterpreterCall { .. }
+                | OutputItem::FileSearchCall { .. } => {
+                    // Built-in tool action items are surfaced through tool_calls.
+                }
                 OutputItem::Unknown => {
-                    // Built-in tool action items (web_search_call, etc.) — no content to surface
+                    // Unknown output items carry no content we can surface.
                 }
             }
         }
@@ -719,6 +741,27 @@ fn tool_calls_from_output(output: &[OutputItem]) -> Vec<ToolCall> {
                     id: format!("call_{}", tool_name),
                     name: tool_name.clone(),
                     arguments: arguments.to_string(),
+                });
+            }
+            OutputItem::WebSearchCall { id, .. } => {
+                tool_calls.push(ToolCall {
+                    id: id.clone(),
+                    name: "web_search_preview".to_string(),
+                    arguments: "{}".to_string(),
+                });
+            }
+            OutputItem::CodeInterpreterCall { id, .. } => {
+                tool_calls.push(ToolCall {
+                    id: id.clone(),
+                    name: "code_interpreter".to_string(),
+                    arguments: "{}".to_string(),
+                });
+            }
+            OutputItem::FileSearchCall { id, .. } => {
+                tool_calls.push(ToolCall {
+                    id: id.clone(),
+                    name: "file_search".to_string(),
+                    arguments: "{}".to_string(),
                 });
             }
             _ => {}
@@ -1526,7 +1569,8 @@ mod tests {
     #[test]
     fn test_response_with_builtin_tool_output_items() {
         // OpenAI emits web_search_call (and other built-in tool action items)
-        // alongside the message. Unknown output item types must not fail parsing.
+        // alongside the message. Known built-ins should surface as tool calls,
+        // while future unknown item types must not fail parsing.
         let json = r#"{
             "id": "resp_websearch",
             "created_at": 1700000000,
@@ -1534,6 +1578,9 @@ mod tests {
             "status": "completed",
             "output": [
                 {"type": "web_search_call", "id": "ws_1", "status": "completed"},
+                {"type": "code_interpreter_call", "id": "ci_1", "status": "completed"},
+                {"type": "file_search_call", "id": "fs_1", "status": "completed"},
+                {"type": "image_generation_call", "id": "ig_1", "status": "completed"},
                 {"type": "message", "content": [{"type": "output_text", "text": "Done."}]}
             ]
         }"#;
@@ -1541,6 +1588,16 @@ mod tests {
         let response: ResponsesApiResponse = serde_json::from_str(json).unwrap();
         let generated = response.into_generate_response().unwrap();
         assert_eq!(generated.text.trim(), "Done.");
+
+        let tool_calls = generated.tool_calls.unwrap();
+        assert_eq!(tool_calls.len(), 3);
+        assert_eq!(tool_calls[0].id, "ws_1");
+        assert_eq!(tool_calls[0].name, "web_search_preview");
+        assert_eq!(tool_calls[0].arguments, "{}");
+        assert_eq!(tool_calls[1].id, "ci_1");
+        assert_eq!(tool_calls[1].name, "code_interpreter");
+        assert_eq!(tool_calls[2].id, "fs_1");
+        assert_eq!(tool_calls[2].name, "file_search");
     }
 
     #[test]

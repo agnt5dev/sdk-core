@@ -390,9 +390,11 @@ fn build_stream(
                             block_type: current_block_type,
                         };
 
-                        // Extract tool_use blocks and accumulate tool calls
-                        if content_block.block_type == "tool_use" {
-                            if let (Some(id), Some(name)) = (&content_block.id, &content_block.name) {
+                        // Extract tool_use/server_tool_use blocks and accumulate tool calls
+                        if content_block.is_tool_use() {
+                            if let (Some(id), Some(name)) =
+                                (&content_block.id, &content_block.name)
+                            {
                                 let input = content_block.input.clone().unwrap_or_else(|| json!({}));
                                 tool_calls.push(super::interface::ToolCall {
                                     id: id.clone(),
@@ -709,7 +711,7 @@ impl MessagesResponse {
                         text_parts.push(text.clone());
                     }
                 }
-                "tool_use" => {
+                "tool_use" | "server_tool_use" => {
                     // Extract tool call information from tool_use block
                     if let (Some(id), Some(name), Some(input)) =
                         (&block.id, &block.name, &block.input)
@@ -957,6 +959,10 @@ impl StreamContentBlock {
         self.block_type == "thinking"
     }
 
+    fn is_tool_use(&self) -> bool {
+        matches!(self.block_type.as_str(), "tool_use" | "server_tool_use")
+    }
+
     /// Get the initial content for this block (if any).
     fn initial_content(&self) -> Option<String> {
         if self.is_thinking() {
@@ -985,9 +991,9 @@ impl StreamContentBlock {
     }
 
     fn to_tool_use_json(&self) -> Option<String> {
-        if self.block_type == "tool_use" {
+        if self.is_tool_use() {
             let json = json!({
-                "type": "tool_use",
+                "type": self.block_type,
                 "id": self.id,
                 "name": self.name,
                 "input": self.input.clone().unwrap_or_else(|| json!({})),
@@ -1108,5 +1114,63 @@ fn delimiter_length(remaining: &str) -> usize {
         4
     } else {
         2
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn response_server_tool_use_surfaces_as_tool_call() {
+        let json = r#"{
+            "id": "msg_123",
+            "model": "claude-sonnet-4-5",
+            "content": [
+                {
+                    "type": "server_tool_use",
+                    "id": "srvtoolu_1",
+                    "name": "web_search",
+                    "input": {"query": "AGNT5"}
+                },
+                {
+                    "type": "text",
+                    "text": "Search complete."
+                }
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        }"#;
+
+        let response: MessagesResponse = serde_json::from_str(json).unwrap();
+        let generated = response
+            .into_generate_response(ResponseFormat::Text)
+            .unwrap();
+
+        assert_eq!(generated.text, "Search complete.");
+        let tool_calls = generated.tool_calls.unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "srvtoolu_1");
+        assert_eq!(tool_calls[0].name, "web_search");
+        assert_eq!(tool_calls[0].arguments, r#"{"query":"AGNT5"}"#);
+    }
+
+    #[test]
+    fn streaming_server_tool_use_block_is_treated_as_tool_use() {
+        let block: StreamContentBlock = serde_json::from_value(json!({
+            "type": "server_tool_use",
+            "id": "srvtoolu_1",
+            "name": "web_fetch",
+            "input": {"url": "https://example.com"}
+        }))
+        .unwrap();
+
+        assert!(block.is_tool_use());
+        let tool_json: JsonValue =
+            serde_json::from_str(&block.to_tool_use_json().unwrap()).unwrap();
+        assert_eq!(tool_json["type"], "server_tool_use");
+        assert_eq!(tool_json["id"], "srvtoolu_1");
+        assert_eq!(tool_json["name"], "web_fetch");
+        assert_eq!(tool_json["input"]["url"], "https://example.com");
     }
 }
