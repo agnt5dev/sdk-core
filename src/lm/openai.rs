@@ -9,7 +9,7 @@ use futures::{Stream, StreamExt};
 use opentelemetry::trace::Span;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::error::{Result as SdkResult, SdkError};
 
@@ -567,18 +567,24 @@ pub enum OutputItem {
         id: String,
         #[serde(rename = "status", default)]
         _status: String,
+        #[serde(flatten)]
+        provider_fields: Map<String, Value>,
     },
     #[serde(rename = "code_interpreter_call")]
     CodeInterpreterCall {
         id: String,
         #[serde(rename = "status", default)]
         _status: String,
+        #[serde(flatten)]
+        provider_fields: Map<String, Value>,
     },
     #[serde(rename = "file_search_call")]
     FileSearchCall {
         id: String,
         #[serde(rename = "status", default)]
         _status: String,
+        #[serde(flatten)]
+        provider_fields: Map<String, Value>,
     },
     /// Future built-in tool action items (image_generation_call, mcp_call, ...).
     /// OpenAI emits these to describe tool actions it took; tolerate unknown
@@ -743,25 +749,37 @@ fn tool_calls_from_output(output: &[OutputItem]) -> Vec<ToolCall> {
                     arguments: arguments.to_string(),
                 });
             }
-            OutputItem::WebSearchCall { id, .. } => {
+            OutputItem::WebSearchCall {
+                id,
+                provider_fields,
+                ..
+            } => {
                 tool_calls.push(ToolCall {
                     id: id.clone(),
                     name: "web_search_preview".to_string(),
-                    arguments: "{}".to_string(),
+                    arguments: built_in_tool_arguments(provider_fields),
                 });
             }
-            OutputItem::CodeInterpreterCall { id, .. } => {
+            OutputItem::CodeInterpreterCall {
+                id,
+                provider_fields,
+                ..
+            } => {
                 tool_calls.push(ToolCall {
                     id: id.clone(),
                     name: "code_interpreter".to_string(),
-                    arguments: "{}".to_string(),
+                    arguments: built_in_tool_arguments(provider_fields),
                 });
             }
-            OutputItem::FileSearchCall { id, .. } => {
+            OutputItem::FileSearchCall {
+                id,
+                provider_fields,
+                ..
+            } => {
                 tool_calls.push(ToolCall {
                     id: id.clone(),
                     name: "file_search".to_string(),
-                    arguments: "{}".to_string(),
+                    arguments: built_in_tool_arguments(provider_fields),
                 });
             }
             _ => {}
@@ -769,6 +787,14 @@ fn tool_calls_from_output(output: &[OutputItem]) -> Vec<ToolCall> {
     }
 
     tool_calls
+}
+
+fn built_in_tool_arguments(provider_fields: &Map<String, Value>) -> String {
+    if provider_fields.is_empty() {
+        "{}".to_string()
+    } else {
+        Value::Object(provider_fields.clone()).to_string()
+    }
 }
 
 fn extract_openai_error_message(value: &Value) -> Option<String> {
@@ -1577,9 +1603,25 @@ mod tests {
             "model": "gpt-4o-mini",
             "status": "completed",
             "output": [
-                {"type": "web_search_call", "id": "ws_1", "status": "completed"},
-                {"type": "code_interpreter_call", "id": "ci_1", "status": "completed"},
-                {"type": "file_search_call", "id": "fs_1", "status": "completed"},
+                {
+                    "type": "web_search_call",
+                    "id": "ws_1",
+                    "status": "completed",
+                    "action": {"type": "search", "query": "AGNT5 built-in tools"}
+                },
+                {
+                    "type": "code_interpreter_call",
+                    "id": "ci_1",
+                    "status": "completed",
+                    "code": "print('hello')"
+                },
+                {
+                    "type": "file_search_call",
+                    "id": "fs_1",
+                    "status": "completed",
+                    "queries": ["AGNT5"],
+                    "results": [{"file_id": "file_1"}]
+                },
                 {"type": "image_generation_call", "id": "ig_1", "status": "completed"},
                 {"type": "message", "content": [{"type": "output_text", "text": "Done."}]}
             ]
@@ -1593,11 +1635,25 @@ mod tests {
         assert_eq!(tool_calls.len(), 3);
         assert_eq!(tool_calls[0].id, "ws_1");
         assert_eq!(tool_calls[0].name, "web_search_preview");
-        assert_eq!(tool_calls[0].arguments, "{}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&tool_calls[0].arguments).unwrap(),
+            serde_json::json!({"action": {"type": "search", "query": "AGNT5 built-in tools"}})
+        );
         assert_eq!(tool_calls[1].id, "ci_1");
         assert_eq!(tool_calls[1].name, "code_interpreter");
+        assert_eq!(
+            serde_json::from_str::<Value>(&tool_calls[1].arguments).unwrap(),
+            serde_json::json!({"code": "print('hello')"})
+        );
         assert_eq!(tool_calls[2].id, "fs_1");
         assert_eq!(tool_calls[2].name, "file_search");
+        assert_eq!(
+            serde_json::from_str::<Value>(&tool_calls[2].arguments).unwrap(),
+            serde_json::json!({
+                "queries": ["AGNT5"],
+                "results": [{"file_id": "file_1"}]
+            })
+        );
     }
 
     #[test]
