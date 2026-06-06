@@ -61,13 +61,28 @@ pub fn can_execute_locally(name: &str) -> bool {
 ///
 /// Returns `Some(ScorerResult)` if handled, `None` if the scorer is unknown
 /// or not implemented in the Rust fast path.
+///
+/// Known deterministic built-ins always return a scorer result. Bad request
+/// payloads are surfaced as config/input errors instead of falling through to
+/// component lookup as "not found".
 pub fn execute(scorer_name: &str, input_data: &[u8]) -> Option<ScorerResult> {
     if !can_execute_locally(scorer_name) {
         return None;
     }
 
     // Parse the input JSON
-    let input_json: Value = serde_json::from_slice(input_data).ok()?;
+    let input_json: Value = match serde_json::from_slice(input_data) {
+        Ok(value) => value,
+        Err(e) => {
+            return Some(ScorerResult {
+                score: 0.0,
+                passed: Some(false),
+                label: Some("input_error".into()),
+                explanation: Some(format!("Invalid scorer input JSON: {}", e)),
+                metadata: None,
+            });
+        }
+    };
 
     let output = input_json.get("output").cloned().unwrap_or(Value::Null);
     let expected = input_json.get("expected").cloned();
@@ -232,6 +247,19 @@ mod tests {
     fn test_unknown_scorer_returns_none() {
         let input = json!({"output": "test"});
         assert!(execute("unknown_scorer", input.to_string().as_bytes()).is_none());
+    }
+
+    #[test]
+    fn test_known_scorer_bad_input_returns_input_error() {
+        let result = execute("exact_match", b"{not json").unwrap();
+        assert_eq!(result.score, 0.0);
+        assert_eq!(result.passed, Some(false));
+        assert_eq!(result.label.as_deref(), Some("input_error"));
+        assert!(result
+            .explanation
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Invalid scorer input JSON"));
     }
 
     #[test]
