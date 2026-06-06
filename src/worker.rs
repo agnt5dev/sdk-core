@@ -2,18 +2,38 @@ use crate::client::{self, EngineClient, WorkerCoordinatorClient};
 use crate::error::Result;
 use crate::journal_queue::{JournalEventMessage, JournalEventQueue, JournalQueueConfig};
 use crate::pb::{
-    CompleteJobRequest, ComponentInfo, DispatchComponentResponse, EventStreamMessage, HealthCheck,
-    PollJobsRequest, RegisterService, RuntimeMessage, RuntimeMessageType, ServiceMessage,
-    UnregisterService, WorkerHealthStatus, WriteCheckpointRequest,
-    execution_engine_service_client::ExecutionEngineServiceClient,
+    execution_engine_service_client::ExecutionEngineServiceClient, CompleteJobRequest,
+    ComponentInfo, DispatchComponentResponse, EventStreamMessage, HealthCheck, PollJobsRequest,
+    RegisterService, RuntimeMessage, RuntimeMessageType, ServiceMessage, UnregisterService,
+    WorkerHealthStatus, WriteCheckpointRequest,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as TokioMutex;
 use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+fn poll_component_names(components: &[ComponentInfo]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut names = Vec::with_capacity(
+        components.len() + crate::eval::builtin_scorer::BUILTIN_SCORER_NAMES.len(),
+    );
+    for component in components {
+        if !component.name.is_empty() && seen.insert(component.name.clone()) {
+            names.push(component.name.clone());
+        }
+    }
+    for scorer in crate::eval::builtin_scorer::BUILTIN_SCORER_NAMES {
+        if crate::eval::builtin_scorer::can_execute_locally(scorer)
+            && seen.insert((*scorer).to_string())
+        {
+            names.push((*scorer).to_string());
+        }
+    }
+    names
+}
 
 fn take_correlation_ids(metadata: &mut HashMap<String, String>) -> (String, String) {
     let correlation_id = metadata
@@ -2333,7 +2353,7 @@ impl Worker {
     ) -> tokio::task::JoinHandle<()> {
         let worker_id = self.config.worker_id.clone();
         let endpoint = self.config.resolved_coordinator_endpoint();
-        let component_ids: Vec<String> = self.components.iter().map(|c| c.name.clone()).collect();
+        let component_ids = poll_component_names(&self.components);
         let project_id = canonical_project_id_from_env();
         let deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").ok();
         let streaming_runs = self.streaming_runs.clone();
@@ -2694,8 +2714,36 @@ impl Worker {
 
 #[cfg(test)]
 mod tests {
-    use super::take_correlation_ids;
+    use super::{poll_component_names, take_correlation_ids};
+    use crate::pb::ComponentInfo;
     use std::collections::HashMap;
+
+    #[test]
+    fn poll_component_names_include_sdk_core_builtin_scorers() {
+        let names = poll_component_names(&[ComponentInfo {
+            name: "ks_noop".to_string(),
+            ..Default::default()
+        }]);
+
+        assert!(names.contains(&"ks_noop".to_string()));
+        assert!(names.contains(&"exact_match".to_string()));
+        assert!(names.contains(&"contains".to_string()));
+        assert!(names.contains(&"json_valid".to_string()));
+        assert!(!names.contains(&"llm_judge".to_string()));
+    }
+
+    #[test]
+    fn poll_component_names_deduplicates_builtin_scorers() {
+        let names = poll_component_names(&[ComponentInfo {
+            name: "exact_match".to_string(),
+            ..Default::default()
+        }]);
+
+        assert_eq!(
+            names.iter().filter(|name| *name == "exact_match").count(),
+            1
+        );
+    }
 
     #[test]
     fn take_correlation_ids_accepts_canonical_keys() {

@@ -1,11 +1,11 @@
 use crate::error::{Result, SdkError};
 use crate::pb::{
-    AppendBatchRequest, AppendRequest, CheckpointRequest, CheckpointType, CompleteJobRequest,
-    CompleteJobResponse, DurableStepCheckpoint, EventStreamMessage, FindByStepKeyRequest,
-    PollJobsRequest, PollJobsResponse, Record, RegisterService, RuntimeMessage, ServiceMessage,
     engine_service_client::EngineServiceClient,
     execution_engine_service_client::ExecutionEngineServiceClient,
-    worker_coordinator_service_client::WorkerCoordinatorServiceClient,
+    worker_coordinator_service_client::WorkerCoordinatorServiceClient, AppendBatchRequest,
+    AppendRequest, CheckpointRequest, CheckpointType, CompleteJobRequest, CompleteJobResponse,
+    DurableStepCheckpoint, EventStreamMessage, FindByStepKeyRequest, PollJobsRequest,
+    PollJobsResponse, Record, RegisterService, RuntimeMessage, ServiceMessage,
 };
 use std::collections::HashMap;
 use std::time::Duration;
