@@ -10,13 +10,11 @@ pub mod journal_queue;
 pub mod lm;
 pub mod logging;
 pub mod mcp;
-pub mod memory;
 pub mod memory_service;
 pub mod runtime_adapter;
 pub mod sandbox;
 pub mod span_filter;
 pub mod telemetry;
-pub mod vectordb;
 pub mod webhook;
 pub mod worker;
 
@@ -49,7 +47,6 @@ pub use lm::{
     StreamRequest, TokenUsage, ToolChoice,
 };
 pub use logging::{clear_error_buffer, get_error_buffer, init_logging};
-pub use memory::{MemoryMetadata, MemoryResult, MemoryScope, SemanticMemory, SemanticMemoryConfig};
 pub use runtime_adapter::{
     DummyStateManager, EntityStateLoadResult, EntityStateManager, EntityStateSaveResult,
     InvocationRequest, InvocationResponse, RuntimeAdapter, RuntimeCapabilities, RuntimeContext,
@@ -68,12 +65,6 @@ pub use telemetry::{
     extract_context_from_runtime_message, init_telemetry, record_execution_request,
     record_execution_request_with_attrs, record_sandbox_error, record_sandbox_success,
     record_span_error, record_span_success, shutdown_telemetry,
-};
-#[cfg(feature = "qdrant")]
-pub use vectordb::QdrantProvider;
-pub use vectordb::{
-    Collection, DistanceMetric, PgVectorProvider, PineconeProvider, SearchQuery, SearchResult,
-    VectorDatabase, VectorDbRegistry, VectorEntry, VectorFilter, VectorMetadata,
 };
 pub use worker::Worker;
 

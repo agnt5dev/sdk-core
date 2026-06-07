@@ -1,8 +1,7 @@
 //! Semantic memory service with provider-backed vector storage.
 //!
-//! This is the AGNT5-native memory path. It is intentionally separate from the
-//! older `SemanticMemory` wrapper in `memory.rs` because this API enforces
-//! tenant/deployment/scope isolation and provenance.
+//! This is the AGNT5-native memory path. It enforces tenant/deployment/scope
+//! isolation and provenance.
 
 use std::sync::Arc;
 
