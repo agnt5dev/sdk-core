@@ -1,5 +1,5 @@
 // Embedder trait and implementations for generating text embeddings
-// Used by SemanticMemory for vectorizing text content
+// Used by memory providers and applications for vectorizing text content.
 
 use std::collections::HashMap;
 use std::env;
