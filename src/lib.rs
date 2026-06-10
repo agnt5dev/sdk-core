@@ -39,12 +39,13 @@ pub use journal_queue::{
 };
 pub use lm::{
     generate, stream, AnthropicConfig, AnthropicProvider, AzureOpenAiConfig, AzureOpenAiProvider,
-    BedrockConfig, BedrockProvider, BuiltInTool, Embedder, EmbedderRegistry, GenerateRequest,
-    GenerateResponse, GenerationConfig, GroqConfig, GroqProvider, JsonSchemaFormat, LanguageModel,
-    Message, MessageRole, Modality, OpenAiChatConfig, OpenAiChatProvider, OpenAiConfig,
-    OpenAiEmbedder, OpenAiEmbedderConfig, OpenAiEmbeddingModel, OpenAiProvider, OpenRouterConfig,
-    OpenRouterProvider, PromptRef, ReasoningEffort, ResponseFormat, StreamChunk, StreamHandle,
-    StreamRequest, TokenUsage, ToolChoice,
+    BasetenConfig, BasetenProvider, BedrockConfig, BedrockProvider, BuiltInTool, Embedder,
+    EmbedderRegistry, FireworksConfig, FireworksProvider, GenerateRequest, GenerateResponse,
+    GenerationConfig, GroqConfig, GroqProvider, JsonSchemaFormat, LanguageModel, LeptonConfig,
+    LeptonProvider, Message, MessageRole, Modality, OpenAiChatConfig, OpenAiChatProvider,
+    OpenAiConfig, OpenAiEmbedder, OpenAiEmbedderConfig, OpenAiEmbeddingModel, OpenAiProvider,
+    OpenRouterConfig, OpenRouterProvider, PromptRef, ReasoningEffort, ResponseFormat, StreamChunk,
+    StreamHandle, StreamRequest, TogetherConfig, TogetherProvider, TokenUsage, ToolChoice,
 };
 pub use logging::{clear_error_buffer, get_error_buffer, init_logging};
 pub use runtime_adapter::{
