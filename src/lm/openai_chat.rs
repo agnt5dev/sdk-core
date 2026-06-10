@@ -31,6 +31,7 @@ pub struct OpenAiChatConfig {
     pub api_key: String,
     pub base_url: String,
     pub chat_path: String,
+    pub auth_scheme: String,
     pub organization: Option<String>,
     pub project: Option<String>,
     pub timeout: Duration,
@@ -45,6 +46,7 @@ impl OpenAiChatConfig {
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
             chat_path: DEFAULT_CHAT_PATH.to_string(),
+            auth_scheme: "Bearer".to_string(),
             organization: None,
             project: None,
             timeout: DEFAULT_TIMEOUT,
@@ -61,6 +63,11 @@ impl OpenAiChatConfig {
 
     pub fn with_chat_path(mut self, chat_path: impl Into<String>) -> Self {
         self.chat_path = chat_path.into();
+        self
+    }
+
+    pub fn with_auth_scheme(mut self, auth_scheme: impl Into<String>) -> Self {
+        self.auth_scheme = auth_scheme.into();
         self
     }
 
@@ -161,7 +168,10 @@ impl OpenAiChatProvider {
         let mut builder = self
             .http
             .post(url)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
+            .header(
+                "Authorization",
+                format!("{} {}", self.config.auth_scheme, self.config.api_key),
+            )
             .header("Content-Type", "application/json");
 
         if let Some(org) = &self.config.organization {
