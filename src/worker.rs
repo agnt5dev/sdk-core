@@ -480,6 +480,28 @@ impl Worker {
         Ok(Some(client))
     }
 
+    /// Remove per-run tracking entries (lease stash, streaming flag) for a
+    /// finished invocation.
+    ///
+    /// Language SDKs that deliver results via the event queue (e.g. Python)
+    /// never send a terminal DispatchComponentResponse, so the cleanup in
+    /// `forward_worker_response` never runs for them. Without this hook the
+    /// maps grow by one entry per dispatch until the process OOMs under
+    /// sustained load. Mirrors `forward_worker_response`: lease entries are
+    /// keyed by the full invocation_id, the streaming flag by the base run_id.
+    fn cleanup_run_tracking(&self, invocation_id: &str) {
+        if let Ok(mut map) = self.pending_lease_ids.lock() {
+            map.remove(invocation_id);
+        }
+        let run_id = invocation_id
+            .split(':')
+            .next()
+            .unwrap_or(invocation_id);
+        if let Ok(mut map) = self.streaming_runs.lock() {
+            map.remove(run_id);
+        }
+    }
+
     /// Emit a checkpoint event synchronously and wait for acknowledgement.
     ///
     /// Sends a WriteCheckpoint unary RPC directly to the Execution Engine.
@@ -508,11 +530,13 @@ impl Worker {
         source_timestamp_ns: i64,
         timeout_ms: u64,
     ) -> Result<()> {
+        let is_terminal = event_type == "run.completed" || event_type == "run.failed";
+
         // ── Engine path: when AGNT5_ENGINE_URL is set, route directly to engine ──
         if let Some(mut engine) = self.ensure_engine_client().await? {
             // Before terminal checkpoints, flush any pending events for this run
             // directly to the engine via AppendBatch.
-            if event_type == "run.completed" || event_type == "run.failed" {
+            if is_terminal {
                 let pending = self.journal_queue.drain_run_events(&run_id);
                 if !pending.is_empty() {
                     let tenant_id = canonical_project_id_from_metadata(&metadata)
@@ -619,6 +643,10 @@ impl Worker {
                 experiment_id.as_deref(),
             );
 
+            if is_terminal {
+                self.cleanup_run_tracking(&run_id);
+            }
+
             return result;
         }
 
@@ -628,7 +656,7 @@ impl Worker {
         // pending SSE-only events (logs, deltas) for this run.
         // Route through EventStream (EE) which is the single SSE publisher.
         // Falls back to dispatch stream (WC) only if EventStream is unavailable.
-        if event_type == "run.completed" || event_type == "run.failed" {
+        if is_terminal {
             let pending = self.journal_queue.drain_run_events(&run_id);
             if !pending.is_empty() {
                 let es_tx = self.event_stream_tx.lock().ok().and_then(|g| g.clone());
@@ -805,6 +833,10 @@ impl Worker {
             result.is_ok(),
             experiment_id.as_deref(),
         );
+
+        if is_terminal {
+            self.cleanup_run_tracking(&run_id);
+        }
 
         result
     }
@@ -1589,6 +1621,11 @@ impl Worker {
                                             );
                                         }
                                     }
+                                    // A cancelled run never emits run.completed/
+                                    // run.failed from this worker (the gateway
+                                    // authors run.cancelled), so drop its
+                                    // tracking entries here.
+                                    self.cleanup_run_tracking(&req.invocation_id);
                                 }
                                 continue;
                             }
@@ -1798,9 +1835,14 @@ impl Worker {
         heartbeat_task.abort();
         journal_flush_task.abort();
 
-        // Clear streaming runs tracking AFTER flush task is aborted,
-        // so the flush task can drain any remaining SSE events first
+        // Clear per-run tracking AFTER flush task is aborted, so the flush
+        // task can drain any remaining SSE events first. In-flight work has
+        // already completed (worker handles awaited above), so no invocation
+        // still needs its lease stash.
         if let Ok(mut map) = self.streaming_runs.lock() {
+            map.clear();
+        }
+        if let Ok(mut map) = self.pending_lease_ids.lock() {
             map.clear();
         }
 
@@ -2714,9 +2756,77 @@ impl Worker {
 
 #[cfg(test)]
 mod tests {
-    use super::{poll_component_names, take_correlation_ids};
+    use super::{poll_component_names, take_correlation_ids, Worker, WorkerConfig};
     use crate::pb::ComponentInfo;
     use std::collections::HashMap;
+
+    #[test]
+    fn cleanup_run_tracking_removes_per_run_entries() {
+        let config = WorkerConfig::new(
+            "svc".to_string(),
+            "1.0.0".to_string(),
+            "standalone".to_string(),
+        );
+        let worker = Worker::new(config, Vec::new(), HashMap::new());
+
+        worker
+            .pending_lease_ids
+            .lock()
+            .unwrap()
+            .insert("run-1".to_string(), "lease-1".to_string());
+        worker
+            .pending_lease_ids
+            .lock()
+            .unwrap()
+            .insert("run-2".to_string(), "lease-2".to_string());
+        worker
+            .streaming_runs
+            .lock()
+            .unwrap()
+            .insert("run-1".to_string(), true);
+
+        worker.cleanup_run_tracking("run-1");
+
+        assert!(!worker
+            .pending_lease_ids
+            .lock()
+            .unwrap()
+            .contains_key("run-1"));
+        assert!(worker
+            .pending_lease_ids
+            .lock()
+            .unwrap()
+            .contains_key("run-2"));
+        assert!(!worker.streaming_runs.lock().unwrap().contains_key("run-1"));
+    }
+
+    #[test]
+    fn cleanup_run_tracking_strips_sub_invocation_suffix_for_streaming_flag() {
+        let config = WorkerConfig::new(
+            "svc".to_string(),
+            "1.0.0".to_string(),
+            "standalone".to_string(),
+        );
+        let worker = Worker::new(config, Vec::new(), HashMap::new());
+
+        // Lease entries are keyed by the full invocation_id; the streaming
+        // flag is keyed by the base run_id (before the first ':').
+        worker
+            .pending_lease_ids
+            .lock()
+            .unwrap()
+            .insert("run-1:0".to_string(), "lease-1".to_string());
+        worker
+            .streaming_runs
+            .lock()
+            .unwrap()
+            .insert("run-1".to_string(), true);
+
+        worker.cleanup_run_tracking("run-1:0");
+
+        assert!(worker.pending_lease_ids.lock().unwrap().is_empty());
+        assert!(worker.streaming_runs.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn poll_component_names_include_sdk_core_builtin_scorers() {
