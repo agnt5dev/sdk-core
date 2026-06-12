@@ -56,7 +56,7 @@ pub use runtime_adapter::{
 pub use sandbox::{
     CreateSandboxOptions, DaytonaProviderConfig, DaytonaSandbox, DaytonaSandboxProvider,
     E2bProviderConfig, E2bSandbox, E2bSandboxProvider, ExecuteCodeRequest, ExecuteCodeResult,
-    FileInfo, Language, ListFilesResult, ModalProviderConfig, ModalSandboxProvider,
+    FileInfo, Language, ListFilesResult, ModalProviderConfig, ModalSandbox, ModalSandboxProvider,
     NorthflankProviderConfig, NorthflankSandbox, NorthflankSandboxProvider, ReadFileResult,
     RemoteSandbox, RemoteSandboxConfig, SandboxAuth, SandboxBackend, SandboxBackendKind,
     SandboxCapabilities, SandboxExecutor, SandboxHealthResult, SandboxInfo, SandboxProvider,

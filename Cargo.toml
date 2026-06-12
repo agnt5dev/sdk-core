@@ -11,7 +11,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # gRPC and Protocol Buffers
-tonic = "0.14.1"
+tonic = { version = "0.14.1", features = ["tls-ring", "tls-webpki-roots"] }
 tonic-prost = "0.14.1"
 prost = "0.14.1"
 prost-types = "0.14.1"

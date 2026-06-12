@@ -10,7 +10,7 @@
 //! - [`vercel`][] — Vercel Sandbox (api.vercel.com /v2/sandboxes)
 //! - [`northflank`][] — Northflank (REST lifecycle + websocket exec)
 //! - [`together`][] — Together Code Interpreter (api.together.ai /v1/tci)
-//! - [`modal`][] — Modal (placeholder — gRPC-only API, native support planned)
+//! - [`modal`][] — Modal (native gRPC via vendored protos)
 
 pub(crate) mod common;
 pub mod daytona;

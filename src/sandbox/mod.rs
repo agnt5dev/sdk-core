@@ -28,7 +28,7 @@ pub mod types;
 
 pub use providers::daytona::{DaytonaProviderConfig, DaytonaSandbox, DaytonaSandboxProvider};
 pub use providers::e2b::{E2bProviderConfig, E2bSandbox, E2bSandboxProvider};
-pub use providers::modal::{ModalProviderConfig, ModalSandboxProvider};
+pub use providers::modal::{ModalProviderConfig, ModalSandbox, ModalSandboxProvider};
 pub use providers::northflank::{
     NorthflankProviderConfig, NorthflankSandbox, NorthflankSandboxProvider,
 };
@@ -258,9 +258,7 @@ impl SandboxRegistry {
     /// | `vercel` | `VERCEL_OIDC_TOKEN` or `VERCEL_TOKEN` | `VERCEL_TEAM_ID`, `VERCEL_PROJECT_ID` |
     /// | `northflank` | `NORTHFLANK_API_TOKEN` | `NORTHFLANK_PROJECT_ID` (required), `NORTHFLANK_TEAM_ID`, ... |
     /// | `together` | `TOGETHER_API_KEY` | `TOGETHER_BASE_URL` |
-    ///
-    /// Modal is intentionally not auto-registered: its API is gRPC-only and
-    /// the [`ModalSandboxProvider`] placeholder fails on every operation.
+    /// | `modal` | `MODAL_TOKEN_ID` | `MODAL_TOKEN_SECRET` (required), `MODAL_APP_NAME`, ... |
     pub fn load_providers_from_environment(&mut self) -> Result<()> {
         if std::env::var("E2B_API_KEY").is_ok() {
             self.register_provider(Arc::new(E2bSandboxProvider::from_env()?));
@@ -276,6 +274,9 @@ impl SandboxRegistry {
         }
         if std::env::var("TOGETHER_API_KEY").is_ok() {
             self.register_provider(Arc::new(TogetherSandboxProvider::from_env()?));
+        }
+        if std::env::var("MODAL_TOKEN_ID").is_ok() {
+            self.register_provider(Arc::new(ModalSandboxProvider::from_env()?));
         }
         Ok(())
     }

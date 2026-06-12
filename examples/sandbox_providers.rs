@@ -16,6 +16,8 @@
 //! export NORTHFLANK_API_TOKEN=... \
 //!        NORTHFLANK_PROJECT_ID=...          # Northflank
 //! export TOGETHER_API_KEY=...               # Together Code Interpreter
+//! export MODAL_TOKEN_ID=ak-... \
+//!        MODAL_TOKEN_SECRET=as-...          # Modal
 //!
 //! # Test everything that's configured:
 //! cargo run --example sandbox_providers
@@ -81,6 +83,7 @@ async fn main() {
         eprintln!("  VERCEL_OIDC_TOKEN (or VERCEL_TOKEN + VERCEL_TEAM_ID + VERCEL_PROJECT_ID)");
         eprintln!("  NORTHFLANK_API_TOKEN + NORTHFLANK_PROJECT_ID");
         eprintln!("  TOGETHER_API_KEY");
+        eprintln!("  MODAL_TOKEN_ID + MODAL_TOKEN_SECRET");
         std::process::exit(1);
     }
 
