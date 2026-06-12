@@ -5,7 +5,7 @@
 //! sandbox. These helpers centralize the language → command mapping and shell
 //! quoting so every provider behaves identically.
 
-use crate::error::{ErrorCode, Result, SdkError};
+use crate::error::{ErrorCode, SdkError};
 use crate::sandbox::types::{ExecuteCodeRequest, Language};
 
 /// Interpreter argv for executing `req.code` inside a POSIX sandbox.
@@ -40,6 +40,42 @@ pub(crate) fn interpreter_command_line(req: &ExecuteCodeRequest) -> String {
 pub(crate) fn shell_single_quote(s: &str) -> String {
     // 'foo'"'"'bar' pattern: close quote, escaped literal quote, reopen.
     format!("'{}'", s.replace('\'', "'\"'\"'"))
+}
+
+/// Parse directory listings in the shared `type|size|mode|mtime|path` line
+/// format (one entry per line, `|`-separated):
+///
+/// - type: `d` for directory, anything else for file
+/// - size: bytes
+/// - mode: octal permissions (e.g. `644`)
+/// - mtime: Unix seconds, fractional part allowed
+/// - path: absolute path (may itself contain `|`-free text only)
+///
+/// This is the output of GNU `find -printf '%y|%s|%m|%T@|%p\n'` and of the
+/// equivalent Python `os.walk` snippets used by providers without a native
+/// listing API.
+pub(crate) fn parse_listing_output(stdout: &str) -> Vec<crate::sandbox::types::FileInfo> {
+    let mut files = Vec::new();
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.splitn(5, '|').collect();
+        if parts.len() != 5 {
+            continue;
+        }
+        let path = parts[4].to_string();
+        let name = path.rsplit('/').next().unwrap_or(path.as_str()).to_string();
+        files.push(crate::sandbox::types::FileInfo {
+            name,
+            size: parts[1].parse().unwrap_or(0),
+            mode: u32::from_str_radix(parts[2], 8).unwrap_or(0),
+            is_dir: parts[0] == "d",
+            mod_time: parts[3]
+                .parse::<f64>()
+                .map(|t| (t * 1000.0) as i64)
+                .unwrap_or(0),
+            path,
+        });
+    }
+    files
 }
 
 /// Standard error for operations a provider's API does not expose.
@@ -129,5 +165,19 @@ mod tests {
     fn test_interpreter_command_line_quotes_code() {
         let line = interpreter_command_line(&req(Language::Python, "print('hi')"));
         assert_eq!(line, "python3 '-c' 'print('\"'\"'hi'\"'\"')'");
+    }
+
+    #[test]
+    fn test_parse_listing_output() {
+        let stdout = "f|42|644|1718200000.5|/workspace/test.txt\nd|4096|755|1718200001.0|/workspace/src\nbogus line\n";
+        let files = parse_listing_output(stdout);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].name, "test.txt");
+        assert_eq!(files[0].size, 42);
+        assert_eq!(files[0].mode, 0o644);
+        assert!(!files[0].is_dir);
+        assert_eq!(files[0].mod_time, 1718200000500);
+        assert!(files[1].is_dir);
+        assert_eq!(files[1].name, "src");
     }
 }
