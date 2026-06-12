@@ -490,11 +490,12 @@ impl ResponsesApiRequest {
             })),
         };
 
-        // Check if this is a reasoning model that doesn't support temperature
-        // Reasoning models (gpt-5, o1, o3 series) don't support temperature, top_p parameters
-        // Note: gpt-4o DOES support temperature, only gpt-5 and o-series don't
-        let is_reasoning_model =
-            model.starts_with("gpt-5") || model.starts_with("o1-") || model.starts_with("o3-");
+        // Reasoning models don't support temperature/top_p; warn instead of
+        // silently dropping the configured values.
+        let is_reasoning_model = super::openai_common::is_reasoning_model(&model);
+        if is_reasoning_model {
+            super::openai_common::warn_dropped_sampling_params(&model, &req.config);
+        }
 
         // Store responses when tools are provided (for agentic continuation)
         // or when explicitly continuing a conversation with previous_response_id.

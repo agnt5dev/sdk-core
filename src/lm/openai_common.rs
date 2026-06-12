@@ -1,4 +1,6 @@
+use std::collections::HashSet;
 use std::pin::Pin;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::anyhow;
 use async_stream::try_stream;
@@ -10,9 +12,47 @@ use serde_json::{self, json, Value as JsonValue};
 use crate::error::{Result as SdkResult, SdkError};
 
 use super::interface::{
-    ContentBlockType, GenerateRequest, GenerateResponse, JsonSchemaFormat, Message, MessageRole,
-    ResponseFormat, StreamChunk, StreamHandle, TokenUsage, ToolCall, ToolChoice, ToolDefinition,
+    ContentBlockType, GenerateRequest, GenerateResponse, GenerationConfig, JsonSchemaFormat,
+    Message, MessageRole, ResponseFormat, StreamChunk, StreamHandle, TokenUsage, ToolCall,
+    ToolChoice, ToolDefinition,
 };
+
+/// OpenAI reasoning models (gpt-5, o1, o3, o4 series) don't support sampling
+/// parameters (`temperature`, `top_p`) and require `max_completion_tokens`
+/// instead of `max_tokens`. Note: gpt-4o DOES support temperature.
+pub(crate) fn is_reasoning_model(model: &str) -> bool {
+    model.starts_with("gpt-5")
+        || model == "o1"
+        || model.starts_with("o1-")
+        || model == "o3"
+        || model.starts_with("o3-")
+        || model == "o4"
+        || model.starts_with("o4-")
+}
+
+/// Warn when configured sampling parameters are unsupported by the target
+/// model and dropped from the request payload, so misconfiguration is never
+/// silent. Deduplicated per (model, parameter) per process to avoid flooding
+/// logs on every request.
+pub(crate) fn warn_dropped_sampling_params(model: &str, config: &GenerationConfig) {
+    static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+    for (param, value) in [("temperature", config.temperature), ("top_p", config.top_p)] {
+        if value.is_none() {
+            continue;
+        }
+        let mut warned = WARNED
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap();
+        if warned.insert(format!("{model}/{param}")) {
+            tracing::warn!(
+                "⚠️  '{param}' is not supported by model '{model}' and will be ignored. \
+                 Remove '{param}' from your configuration to silence this warning."
+            );
+        }
+    }
+}
 
 #[derive(Serialize)]
 pub(crate) struct ChatCompletionPayload {
@@ -42,15 +82,10 @@ impl ChatCompletionPayload {
     pub(crate) fn from_request(request: &GenerateRequest, model: String, stream: bool) -> Self {
         let messages = build_api_messages(request);
 
-        // Detect reasoning models that don't support temperature, top_p, max_tokens
-        // Reasoning models (gpt-5, o1, o3, o4 series) require max_completion_tokens instead
-        let is_reasoning_model = model.starts_with("gpt-5")
-            || model == "o1"
-            || model.starts_with("o1-")
-            || model == "o3"
-            || model.starts_with("o3-")
-            || model == "o4"
-            || model.starts_with("o4-");
+        let is_reasoning_model = is_reasoning_model(&model);
+        if is_reasoning_model {
+            warn_dropped_sampling_params(&model, &request.config);
+        }
 
         // Use max_completion_tokens for reasoning models, max_tokens for others
         let (max_tokens, max_completion_tokens) = if is_reasoning_model {
@@ -708,6 +743,44 @@ fn build_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_reasoning_models() {
+        for model in [
+            "gpt-5",
+            "gpt-5-mini",
+            "gpt-5-nano",
+            "o1",
+            "o1-preview",
+            "o3",
+            "o3-mini",
+            "o4",
+            "o4-mini",
+        ] {
+            assert!(is_reasoning_model(model), "{model} should be reasoning");
+        }
+        for model in ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-3.5-turbo"] {
+            assert!(
+                !is_reasoning_model(model),
+                "{model} should not be reasoning"
+            );
+        }
+    }
+
+    #[test]
+    fn chat_payload_drops_sampling_params_for_reasoning_models() {
+        let request = GenerateRequest::new("openai/gpt-5-mini")
+            .user_message("Hi")
+            .configure(|c| {
+                c.temperature = Some(0.7);
+                c.top_p = Some(0.9);
+            });
+
+        let payload =
+            ChatCompletionPayload::from_request(&request, "gpt-5-mini".to_string(), false);
+        assert!(payload.temperature.is_none());
+        assert!(payload.top_p.is_none());
+    }
 
     #[test]
     fn partial_response_accumulates_streaming_tool_call_deltas() {
