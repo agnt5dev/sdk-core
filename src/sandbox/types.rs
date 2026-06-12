@@ -354,6 +354,34 @@ pub struct SandboxInfo {
     pub backend_kind: SandboxBackendKind,
 }
 
+/// Options for creating a new sandbox instance via a [`SandboxProvider`](crate::sandbox::SandboxProvider).
+///
+/// All fields are optional; providers apply their own defaults and ignore
+/// options they don't support (e.g., E2B sizes sandboxes via the template,
+/// so `cpu_cores`/`memory_mib` are ignored there).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CreateSandboxOptions {
+    /// Template, snapshot, or container image identifier. Provider-specific:
+    /// E2B template ID, Daytona snapshot name, Modal/Northflank image, etc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    /// Sandbox lifetime in seconds before the provider auto-stops it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    /// Environment variables available inside the sandbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<HashMap<String, String>>,
+    /// Arbitrary metadata/labels attached to the sandbox for filtering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<HashMap<String, String>>,
+    /// CPU cores to allocate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_cores: Option<u32>,
+    /// Memory in MiB to allocate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_mib: Option<u64>,
+}
+
 // ── Defaults ────────────────────────────────────────────────────
 
 fn default_timeout_ms() -> u64 {

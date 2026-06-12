@@ -80,6 +80,35 @@ pub trait SandboxBackend: SandboxExecutor + SandboxWorkspace {}
 
 impl<T: SandboxExecutor + SandboxWorkspace> SandboxBackend for T {}
 
+/// Control plane for a managed sandbox provider (E2B, Daytona, Modal, ...).
+///
+/// While [`SandboxBackend`] is the data plane for a *running* sandbox,
+/// `SandboxProvider` manages sandbox lifecycle: provisioning new instances,
+/// reconnecting to existing ones, and tearing them down.
+///
+/// Provider-specific extras (e.g., E2B preview URLs, Daytona git operations)
+/// are inherent methods on the concrete handle types, mirroring how
+/// `run_command` is inherent on [`RemoteSandbox`] rather than part of the
+/// universal trait.
+#[async_trait]
+pub trait SandboxProvider: Send + Sync {
+    /// Stable provider name ("e2b", "daytona", "modal", "northflank",
+    /// "vercel", "together"). Used as the registry key.
+    fn name(&self) -> &'static str;
+
+    /// Provision a new sandbox and return a connected backend handle.
+    async fn create_sandbox(&self, opts: CreateSandboxOptions) -> Result<Arc<dyn SandboxBackend>>;
+
+    /// Connect to an existing sandbox by provider-native ID.
+    async fn connect_sandbox(&self, sandbox_id: &str) -> Result<Arc<dyn SandboxBackend>>;
+
+    /// Destroy a sandbox. Returns `true` if the provider confirmed deletion.
+    async fn destroy_sandbox(&self, sandbox_id: &str) -> Result<bool>;
+
+    /// List sandboxes visible to the configured credentials.
+    async fn list_sandboxes(&self) -> Result<Vec<SandboxInfo>>;
+}
+
 // ── Registry ────────────────────────────────────────────────────
 
 /// Registry for managing sandbox backends.
@@ -89,6 +118,7 @@ impl<T: SandboxExecutor + SandboxWorkspace> SandboxBackend for T {}
 /// remote to wasm — it only auto-selects when no backend is specified at all.
 pub struct SandboxRegistry {
     backends: HashMap<String, Arc<dyn SandboxBackend>>,
+    providers: HashMap<String, Arc<dyn SandboxProvider>>,
     default_backend: Option<String>,
 }
 
@@ -96,6 +126,7 @@ impl SandboxRegistry {
     pub fn new() -> Self {
         Self {
             backends: HashMap::new(),
+            providers: HashMap::new(),
             default_backend: None,
         }
     }
@@ -136,6 +167,21 @@ impl SandboxRegistry {
     /// List registered backend names.
     pub fn list_backends(&self) -> Vec<&str> {
         self.backends.keys().map(|s| s.as_str()).collect()
+    }
+
+    /// Register a sandbox provider control plane under its [`SandboxProvider::name`].
+    pub fn register_provider(&mut self, provider: Arc<dyn SandboxProvider>) {
+        self.providers.insert(provider.name().to_string(), provider);
+    }
+
+    /// Get a registered provider by name.
+    pub fn get_provider(&self, name: &str) -> Option<Arc<dyn SandboxProvider>> {
+        self.providers.get(name).cloned()
+    }
+
+    /// List registered provider names.
+    pub fn list_providers(&self) -> Vec<&str> {
+        self.providers.keys().map(|s| s.as_str()).collect()
     }
 
     /// Auto-detect backends from environment variables.
