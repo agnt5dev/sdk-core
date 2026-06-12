@@ -124,17 +124,11 @@ tonic-prost-build = "0.14"
 protobuf-src = "2.0"
 
 # Examples
+# (Files in examples/ are auto-discovered; entries here are only needed for
+# non-standard paths. Stale entries for deleted examples break cargo fmt.)
 [[example]]
 name = "debug_worker"
 path = "examples/debug_worker.rs"
-
-[[example]]
-name = "llm_example"
-path = "examples/llm_example.rs"
-
-[[example]]
-name = "openrouter_example"
-path = "examples/openrouter_example.rs"
 
 [[example]]
 name = "language_model_example"
