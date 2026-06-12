@@ -340,7 +340,7 @@ pub enum ServerConfig {
     Stdio(StdioConfig),
     /// SSE transport (HTTP+SSE — older 2024-11-05 spec)
     Sse(SseConfig),
-    /// Streamable HTTP transport (single endpoint, 2025-03-26 spec)
+    /// Streamable HTTP transport (single endpoint, 2025-11-25 spec)
     StreamableHttp(StreamableHttpConfig),
 }
 
@@ -411,11 +411,11 @@ impl SseConfig {
     }
 }
 
-/// Configuration for Streamable HTTP transport (MCP 2025-03-26 spec).
+/// Configuration for Streamable HTTP transport (MCP 2025-11-25 spec).
 ///
 /// Single endpoint URL: every client request is a POST whose response is
 /// either a single JSON document or a `text/event-stream` carrying one or
-/// more JSON-RPC messages. The server may issue an `Mcp-Session-Id` on
+/// more JSON-RPC messages. The server may issue an `MCP-Session-Id` on
 /// initialize which the client must echo on subsequent requests.
 #[derive(Debug, Clone)]
 pub struct StreamableHttpConfig {
@@ -450,7 +450,7 @@ impl StreamableHttpConfig {
 impl Default for InitializeParams {
     fn default() -> Self {
         Self {
-            protocol_version: "2024-11-05".to_string(),
+            protocol_version: "2025-11-25".to_string(),
             capabilities: ClientCapabilities::default(),
             client_info: ClientInfo {
                 name: "agnt5-sdk".to_string(),
