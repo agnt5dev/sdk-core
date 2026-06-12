@@ -107,7 +107,7 @@ impl McpClient {
         );
     }
 
-    /// Add a Streamable HTTP server (MCP 2025-03-26 spec).
+    /// Add a Streamable HTTP server (MCP 2025-11-25 spec).
     pub fn add_streamable_http_server(&mut self, name: impl Into<String>, url: impl Into<String>) {
         self.add_server(
             name,
@@ -169,7 +169,7 @@ impl McpClient {
         );
 
         // Send initialized notification
-        let initialized_req = JsonRpcRequest::notification("initialized", None);
+        let initialized_req = JsonRpcRequest::notification("notifications/initialized", None);
         transport.notify(initialized_req).await?;
 
         // List available tools

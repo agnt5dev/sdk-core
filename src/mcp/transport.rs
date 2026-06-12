@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, Mutex};
 
@@ -40,7 +40,7 @@ pub trait Transport: Send + Sync {
 
 /// Stdio transport for local subprocess communication
 ///
-/// Uses Content-Length framing (LSP/MCP standard) for message boundaries.
+/// Uses newline-delimited JSON-RPC messages for MCP stdio boundaries.
 pub struct StdioTransport {
     /// Child process handle
     process: Arc<Mutex<Option<Child>>>,
@@ -237,52 +237,27 @@ impl Transport for StdioTransport {
     }
 }
 
-/// Read a Content-Length framed message
+/// Read a newline-delimited JSON-RPC message.
 async fn read_message<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
 ) -> McpResult<Option<Vec<u8>>> {
-    // Read headers
-    let mut content_length: Option<usize> = None;
-    loop {
-        let mut line = String::new();
-        let bytes_read = reader.read_line(&mut line).await?;
-        if bytes_read == 0 {
-            return Ok(None); // EOF
-        }
-
-        let line = line.trim();
-        if line.is_empty() {
-            break; // End of headers
-        }
-
-        if let Some(value) = line.strip_prefix("Content-Length:") {
-            content_length = Some(
-                value
-                    .trim()
-                    .parse()
-                    .map_err(|_| McpError::Protocol("Invalid Content-Length".to_string()))?,
-            );
-        }
+    let mut line = String::new();
+    let bytes_read = reader.read_line(&mut line).await?;
+    if bytes_read == 0 {
+        return Ok(None);
     }
 
-    let length = content_length
-        .ok_or_else(|| McpError::Protocol("Missing Content-Length header".to_string()))?;
-
-    // Read body
-    let mut body = vec![0u8; length];
-    reader.read_exact(&mut body).await?;
-
-    Ok(Some(body))
+    let line = line.trim_end_matches(['\r', '\n']);
+    Ok(Some(line.as_bytes().to_vec()))
 }
 
-/// Write a Content-Length framed message
+/// Write a newline-delimited JSON-RPC message.
 async fn write_message<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
     message: &[u8],
 ) -> McpResult<()> {
-    let header = format!("Content-Length: {}\r\n\r\n", message.len());
-    writer.write_all(header.as_bytes()).await?;
     writer.write_all(message).await?;
+    writer.write_all(b"\n").await?;
     writer.flush().await?;
     Ok(())
 }
@@ -535,16 +510,16 @@ impl Transport for SseTransport {
 }
 
 // ============================================================================
-// Streamable HTTP Transport (MCP 2025-03-26 spec)
+// Streamable HTTP Transport (MCP 2025-11-25 spec)
 // ============================================================================
 
 /// Streamable HTTP transport.
 ///
-/// The 2025-03-26 MCP spec replaces HTTP+SSE's two-endpoint design with a
+/// The 2025-11-25 MCP spec replaces HTTP+SSE's two-endpoint design with a
 /// single endpoint URL. Each client request is a POST whose response is
 /// either a single `application/json` document or a `text/event-stream`
 /// carrying one or more JSON-RPC messages. Servers may issue an
-/// `Mcp-Session-Id` on the initialize response which the client must echo
+/// `MCP-Session-Id` on the initialize response which the client must echo
 /// on every subsequent request, plus an `MCP-Protocol-Version` header
 /// after negotiation.
 ///
@@ -556,7 +531,7 @@ pub struct StreamableHttpTransport {
     url: String,
     client: reqwest::Client,
     request_id: AtomicU64,
-    /// `Mcp-Session-Id` echoed back from the server, if any.
+    /// `MCP-Session-Id` echoed back from the server, if any.
     session_id: Arc<Mutex<Option<String>>>,
     /// Connected state. Streamable HTTP has no persistent connection, but
     /// keep this for parity with the Transport trait.
@@ -602,12 +577,12 @@ impl StreamableHttpTransport {
             .client
             .post(&self.url)
             .header("Accept", "application/json, text/event-stream")
-            .header("MCP-Protocol-Version", "2025-03-26")
+            .header("MCP-Protocol-Version", "2025-11-25")
             .json(body);
 
         let session = self.session_id.lock().await;
         if let Some(sid) = session.as_ref() {
-            req = req.header("Mcp-Session-Id", sid);
+            req = req.header("MCP-Session-Id", sid);
         }
         Ok(req)
     }
@@ -773,6 +748,55 @@ data: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{}}\n";
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, BufReader};
+
+    #[tokio::test]
+    async fn read_message_accepts_jsonl_framing() {
+        let input = br#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
+        let mut data = input.to_vec();
+        data.extend_from_slice(b"\r\n");
+        let mut reader = BufReader::new(data.as_slice());
+
+        let message = read_message(&mut reader).await.unwrap().unwrap();
+
+        assert_eq!(message, input);
+    }
+
+    #[tokio::test]
+    async fn write_message_emits_jsonl_without_content_length() {
+        let (mut writer, mut reader) = tokio::io::duplex(128);
+        let payload = br#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
+
+        write_message(&mut writer, payload).await.unwrap();
+
+        let mut output = vec![0; payload.len() + 1];
+        reader.read_exact(&mut output).await.unwrap();
+        assert_eq!(output, [payload.as_slice(), b"\n"].concat());
+        assert!(!String::from_utf8_lossy(&output).contains("Content-Length"));
+    }
+
+    #[tokio::test]
+    async fn stdio_transport_talks_to_strict_jsonl_process() {
+        let script = r#"while IFS= read -r line; do
+case "$line" in Content-Length*) exit 2;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}'
+done"#;
+        let transport = StdioTransport::new(StdioConfig::new(
+            "sh",
+            vec!["-c".to_string(), script.to_string()],
+        ))
+        .await
+        .unwrap();
+
+        let response = transport
+            .request(JsonRpcRequest::new("ping", None, 0))
+            .await
+            .unwrap();
+
+        let result = response.into_result().unwrap();
+        assert_eq!(result["ok"], true);
+        transport.close().await.unwrap();
+    }
 
     #[test]
     fn test_stdio_config() {
