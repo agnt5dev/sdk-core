@@ -493,10 +493,7 @@ impl Worker {
         if let Ok(mut map) = self.pending_lease_ids.lock() {
             map.remove(invocation_id);
         }
-        let run_id = invocation_id
-            .split(':')
-            .next()
-            .unwrap_or(invocation_id);
+        let run_id = invocation_id.split(':').next().unwrap_or(invocation_id);
         if let Ok(mut map) = self.streaming_runs.lock() {
             map.remove(run_id);
         }
@@ -1693,9 +1690,6 @@ impl Worker {
                                                     crate::pb::service_message::MessageType::FunctionResponse(response),
                                                 ),
                                             };
-                                            if let Err(e) = response_tx.send_async(service_message).await {
-                                                error!("Failed to send built-in scorer response: {}", e);
-                                            }
 
                                             // Emit boundary events to EE via WriteCheckpoint so
                                             // journal entries are created and NATS terminal events
@@ -1711,31 +1705,39 @@ impl Worker {
                                                 .unwrap_or_default()
                                                 .as_nanos() as i64;
 
-                                            // run.started
-                                            if let Err(e) = self.emit_checkpoint_sync(
-                                                run_id.clone(),
-                                                "run.started".to_string(),
-                                                req.input_data.clone(),
-                                                0,
-                                                req.metadata.clone(),
-                                                timestamp_ns,
-                                                5000,
-                                            ).await {
-                                                warn!("Built-in scorer: failed to emit run.started checkpoint: {}", e);
-                                            }
+                                            let checkpoint_worker = self.clone();
+                                            let response_tx = response_tx.clone();
+                                            let input_data = req.input_data.clone();
+                                            let metadata = req.metadata.clone();
+                                            tokio::spawn(async move {
+                                                if let Err(e) = checkpoint_worker.emit_checkpoint_sync(
+                                                    run_id.clone(),
+                                                    "run.started".to_string(),
+                                                    input_data,
+                                                    0,
+                                                    metadata.clone(),
+                                                    timestamp_ns,
+                                                    5000,
+                                                ).await {
+                                                    warn!("Built-in scorer: failed to emit run.started checkpoint: {}", e);
+                                                }
 
-                                            // run.completed
-                                            if let Err(e) = self.emit_checkpoint_sync(
-                                                run_id,
-                                                "run.completed".to_string(),
-                                                output_data.clone(),
-                                                1,
-                                                req.metadata.clone(),
-                                                timestamp_ns,
-                                                5000,
-                                            ).await {
-                                                warn!("Built-in scorer: failed to emit run.completed checkpoint: {}", e);
-                                            }
+                                                if let Err(e) = checkpoint_worker.emit_checkpoint_sync(
+                                                    run_id,
+                                                    "run.completed".to_string(),
+                                                    output_data,
+                                                    1,
+                                                    metadata,
+                                                    timestamp_ns,
+                                                    5000,
+                                                ).await {
+                                                    warn!("Built-in scorer: failed to emit run.completed checkpoint: {}", e);
+                                                }
+
+                                                if let Err(e) = response_tx.send_async(service_message).await {
+                                                    error!("Failed to send built-in scorer response: {}", e);
+                                                }
+                                            });
 
                                             continue;
                                         }
@@ -1985,7 +1987,12 @@ impl Worker {
                 let worker_id = worker_id_outer.clone();
                 let journal_queue = journal_queue_outer.clone();
                 let flush_interval_ms = journal_queue.flush_interval_ms();
-                let batch_size = journal_queue.batch_size();
+                let batch_size = journal_queue.batch_size().max(1);
+                let max_batches_per_tick = std::env::var("AGNT5_JOURNAL_MAX_BATCHES_PER_TICK")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(32)
+                    .max(1);
                 let streaming_runs = streaming_runs_outer.clone();
                 let pending_lease_ids = pending_lease_ids_outer.clone();
                 let ee_endpoint = ee_endpoint_outer.clone();
@@ -2012,8 +2019,17 @@ impl Worker {
                     loop {
                         interval.tick().await;
 
-                        // Drain batch of events
-                        let batch = journal_queue.drain_batch(batch_size);
+                        // Drain more than one nominal batch when backlog is already present.
+                        // This preserves the normal small-batch latency path while allowing
+                        // the flush task to catch up instead of hard-capping at one batch
+                        // per interval.
+                        let queued = journal_queue.len();
+                        let drain_limit = if queued > batch_size {
+                            queued.min(batch_size.saturating_mul(max_batches_per_tick))
+                        } else {
+                            batch_size
+                        };
+                        let batch = journal_queue.drain_batch(drain_limit);
                         if batch.is_empty() {
                             continue;
                         }
