@@ -208,14 +208,12 @@ impl LanguageModel for AnthropicProvider {
                     if let (Some(input_tokens), Some(output_tokens)) =
                         (usage.prompt_tokens, usage.completion_tokens)
                     {
-                        // TODO: Extract cached tokens when TokenUsage struct is extended
-                        // For now, calculate cost without cache discount
                         if let Some(cost) = telemetry::calculate_cost(
                             "anthropic",
                             &response.model,
-                            input_tokens as u32,
-                            output_tokens as u32,
-                            None, // cached_tokens - will be added when TokenUsage is extended
+                            input_tokens,
+                            output_tokens,
+                            usage.cached_tokens,
                         ) {
                             telemetry::set_cost_attributes(&mut span, cost);
                         }
@@ -772,15 +770,34 @@ struct TextBlockResponse {
 struct Usage {
     input_tokens: Option<u32>,
     output_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cache_creation_input_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cache_read_input_tokens: Option<u32>,
 }
 
 fn usage_from_api(usage: Option<Usage>) -> Option<TokenUsage> {
-    usage.map(|usage| TokenUsage {
-        prompt_tokens: usage.input_tokens,
-        completion_tokens: usage.output_tokens,
-        total_tokens: usage
+    usage.map(|usage| {
+        let cache_creation = usage.cache_creation_input_tokens;
+        let cache_read = usage.cache_read_input_tokens;
+        // Anthropic reports `input_tokens` as the cache-miss tokens only,
+        // excluding cache reads and writes. Normalize to the OpenAI convention
+        // where `prompt_tokens` counts all input tokens (misses + cache reads +
+        // cache writes) so that `cached_tokens` is a subset of `prompt_tokens`.
+        let prompt_tokens = usage
             .input_tokens
-            .and_then(|input| usage.output_tokens.map(|output| input + output)),
+            .map(|input| input + cache_creation.unwrap_or(0) + cache_read.unwrap_or(0));
+        let total_tokens = match (prompt_tokens, usage.output_tokens) {
+            (Some(prompt), Some(output)) => Some(prompt + output),
+            _ => None,
+        };
+        TokenUsage {
+            prompt_tokens,
+            completion_tokens: usage.output_tokens,
+            total_tokens,
+            cached_tokens: cache_read,
+            cache_creation_tokens: cache_creation,
+        }
     })
 }
 
@@ -1153,6 +1170,41 @@ mod tests {
         assert_eq!(tool_calls[0].id, "srvtoolu_1");
         assert_eq!(tool_calls[0].name, "web_search");
         assert_eq!(tool_calls[0].arguments, r#"{"query":"AGNT5"}"#);
+    }
+
+    #[test]
+    fn usage_normalizes_cache_tokens_into_prompt_total() {
+        // Anthropic reports `input_tokens` as cache-miss tokens only. The
+        // normalized usage should fold cache reads + writes into prompt_tokens
+        // while surfacing them separately.
+        let usage: Usage = serde_json::from_str(
+            r#"{
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "cache_creation_input_tokens": 30,
+                "cache_read_input_tokens": 50
+            }"#,
+        )
+        .unwrap();
+
+        let normalized = usage_from_api(Some(usage)).unwrap();
+        // 100 misses + 30 writes + 50 reads = 180 total input tokens.
+        assert_eq!(normalized.prompt_tokens, Some(180));
+        assert_eq!(normalized.completion_tokens, Some(20));
+        assert_eq!(normalized.total_tokens, Some(200));
+        assert_eq!(normalized.cached_tokens, Some(50));
+        assert_eq!(normalized.cache_creation_tokens, Some(30));
+    }
+
+    #[test]
+    fn usage_without_cache_fields_is_unchanged() {
+        let usage: Usage =
+            serde_json::from_str(r#"{"input_tokens": 10, "output_tokens": 5}"#).unwrap();
+        let normalized = usage_from_api(Some(usage)).unwrap();
+        assert_eq!(normalized.prompt_tokens, Some(10));
+        assert_eq!(normalized.total_tokens, Some(15));
+        assert_eq!(normalized.cached_tokens, None);
+        assert_eq!(normalized.cache_creation_tokens, None);
     }
 
     #[test]

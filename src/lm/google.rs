@@ -241,7 +241,7 @@ impl LanguageModel for GoogleProvider {
                             &response.model,
                             input_tokens,
                             output_tokens,
-                            None,
+                            usage.cached_tokens,
                         ) {
                             telemetry::set_cost_attributes(&mut span, cost);
                         }
@@ -796,6 +796,8 @@ impl GeminiResponse {
             prompt_tokens: u.prompt_token_count,
             completion_tokens: u.candidates_token_count,
             total_tokens: u.total_token_count,
+            cached_tokens: u.cached_content_token_count,
+            cache_creation_tokens: None,
         });
 
         Ok(GenerateResponse {
@@ -833,6 +835,9 @@ struct GeminiUsageMetadata {
     candidates_token_count: Option<u32>,
     #[serde(rename = "totalTokenCount")]
     total_token_count: Option<u32>,
+    /// Tokens served from Gemini context caching. Subset of `promptTokenCount`.
+    #[serde(rename = "cachedContentTokenCount", default)]
+    cached_content_token_count: Option<u32>,
 }
 
 // Streaming response
@@ -891,6 +896,8 @@ impl PartialResponse {
             prompt_tokens: u.prompt_token_count,
             completion_tokens: u.candidates_token_count,
             total_tokens: u.total_token_count,
+            cached_tokens: u.cached_content_token_count,
+            cache_creation_tokens: None,
         });
 
         Ok(GenerateResponse {

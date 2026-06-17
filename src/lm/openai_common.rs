@@ -380,6 +380,15 @@ pub(crate) struct ApiUsage {
     pub(crate) prompt_tokens: Option<u32>,
     pub(crate) completion_tokens: Option<u32>,
     pub(crate) total_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+/// Cached-token breakdown for the Chat Completions usage object.
+#[derive(Deserialize, Serialize, Clone)]
+pub(crate) struct PromptTokensDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cached_tokens: Option<u32>,
 }
 
 fn usage_from_api(usage: Option<ApiUsage>) -> Option<TokenUsage> {
@@ -387,6 +396,8 @@ fn usage_from_api(usage: Option<ApiUsage>) -> Option<TokenUsage> {
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: usage.completion_tokens,
         total_tokens: usage.total_tokens,
+        cached_tokens: usage.prompt_tokens_details.and_then(|d| d.cached_tokens),
+        cache_creation_tokens: None,
     })
 }
 

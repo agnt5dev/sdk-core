@@ -316,14 +316,12 @@ impl LanguageModel for OpenAiChatProvider {
                     if let (Some(input_tokens), Some(output_tokens)) =
                         (usage.prompt_tokens, usage.completion_tokens)
                     {
-                        // TODO: Extract cached tokens when TokenUsage struct is extended
-                        // For now, calculate cost without cache discount
                         if let Some(cost) = telemetry::calculate_cost(
                             "openai",
                             &response.model,
-                            input_tokens as u32,
-                            output_tokens as u32,
-                            None, // cached_tokens - will be added when TokenUsage is extended
+                            input_tokens,
+                            output_tokens,
+                            usage.cached_tokens,
                         ) {
                             telemetry::set_cost_attributes(&mut span, cost);
                         }

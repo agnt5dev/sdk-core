@@ -605,6 +605,16 @@ pub struct ApiUsage {
     pub completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_tokens: Option<u32>,
+    /// Breakdown of input tokens, including the cached (cache-hit) portion.
+    #[serde(default)]
+    pub input_tokens_details: Option<InputTokensDetails>,
+}
+
+/// Cached-token breakdown for the Responses API usage object.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct InputTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: Option<u32>,
 }
 
 /// Complete Responses API response
@@ -702,6 +712,8 @@ impl ResponsesApiResponse {
             prompt_tokens: u.prompt_tokens,
             completion_tokens: u.completion_tokens,
             total_tokens: u.total_tokens,
+            cached_tokens: u.input_tokens_details.and_then(|d| d.cached_tokens),
+            cache_creation_tokens: None,
         });
 
         Ok(GenerateResponse {
@@ -963,6 +975,8 @@ impl StreamingState {
                 prompt_tokens: u.prompt_tokens,
                 completion_tokens: u.completion_tokens,
                 total_tokens: u.total_tokens,
+                cached_tokens: u.input_tokens_details.and_then(|d| d.cached_tokens),
+                cache_creation_tokens: None,
             }),
             finish_reason: Some("completed".to_string()),
             tool_calls: if self.tool_calls.is_empty() {
@@ -1256,14 +1270,12 @@ impl LanguageModel for OpenAiProvider {
                     if let (Some(input_tokens), Some(output_tokens)) =
                         (usage.prompt_tokens, usage.completion_tokens)
                     {
-                        // TODO: Extract cached tokens when TokenUsage struct is extended
-                        // For now, calculate cost without cache discount
                         if let Some(cost) = telemetry::calculate_cost(
                             "openai",
                             &response.model,
-                            input_tokens as u32,
-                            output_tokens as u32,
-                            None, // cached_tokens - will be added when TokenUsage is extended
+                            input_tokens,
+                            output_tokens,
+                            usage.cached_tokens,
                         ) {
                             telemetry::set_cost_attributes(&mut span, cost);
                         }
@@ -1687,6 +1699,7 @@ mod tests {
             prompt_tokens: Some(10),
             completion_tokens: Some(5),
             total_tokens: Some(15),
+            input_tokens_details: None,
         });
 
         let response = state.into_generate_response(ResponseFormat::Text).unwrap();

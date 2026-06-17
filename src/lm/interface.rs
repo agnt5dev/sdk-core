@@ -539,11 +539,24 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct TokenUsage {
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
     pub total_tokens: Option<u32>,
+    /// Input tokens served from a prompt cache (cache hits).
+    ///
+    /// This is a subset of `prompt_tokens`, following the OpenAI usage
+    /// convention. Maps to OpenAI `prompt_tokens_details.cached_tokens`,
+    /// Anthropic/Bedrock `cache_read_input_tokens`, and Gemini
+    /// `cachedContentTokenCount`. `None` when the provider does not report it.
+    pub cached_tokens: Option<u32>,
+    /// Input tokens written to the prompt cache on this request (cache writes).
+    ///
+    /// Anthropic-style providers only (`cache_creation_input_tokens`); these
+    /// are billed at a premium and are also counted within `prompt_tokens`.
+    /// `None` for providers that do not report or charge for cache creation.
+    pub cache_creation_tokens: Option<u32>,
 }
 
 /// Type of content block in a streaming response.

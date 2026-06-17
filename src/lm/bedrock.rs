@@ -439,18 +439,33 @@ struct BedrockContentBlock {
 struct BedrockUsage {
     input_tokens: Option<u32>,
     output_tokens: Option<u32>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u32>,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u32>,
 }
 
 impl BedrockUsage {
     fn into_token_usage(self) -> Option<TokenUsage> {
-        let total = match (self.input_tokens, self.output_tokens) {
-            (Some(input), Some(output)) => Some(input + output),
+        let cache_creation = self.cache_creation_input_tokens;
+        let cache_read = self.cache_read_input_tokens;
+        // Bedrock (Anthropic invoke format) reports `input_tokens` excluding
+        // cache reads and writes. Normalize to the OpenAI convention where
+        // `prompt_tokens` counts all input tokens, keeping `cached_tokens` a
+        // subset of `prompt_tokens`.
+        let prompt_tokens = self
+            .input_tokens
+            .map(|input| input + cache_creation.unwrap_or(0) + cache_read.unwrap_or(0));
+        let total = match (prompt_tokens, self.output_tokens) {
+            (Some(prompt), Some(output)) => Some(prompt + output),
             _ => None,
         };
         Some(TokenUsage {
-            prompt_tokens: self.input_tokens,
+            prompt_tokens,
             completion_tokens: self.output_tokens,
             total_tokens: total,
+            cached_tokens: cache_read,
+            cache_creation_tokens: cache_creation,
         })
     }
 }

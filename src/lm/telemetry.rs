@@ -29,6 +29,8 @@ pub mod attributes {
     pub const REQUEST_MAX_TOKENS: &str = "gen_ai.request.max_tokens";
     pub const USAGE_INPUT_TOKENS: &str = "gen_ai.usage.input_tokens";
     pub const USAGE_OUTPUT_TOKENS: &str = "gen_ai.usage.output_tokens";
+    pub const USAGE_CACHE_READ_TOKENS: &str = "gen_ai.usage.cache_read_input_tokens";
+    pub const USAGE_CACHE_CREATION_TOKENS: &str = "gen_ai.usage.cache_creation_input_tokens";
     pub const USAGE_COST: &str = "gen_ai.usage.cost";
     pub const USAGE_COST_CURRENCY: &str = "gen_ai.usage.cost.currency";
     pub const RESPONSE_FINISH_REASONS: &str = "gen_ai.response.finish_reasons";
@@ -431,7 +433,9 @@ pub fn get_model_pricing(provider: &str, model: &str) -> Option<ModelPricing> {
 /// * `model` - Model name
 /// * `input_tokens` - Number of input/prompt tokens
 /// * `output_tokens` - Number of output/completion tokens
-/// * `cached_tokens` - Optional cached input tokens (typically 90% discount)
+/// * `cached_tokens` - Optional cache-hit input tokens. Must be a subset of
+///   `input_tokens` (the OpenAI usage convention). These are billed at a steep
+///   discount (~10% of the input rate).
 ///
 /// # Returns
 /// * `Some(cost)` - USD cost for the API call
@@ -445,20 +449,18 @@ pub fn calculate_cost(
 ) -> Option<f64> {
     let pricing = get_model_pricing(provider, model)?;
 
-    // Calculate input cost
-    let input_cost = (input_tokens as f64 / 1_000_000.0) * pricing.input_per_1m;
+    // Cache-hit tokens are part of `input_tokens` but billed at a discount, so
+    // split the input into the cached portion and the full-price remainder.
+    // Clamp to `input_tokens` to stay robust against inconsistent provider usage
+    // objects.
+    let cached = cached_tokens.unwrap_or(0).min(input_tokens);
+    let non_cached_input = input_tokens - cached;
 
-    // Calculate output cost
+    let input_cost = (non_cached_input as f64 / 1_000_000.0) * pricing.input_per_1m;
+    let cached_cost = (cached as f64 / 1_000_000.0) * pricing.input_per_1m * 0.1;
     let output_cost = (output_tokens as f64 / 1_000_000.0) * pricing.output_per_1m;
 
-    // Calculate cached token cost (typically 90% discount)
-    let cached_cost = if let Some(cached) = cached_tokens {
-        (cached as f64 / 1_000_000.0) * pricing.input_per_1m * 0.1
-    } else {
-        0.0
-    };
-
-    Some(input_cost + output_cost + cached_cost)
+    Some(input_cost + cached_cost + output_cost)
 }
 
 /// Set cost attributes on the span
@@ -696,6 +698,20 @@ pub fn set_token_usage_attributes(span: &mut impl Span, usage: &TokenUsage) {
             completion_tokens as i64,
         ));
     }
+
+    if let Some(cached_tokens) = usage.cached_tokens {
+        span.set_attribute(KeyValue::new(
+            attributes::USAGE_CACHE_READ_TOKENS,
+            cached_tokens as i64,
+        ));
+    }
+
+    if let Some(cache_creation_tokens) = usage.cache_creation_tokens {
+        span.set_attribute(KeyValue::new(
+            attributes::USAGE_CACHE_CREATION_TOKENS,
+            cache_creation_tokens as i64,
+        ));
+    }
 }
 
 /// Record an error on the span
@@ -821,6 +837,32 @@ mod tests {
         // tests with `--test-threads=1` if that happens.
         std::env::remove_var("AGNT5_LLM_CAPTURE_CONTENT");
         assert!(should_capture_content());
+    }
+
+    #[test]
+    fn test_calculate_cost_discounts_cached_tokens() {
+        // gpt-4o input is $2.50 / 1M tokens. Use 0 output tokens to isolate the
+        // input-side math. With 1000 input tokens and no cache, the full input
+        // price applies.
+        let full = calculate_cost("openai", "gpt-4o", 1000, 0, None).unwrap();
+        assert!((full - 0.0025).abs() < 1e-9, "full cost was {full}");
+
+        // With 500 of those 1000 tokens served from cache, the cached half is
+        // billed at 10% and the rest at full price:
+        //   500/1e6 * 2.50      = 0.00125
+        //   500/1e6 * 2.50 * 0.1 = 0.000125
+        let cached = calculate_cost("openai", "gpt-4o", 1000, 0, Some(500)).unwrap();
+        assert!((cached - 0.001375).abs() < 1e-9, "cached cost was {cached}");
+        assert!(cached < full, "caching should never increase cost");
+    }
+
+    #[test]
+    fn test_calculate_cost_clamps_cached_over_input() {
+        // A malformed usage object reporting more cached tokens than input
+        // tokens must not produce a negative or inflated cost.
+        let cost = calculate_cost("openai", "gpt-4o", 1000, 0, Some(5000)).unwrap();
+        // All 1000 input tokens treated as cached: 1000/1e6 * 2.50 * 0.1.
+        assert!((cost - 0.00025).abs() < 1e-9, "clamped cost was {cost}");
     }
 
     #[test]
