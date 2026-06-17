@@ -463,7 +463,11 @@ fn build_stream(
                             partial.stop_reason = Some(reason);
                         }
                         if let Some(usage) = usage {
-                            partial.usage = Some(usage);
+                            // Anthropic sends input + cache tokens in
+                            // `message_start` and only `output_tokens` in
+                            // `message_delta`. Merge field-by-field so the
+                            // earlier prompt/cache counts are not lost.
+                            merge_stream_usage(&mut partial.usage, usage);
                         }
                     }
                     StreamEvent::MessageStop => {
@@ -774,6 +778,33 @@ struct Usage {
     cache_creation_input_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cache_read_input_tokens: Option<u32>,
+}
+
+/// Merge a streaming usage update into the accumulated usage, overwriting only
+/// the fields the update actually carries.
+///
+/// Anthropic streams report prompt and cache tokens once in `message_start` and
+/// then send `message_delta` events that only contain the running
+/// `output_tokens`. A naive replace would discard the prompt/cache counts, so
+/// we merge per-field instead.
+fn merge_stream_usage(target: &mut Option<Usage>, update: Usage) {
+    match target {
+        Some(existing) => {
+            if update.input_tokens.is_some() {
+                existing.input_tokens = update.input_tokens;
+            }
+            if update.output_tokens.is_some() {
+                existing.output_tokens = update.output_tokens;
+            }
+            if update.cache_creation_input_tokens.is_some() {
+                existing.cache_creation_input_tokens = update.cache_creation_input_tokens;
+            }
+            if update.cache_read_input_tokens.is_some() {
+                existing.cache_read_input_tokens = update.cache_read_input_tokens;
+            }
+        }
+        None => *target = Some(update),
+    }
 }
 
 fn usage_from_api(usage: Option<Usage>) -> Option<TokenUsage> {
@@ -1194,6 +1225,27 @@ mod tests {
         assert_eq!(normalized.total_tokens, Some(200));
         assert_eq!(normalized.cached_tokens, Some(50));
         assert_eq!(normalized.cache_creation_tokens, Some(30));
+    }
+
+    #[test]
+    fn streaming_usage_merge_preserves_prompt_and_cache_tokens() {
+        // message_start carries input + cache tokens; message_delta only
+        // carries the running output_tokens. The merged result must retain the
+        // prompt/cache counts from message_start.
+        let mut acc: Option<Usage> = Some(
+            serde_json::from_str(
+                r#"{"input_tokens": 100, "output_tokens": 1, "cache_read_input_tokens": 40}"#,
+            )
+            .unwrap(),
+        );
+        let delta: Usage = serde_json::from_str(r#"{"output_tokens": 25}"#).unwrap();
+        merge_stream_usage(&mut acc, delta);
+
+        let normalized = usage_from_api(acc).unwrap();
+        // 100 misses + 40 reads folded into prompt_tokens; output from the delta.
+        assert_eq!(normalized.prompt_tokens, Some(140));
+        assert_eq!(normalized.completion_tokens, Some(25));
+        assert_eq!(normalized.cached_tokens, Some(40));
     }
 
     #[test]
