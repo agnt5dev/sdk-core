@@ -14,5 +14,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ],
             &["../../protos/proto"],
         )?;
+
+    // Modal sandbox provider: vendored gRPC contract (Modal has no REST API).
+    tonic_prost_build::configure()
+        .build_server(false)
+        .compile_protos(&["proto/modal/api.proto"], &["proto/modal"])?;
     Ok(())
 }

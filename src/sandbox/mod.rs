@@ -26,7 +26,15 @@
 pub mod providers;
 pub mod types;
 
+pub use providers::daytona::{DaytonaProviderConfig, DaytonaSandbox, DaytonaSandboxProvider};
+pub use providers::e2b::{E2bProviderConfig, E2bSandbox, E2bSandboxProvider};
+pub use providers::modal::{ModalProviderConfig, ModalSandbox, ModalSandboxProvider};
+pub use providers::northflank::{
+    NorthflankProviderConfig, NorthflankSandbox, NorthflankSandboxProvider,
+};
 pub use providers::remote::{RemoteSandbox, RemoteSandboxConfig, SandboxAuth};
+pub use providers::together::{TogetherProviderConfig, TogetherSandbox, TogetherSandboxProvider};
+pub use providers::vercel::{VercelProviderConfig, VercelSandbox, VercelSandboxProvider};
 pub use types::*;
 
 #[cfg(feature = "wasm-sandbox")]
@@ -80,6 +88,35 @@ pub trait SandboxBackend: SandboxExecutor + SandboxWorkspace {}
 
 impl<T: SandboxExecutor + SandboxWorkspace> SandboxBackend for T {}
 
+/// Control plane for a managed sandbox provider (E2B, Daytona, Modal, ...).
+///
+/// While [`SandboxBackend`] is the data plane for a *running* sandbox,
+/// `SandboxProvider` manages sandbox lifecycle: provisioning new instances,
+/// reconnecting to existing ones, and tearing them down.
+///
+/// Provider-specific extras (e.g., E2B preview URLs, Daytona git operations)
+/// are inherent methods on the concrete handle types, mirroring how
+/// `run_command` is inherent on [`RemoteSandbox`] rather than part of the
+/// universal trait.
+#[async_trait]
+pub trait SandboxProvider: Send + Sync {
+    /// Stable provider name ("e2b", "daytona", "modal", "northflank",
+    /// "vercel", "together"). Used as the registry key.
+    fn name(&self) -> &'static str;
+
+    /// Provision a new sandbox and return a connected backend handle.
+    async fn create_sandbox(&self, opts: CreateSandboxOptions) -> Result<Arc<dyn SandboxBackend>>;
+
+    /// Connect to an existing sandbox by provider-native ID.
+    async fn connect_sandbox(&self, sandbox_id: &str) -> Result<Arc<dyn SandboxBackend>>;
+
+    /// Destroy a sandbox. Returns `true` if the provider confirmed deletion.
+    async fn destroy_sandbox(&self, sandbox_id: &str) -> Result<bool>;
+
+    /// List sandboxes visible to the configured credentials.
+    async fn list_sandboxes(&self) -> Result<Vec<SandboxInfo>>;
+}
+
 // ── Registry ────────────────────────────────────────────────────
 
 /// Registry for managing sandbox backends.
@@ -89,6 +126,7 @@ impl<T: SandboxExecutor + SandboxWorkspace> SandboxBackend for T {}
 /// remote to wasm — it only auto-selects when no backend is specified at all.
 pub struct SandboxRegistry {
     backends: HashMap<String, Arc<dyn SandboxBackend>>,
+    providers: HashMap<String, Arc<dyn SandboxProvider>>,
     default_backend: Option<String>,
 }
 
@@ -96,6 +134,7 @@ impl SandboxRegistry {
     pub fn new() -> Self {
         Self {
             backends: HashMap::new(),
+            providers: HashMap::new(),
             default_backend: None,
         }
     }
@@ -136,6 +175,21 @@ impl SandboxRegistry {
     /// List registered backend names.
     pub fn list_backends(&self) -> Vec<&str> {
         self.backends.keys().map(|s| s.as_str()).collect()
+    }
+
+    /// Register a sandbox provider control plane under its [`SandboxProvider::name`].
+    pub fn register_provider(&mut self, provider: Arc<dyn SandboxProvider>) {
+        self.providers.insert(provider.name().to_string(), provider);
+    }
+
+    /// Get a registered provider by name.
+    pub fn get_provider(&self, name: &str) -> Option<Arc<dyn SandboxProvider>> {
+        self.providers.get(name).cloned()
+    }
+
+    /// List registered provider names.
+    pub fn list_providers(&self) -> Vec<&str> {
+        self.providers.keys().map(|s| s.as_str()).collect()
     }
 
     /// Auto-detect backends from environment variables.
@@ -186,6 +240,44 @@ impl SandboxRegistry {
             self.register("wasm".to_string(), Arc::new(wasm));
         }
 
+        Ok(())
+    }
+
+    /// Auto-register managed sandbox provider control planes from
+    /// environment variables.
+    ///
+    /// Registration is cheap (no network calls) — sandboxes are only
+    /// provisioned when [`SandboxProvider::create_sandbox`] is invoked.
+    /// A partially configured provider (e.g. `VERCEL_TOKEN` without
+    /// `VERCEL_TEAM_ID`) is an error rather than being silently skipped.
+    ///
+    /// | Provider | Trigger | Additional variables |
+    /// |---|---|---|
+    /// | `e2b` | `E2B_API_KEY` | `E2B_DOMAIN`, `E2B_API_URL`, `E2B_TEMPLATE` |
+    /// | `daytona` | `DAYTONA_API_KEY` | `DAYTONA_API_URL`, `DAYTONA_TARGET` |
+    /// | `vercel` | `VERCEL_OIDC_TOKEN` or `VERCEL_TOKEN` | `VERCEL_TEAM_ID`, `VERCEL_PROJECT_ID` |
+    /// | `northflank` | `NORTHFLANK_API_TOKEN` | `NORTHFLANK_PROJECT_ID` (required), `NORTHFLANK_TEAM_ID`, ... |
+    /// | `together` | `TOGETHER_API_KEY` | `TOGETHER_BASE_URL` |
+    /// | `modal` | `MODAL_TOKEN_ID` | `MODAL_TOKEN_SECRET` (required), `MODAL_APP_NAME`, ... |
+    pub fn load_providers_from_environment(&mut self) -> Result<()> {
+        if std::env::var("E2B_API_KEY").is_ok() {
+            self.register_provider(Arc::new(E2bSandboxProvider::from_env()?));
+        }
+        if std::env::var("DAYTONA_API_KEY").is_ok() {
+            self.register_provider(Arc::new(DaytonaSandboxProvider::from_env()?));
+        }
+        if std::env::var("VERCEL_OIDC_TOKEN").is_ok() || std::env::var("VERCEL_TOKEN").is_ok() {
+            self.register_provider(Arc::new(VercelSandboxProvider::from_env()?));
+        }
+        if std::env::var("NORTHFLANK_API_TOKEN").is_ok() {
+            self.register_provider(Arc::new(NorthflankSandboxProvider::from_env()?));
+        }
+        if std::env::var("TOGETHER_API_KEY").is_ok() {
+            self.register_provider(Arc::new(TogetherSandboxProvider::from_env()?));
+        }
+        if std::env::var("MODAL_TOKEN_ID").is_ok() {
+            self.register_provider(Arc::new(ModalSandboxProvider::from_env()?));
+        }
         Ok(())
     }
 }
