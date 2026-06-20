@@ -788,6 +788,57 @@ pub fn record_execution_request_with_attrs(
     counter.add(1, &attrs);
 }
 
+/// Gauge for worker process memory snapshots.
+static WORKER_MEMORY_BYTES_GAUGE: OnceLock<Gauge<u64>> = OnceLock::new();
+
+fn get_worker_memory_bytes_gauge() -> &'static Gauge<u64> {
+    WORKER_MEMORY_BYTES_GAUGE.get_or_init(|| {
+        let meter = global::meter("agnt5-sdk-core");
+        meter
+            .u64_gauge("agnt5.worker.memory.bytes")
+            .with_description(
+                "Worker process memory snapshot by language, phase, component, and memory kind",
+            )
+            .with_unit("By")
+            .build()
+    })
+}
+
+/// Record one worker process memory sample.
+///
+/// `kind` is a bounded memory source such as `rss`, `heap_used`, or
+/// `cgroup_current`. Do not include run IDs here; memory metrics need stable
+/// labels so they remain queryable during sustained load and leak hunts.
+pub fn record_worker_memory_bytes(
+    language: &str,
+    phase: &str,
+    component_name: &str,
+    component_type: &str,
+    kind: &str,
+    value: u64,
+) {
+    let gauge = get_worker_memory_bytes_gauge();
+    let mut attrs = vec![
+        KeyValue::new("sdk.language", language.to_string()),
+        KeyValue::new("worker.execution.phase", phase.to_string()),
+        KeyValue::new("component.name", component_name.to_string()),
+        KeyValue::new("component.type", component_type.to_string()),
+        KeyValue::new("worker.memory.kind", kind.to_string()),
+    ];
+
+    if let Some(pid) = get_project_id() {
+        attrs.push(KeyValue::new("agnt5.project.id", pid.to_string()));
+    }
+    if let Some(wid) = get_workspace_id() {
+        attrs.push(KeyValue::new("agnt5.workspace.id", wid.to_string()));
+    }
+    if let Some(did) = get_deployment_id() {
+        attrs.push(KeyValue::new("agnt5.deployment.id", did.to_string()));
+    }
+
+    gauge.record(value, &attrs);
+}
+
 // =============================================================================
 // Reconnection Metrics
 // =============================================================================
