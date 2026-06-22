@@ -101,9 +101,9 @@ The inverse helper `is_checkpoint_event_type()` returns true for boundary events
 
 | File | Purpose |
 |------|---------|
-| `src/worker.rs` | Worker lifecycle, dispatch loop, flush task, `emit_checkpoint_sync`, built-in scorer fast path, poll task, `CompleteJob` dispatch |
+| `src/worker.rs` | Worker lifecycle, dispatch loop, flush task, `emit_checkpoint_sync`, built-in scorer fast path, long-poll task, `CompleteJob` dispatch |
 | `src/journal_queue.rs` | `JournalEventQueue`, `JournalEventMessage`, event classification, metrics |
-| `src/client.rs` | `WorkerCoordinatorClient`, `complete_job()`, `poll_jobs()`, `create_ee_event_stream()` |
+| `src/client.rs` | `WorkerCoordinatorClient`, `complete_job()`, `poll_job()`, `create_ee_event_stream()` |
 | `src/eval/builtin_scorer.rs` | Fast-path Rust scorers (`exact_match`, `contains`, `regex_match`, `json_valid`, `levenshtein`) |
 | `src/lib.rs` | Module declarations, public re-exports, `pb` generated code |
 

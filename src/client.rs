@@ -5,10 +5,9 @@ use crate::pb::{
     worker_coordinator_service_client::WorkerCoordinatorServiceClient, AppendBatchRequest,
     AppendRequest, CheckpointRequest, CheckpointType, CompleteJobRequest, CompleteJobResponse,
     DurableStepCheckpoint, EventStreamMessage, FindByStepKeyRequest, PollJobRequest,
-    PollJobResponse, PollJobsRequest, PollJobsResponse, Record, RegisterService,
-    RegisterWorkerSessionRequest, RegisterWorkerSessionResponse, RenewJobLeaseRequest,
-    RenewJobLeaseResponse, ReportWorkerCapacityRequest, ReportWorkerCapacityResponse,
-    RuntimeMessage, ServiceMessage,
+    PollJobResponse, Record, RegisterService, RegisterWorkerSessionRequest,
+    RegisterWorkerSessionResponse, RenewJobLeaseRequest, RenewJobLeaseResponse,
+    ReportWorkerCapacityRequest, ReportWorkerCapacityResponse, RuntimeMessage, ServiceMessage,
 };
 use std::collections::HashMap;
 use std::time::Duration;
@@ -21,7 +20,7 @@ use tracing::{debug, error};
 /// Holds two gRPC clients multiplexed over the same `tonic::Channel`:
 /// - `client`: WorkerCoordinatorService (worker registration, dispatch streaming)
 /// - `engine_client`: EngineService (durable execution: checkpoint, event stream,
-///   job queue poll/complete, memoization lookup via find_by_step_key)
+///   parked job polling/complete, memoization lookup via find_by_step_key)
 ///
 /// The durable execution RPCs used to live on WorkerCoordinatorService and moved
 /// to EngineService as part of the journal-owner consolidation. Both clients
@@ -411,28 +410,6 @@ impl WorkerCoordinatorClient {
             }
         }
         Ok(None)
-    }
-
-    /// Poll for available jobs from the durable queue (managed edition).
-    /// Workers call this with exponential backoff to claim pending jobs.
-    ///
-    /// PollJobs now lives on EngineService (moved from WorkerCoordinatorService).
-    pub async fn poll_jobs(&mut self, req: PollJobsRequest) -> Result<PollJobsResponse> {
-        let response = self
-            .engine_client
-            .poll_jobs(req)
-            .await
-            .map_err(|e| {
-                debug!("PollJobs RPC failed: {}", e);
-                SdkError::Connection {
-                    message: format!("PollJobs failed: {}", e),
-                    code: crate::error::ErrorCode::ConnectionFailed,
-                    source: None,
-                }
-            })?
-            .into_inner();
-
-        Ok(response)
     }
 
     /// Register a parked-poll worker session with the Engine.
