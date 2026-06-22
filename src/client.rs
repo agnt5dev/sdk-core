@@ -4,12 +4,16 @@ use crate::pb::{
     execution_engine_service_client::ExecutionEngineServiceClient,
     worker_coordinator_service_client::WorkerCoordinatorServiceClient, AppendBatchRequest,
     AppendRequest, CheckpointRequest, CheckpointType, CompleteJobRequest, CompleteJobResponse,
-    DurableStepCheckpoint, EventStreamMessage, FindByStepKeyRequest, PollJobsRequest,
-    PollJobsResponse, Record, RegisterService, RuntimeMessage, ServiceMessage,
+    DurableStepCheckpoint, EventStreamMessage, FindByStepKeyRequest, PollJobRequest,
+    PollJobResponse, PollJobsRequest, PollJobsResponse, Record, RegisterService,
+    RegisterWorkerSessionRequest, RegisterWorkerSessionResponse, RenewJobLeaseRequest,
+    RenewJobLeaseResponse, ReportWorkerCapacityRequest, ReportWorkerCapacityResponse,
+    RuntimeMessage, ServiceMessage,
 };
 use std::collections::HashMap;
 use std::time::Duration;
 use tonic::transport::Channel;
+use tonic::Code;
 use tracing::{debug, error};
 
 /// Simple client for communicating with the Worker Coordinator service.
@@ -29,6 +33,20 @@ pub struct WorkerCoordinatorClient {
     engine_client: EngineServiceClient<Channel>,
 }
 
+const WORKER_COORDINATOR_RPC_TIMEOUT: Duration = Duration::from_secs(45);
+const PARKED_POLL_CLIENT_GRACE: Duration = Duration::from_secs(5);
+const MAX_PARKED_POLL_WAIT_MS: i64 = 30_000;
+
+fn poll_job_deadline(req: &PollJobRequest) -> Duration {
+    let wait_ms = req.wait_ms.clamp(0, MAX_PARKED_POLL_WAIT_MS) as u64;
+    Duration::from_millis(wait_ms).saturating_add(PARKED_POLL_CLIENT_GRACE)
+}
+
+fn is_idle_poll_timeout(status: &tonic::Status) -> bool {
+    matches!(status.code(), Code::Cancelled | Code::DeadlineExceeded)
+        && status.message().to_ascii_lowercase().contains("timeout")
+}
+
 impl WorkerCoordinatorClient {
     /// Create a new client connected to the Worker Coordinator
     pub async fn connect(endpoint: String) -> Result<Self> {
@@ -41,7 +59,7 @@ impl WorkerCoordinatorClient {
                 source: None,
             })?
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
+            .timeout(WORKER_COORDINATOR_RPC_TIMEOUT)
             .http2_adaptive_window(true)
             .connect()
             .await
@@ -408,6 +426,97 @@ impl WorkerCoordinatorClient {
                 debug!("PollJobs RPC failed: {}", e);
                 SdkError::Connection {
                     message: format!("PollJobs failed: {}", e),
+                    code: crate::error::ErrorCode::ConnectionFailed,
+                    source: None,
+                }
+            })?
+            .into_inner();
+
+        Ok(response)
+    }
+
+    /// Register a parked-poll worker session with the Engine.
+    pub async fn register_worker_session(
+        &mut self,
+        req: RegisterWorkerSessionRequest,
+    ) -> Result<RegisterWorkerSessionResponse> {
+        let response = self
+            .engine_client
+            .register_worker_session(req)
+            .await
+            .map_err(|e| {
+                debug!("RegisterWorkerSession RPC failed: {}", e);
+                SdkError::Connection {
+                    message: format!("RegisterWorkerSession failed: {}", e),
+                    code: crate::error::ErrorCode::ConnectionFailed,
+                    source: None,
+                }
+            })?
+            .into_inner();
+
+        Ok(response)
+    }
+
+    /// Park one worker slot until a job is available or the Engine times out.
+    pub async fn poll_job(&mut self, req: PollJobRequest) -> Result<PollJobResponse> {
+        let timeout = poll_job_deadline(&req);
+        let mut request = tonic::Request::new(req);
+        request.set_timeout(timeout);
+        let response = match self.engine_client.poll_job(request).await {
+            Ok(response) => response,
+            Err(e) => {
+                if is_idle_poll_timeout(&e) {
+                    debug!("PollJob idle timeout: {}", e);
+                    return Ok(PollJobResponse { job: None });
+                }
+                debug!("PollJob RPC failed: {}", e);
+                return Err(SdkError::Connection {
+                    message: format!("PollJob failed: {}", e),
+                    code: crate::error::ErrorCode::ConnectionFailed,
+                    source: None,
+                });
+            }
+        }
+        .into_inner();
+
+        Ok(response)
+    }
+
+    /// Renew an active job lease for a parked-poll assignment.
+    pub async fn renew_job_lease(
+        &mut self,
+        req: RenewJobLeaseRequest,
+    ) -> Result<RenewJobLeaseResponse> {
+        let response = self
+            .engine_client
+            .renew_job_lease(req)
+            .await
+            .map_err(|e| {
+                debug!("RenewJobLease RPC failed: {}", e);
+                SdkError::Connection {
+                    message: format!("RenewJobLease failed: {}", e),
+                    code: crate::error::ErrorCode::ConnectionFailed,
+                    source: None,
+                }
+            })?
+            .into_inner();
+
+        Ok(response)
+    }
+
+    /// Report current parked-poll capacity and active slot usage.
+    pub async fn report_worker_capacity(
+        &mut self,
+        req: ReportWorkerCapacityRequest,
+    ) -> Result<ReportWorkerCapacityResponse> {
+        let response = self
+            .engine_client
+            .report_worker_capacity(req)
+            .await
+            .map_err(|e| {
+                debug!("ReportWorkerCapacity RPC failed: {}", e);
+                SdkError::Connection {
+                    message: format!("ReportWorkerCapacity failed: {}", e),
                     code: crate::error::ErrorCode::ConnectionFailed,
                     source: None,
                 }
