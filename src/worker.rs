@@ -4,9 +4,9 @@ use crate::journal_queue::{JournalEventMessage, JournalEventQueue, JournalQueueC
 use crate::pb::{
     execution_engine_service_client::ExecutionEngineServiceClient, CompleteJobRequest,
     ComponentInfo, DispatchComponentResponse, EventStreamMessage, HealthCheck, JobAssignment,
-    PollJobRequest, PollJobsRequest, RegisterService, RegisterWorkerSessionRequest,
-    RenewJobLeaseRequest, ReportWorkerCapacityRequest, RuntimeMessage, RuntimeMessageType,
-    ServiceMessage, UnregisterService, WorkerCapability, WorkerHealthStatus, WorkerSlotPolicy,
+    PollJobRequest, RegisterService, RegisterWorkerSessionRequest, RenewJobLeaseRequest,
+    ReportWorkerCapacityRequest, RuntimeMessage, RuntimeMessageType, ServiceMessage,
+    UnregisterService, WorkerCapability, WorkerHealthStatus, WorkerSlotPolicy,
     WriteCheckpointRequest,
 };
 use std::collections::{HashMap, HashSet};
@@ -16,26 +16,6 @@ use tokio::sync::Mutex as TokioMutex;
 use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
-
-fn poll_component_names(components: &[ComponentInfo]) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut names = Vec::with_capacity(
-        components.len() + crate::eval::builtin_scorer::BUILTIN_SCORER_NAMES.len(),
-    );
-    for component in components {
-        if !component.name.is_empty() && seen.insert(component.name.clone()) {
-            names.push(component.name.clone());
-        }
-    }
-    for scorer in crate::eval::builtin_scorer::BUILTIN_SCORER_NAMES {
-        if crate::eval::builtin_scorer::can_execute_locally(scorer)
-            && seen.insert((*scorer).to_string())
-        {
-            names.push((*scorer).to_string());
-        }
-    }
-    names
-}
 
 fn take_correlation_ids(metadata: &mut HashMap<String, String>) -> (String, String) {
     let correlation_id = metadata
@@ -114,12 +94,6 @@ fn runtime_message_from_job_assignment(
     };
 
     (runtime_message, is_streaming, run_id, lease_id)
-}
-
-fn env_bool(name: &str) -> bool {
-    std::env::var(name)
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
 }
 
 fn env_usize(name: &str) -> Option<usize> {
@@ -1792,14 +1766,14 @@ impl Worker {
         let mut metadata = self.metadata.clone();
         metadata.extend(collect_agnt5_env_vars());
 
-        // Phase 6: declare data-path mode at registration. Default PUSH;
-        // `AGNT5_WORKER_MODE=pull` opts into PULL (worker calls PollJobs
-        // instead of receiving dispatches over the bidirectional stream).
+        // Phase 6: declare data-path mode. Default PUSH;
+        // `AGNT5_WORKER_MODE=pull` now means parked long-poll assignment
+        // (`RegisterWorkerSession` + `PollJob`). The legacy batch `PollJobs`
+        // loop is intentionally gone.
         let is_pull_mode = matches!(
             std::env::var("AGNT5_WORKER_MODE").ok().as_deref(),
             Some("pull") | Some("PULL")
         );
-        let parked_poll_enabled = is_pull_mode && env_bool("AGNT5_PARKED_POLL_ENABLED");
         let mode = if is_pull_mode {
             crate::pb::WorkerMode::Pull as i32
         } else {
@@ -1828,11 +1802,10 @@ impl Worker {
             max_concurrency,
         };
 
-        // Parked-poll workers do not need the stateful dispatch stream for
-        // work assignment. They register a worker session and pull work via
-        // unary Engine RPCs below. Keep the legacy stream path for PUSH and
-        // old PollJobs mode until the remaining lifecycle RPCs replace it.
-        let (tx, rx, _runtime_msg_tx_hold) = if parked_poll_enabled {
+        // Pull workers do not need the stateful dispatch stream for work
+        // assignment. They register a worker session and pull work via unary
+        // Engine RPCs below. Push workers keep the stream path.
+        let (tx, rx, _runtime_msg_tx_hold) = if is_pull_mode {
             let (tx, _outgoing_rx) = flume::bounded::<ServiceMessage>(1000);
             let (runtime_msg_tx, runtime_msg_rx) = flume::bounded::<RuntimeMessage>(1000);
             (tx, runtime_msg_rx, Some(runtime_msg_tx))
@@ -1844,7 +1817,7 @@ impl Worker {
         };
 
         if is_reconnect {
-            if parked_poll_enabled {
+            if is_pull_mode {
                 eprintln!(
                     "[INFO] Reconnected to coordinator ({}) for parked polling",
                     coordinator_endpoint
@@ -1855,7 +1828,7 @@ impl Worker {
                     coordinator_endpoint
                 );
             }
-        } else if parked_poll_enabled {
+        } else if is_pull_mode {
             eprintln!(
                 "[INFO] Connected to coordinator ({}) for parked polling",
                 coordinator_endpoint
@@ -1863,7 +1836,7 @@ impl Worker {
         } else {
             eprintln!("[INFO] Connected to coordinator ({})", coordinator_endpoint);
         }
-        if parked_poll_enabled {
+        if is_pull_mode {
             debug!(
                 "Worker {} connected for parked polling",
                 self.config.worker_id
@@ -1935,10 +1908,10 @@ impl Worker {
         // routing for an idle worker.
         let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-        // Start heartbeat task for stream-backed modes. Parked-poll workers
+        // Start heartbeat task for stream-backed modes. Pull workers
         // heartbeat by keeping PollJob requests open and renewing active
         // leases; there is no dispatch stream to send HealthCheck on.
-        let heartbeat_task = if parked_poll_enabled {
+        let heartbeat_task = if is_pull_mode {
             None
         } else {
             Some(self.spawn_heartbeat_task(tx.clone(), in_flight.clone()))
@@ -1991,22 +1964,17 @@ impl Worker {
             worker_handles.push(handle);
         }
 
-        // Phase 8: PULL workers own the poll task; PUSH workers never
-        // spawn it. The legacy `AGNT5_POLL_ENABLED` env gate has been
-        // removed — mode declared at registration is now the only switch.
+        // Pull workers own the parked long-poll task; PUSH workers never
+        // spawn it. The legacy batch PollJobs path has been removed.
         let poll_task = if is_pull_mode {
             let poll_shutdown = shutdown_rx.resubscribe();
-            if parked_poll_enabled {
-                Some(self.spawn_parked_poll_task(
-                    response_tx.clone(),
-                    message_handler.clone(),
-                    poll_shutdown,
-                    max_concurrency,
-                    in_flight.clone(),
-                ))
-            } else {
-                Some(self.spawn_poll_task(task_tx.clone(), poll_shutdown, max_concurrency))
-            }
+            Some(self.spawn_parked_poll_task(
+                response_tx.clone(),
+                message_handler.clone(),
+                poll_shutdown,
+                max_concurrency,
+                in_flight.clone(),
+            ))
         } else {
             None
         };
@@ -3162,156 +3130,9 @@ impl Worker {
             }
         })
     }
-    /// Spawn a polling task that claims jobs from the durable queue (managed edition).
-    /// Runs alongside the streaming dispatch loop. Uses exponential backoff when no jobs.
-    fn spawn_poll_task(
-        &self,
-        task_tx: flume::Sender<RuntimeMessage>,
-        mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
-        max_concurrency: usize,
-    ) -> tokio::task::JoinHandle<()> {
-        let worker_id = self.config.worker_id.clone();
-        let endpoint = self.config.resolved_coordinator_endpoint();
-        let component_ids = poll_component_names(&self.components);
-        let project_id = canonical_project_id_from_env();
-        let deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").ok();
-        let streaming_runs = self.streaming_runs.clone();
-        let pending_lease_ids = self.pending_lease_ids.clone();
-
-        // Polling config from env
-        let initial_backoff_ms: u64 = std::env::var("AGNT5_POLL_INITIAL_BACKOFF_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1000);
-        let max_backoff_ms: u64 = std::env::var("AGNT5_POLL_MAX_BACKOFF_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(30000);
-
-        tokio::spawn(async move {
-            // Skip polling if no project context (not in managed mode).
-            if project_id.is_empty() {
-                eprintln!("[INFO] Job queue polling disabled (AGNT5_PROJECT_ID not set)");
-                return;
-            }
-
-            // Skip if no component IDs available
-            if component_ids.is_empty() {
-                eprintln!("[INFO] Job queue polling disabled (no components registered)");
-                return;
-            }
-
-            // Create dedicated gRPC client for polling
-            let mut client = match WorkerCoordinatorClient::connect(endpoint.clone()).await {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("[WARN] Job queue poll task failed to connect: {}", e);
-                    return;
-                }
-            };
-
-            eprintln!(
-                "[INFO] Job queue polling started ({} components, tenant={})",
-                component_ids.len(),
-                project_id
-            );
-
-            let mut backoff = Duration::from_millis(initial_backoff_ms);
-            let max_backoff = Duration::from_millis(max_backoff_ms);
-
-            loop {
-                // Wait with backoff, respecting shutdown
-                tokio::select! {
-                    _ = shutdown_rx.recv() => {
-                        info!("Poll task shutting down");
-                        return;
-                    }
-                    _ = tokio::time::sleep(backoff) => {}
-                }
-
-                // Capacity-aware: only poll when worker pool has spare slots
-                let queue_len = task_tx.len();
-                let available = max_concurrency.saturating_sub(queue_len);
-                if available == 0 {
-                    debug!("Poll task: worker pool full (queue={}), waiting", queue_len);
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
-
-                let max_jobs = available.min(10) as i32; // Cap at 10 per poll
-
-                match client
-                    .poll_jobs(PollJobsRequest {
-                        worker_id: worker_id.clone(),
-                        component_ids: component_ids.clone(),
-                        max_jobs,
-                        project_id: project_id.clone(),
-                        deployment_id: deployment_id.clone(),
-                        claim_timeout_ms: 300_000,
-                    })
-                    .await
-                {
-                    Ok(resp) if resp.jobs.is_empty() => {
-                        // No work — log the current backoff so empty-poll behavior is visible.
-                        eprintln!(
-                            "[INFO] Job queue: no jobs available, next poll in {}ms",
-                            backoff.as_millis()
-                        );
-                        backoff = std::cmp::min(backoff * 2, max_backoff);
-                    }
-                    Ok(resp) => {
-                        // Reset backoff on successful poll
-                        backoff = Duration::from_millis(initial_backoff_ms);
-                        let job_count = resp.jobs.len();
-                        eprintln!("[INFO] Job queue: claimed {} jobs", job_count);
-
-                        for job in resp.jobs {
-                            let (runtime_message, is_streaming, run_id, lease_id) =
-                                runtime_message_from_job_assignment(job);
-                            if !lease_id.is_empty() {
-                                if let Ok(mut map) = pending_lease_ids.lock() {
-                                    map.insert(run_id.clone(), lease_id);
-                                }
-                            }
-
-                            // Track streaming runs for polled jobs (same as dispatch stream path)
-                            // Without this, the journal flush task drops SSE-only events (logs, deltas)
-                            // because it doesn't know the run has an SSE listener.
-                            if is_streaming {
-                                if let Ok(mut map) = streaming_runs.lock() {
-                                    map.insert(run_id, true);
-                                }
-                            }
-
-                            if let Err(e) = task_tx.send_async(runtime_message).await {
-                                warn!("Poll task: failed to dispatch job to worker pool: {}", e);
-                                break;
-                            }
-                        }
-
-                        eprintln!(
-                            "[INFO] Job queue: dispatched {} jobs to worker pool",
-                            job_count
-                        );
-                    }
-                    Err(e) => {
-                        // Phase 8: the Unimplemented fallback is gone — the
-                        // coordinator always implements PollJobs/CompleteJob
-                        // now that managed-edition gating has been removed.
-                        // Any error here is a real transport/server problem,
-                        // so back off and retry instead of silently stopping.
-                        eprintln!("[WARN] Job queue poll error: {}", e);
-                        backoff = std::cmp::min(backoff * 2, max_backoff);
-                    }
-                }
-            }
-        })
-    }
-
     /// Handle a polled job response by calling CompleteJob RPC.
     ///
-    /// Called from the dispatch loop on PULL workers (mode-based routing,
-    /// Phase 8). On the coordinator's poll path `job_id == run_id`, so we
+    /// Called from parked long-poll workers. On the poll path `job_id == run_id`, so we
     /// derive the job_id from `resp.invocation_id` — stripping any
     /// `:suffix` the worker appends for streaming invocations. Project identity
     /// comes from `AGNT5_PROJECT_ID`.
@@ -3350,8 +3171,8 @@ impl Worker {
                 }
             };
 
-        // Phase 8: PULL workers derive tenant_id from the same env var the
-        // poll task uses for the PollJobs request.
+        // Pull workers derive tenant_id from the same env var the parked
+        // PollJob task uses.
         let tenant_id = canonical_project_id_from_env();
 
         // Call CompleteJob RPC
@@ -3475,10 +3296,10 @@ impl Worker {
 mod tests {
     use super::{
         parked_lease_danger_retry_ms, parked_lease_renew_interval_ms,
-        parked_lease_renew_interval_with_jitter_ms, poll_component_names,
-        runtime_message_from_job_assignment, take_correlation_ids, Worker, WorkerConfig,
+        parked_lease_renew_interval_with_jitter_ms, runtime_message_from_job_assignment,
+        take_correlation_ids, Worker, WorkerConfig,
     };
-    use crate::pb::{runtime_message, ComponentInfo, JobAssignment};
+    use crate::pb::{runtime_message, JobAssignment};
     use std::collections::HashMap;
 
     #[test]
@@ -3547,33 +3368,6 @@ mod tests {
 
         assert!(worker.pending_lease_ids.lock().unwrap().is_empty());
         assert!(worker.streaming_runs.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn poll_component_names_include_sdk_core_builtin_scorers() {
-        let names = poll_component_names(&[ComponentInfo {
-            name: "ks_noop".to_string(),
-            ..Default::default()
-        }]);
-
-        assert!(names.contains(&"ks_noop".to_string()));
-        assert!(names.contains(&"exact_match".to_string()));
-        assert!(names.contains(&"contains".to_string()));
-        assert!(names.contains(&"json_valid".to_string()));
-        assert!(!names.contains(&"llm_judge".to_string()));
-    }
-
-    #[test]
-    fn poll_component_names_deduplicates_builtin_scorers() {
-        let names = poll_component_names(&[ComponentInfo {
-            name: "exact_match".to_string(),
-            ..Default::default()
-        }]);
-
-        assert_eq!(
-            names.iter().filter(|name| *name == "exact_match").count(),
-            1
-        );
     }
 
     #[test]
