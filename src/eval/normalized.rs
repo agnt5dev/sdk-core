@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 
 pub const NORMALIZED_SESSION_SCHEMA: &str = "agnt5.eval.normalized_session.v1";
 pub const NORMALIZED_SPAN_SCHEMA: &str = "agnt5.eval.normalized_span.v1";
+pub const TRACE_EVAL_CONTEXT_SCHEMA: &str = "agnt5.eval.trace_eval_context.v1";
 pub const TRACE_ARTIFACT_MANIFEST_SCHEMA: &str = "agnt5.eval.trace_artifact_manifest.v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -264,6 +265,10 @@ pub struct TraceArtifactManifest {
     pub trace_id: Option<String>,
     pub normalized_session_ref: String,
     pub normalized_session_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_eval_context_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_eval_context_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_trace_ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
