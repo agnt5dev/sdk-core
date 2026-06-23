@@ -151,7 +151,7 @@ pub fn init_telemetry(service_name: &str, service_version: &str) -> Result<(), S
 
 fn init_telemetry_inner(service_name: &str, service_version: &str) -> Result<(), SdkError> {
     let otel_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-        .unwrap_or_else(|_| "https://grpc.agnt5.com:3418".to_string());
+        .unwrap_or_else(|_| "http://grpc.agnt5.com:3418".to_string());
 
     tracing::debug!(
         "Initializing OpenTelemetry: endpoint={}, service={}",
