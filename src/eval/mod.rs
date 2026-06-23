@@ -12,6 +12,7 @@ pub mod deterministic;
 pub mod llm_judge;
 pub mod normalized;
 pub mod trace;
+pub mod trace_eval_metrics;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -208,7 +209,7 @@ pub use normalized::{
     NormalizedHandoff, NormalizedLlmCall, NormalizedSession, NormalizedSessionSummary,
     NormalizedSpan, NormalizedToolCall, NormalizedTraceError, RedactionPolicySnapshot,
     TraceArtifactManifest, NORMALIZED_SESSION_SCHEMA, NORMALIZED_SPAN_SCHEMA,
-    TRACE_ARTIFACT_MANIFEST_SCHEMA,
+    TRACE_ARTIFACT_MANIFEST_SCHEMA, TRACE_EVAL_CONTEXT_SCHEMA,
 };
 pub use trace::{trace_score, TraceAssertion};
 

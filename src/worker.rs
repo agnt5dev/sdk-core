@@ -1,5 +1,5 @@
 use crate::client::{self, EngineClient, WorkerCoordinatorClient};
-use crate::error::Result;
+use crate::error::{Result, SdkError};
 use crate::journal_queue::{JournalEventMessage, JournalEventQueue, JournalQueueConfig};
 use crate::pb::{
     execution_engine_service_client::ExecutionEngineServiceClient, CompleteJobRequest,
@@ -16,6 +16,53 @@ use tokio::sync::Mutex as TokioMutex;
 use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+const PARKED_WORKER_SESSION_REGISTER_ATTEMPTS: usize = 3;
+const PARKED_WORKER_SESSION_REGISTER_RETRY_MS: u64 = 1_000;
+const PARKED_WORKER_SESSION_TRANSIENT_RETRY_MAX_MS: u64 = 32_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ParkedWorkerSessionRegistrationResult {
+    Registered(String),
+    Rejected,
+}
+
+#[derive(Clone)]
+struct ParkedWorkerSessionRegistration {
+    worker_id: String,
+    project_id: String,
+    deployment_id: String,
+    min_slots: usize,
+    max_slots: usize,
+    capabilities: Vec<WorkerCapability>,
+    components: Vec<ComponentInfo>,
+    service_name: String,
+    service_version: String,
+    service_type: String,
+}
+
+impl ParkedWorkerSessionRegistration {
+    fn request(&self) -> RegisterWorkerSessionRequest {
+        RegisterWorkerSessionRequest {
+            worker_id: self.worker_id.clone(),
+            project_id: self.project_id.clone(),
+            deployment_id: self.deployment_id.clone(),
+            max_slots: self.max_slots as u32,
+            slot_policy: Some(WorkerSlotPolicy {
+                min_slots: self.min_slots as u32,
+                max_slots: self.max_slots as u32,
+                target_cpu_usage: 0.75,
+                target_memory_usage: 0.80,
+                ramp_throttle_ms: 1_000,
+            }),
+            capabilities: self.capabilities.clone(),
+            components: self.components.clone(),
+            service_name: self.service_name.clone(),
+            service_version: self.service_version.clone(),
+            service_type: self.service_type.clone(),
+        }
+    }
+}
 
 fn take_correlation_ids(metadata: &mut HashMap<String, String>) -> (String, String) {
     let correlation_id = metadata
@@ -558,7 +605,7 @@ async fn complete_or_forward_parked_response(
     service_message: ServiceMessage,
     fallback_lease_id: &str,
     worker_id: &str,
-    worker_session_id: &str,
+    worker_session_id: &Arc<TokioMutex<String>>,
     tenant_id: &str,
     slot_idx: usize,
     response_tx: &flume::Sender<ServiceMessage>,
@@ -577,11 +624,18 @@ async fn complete_or_forward_parked_response(
 
     let job_id = completion.job_id.clone();
     let started = Instant::now();
-    if let Err(e) =
-        complete_polled_job_with_client(client, worker_id, worker_session_id, tenant_id, completion)
-            .await
+    let current_session_id = worker_session_id.lock().await.clone();
+    if let Err(e) = complete_polled_job_with_client(
+        client,
+        worker_id,
+        &current_session_id,
+        tenant_id,
+        completion,
+    )
+    .await
     {
         warn!("Parked poll slot {} CompleteJob failed: {}", slot_idx, e);
+        return false;
     } else {
         let elapsed = started.elapsed();
         if elapsed > Duration::from_millis(500) {
@@ -653,7 +707,7 @@ async fn report_worker_capacity_with_client(
 fn spawn_parked_capacity_reporter(
     mut client: WorkerCoordinatorClient,
     worker_id: String,
-    worker_session_id: String,
+    worker_session_id: Arc<TokioMutex<String>>,
     open_poll_slots: Arc<std::sync::atomic::AtomicUsize>,
     active_slots: Arc<std::sync::atomic::AtomicUsize>,
     desired_slots: usize,
@@ -664,10 +718,11 @@ fn spawn_parked_capacity_reporter(
         .unwrap_or(5_000)
         .clamp(1_000, 60_000) as u64;
     tokio::spawn(async move {
+        let current_session_id = worker_session_id.lock().await.clone();
         report_worker_capacity_with_client(
             &mut client,
             &worker_id,
-            &worker_session_id,
+            &current_session_id,
             open_poll_slots.clone(),
             active_slots.clone(),
             desired_slots,
@@ -680,10 +735,11 @@ fn spawn_parked_capacity_reporter(
             tokio::select! {
                 _ = shutdown_rx.recv() => return,
                 _ = interval.tick() => {
+                    let current_session_id = worker_session_id.lock().await.clone();
                     report_worker_capacity_with_client(
                         &mut client,
                         &worker_id,
-                        &worker_session_id,
+                        &current_session_id,
                         open_poll_slots.clone(),
                         active_slots.clone(),
                         desired_slots,
@@ -696,10 +752,157 @@ fn spawn_parked_capacity_reporter(
     })
 }
 
+fn is_worker_session_inactive_error(error: &SdkError) -> bool {
+    // Keep in sync with runtime's `Status::permission_denied("worker session is not active")`.
+    error
+        .to_string()
+        .to_ascii_lowercase()
+        .contains("worker session is not active")
+}
+
+fn is_parked_worker_session_registration_rejection(error: &SdkError) -> bool {
+    let error = error.to_string().to_ascii_lowercase();
+    [
+        "invalid argument",
+        "permission denied",
+        "unauthenticated",
+        "failed precondition",
+        "out of range",
+        "unimplemented",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
+}
+
+fn parked_worker_session_was_refreshed(
+    current_session_id: &str,
+    observed_session_id: &str,
+) -> bool {
+    current_session_id != observed_session_id
+}
+
+fn exit_parked_worker_process(reason: &str) -> ! {
+    error!("{}", reason);
+    // Managed pull workers cannot make progress without a valid session. Exiting is intentional:
+    // Kubernetes should replace an unrecoverable worker instead of leaving it Ready but unable to poll.
+    std::process::exit(1);
+}
+
+async fn register_parked_worker_session_with_retries(
+    client: &mut WorkerCoordinatorClient,
+    registration: &ParkedWorkerSessionRegistration,
+    reason: &str,
+) -> ParkedWorkerSessionRegistrationResult {
+    let mut rejection_attempts = 0;
+    let mut transient_attempts = 0;
+    let mut transient_delay = Duration::from_millis(PARKED_WORKER_SESSION_REGISTER_RETRY_MS);
+    loop {
+        match client.register_worker_session(registration.request()).await {
+            Ok(session) => {
+                return ParkedWorkerSessionRegistrationResult::Registered(
+                    session.worker_session_id,
+                );
+            }
+            Err(e) if is_parked_worker_session_registration_rejection(&e) => {
+                rejection_attempts += 1;
+                warn!(
+                    "{} attempt {}/{} failed: {}",
+                    reason, rejection_attempts, PARKED_WORKER_SESSION_REGISTER_ATTEMPTS, e
+                );
+                if rejection_attempts >= PARKED_WORKER_SESSION_REGISTER_ATTEMPTS {
+                    return ParkedWorkerSessionRegistrationResult::Rejected;
+                }
+                tokio::time::sleep(Duration::from_millis(
+                    PARKED_WORKER_SESSION_REGISTER_RETRY_MS,
+                ))
+                .await;
+            }
+            Err(e) => {
+                transient_attempts += 1;
+                warn!(
+                    "{} transient attempt {} failed: {}; retrying in {}ms",
+                    reason,
+                    transient_attempts,
+                    e,
+                    transient_delay.as_millis()
+                );
+                tokio::time::sleep(transient_delay).await;
+                transient_delay = (transient_delay * 2).min(Duration::from_millis(
+                    PARKED_WORKER_SESSION_TRANSIENT_RETRY_MAX_MS,
+                ));
+            }
+        }
+    }
+}
+
+async fn try_refresh_parked_worker_session_once(
+    client: &mut WorkerCoordinatorClient,
+    session_id: &Arc<TokioMutex<String>>,
+    observed_session_id: &str,
+    registration: &ParkedWorkerSessionRegistration,
+    slot_idx: usize,
+) -> bool {
+    let current_session_id = session_id.lock().await.clone();
+    if parked_worker_session_was_refreshed(&current_session_id, observed_session_id) {
+        debug!(
+            "Parked poll slot {} observed stale worker session; another slot refreshed it",
+            slot_idx
+        );
+        return true;
+    }
+
+    warn!(
+        "Parked poll slot {} detected inactive worker session; re-registering parked worker session",
+        slot_idx
+    );
+    match register_parked_worker_session_with_retries(
+        client,
+        registration,
+        "RegisterWorkerSession retry after inactive worker session",
+    )
+    .await
+    {
+        ParkedWorkerSessionRegistrationResult::Registered(new_session_id) => {
+            let mut current_session_id = session_id.lock().await;
+            if parked_worker_session_was_refreshed(&current_session_id, observed_session_id) {
+                debug!(
+                    "Parked poll slot {} discarding refreshed session; another slot already updated it",
+                    slot_idx
+                );
+                return true;
+            }
+            *current_session_id = new_session_id;
+            info!(
+                "Parked poll slot {} refreshed inactive worker session",
+                slot_idx
+            );
+            true
+        }
+        ParkedWorkerSessionRegistrationResult::Rejected => false,
+    }
+}
+
+async fn refresh_parked_worker_session(
+    client: &mut WorkerCoordinatorClient,
+    session_id: &Arc<TokioMutex<String>>,
+    observed_session_id: &str,
+    registration: &ParkedWorkerSessionRegistration,
+    slot_idx: usize,
+) -> bool {
+    try_refresh_parked_worker_session_once(
+        client,
+        session_id,
+        observed_session_id,
+        registration,
+        slot_idx,
+    )
+    .await
+}
+
 fn spawn_parked_lease_renewal(
     mut client: WorkerCoordinatorClient,
     worker_id: String,
-    worker_session_id: String,
+    worker_session_id: Arc<TokioMutex<String>>,
     run_id: String,
     lease_id: String,
     lease_timeout_ms: i64,
@@ -723,7 +926,7 @@ fn spawn_parked_lease_renewal(
             match client
                 .renew_job_lease(RenewJobLeaseRequest {
                     worker_id: worker_id.clone(),
-                    worker_session_id: worker_session_id.clone(),
+                    worker_session_id: worker_session_id.lock().await.clone(),
                     run_id: run_id.clone(),
                     lease_id: lease_id.clone(),
                     lease_timeout_ms,
@@ -2919,33 +3122,31 @@ impl Worker {
                     return;
                 }
             };
-            let session = match client
-                .register_worker_session(RegisterWorkerSessionRequest {
-                    worker_id: worker_id.clone(),
-                    project_id: project_id.clone(),
-                    deployment_id: deployment_id.clone(),
-                    max_slots: max_slots as u32,
-                    slot_policy: Some(WorkerSlotPolicy {
-                        min_slots: min_slots as u32,
-                        max_slots: max_slots as u32,
-                        target_cpu_usage: 0.75,
-                        target_memory_usage: 0.80,
-                        ramp_throttle_ms: 1_000,
-                    }),
-                    capabilities,
-                    components,
-                    service_name,
-                    service_version,
-                    service_type,
-                })
-                .await
-            {
-                Ok(session) => session,
-                Err(e) => {
-                    eprintln!("[WARN] RegisterWorkerSession failed: {}", e);
-                    return;
-                }
+            let registration = ParkedWorkerSessionRegistration {
+                worker_id: worker_id.clone(),
+                project_id: project_id.clone(),
+                deployment_id: deployment_id.clone(),
+                min_slots,
+                max_slots,
+                capabilities,
+                components,
+                service_name,
+                service_version,
+                service_type,
             };
+            let initial_session_id = match register_parked_worker_session_with_retries(
+                &mut client,
+                &registration,
+                "RegisterWorkerSession",
+            )
+            .await
+            {
+                ParkedWorkerSessionRegistrationResult::Registered(session_id) => session_id,
+                ParkedWorkerSessionRegistrationResult::Rejected => exit_parked_worker_process(
+                    "RegisterWorkerSession was rejected after 3 attempts; exiting worker process",
+                ),
+            };
+            let worker_session_id = Arc::new(TokioMutex::new(initial_session_id));
 
             eprintln!(
                 "[INFO] Parked polling started (deployment={}, min_slots={}, max_slots={})",
@@ -2956,7 +3157,7 @@ impl Worker {
             let capacity_reporter = spawn_parked_capacity_reporter(
                 client.clone(),
                 worker_id.clone(),
-                session.worker_session_id.clone(),
+                worker_session_id.clone(),
                 open_poll_slots.clone(),
                 in_flight.clone(),
                 min_slots,
@@ -2968,7 +3169,8 @@ impl Worker {
             for slot_idx in 0..min_slots {
                 let mut client = client.clone();
                 let worker_id = worker_id.clone();
-                let worker_session_id = session.worker_session_id.clone();
+                let worker_session_id = worker_session_id.clone();
+                let registration = registration.clone();
                 let project_id = project_id.clone();
                 let response_tx = response_tx.clone();
                 let handler = message_handler.clone();
@@ -2980,11 +3182,12 @@ impl Worker {
                 slots.spawn(async move {
                     let worker_name = format!("{}-parked-{}", worker_id, slot_idx);
                     loop {
+                        let current_session_id = worker_session_id.lock().await.clone();
                         open_poll_slots.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let poll_result = client
                             .poll_job(PollJobRequest {
                                 worker_id: worker_id.clone(),
-                                worker_session_id: worker_session_id.clone(),
+                                worker_session_id: current_session_id.clone(),
                                 wait_ms: 30_000,
                                 claim_timeout_ms,
                             })
@@ -3096,6 +3299,22 @@ impl Worker {
                                 let _ = renew_stop_tx.send(());
                                 if let Some(handle) = renewal {
                                     let _ = handle.await;
+                                }
+                            }
+                            Err(e) if is_worker_session_inactive_error(&e) => {
+                                warn!("Parked poll slot {} error: {}", slot_idx, e);
+                                if !refresh_parked_worker_session(
+                                    &mut client,
+                                    &worker_session_id,
+                                    &current_session_id,
+                                    &registration,
+                                    slot_idx,
+                                )
+                                .await
+                                {
+                                    exit_parked_worker_process(
+                                        "RegisterWorkerSession retry was rejected after 3 attempts; exiting worker process",
+                                    );
                                 }
                             }
                             Err(e) => {
@@ -3295,10 +3514,13 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::{
+        is_parked_worker_session_registration_rejection, is_worker_session_inactive_error,
         parked_lease_danger_retry_ms, parked_lease_renew_interval_ms,
-        parked_lease_renew_interval_with_jitter_ms, runtime_message_from_job_assignment,
-        take_correlation_ids, Worker, WorkerConfig,
+        parked_lease_renew_interval_with_jitter_ms, parked_worker_session_was_refreshed,
+        runtime_message_from_job_assignment, take_correlation_ids, ParkedWorkerSessionRegistration,
+        Worker, WorkerConfig,
     };
+    use crate::error::{ErrorCode, SdkError};
     use crate::pb::{runtime_message, JobAssignment};
     use std::collections::HashMap;
 
@@ -3433,6 +3655,87 @@ mod tests {
                 "jittered interval out of ±10% range: {jittered}"
             );
         }
+    }
+
+    #[test]
+    fn worker_session_inactive_errors_are_detected() {
+        let error = SdkError::Connection {
+            message: "PollJob failed: code: 'The caller does not have permission to execute the specified operation', message: \"worker session is not active\"".to_string(),
+            code: ErrorCode::ConnectionFailed,
+            source: None,
+        };
+
+        assert!(is_worker_session_inactive_error(&error));
+    }
+
+    #[test]
+    fn parked_worker_session_registration_classifies_rejections() {
+        let rejected = SdkError::Connection {
+            message:
+                "RegisterWorkerSession failed: code: 'Invalid argument', message: \"bad worker\""
+                    .to_string(),
+            code: ErrorCode::ConnectionFailed,
+            source: None,
+        };
+        let transient = SdkError::Connection {
+            message: "RegisterWorkerSession failed: code: 'The service is currently unavailable'"
+                .to_string(),
+            code: ErrorCode::ConnectionFailed,
+            source: None,
+        };
+
+        assert!(is_parked_worker_session_registration_rejection(&rejected));
+        assert!(!is_parked_worker_session_registration_rejection(&transient));
+    }
+
+    #[test]
+    fn parked_worker_session_refreshed_detects_stale_observed_session() {
+        assert!(parked_worker_session_was_refreshed(
+            "new-session",
+            "old-session"
+        ));
+        assert!(!parked_worker_session_was_refreshed(
+            "same-session",
+            "same-session"
+        ));
+    }
+
+    #[test]
+    fn parked_worker_session_registration_builds_repeatable_request() {
+        let registration = ParkedWorkerSessionRegistration {
+            worker_id: "worker-1".into(),
+            project_id: "project-1".into(),
+            deployment_id: "deployment-1".into(),
+            min_slots: 2,
+            max_slots: 5,
+            capabilities: vec![crate::pb::WorkerCapability {
+                component_type: crate::pb::ComponentType::Function as i32,
+                component_name: "do_work".into(),
+            }],
+            components: vec![crate::pb::ComponentInfo {
+                component_type: crate::pb::ComponentType::Function as i32,
+                name: "do_work".into(),
+                ..Default::default()
+            }],
+            service_name: "svc".into(),
+            service_version: "1.2.3".into(),
+            service_type: "worker".into(),
+        };
+
+        let first = registration.request();
+        let second = registration.request();
+
+        assert_eq!(first.worker_id, "worker-1");
+        assert_eq!(first.project_id, "project-1");
+        assert_eq!(first.deployment_id, "deployment-1");
+        assert_eq!(first.max_slots, 5);
+        assert_eq!(first.slot_policy.as_ref().unwrap().min_slots, 2);
+        assert_eq!(first.slot_policy.as_ref().unwrap().max_slots, 5);
+        assert_eq!(first.capabilities.len(), 1);
+        assert_eq!(first.components.len(), 1);
+        assert_eq!(second.service_name, "svc");
+        assert_eq!(second.service_version, "1.2.3");
+        assert_eq!(second.service_type, "worker");
     }
 
     #[test]
