@@ -55,6 +55,7 @@ impl RuntimeServiceClient {
             service_version: config.service_version.clone(),
             service_type: config.service_type.clone(),
             components: vec![],
+            capabilities: vec![],
             metadata,
             mode: crate::pb::WorkerMode::Push as i32,
             deployment_id: std::env::var("AGNT5_DEPLOYMENT_ID").unwrap_or_default(),

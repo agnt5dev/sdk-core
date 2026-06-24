@@ -1994,6 +1994,7 @@ impl Worker {
         // 100. Drives both the local pool size and the registration field.
         let max_concurrency: u32 = self.config.max_concurrency.unwrap_or(100);
 
+        let capabilities = worker_capabilities(&self.components);
         let registration = RegisterService {
             service_name: self.config.service_name.clone(),
             service_version: self.config.service_version.clone(),
@@ -2003,6 +2004,7 @@ impl Worker {
             mode,
             deployment_id,
             max_concurrency,
+            capabilities,
         };
 
         // Pull workers do not need the stateful dispatch stream for work
@@ -3517,8 +3519,8 @@ mod tests {
         is_parked_worker_session_registration_rejection, is_worker_session_inactive_error,
         parked_lease_danger_retry_ms, parked_lease_renew_interval_ms,
         parked_lease_renew_interval_with_jitter_ms, parked_worker_session_was_refreshed,
-        runtime_message_from_job_assignment, take_correlation_ids, ParkedWorkerSessionRegistration,
-        Worker, WorkerConfig,
+        runtime_message_from_job_assignment, take_correlation_ids, worker_capabilities,
+        ParkedWorkerSessionRegistration, Worker, WorkerConfig,
     };
     use crate::error::{ErrorCode, SdkError};
     use crate::pb::{runtime_message, JobAssignment};
@@ -3736,6 +3738,34 @@ mod tests {
         assert_eq!(second.service_name, "svc");
         assert_eq!(second.service_version, "1.2.3");
         assert_eq!(second.service_type, "worker");
+    }
+
+    #[test]
+    fn worker_capabilities_include_declared_components_and_local_builtin_scorers() {
+        let capabilities = worker_capabilities(&[crate::pb::ComponentInfo {
+            component_type: crate::pb::ComponentType::Function as i32,
+            name: "do_work".into(),
+            ..Default::default()
+        }]);
+
+        assert!(capabilities.iter().any(|cap| {
+            cap.component_type == crate::pb::ComponentType::Function as i32
+                && cap.component_name == "do_work"
+        }));
+        for scorer in [
+            "json_valid",
+            "step_efficiency",
+            "plan_quality",
+            "plan_adherence",
+        ] {
+            assert!(
+                capabilities.iter().any(|cap| {
+                    cap.component_type == crate::pb::ComponentType::Scorer as i32
+                        && cap.component_name == scorer
+                }),
+                "missing local built-in scorer capability {scorer}"
+            );
+        }
     }
 
     #[test]
