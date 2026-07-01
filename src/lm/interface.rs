@@ -182,12 +182,65 @@ impl PromptRef {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PromptCacheConfig {
+    /// Enable provider-native prompt caching for providers that require an
+    /// explicit request signal. Providers with automatic prompt caching may
+    /// ignore this while still reporting cache usage.
+    pub enabled: bool,
+    /// Optional cache lifetime hint. Anthropic currently supports "1h".
+    pub ttl: Option<String>,
+    /// Optional provider-side routing key. OpenAI Responses maps this to
+    /// `prompt_cache_key`.
+    pub key: Option<String>,
+    /// Optional retention hint. OpenAI Responses maps this to
+    /// `prompt_cache_retention`.
+    pub retention: Option<String>,
+    /// Explicit reusable context-cache resource name. Gemini maps this to
+    /// `cachedContent`.
+    pub resource: Option<String>,
+}
+
+impl PromptCacheConfig {
+    pub fn enabled() -> Self {
+        Self {
+            enabled: true,
+            ..Default::default()
+        }
+    }
+
+    pub fn ttl(mut self, ttl: impl Into<String>) -> Self {
+        self.ttl = Some(ttl.into());
+        self.enabled = true;
+        self
+    }
+
+    pub fn key(mut self, key: impl Into<String>) -> Self {
+        self.key = Some(key.into());
+        self.enabled = true;
+        self
+    }
+
+    pub fn retention(mut self, retention: impl Into<String>) -> Self {
+        self.retention = Some(retention.into());
+        self.enabled = true;
+        self
+    }
+
+    pub fn resource(mut self, resource: impl Into<String>) -> Self {
+        self.resource = Some(resource.into());
+        self.enabled = true;
+        self
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct GenerationConfig {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub max_output_tokens: Option<u32>,
     pub response_format: ResponseFormat,
+    pub prompt_cache: Option<PromptCacheConfig>,
     /// Reasoning effort for o-series models (o1, o3-mini, o3)
     /// Only supported by OpenAI Responses API
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -220,6 +273,16 @@ impl GenerationConfig {
 
     pub fn response_format(mut self, format: ResponseFormat) -> Self {
         self.response_format = format;
+        self
+    }
+
+    pub fn prompt_cache(mut self, config: PromptCacheConfig) -> Self {
+        self.prompt_cache = Some(config);
+        self
+    }
+
+    pub fn enable_prompt_cache(mut self) -> Self {
+        self.prompt_cache = Some(PromptCacheConfig::enabled());
         self
     }
 

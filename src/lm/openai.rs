@@ -358,6 +358,10 @@ pub struct ResponsesApiRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>, // Enable streaming responses
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_retention: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
@@ -510,6 +514,16 @@ impl ResponsesApiRequest {
             previous_response_id: req.previous_response_id.clone(),
             store: Some(should_store),
             stream: None, // Set to Some(true) for streaming
+            prompt_cache_key: req
+                .config
+                .prompt_cache
+                .as_ref()
+                .and_then(|cache| cache.key.clone()),
+            prompt_cache_retention: req
+                .config
+                .prompt_cache
+                .as_ref()
+                .and_then(|cache| cache.retention.clone()),
             temperature: if is_reasoning_model {
                 None
             } else {
@@ -1603,6 +1617,35 @@ mod tests {
             }
             other => panic!("expected LmApiError, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn responses_usage_reads_input_tokens_details_cached_tokens() {
+        let json = r#"{
+            "id": "resp_cached",
+            "created_at": 1700000000,
+            "model": "gpt-4o-mini",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "Done."}]
+                }
+            ],
+            "usage": {
+                "input_tokens": 1500,
+                "input_tokens_details": {"cached_tokens": 1024},
+                "output_tokens": 200,
+                "total_tokens": 1700
+            }
+        }"#;
+
+        let response: ResponsesApiResponse = serde_json::from_str(json).unwrap();
+        let generated = response.into_generate_response().unwrap();
+        let usage = generated.usage.unwrap();
+
+        assert_eq!(usage.prompt_tokens, Some(1500));
+        assert_eq!(usage.cached_tokens, Some(1024));
     }
 
     #[test]

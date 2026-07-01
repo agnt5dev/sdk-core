@@ -156,9 +156,32 @@ impl GoogleProvider {
         )
     }
 
+    fn cached_contents_endpoint(&self) -> String {
+        let base = self.config.base_url.trim_end_matches('/');
+        format!(
+            "{base}/{}/cachedContents?key={}",
+            self.config.version, self.config.api_key
+        )
+    }
+
+    fn cached_content_resource_endpoint(&self, name: &str) -> String {
+        let base = self.config.base_url.trim_end_matches('/');
+        let name = name.trim_start_matches('/');
+        format!(
+            "{base}/{}/{}?key={}",
+            self.config.version, name, self.config.api_key
+        )
+    }
+
     fn request(&self, url: &str) -> reqwest::RequestBuilder {
         self.http
             .post(url)
+            .header("content-type", "application/json")
+    }
+
+    fn delete_request(&self, url: &str) -> reqwest::RequestBuilder {
+        self.http
+            .delete(url)
             .header("content-type", "application/json")
     }
 
@@ -168,6 +191,63 @@ impl GoogleProvider {
 
     pub async fn stream(&self, request: StreamRequest) -> SdkResult<StreamHandle> {
         stream_via_model(self, request).await
+    }
+
+    pub async fn create_cached_content(
+        &self,
+        model: &str,
+        system: Option<String>,
+        contents: Vec<String>,
+        ttl_seconds: Option<u32>,
+    ) -> SdkResult<String> {
+        if contents.is_empty() {
+            return Err(SdkError::Configuration {
+                message: "at least one content item is required for Gemini CachedContent"
+                    .to_string(),
+                field: Some("contents".to_string()),
+            });
+        }
+
+        let model = normalize_model(model)?;
+        let payload = GeminiCachedContentPayload::new(model, system, contents, ttl_seconds)?;
+        let url = self.cached_contents_endpoint();
+
+        let response = http::send_with_retry(
+            || self.request(&url).json(&payload),
+            &self.config.retry_config,
+            "google",
+            None,
+        )
+        .await?;
+
+        let parsed: GeminiCachedContentResponse = response.json().await.map_err(|err| {
+            SdkError::Other(anyhow!(
+                "failed to parse Google CachedContent response: {err}"
+            ))
+        })?;
+
+        Ok(parsed.name)
+    }
+
+    pub async fn delete_cached_content(&self, name: &str) -> SdkResult<()> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err(SdkError::Configuration {
+                message: "Gemini CachedContent name must not be empty".to_string(),
+                field: Some("name".to_string()),
+            });
+        }
+
+        let url = self.cached_content_resource_endpoint(trimmed);
+        http::send_with_retry(
+            || self.delete_request(&url),
+            &self.config.retry_config,
+            "google",
+            None,
+        )
+        .await?;
+
+        Ok(())
     }
 }
 
@@ -461,6 +541,8 @@ fn build_stream(
 #[derive(Serialize)]
 struct GeminiPayload {
     contents: Vec<GeminiContent>,
+    #[serde(rename = "cachedContent", skip_serializing_if = "Option::is_none")]
+    cached_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     system_instruction: Option<GeminiContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -496,6 +578,7 @@ impl GeminiPayload {
             top_p,
             max_output_tokens,
             response_format,
+            prompt_cache,
             reasoning_effort: _,
             modalities: _,
             built_in_tools,
@@ -527,12 +610,89 @@ impl GeminiPayload {
 
         Ok(Self {
             contents,
+            cached_content: prompt_cache.and_then(|cache| {
+                cache.resource.and_then(|resource| {
+                    let trimmed = resource.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                })
+            }),
             system_instruction,
             generation_config,
             tools,
             tool_config,
         })
     }
+}
+
+#[derive(Serialize)]
+struct GeminiCachedContentPayload {
+    model: String,
+    #[serde(rename = "systemInstruction", skip_serializing_if = "Option::is_none")]
+    system_instruction: Option<GeminiContent>,
+    contents: Vec<GeminiContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl: Option<String>,
+}
+
+impl GeminiCachedContentPayload {
+    fn new(
+        model: String,
+        system: Option<String>,
+        contents: Vec<String>,
+        ttl_seconds: Option<u32>,
+    ) -> SdkResult<Self> {
+        let model = if model.starts_with("models/") {
+            model
+        } else {
+            format!("models/{model}")
+        };
+
+        let system_instruction = system.and_then(|prompt| {
+            let trimmed = prompt.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(GeminiContent::from_text(None, trimmed.to_string()))
+            }
+        });
+
+        let mut cache_contents = Vec::with_capacity(contents.len());
+        for content in contents {
+            let trimmed = content.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            cache_contents.push(GeminiContent::from_text(
+                Some("user".to_string()),
+                trimmed.to_string(),
+            ));
+        }
+
+        if cache_contents.is_empty() {
+            return Err(SdkError::Configuration {
+                message: "Gemini CachedContent contents must include non-empty text".to_string(),
+                field: Some("contents".to_string()),
+            });
+        }
+
+        let ttl = ttl_seconds.map(|seconds| format!("{seconds}s"));
+
+        Ok(Self {
+            model,
+            system_instruction,
+            contents: cache_contents,
+            ttl,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct GeminiCachedContentResponse {
+    name: String,
 }
 
 /// Map a generic BuiltInTool to its Gemini API tool spec. Gemini 2.0+ accepts
@@ -553,6 +713,17 @@ struct GeminiContent {
 }
 
 impl GeminiContent {
+    fn from_text(role: Option<String>, text: String) -> Self {
+        Self {
+            role,
+            parts: vec![GeminiPart {
+                text: Some(text),
+                function_call: None,
+                function_response: None,
+            }],
+        }
+    }
+
     fn from_sdk_message(message: &Message) -> Self {
         let mut parts = Vec::new();
 
@@ -965,5 +1136,51 @@ fn delimiter_length(remaining: &str) -> usize {
         4
     } else {
         2
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generate_payload_includes_cached_content_reference() {
+        let request = GenerateRequest::new("google/gemini-2.5-flash")
+            .user_message("What are the termination clauses?")
+            .configure(|config| {
+                config.prompt_cache = Some(
+                    crate::lm::PromptCacheConfig::enabled().resource("cachedContents/cache_123"),
+                );
+            });
+
+        let payload = GeminiPayload::from_request(&request).unwrap();
+        let value = serde_json::to_value(payload).unwrap();
+
+        assert_eq!(value["cachedContent"], "cachedContents/cache_123");
+        assert!(value.get("contents").is_some());
+    }
+
+    #[test]
+    fn cached_content_create_payload_uses_models_prefix_and_ttl() {
+        let payload = GeminiCachedContentPayload::new(
+            "gemini-2.5-flash".to_string(),
+            Some("You are a legal analyst.".to_string()),
+            vec!["Large stable document".to_string()],
+            Some(3600),
+        )
+        .unwrap();
+
+        let value = serde_json::to_value(payload).unwrap();
+
+        assert_eq!(value["model"], "models/gemini-2.5-flash");
+        assert_eq!(value["ttl"], "3600s");
+        assert_eq!(
+            value["systemInstruction"]["parts"][0]["text"],
+            "You are a legal analyst."
+        );
+        assert_eq!(
+            value["contents"][0]["parts"][0]["text"],
+            "Large stable document"
+        );
     }
 }

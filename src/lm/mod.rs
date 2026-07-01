@@ -36,9 +36,9 @@ pub use http::RetryConfig;
 pub use huggingface::{HuggingFaceConfig, HuggingFaceProvider};
 pub use interface::{
     generate, stream, BuiltInTool, ContentBlockType, GenerateRequest, GenerateResponse,
-    GenerationConfig, JsonSchemaFormat, LanguageModel, Message, MessageRole, Modality, PromptRef,
-    ReasoningEffort, ResponseFormat, ResponseMetadata, StreamChunk, StreamHandle, StreamRequest,
-    TokenUsage, ToolCall, ToolChoice, ToolDefinition,
+    GenerationConfig, JsonSchemaFormat, LanguageModel, Message, MessageRole, Modality,
+    PromptCacheConfig, PromptRef, ReasoningEffort, ResponseFormat, ResponseMetadata, StreamChunk,
+    StreamHandle, StreamRequest, TokenUsage, ToolCall, ToolChoice, ToolDefinition,
 };
 pub use lepton::{LeptonConfig, LeptonProvider};
 pub use mistral::{MistralConfig, MistralProvider};

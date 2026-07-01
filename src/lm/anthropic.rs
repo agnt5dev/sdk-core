@@ -499,6 +499,8 @@ struct MessagesPayload {
     messages: Vec<AnthropicMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
@@ -526,6 +528,7 @@ impl MessagesPayload {
             top_p,
             max_output_tokens,
             response_format,
+            prompt_cache,
             reasoning_effort: _,
             modalities: _,
             built_in_tools,
@@ -558,6 +561,7 @@ impl MessagesPayload {
             model,
             messages,
             system,
+            cache_control: build_cache_control(prompt_cache.as_ref()),
             max_tokens,
             temperature,
             top_p,
@@ -566,6 +570,37 @@ impl MessagesPayload {
             tool_choice,
         })
     }
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq)]
+struct CacheControl {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl: Option<String>,
+}
+
+fn build_cache_control(
+    cache: Option<&super::interface::PromptCacheConfig>,
+) -> Option<CacheControl> {
+    let Some(cache) = cache else {
+        return None;
+    };
+    if !cache.enabled && cache.ttl.is_none() {
+        return None;
+    }
+
+    Some(CacheControl {
+        kind: "ephemeral".to_string(),
+        ttl: cache.ttl.as_ref().and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }),
+    })
 }
 
 /// Map a generic BuiltInTool to its Anthropic Messages-API tool spec, if any.
@@ -1225,6 +1260,25 @@ mod tests {
         assert_eq!(normalized.total_tokens, Some(200));
         assert_eq!(normalized.cached_tokens, Some(50));
         assert_eq!(normalized.cache_creation_tokens, Some(30));
+    }
+
+    #[test]
+    fn request_payload_includes_top_level_cache_control() {
+        let request = GenerateRequest::new("anthropic/claude-3-5-haiku-latest")
+            .system_prompt("Stable instructions")
+            .user_message("Summarize this")
+            .configure(|config| {
+                config.prompt_cache = Some(crate::lm::PromptCacheConfig::enabled().ttl("1h"));
+            });
+
+        let payload = MessagesPayload::from_request(&request, false).unwrap();
+        let value = serde_json::to_value(payload).unwrap();
+
+        assert_eq!(value["system"], "Stable instructions");
+        assert_eq!(
+            value["cache_control"],
+            json!({"type": "ephemeral", "ttl": "1h"})
+        );
     }
 
     #[test]
