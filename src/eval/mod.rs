@@ -7,6 +7,7 @@
 //!   routed through the LM client rather than the sync fast path.
 //! - Trace assertions for glassbox testing.
 
+pub mod agent_trace_metrics;
 pub mod builtin_scorer;
 pub mod deterministic;
 pub mod llm_judge;
