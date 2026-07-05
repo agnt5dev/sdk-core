@@ -15,9 +15,15 @@ pub struct TraceEvalContext {
     #[serde(default)]
     pub project_id: String,
     #[serde(default)]
+    pub deployment_id: String,
+    #[serde(default)]
     pub root_run_id: String,
     #[serde(default)]
+    pub trace_id: String,
+    #[serde(default)]
     pub task: Option<TraceEvalTask>,
+    #[serde(default)]
+    pub session: TraceEvalSession,
     #[serde(default)]
     pub plan: TraceEvalPlan,
     #[serde(default)]
@@ -26,12 +32,40 @@ pub struct TraceEvalContext {
     pub features: TraceEvalFeatures,
     #[serde(default)]
     pub evidence_refs: Value,
+    #[serde(default)]
+    pub redaction_policy_snapshot: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TraceEvalTask {
     #[serde(default)]
     pub text_safe: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TraceEvalSession {
+    #[serde(default)]
+    pub turn_count: i64,
+    #[serde(default)]
+    pub turns: Vec<TraceEvalTurn>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TraceEvalTurn {
+    #[serde(default)]
+    pub turn_index: i64,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub started_at: i64,
+    #[serde(default)]
+    pub ended_at: i64,
+    #[serde(default)]
+    pub message_ref: String,
+    #[serde(default)]
+    pub message_hash: String,
+    #[serde(default)]
+    pub summary_safe: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -61,17 +95,81 @@ pub struct TraceEvalExecutionStep {
     #[serde(default)]
     pub kind: String,
     #[serde(default)]
+    pub span_id: String,
+    #[serde(default)]
+    pub run_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
     pub role: String,
     #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub started_at: i64,
+    #[serde(default)]
+    pub ended_at: i64,
+    #[serde(default)]
+    pub duration_ms: i64,
+    #[serde(default)]
+    pub summary_safe: String,
+    #[serde(default)]
+    pub tool_name: String,
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub tokens: i64,
+    #[serde(default)]
+    pub input_ref: String,
+    #[serde(default)]
+    pub input_hash: String,
+    #[serde(default)]
+    pub output_ref: String,
+    #[serde(default)]
+    pub output_hash: String,
+    #[serde(default)]
+    pub arguments_ref: String,
+    #[serde(default)]
+    pub arguments_hash: String,
+    #[serde(default)]
+    pub result_ref: String,
+    #[serde(default)]
+    pub result_hash: String,
+    #[serde(default)]
+    pub prompt_ref: String,
+    #[serde(default)]
+    pub prompt_hash: String,
+    #[serde(default)]
+    pub response_ref: String,
+    #[serde(default)]
+    pub response_hash: String,
+    #[serde(default)]
+    pub error_code: String,
+    #[serde(default)]
+    pub error_class: String,
+    #[serde(default)]
+    pub error_safe: String,
+    #[serde(default)]
     pub matches_plan_step: Option<i64>,
+    #[serde(default)]
+    pub flags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TraceEvalFeatures {
     #[serde(default)]
+    pub execution_step_count: i64,
+    #[serde(default)]
+    pub tool_call_count: i64,
+    #[serde(default)]
     pub unique_tool_call_count: i64,
     #[serde(default)]
+    pub turn_count: i64,
+    #[serde(default)]
     pub llm_call_count: i64,
+    #[serde(default)]
+    pub total_tokens: i64,
     #[serde(default)]
     pub error_count: i64,
     #[serde(default)]
@@ -365,7 +463,9 @@ pub fn plan_quality(input_json: &Value) -> ScorerResult {
     }
 }
 
-fn trace_eval_context_from_input(input_json: &Value) -> Result<TraceEvalContext, ScorerResult> {
+pub(crate) fn trace_eval_context_from_input(
+    input_json: &Value,
+) -> Result<TraceEvalContext, ScorerResult> {
     let raw = input_json
         .get("trace_eval_context")
         .or_else(|| input_json.get("trace"));
@@ -417,7 +517,11 @@ fn validate_trace_eval_context(trace_ctx: &TraceEvalContext) -> Result<(), Strin
     Ok(())
 }
 
-fn score_threshold(config: &Value, builtin: &str, default_value: f64) -> Result<f64, ScorerResult> {
+pub(crate) fn score_threshold(
+    config: &Value,
+    builtin: &str,
+    default_value: f64,
+) -> Result<f64, ScorerResult> {
     let threshold = number_config(config, "score_threshold")
         .or_else(|| number_config(config, "threshold"))
         .unwrap_or(default_value);
@@ -717,7 +821,7 @@ fn plan_metric_label<'a>(
     }
 }
 
-fn error_result(label: &str, explanation: impl Into<String>) -> ScorerResult {
+pub(crate) fn error_result(label: &str, explanation: impl Into<String>) -> ScorerResult {
     ScorerResult {
         score: 0.0,
         passed: Some(false),
@@ -727,7 +831,7 @@ fn error_result(label: &str, explanation: impl Into<String>) -> ScorerResult {
     }
 }
 
-fn format_score(value: f64) -> String {
+pub(crate) fn format_score(value: f64) -> String {
     format!("{value:.3}")
 }
 

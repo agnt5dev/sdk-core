@@ -23,9 +23,24 @@ pub const BUILTIN_SCORER_NAMES: &[&str] = &[
     "levenshtein",
     "llm_judge",
     "agent_judge",
+    "tool_called",
+    "tool_not_called",
+    "tool_sequence",
+    "tool_sequence_in_order",
+    "tool_sequence_exact",
+    "tool_sequence_any_order",
+    "tool_trajectory",
+    "tool_params_match",
+    "max_tool_calls",
+    "max_llm_calls",
+    "max_tokens",
+    "duration_under",
+    "no_errors",
+    "tool_failure_recovered",
     "step_efficiency",
     "plan_quality",
     "plan_adherence",
+    "state_equals",
 ];
 
 /// Check if a scorer name is a known built-in scorer.
@@ -49,9 +64,24 @@ pub fn can_execute_locally(name: &str) -> bool {
             | "json_schema"
             | "numeric_range"
             | "levenshtein"
+            | "tool_called"
+            | "tool_not_called"
+            | "tool_sequence"
+            | "tool_sequence_in_order"
+            | "tool_sequence_exact"
+            | "tool_sequence_any_order"
+            | "tool_trajectory"
+            | "tool_params_match"
+            | "max_tool_calls"
+            | "max_llm_calls"
+            | "max_tokens"
+            | "duration_under"
+            | "no_errors"
+            | "tool_failure_recovered"
             | "step_efficiency"
             | "plan_quality"
             | "plan_adherence"
+            | "state_equals"
     )
 }
 
@@ -175,9 +205,30 @@ pub fn execute(scorer_name: &str, input_data: &[u8]) -> Option<ScorerResult> {
             let cfg: LevenshteinConfig = serde_json::from_value(config).unwrap_or_default();
             Some(levenshtein(&scorer_input, &cfg))
         }
+        "tool_called" => Some(super::agent_trace_metrics::tool_called(&input_json)),
+        "tool_not_called" => Some(super::agent_trace_metrics::tool_not_called(&input_json)),
+        "tool_sequence" => Some(super::agent_trace_metrics::tool_sequence(&input_json)),
+        "tool_sequence_in_order" => Some(super::agent_trace_metrics::tool_sequence_in_order(
+            &input_json,
+        )),
+        "tool_sequence_exact" => Some(super::agent_trace_metrics::tool_sequence_exact(&input_json)),
+        "tool_sequence_any_order" => Some(super::agent_trace_metrics::tool_sequence_any_order(
+            &input_json,
+        )),
+        "tool_trajectory" => Some(super::agent_trace_metrics::tool_trajectory(&input_json)),
+        "tool_params_match" => Some(super::agent_trace_metrics::tool_params_match(&input_json)),
+        "max_tool_calls" => Some(super::agent_trace_metrics::max_tool_calls(&input_json)),
+        "max_llm_calls" => Some(super::agent_trace_metrics::max_llm_calls(&input_json)),
+        "max_tokens" => Some(super::agent_trace_metrics::max_tokens(&input_json)),
+        "duration_under" => Some(super::agent_trace_metrics::duration_under(&input_json)),
+        "no_errors" => Some(super::agent_trace_metrics::no_errors(&input_json)),
+        "tool_failure_recovered" => Some(super::agent_trace_metrics::tool_failure_recovered(
+            &input_json,
+        )),
         "step_efficiency" => Some(super::trace_eval_metrics::step_efficiency(&input_json)),
         "plan_quality" => Some(super::trace_eval_metrics::plan_quality(&input_json)),
         "plan_adherence" => Some(super::trace_eval_metrics::plan_adherence(&input_json)),
+        "state_equals" => Some(super::agent_trace_metrics::state_equals(&input_json)),
         _ => None,
     }
 }
@@ -386,6 +437,110 @@ mod tests {
         assert_eq!(result.score, 0.0);
         assert_eq!(result.passed, Some(false));
         assert_eq!(result.label.as_deref(), Some("config_error"));
+    }
+
+    #[test]
+    fn test_agent_trace_metrics_execute_locally_from_trace_eval_context() {
+        let trace_eval_context = json!({
+            "schema_version": "agnt5.eval.trace_eval_context.v1",
+            "project_id": "project-1",
+            "session_id": "session-1",
+            "root_run_id": "root-runtime-run-1",
+            "execution_steps": [
+                {"index": 1, "kind": "llm_call", "role": "planning", "tokens": 20, "started_at": 10, "ended_at": 20},
+                {"index": 2, "kind": "tool_call", "tool_name": "search_docs", "arguments_hash": "args-a", "status": "completed", "started_at": 20, "ended_at": 30},
+                {"index": 3, "kind": "tool_call", "tool_name": "lookup_order", "arguments_hash": "args-b", "status": "completed", "started_at": 30, "ended_at": 40},
+                {"index": 4, "kind": "llm_call", "role": "final_response", "tokens": 30, "started_at": 40, "ended_at": 50}
+            ],
+            "features": {
+                "execution_step_count": 4,
+                "tool_call_count": 2,
+                "unique_tool_call_count": 2,
+                "llm_call_count": 2,
+                "total_tokens": 50,
+                "error_count": 0
+            },
+            "evidence_refs": {"normalized_session_ref": "mem://session"}
+        });
+        let cases = [
+            ("tool_called", json!({"tool": "search_docs"})),
+            ("tool_not_called", json!({"tool": "write_ticket"})),
+            (
+                "tool_sequence",
+                json!({"tools": ["search_docs", "lookup_order"]}),
+            ),
+            (
+                "tool_sequence_in_order",
+                json!({"tools": ["search_docs", "lookup_order"]}),
+            ),
+            (
+                "tool_sequence_exact",
+                json!({"tools": ["search_docs", "lookup_order"]}),
+            ),
+            (
+                "tool_sequence_any_order",
+                json!({"tools": ["lookup_order", "search_docs"]}),
+            ),
+            (
+                "tool_trajectory",
+                json!({"tools": ["lookup_order", "search_docs"], "pattern": "any_order"}),
+            ),
+            (
+                "tool_params_match",
+                json!({"tool": "search_docs", "params": {"arguments_hash": "args-a"}}),
+            ),
+            ("max_tool_calls", json!({"max": 2})),
+            ("max_llm_calls", json!({"max": 2})),
+            ("max_tokens", json!({"max": 50})),
+            ("duration_under", json!({"max_ms": 40})),
+            ("no_errors", json!({})),
+        ];
+
+        for (scorer_name, config) in cases {
+            assert!(is_builtin_scorer(scorer_name));
+            assert!(can_execute_locally(scorer_name));
+            let input = json!({
+                "output": "test",
+                "config": config,
+                "trace_eval_context": trace_eval_context,
+            });
+            let result = execute(scorer_name, input.to_string().as_bytes()).unwrap();
+            assert_eq!(
+                result.passed,
+                Some(true),
+                "{scorer_name} should pass: {result:?}",
+            );
+        }
+
+        let state_input = json!({
+            "config": {"name": "cart", "expected": {"items": 2}},
+            "states": {"cart": {"items": 2}}
+        });
+        let state_result = execute("state_equals", state_input.to_string().as_bytes()).unwrap();
+        assert_eq!(state_result.passed, Some(true));
+
+        let recovery_input = json!({
+            "output": "test",
+            "config": {"tool": "search_docs", "error_code": "SIMULATED_TIMEOUT"},
+            "trace_eval_context": {
+                "schema_version": "agnt5.eval.trace_eval_context.v1",
+                "project_id": "project-1",
+                "session_id": "session-1",
+                "root_run_id": "root-runtime-run-1",
+                "execution_steps": [
+                    {"index": 1, "kind": "tool_call", "tool_name": "search_docs", "status": "failed", "error_code": "SIMULATED_TIMEOUT"},
+                    {"index": 2, "kind": "llm_call", "role": "replan", "status": "completed"},
+                    {"index": 3, "kind": "tool_call", "tool_name": "lookup_order", "status": "completed", "result_hash": "result-b"}
+                ],
+                "features": {"error_count": 1}
+            }
+        });
+        let recovery_result = execute(
+            "tool_failure_recovered",
+            recovery_input.to_string().as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(recovery_result.passed, Some(true));
     }
 
     #[test]
