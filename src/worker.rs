@@ -681,11 +681,12 @@ async fn report_worker_capacity_with_client(
     worker_session_id: &str,
     open_poll_slots: Arc<std::sync::atomic::AtomicUsize>,
     active_slots: Arc<std::sync::atomic::AtomicUsize>,
-    desired_slots: usize,
+    desired_slots: Arc<std::sync::atomic::AtomicUsize>,
     effective_max_slots: usize,
 ) {
     let open_poll_slots = open_poll_slots.load(std::sync::atomic::Ordering::Relaxed) as u32;
     let active_slots = active_slots.load(std::sync::atomic::Ordering::Relaxed) as u32;
+    let desired_slots = desired_slots.load(std::sync::atomic::Ordering::Relaxed);
     if let Err(e) = client
         .report_worker_capacity(ReportWorkerCapacityRequest {
             worker_id: worker_id.to_string(),
@@ -710,7 +711,7 @@ fn spawn_parked_capacity_reporter(
     worker_session_id: Arc<TokioMutex<String>>,
     open_poll_slots: Arc<std::sync::atomic::AtomicUsize>,
     active_slots: Arc<std::sync::atomic::AtomicUsize>,
-    desired_slots: usize,
+    desired_slots: Arc<std::sync::atomic::AtomicUsize>,
     effective_max_slots: usize,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
@@ -725,7 +726,7 @@ fn spawn_parked_capacity_reporter(
             &current_session_id,
             open_poll_slots.clone(),
             active_slots.clone(),
-            desired_slots,
+            desired_slots.clone(),
             effective_max_slots,
         )
         .await;
@@ -742,7 +743,7 @@ fn spawn_parked_capacity_reporter(
                         &current_session_id,
                         open_poll_slots.clone(),
                         active_slots.clone(),
-                        desired_slots,
+                        desired_slots.clone(),
                         effective_max_slots,
                     )
                     .await;
@@ -897,6 +898,261 @@ async fn refresh_parked_worker_session(
         slot_idx,
     )
     .await
+}
+
+/// Slot lifecycle events sent from parked poll slots to the ramp supervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParkedSlotEvent {
+    /// A parked slot received a job and is about to execute it.
+    GotJob,
+    /// A surplus idle slot retired itself (`total_slots` already decremented).
+    Retired,
+}
+
+/// Shared state for one parked polling session. Bundled behind an `Arc` so the
+/// supervisor can spawn additional slots with a single clone while ramping.
+/// The message handler stays outside: each slot owns its own clone so the
+/// context does not force `Sync` on the handler type.
+struct ParkedPollContext {
+    client: WorkerCoordinatorClient,
+    worker_id: String,
+    worker_session_id: Arc<TokioMutex<String>>,
+    registration: ParkedWorkerSessionRegistration,
+    project_id: String,
+    response_tx: flume::Sender<ServiceMessage>,
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    cancel_tokens: Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
+    streaming_runs: Arc<std::sync::Mutex<HashMap<String, bool>>>,
+    pending_lease_ids: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    open_poll_slots: Arc<std::sync::atomic::AtomicUsize>,
+    /// Live slot count (parked + busy), shared with the supervisor.
+    total_slots: Arc<std::sync::atomic::AtomicUsize>,
+    /// Slots currently executing a handler; drives ramp-up decisions. Kept
+    /// separate from `in_flight`, which also counts stream-dispatched work.
+    busy_slots: Arc<std::sync::atomic::AtomicUsize>,
+    events_tx: tokio::sync::mpsc::UnboundedSender<ParkedSlotEvent>,
+    claim_timeout_ms: i64,
+    min_slots: usize,
+    retire_empty_polls: usize,
+}
+
+/// How many new slots to spawn when a parked slot goes busy: grow the fleet
+/// toward `2 * busy` (a parked buffer equal to current demand) so a burst of N
+/// jobs reaches N concurrent handlers in ~log2(N) poll round-trips, without
+/// spawning for demand that already-parked slots can absorb and never
+/// exceeding `max_slots` total.
+fn parked_ramp_spawn_count(total_slots: usize, busy_slots: usize, max_slots: usize) -> usize {
+    busy_slots
+        .saturating_mul(2)
+        .min(max_slots)
+        .saturating_sub(total_slots)
+}
+
+/// Decrement `total_slots` unless that would drop the fleet below `min_slots`.
+/// Returns true when the calling slot won the right to retire.
+fn try_retire_parked_slot(total_slots: &std::sync::atomic::AtomicUsize, min_slots: usize) -> bool {
+    total_slots
+        .fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |current| (current > min_slots).then(|| current - 1),
+        )
+        .is_ok()
+}
+
+/// Spawn one more parked poll slot into the supervisor's JoinSet, bumping the
+/// live slot count.
+fn spawn_parked_slot<F, Fut>(
+    slots: &mut tokio::task::JoinSet<()>,
+    ctx: &Arc<ParkedPollContext>,
+    handler: F,
+    next_slot_id: &mut usize,
+) where
+    F: Fn(RuntimeMessage, flume::Sender<ServiceMessage>) -> Fut + Send + Clone + 'static,
+    Fut: std::future::Future<Output = Result<Option<ServiceMessage>>> + Send + 'static,
+{
+    ctx.total_slots
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let slot_id = *next_slot_id;
+    *next_slot_id += 1;
+    slots.spawn(run_parked_poll_slot(ctx.clone(), handler, slot_id));
+}
+
+/// One parked poll slot: owns exactly one outstanding PollJob request or one
+/// active handler invocation. Emits `GotJob` before executing so the supervisor
+/// can ramp capacity, and retires itself after enough consecutive empty polls
+/// once the fleet is above `min_slots`.
+async fn run_parked_poll_slot<F, Fut>(ctx: Arc<ParkedPollContext>, handler: F, slot_id: usize)
+where
+    F: Fn(RuntimeMessage, flume::Sender<ServiceMessage>) -> Fut + Send + Clone + 'static,
+    Fut: std::future::Future<Output = Result<Option<ServiceMessage>>> + Send + 'static,
+{
+    let mut client = ctx.client.clone();
+    let worker_name = format!("{}-parked-{}", ctx.worker_id, slot_id);
+    // Deterministic jitter so surplus slots don't all retire on the same tick.
+    let retire_threshold = ctx.retire_empty_polls + (slot_id % 2);
+    let mut consecutive_empty = 0usize;
+    loop {
+        let current_session_id = ctx.worker_session_id.lock().await.clone();
+        ctx.open_poll_slots
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let poll_result = client
+            .poll_job(PollJobRequest {
+                worker_id: ctx.worker_id.clone(),
+                worker_session_id: current_session_id.clone(),
+                wait_ms: 30_000,
+                claim_timeout_ms: ctx.claim_timeout_ms,
+            })
+            .await;
+        ctx.open_poll_slots
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+
+        match poll_result {
+            Ok(resp) => {
+                let Some(job) = resp.job else {
+                    consecutive_empty += 1;
+                    if consecutive_empty >= retire_threshold
+                        && try_retire_parked_slot(&ctx.total_slots, ctx.min_slots)
+                    {
+                        debug!(
+                            "Parked poll slot {} retiring after {} empty polls",
+                            slot_id, consecutive_empty
+                        );
+                        let _ = ctx.events_tx.send(ParkedSlotEvent::Retired);
+                        return;
+                    }
+                    continue;
+                };
+                consecutive_empty = 0;
+                // Busy-count guard (same RAII semantics as the in-flight guard):
+                // ramp decisions must see accurate demand even if the handler
+                // panics or is cancelled.
+                let _busy = InFlightGuard::enter(&ctx.busy_slots);
+                let _ = ctx.events_tx.send(ParkedSlotEvent::GotJob);
+                let lease_timeout_ms = job
+                    .metadata
+                    .get("lease_timeout_ms")
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .filter(|v| *v > 0)
+                    .unwrap_or(ctx.claim_timeout_ms);
+                let (runtime_message, is_streaming, run_id, lease_id) =
+                    runtime_message_from_job_assignment(job);
+                let completion_run_id = run_id.clone();
+                let completion_lease_id = lease_id.clone();
+                if !lease_id.is_empty() {
+                    if let Ok(mut map) = ctx.pending_lease_ids.lock() {
+                        map.insert(run_id.clone(), lease_id.clone());
+                    }
+                }
+                if is_streaming {
+                    if let Ok(mut map) = ctx.streaming_runs.lock() {
+                        map.insert(run_id.clone(), true);
+                    }
+                }
+
+                let (renew_stop_tx, renew_handle) = tokio::sync::oneshot::channel::<()>();
+                let renewal = spawn_parked_lease_renewal(
+                    client.clone(),
+                    ctx.worker_id.clone(),
+                    ctx.worker_session_id.clone(),
+                    run_id.clone(),
+                    lease_id.clone(),
+                    lease_timeout_ms,
+                    renew_handle,
+                );
+
+                let (slot_response_tx, slot_response_rx) = flume::unbounded::<ServiceMessage>();
+                let returned_response = execute_runtime_message_for_response(
+                    &worker_name,
+                    runtime_message,
+                    slot_response_tx.clone(),
+                    handler.clone(),
+                    ctx.in_flight.clone(),
+                    ctx.cancel_tokens.clone(),
+                )
+                .await;
+                drop(slot_response_tx);
+
+                let mut completed = false;
+                if let Some(service_message) = returned_response {
+                    completed = complete_or_forward_parked_response(
+                        &mut client,
+                        service_message,
+                        &completion_lease_id,
+                        &ctx.worker_id,
+                        &ctx.worker_session_id,
+                        &ctx.project_id,
+                        slot_id,
+                        &ctx.response_tx,
+                    )
+                    .await;
+                }
+                while let Ok(service_message) = slot_response_rx.try_recv() {
+                    if completed
+                        && polled_job_completion_from_service_message(
+                            &service_message,
+                            &completion_lease_id,
+                        )
+                        .is_some()
+                    {
+                        debug!(
+                            "Parked poll slot {} dropping duplicate completion for job_id={}",
+                            slot_id, completion_run_id
+                        );
+                        continue;
+                    }
+                    completed = complete_or_forward_parked_response(
+                        &mut client,
+                        service_message,
+                        &completion_lease_id,
+                        &ctx.worker_id,
+                        &ctx.worker_session_id,
+                        &ctx.project_id,
+                        slot_id,
+                        &ctx.response_tx,
+                    )
+                    .await
+                        || completed;
+                }
+
+                if completed {
+                    if let Ok(mut map) = ctx.pending_lease_ids.lock() {
+                        map.remove(&completion_run_id);
+                    }
+                    if let Ok(mut map) = ctx.streaming_runs.lock() {
+                        map.remove(&completion_run_id);
+                    }
+                }
+
+                let _ = renew_stop_tx.send(());
+                if let Some(handle) = renewal {
+                    let _ = handle.await;
+                }
+            }
+            Err(e) if is_worker_session_inactive_error(&e) => {
+                consecutive_empty = 0;
+                warn!("Parked poll slot {} error: {}", slot_id, e);
+                if !refresh_parked_worker_session(
+                    &mut client,
+                    &ctx.worker_session_id,
+                    &current_session_id,
+                    &ctx.registration,
+                    slot_id,
+                )
+                .await
+                {
+                    exit_parked_worker_process(
+                        "RegisterWorkerSession retry was rejected after 3 attempts; exiting worker process",
+                    );
+                }
+            }
+            Err(e) => {
+                consecutive_empty = 0;
+                warn!("Parked poll slot {} error: {}", slot_id, e);
+                tokio::time::sleep(Duration::from_millis(1_000)).await;
+            }
+        }
+    }
 }
 
 fn spawn_parked_lease_renewal(
@@ -3069,8 +3325,9 @@ impl Worker {
     }
 
     /// Spawn parked one-job pollers. Each slot owns exactly one outstanding
-    /// PollJob request or one active handler invocation. Dynamic ramping to
-    /// `max_slots` is added after local E2E validation.
+    /// PollJob request or one active handler invocation. A supervisor ramps the
+    /// slot count toward `max_slots` while jobs are arriving and surplus idle
+    /// slots retire back down to `min_slots` after consecutive empty polls.
     fn spawn_parked_poll_task<F, Fut>(
         &self,
         response_tx: flume::Sender<ServiceMessage>,
@@ -3106,6 +3363,9 @@ impl Worker {
             .and_then(|s| s.parse::<i64>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(300_000);
+        let retire_empty_polls = env_usize("AGNT5_SLOT_RETIRE_EMPTY_POLLS")
+            .filter(|v| *v > 0)
+            .unwrap_or(2);
 
         tokio::spawn(async move {
             if project_id.is_empty() {
@@ -3156,176 +3416,45 @@ impl Worker {
             );
 
             let open_poll_slots = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let total_slots = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let busy_slots = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let capacity_reporter = spawn_parked_capacity_reporter(
                 client.clone(),
                 worker_id.clone(),
                 worker_session_id.clone(),
                 open_poll_slots.clone(),
-                in_flight.clone(),
-                min_slots,
+                busy_slots.clone(),
+                total_slots.clone(),
                 max_slots,
                 shutdown_rx.resubscribe(),
             );
 
+            let (events_tx, mut events_rx) =
+                tokio::sync::mpsc::unbounded_channel::<ParkedSlotEvent>();
+            let ctx = Arc::new(ParkedPollContext {
+                client,
+                worker_id,
+                worker_session_id,
+                registration,
+                project_id,
+                response_tx,
+                in_flight,
+                cancel_tokens,
+                streaming_runs,
+                pending_lease_ids,
+                open_poll_slots,
+                total_slots: total_slots.clone(),
+                busy_slots: busy_slots.clone(),
+                events_tx,
+                claim_timeout_ms,
+                min_slots,
+                retire_empty_polls,
+            });
+
             let mut slots = tokio::task::JoinSet::new();
-            for slot_idx in 0..min_slots {
-                let mut client = client.clone();
-                let worker_id = worker_id.clone();
-                let worker_session_id = worker_session_id.clone();
-                let registration = registration.clone();
-                let project_id = project_id.clone();
-                let response_tx = response_tx.clone();
-                let handler = message_handler.clone();
-                let in_flight = in_flight.clone();
-                let cancel_tokens = cancel_tokens.clone();
-                let streaming_runs = streaming_runs.clone();
-                let pending_lease_ids = pending_lease_ids.clone();
-                let open_poll_slots = open_poll_slots.clone();
-                slots.spawn(async move {
-                    let worker_name = format!("{}-parked-{}", worker_id, slot_idx);
-                    loop {
-                        let current_session_id = worker_session_id.lock().await.clone();
-                        open_poll_slots.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let poll_result = client
-                            .poll_job(PollJobRequest {
-                                worker_id: worker_id.clone(),
-                                worker_session_id: current_session_id.clone(),
-                                wait_ms: 30_000,
-                                claim_timeout_ms,
-                            })
-                            .await;
-                        open_poll_slots.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-
-                        match poll_result {
-                            Ok(resp) => {
-                                let Some(job) = resp.job else {
-                                    continue;
-                                };
-                                let lease_timeout_ms = job
-                                    .metadata
-                                    .get("lease_timeout_ms")
-                                    .and_then(|v| v.parse::<i64>().ok())
-                                    .filter(|v| *v > 0)
-                                    .unwrap_or(claim_timeout_ms);
-                                let (runtime_message, is_streaming, run_id, lease_id) =
-                                    runtime_message_from_job_assignment(job);
-                                let completion_run_id = run_id.clone();
-                                let completion_lease_id = lease_id.clone();
-                                if !lease_id.is_empty() {
-                                    if let Ok(mut map) = pending_lease_ids.lock() {
-                                        map.insert(run_id.clone(), lease_id.clone());
-                                    }
-                                }
-                                if is_streaming {
-                                    if let Ok(mut map) = streaming_runs.lock() {
-                                        map.insert(run_id.clone(), true);
-                                    }
-                                }
-
-                                let (renew_stop_tx, renew_handle) =
-                                    tokio::sync::oneshot::channel::<()>();
-                                let renewal = spawn_parked_lease_renewal(
-                                    client.clone(),
-                                    worker_id.clone(),
-                                    worker_session_id.clone(),
-                                    run_id.clone(),
-                                    lease_id.clone(),
-                                    lease_timeout_ms,
-                                    renew_handle,
-                                );
-
-                                let (slot_response_tx, slot_response_rx) =
-                                    flume::unbounded::<ServiceMessage>();
-                                let returned_response = execute_runtime_message_for_response(
-                                    &worker_name,
-                                    runtime_message,
-                                    slot_response_tx.clone(),
-                                    handler.clone(),
-                                    in_flight.clone(),
-                                    cancel_tokens.clone(),
-                                )
-                                .await;
-                                drop(slot_response_tx);
-
-                                let mut completed = false;
-                                if let Some(service_message) = returned_response {
-                                    completed = complete_or_forward_parked_response(
-                                        &mut client,
-                                        service_message,
-                                        &completion_lease_id,
-                                        &worker_id,
-                                        &worker_session_id,
-                                        &project_id,
-                                        slot_idx,
-                                        &response_tx,
-                                    )
-                                    .await;
-                                }
-                                while let Ok(service_message) = slot_response_rx.try_recv() {
-                                    if completed
-                                        && polled_job_completion_from_service_message(
-                                            &service_message,
-                                            &completion_lease_id,
-                                        )
-                                        .is_some()
-                                    {
-                                        debug!(
-                                            "Parked poll slot {} dropping duplicate completion for job_id={}",
-                                            slot_idx, completion_run_id
-                                        );
-                                        continue;
-                                    }
-                                    completed = complete_or_forward_parked_response(
-                                        &mut client,
-                                        service_message,
-                                        &completion_lease_id,
-                                        &worker_id,
-                                        &worker_session_id,
-                                        &project_id,
-                                        slot_idx,
-                                        &response_tx,
-                                    )
-                                    .await
-                                        || completed;
-                                }
-
-                                if completed {
-                                    if let Ok(mut map) = pending_lease_ids.lock() {
-                                        map.remove(&completion_run_id);
-                                    }
-                                    if let Ok(mut map) = streaming_runs.lock() {
-                                        map.remove(&completion_run_id);
-                                    }
-                                }
-
-                                let _ = renew_stop_tx.send(());
-                                if let Some(handle) = renewal {
-                                    let _ = handle.await;
-                                }
-                            }
-                            Err(e) if is_worker_session_inactive_error(&e) => {
-                                warn!("Parked poll slot {} error: {}", slot_idx, e);
-                                if !refresh_parked_worker_session(
-                                    &mut client,
-                                    &worker_session_id,
-                                    &current_session_id,
-                                    &registration,
-                                    slot_idx,
-                                )
-                                .await
-                                {
-                                    exit_parked_worker_process(
-                                        "RegisterWorkerSession retry was rejected after 3 attempts; exiting worker process",
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Parked poll slot {} error: {}", slot_idx, e);
-                                tokio::time::sleep(Duration::from_millis(1_000)).await;
-                            }
-                        }
-                    }
-                });
+            let mut next_slot_id = 0usize;
+            for _ in 0..min_slots {
+                spawn_parked_slot(&mut slots, &ctx, message_handler.clone(), &mut next_slot_id);
             }
 
             loop {
@@ -3337,14 +3466,55 @@ impl Worker {
                         capacity_reporter.abort();
                         return;
                     }
+                    // `ctx` holds an `events_tx` clone, so recv() never yields None here.
+                    event = events_rx.recv() => {
+                        if let Some(ParkedSlotEvent::GotJob) = event {
+                            let spawn = parked_ramp_spawn_count(
+                                total_slots.load(std::sync::atomic::Ordering::Relaxed),
+                                busy_slots.load(std::sync::atomic::Ordering::Relaxed),
+                                max_slots,
+                            );
+                            for _ in 0..spawn {
+                                spawn_parked_slot(
+                                    &mut slots,
+                                    &ctx,
+                                    message_handler.clone(),
+                                    &mut next_slot_id,
+                                );
+                            }
+                            if spawn > 0 {
+                                debug!(
+                                    "Parked poll ramp: spawned {} slot(s) (total={})",
+                                    spawn,
+                                    total_slots.load(std::sync::atomic::Ordering::Relaxed)
+                                );
+                            }
+                        }
+                    }
                     result = slots.join_next() => {
                         match result {
+                            // Clean exit is self-retirement; the slot already
+                            // decremented total_slots.
                             Some(Ok(())) => {}
-                            Some(Err(e)) => warn!("Parked poll slot exited: {}", e),
-                            None => {
-                                capacity_reporter.abort();
-                                return;
+                            Some(Err(e)) => {
+                                warn!("Parked poll slot exited abnormally: {}", e);
+                                let _ = total_slots.fetch_update(
+                                    std::sync::atomic::Ordering::Relaxed,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                    |current| current.checked_sub(1),
+                                );
                             }
+                            // JoinSet drained unexpectedly; reconcile the count and
+                            // rebuild the floor below instead of exiting.
+                            None => total_slots.store(0, std::sync::atomic::Ordering::Relaxed),
+                        }
+                        while total_slots.load(std::sync::atomic::Ordering::Relaxed) < min_slots {
+                            spawn_parked_slot(
+                                &mut slots,
+                                &ctx,
+                                message_handler.clone(),
+                                &mut next_slot_id,
+                            );
                         }
                     }
                 }
@@ -3518,8 +3688,9 @@ mod tests {
     use super::{
         is_parked_worker_session_registration_rejection, is_worker_session_inactive_error,
         parked_lease_danger_retry_ms, parked_lease_renew_interval_ms,
-        parked_lease_renew_interval_with_jitter_ms, parked_worker_session_was_refreshed,
-        runtime_message_from_job_assignment, take_correlation_ids, worker_capabilities,
+        parked_lease_renew_interval_with_jitter_ms, parked_ramp_spawn_count,
+        parked_worker_session_was_refreshed, runtime_message_from_job_assignment,
+        take_correlation_ids, try_retire_parked_slot, worker_capabilities,
         ParkedWorkerSessionRegistration, Worker, WorkerConfig,
     };
     use crate::error::{ErrorCode, SdkError};
@@ -3700,6 +3871,55 @@ mod tests {
             "same-session",
             "same-session"
         ));
+    }
+
+    #[test]
+    fn parked_ramp_spawn_count_doubles_demand_within_max_slots() {
+        // One busy slot out of one total: spawn one more (1 -> 2).
+        assert_eq!(parked_ramp_spawn_count(1, 1, 100), 1);
+        // Doubling wave: 4 busy of 4 total spawns 4 more.
+        assert_eq!(parked_ramp_spawn_count(4, 4, 100), 4);
+        // Already-parked slots absorb demand: no spawn while total >= 2 * busy.
+        assert_eq!(parked_ramp_spawn_count(4, 1, 100), 0);
+        assert_eq!(parked_ramp_spawn_count(4, 2, 100), 0);
+        // Spawn only the shortfall toward 2 * busy.
+        assert_eq!(parked_ramp_spawn_count(4, 3, 100), 2);
+        // Headroom caps the wave.
+        assert_eq!(parked_ramp_spawn_count(8, 8, 10), 2);
+        // Saturated fleet spawns nothing.
+        assert_eq!(parked_ramp_spawn_count(10, 10, 10), 0);
+        assert_eq!(parked_ramp_spawn_count(12, 10, 10), 0);
+        // Idle fleet spawns nothing.
+        assert_eq!(parked_ramp_spawn_count(4, 0, 10), 0);
+    }
+
+    #[test]
+    fn try_retire_parked_slot_never_drops_below_min_slots() {
+        let total = std::sync::atomic::AtomicUsize::new(3);
+        assert!(try_retire_parked_slot(&total, 1));
+        assert!(try_retire_parked_slot(&total, 1));
+        assert_eq!(total.load(std::sync::atomic::Ordering::Relaxed), 1);
+        // At the floor: retirement is refused and the count is unchanged.
+        assert!(!try_retire_parked_slot(&total, 1));
+        assert_eq!(total.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn try_retire_parked_slot_respects_floor_under_concurrent_callers() {
+        let total = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(8));
+        let min_slots = 2;
+        let retired: usize = (0..8)
+            .map(|_| {
+                let total = total.clone();
+                std::thread::spawn(move || try_retire_parked_slot(&total, min_slots))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|retired| *retired)
+            .count();
+        assert_eq!(retired, 6);
+        assert_eq!(total.load(std::sync::atomic::Ordering::Relaxed), min_slots);
     }
 
     #[test]
