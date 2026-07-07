@@ -889,7 +889,14 @@ async fn refresh_parked_worker_session(
     observed_session_id: &str,
     registration: &ParkedWorkerSessionRegistration,
     slot_idx: usize,
+    refresh_lock: &Arc<TokioMutex<()>>,
 ) -> bool {
+    // Single-flight the refresh: hold the lock across the stale-check +
+    // register + store so concurrent ramped slots don't each register a fresh
+    // session. The winner stores its new ID; losers acquire the lock afterward,
+    // see the refreshed session in `try_refresh_parked_worker_session_once`, and
+    // return early without registering.
+    let _refresh_guard = refresh_lock.lock().await;
     try_refresh_parked_worker_session_once(
         client,
         session_id,
@@ -931,6 +938,13 @@ struct ParkedPollContext {
     /// separate from `in_flight`, which also counts stream-dispatched work.
     busy_slots: Arc<std::sync::atomic::AtomicUsize>,
     events_tx: tokio::sync::mpsc::UnboundedSender<ParkedSlotEvent>,
+    /// Single-flights worker-session re-registration. A burst of ramped slots can
+    /// all observe the same inactive session at once; without this, each would
+    /// `RegisterWorkerSession` and the locally stored ID (chosen by lock order)
+    /// can diverge from the coordinator's last-write-wins session, leaving every
+    /// slot polling with a rejected session. Held across the whole refresh so
+    /// losers observe the winner's session and skip re-registering.
+    session_refresh_lock: Arc<TokioMutex<()>>,
     claim_timeout_ms: i64,
     min_slots: usize,
     retire_empty_polls: usize,
@@ -948,14 +962,27 @@ fn parked_ramp_spawn_count(total_slots: usize, busy_slots: usize, max_slots: usi
         .saturating_sub(total_slots)
 }
 
-/// Decrement `total_slots` unless that would drop the fleet below `min_slots`.
+/// Retire one surplus slot, but only while at least `min_slots` *idle* pollers
+/// would remain. `idle = total_slots - busy_slots`; a slot may retire only when
+/// `total_slots > min_slots + busy_slots`, so a busy handler never leaves the
+/// fleet with fewer than `min_slots` outstanding `PollJob` requests. Flooring on
+/// total alone lets the last idle poller retire while the sole remaining slot is
+/// busy, which reintroduces serial execution for sparse long-running work. Since
+/// `busy_slots >= 0`, this also preserves the hard `min_slots` floor on the total.
 /// Returns true when the calling slot won the right to retire.
-fn try_retire_parked_slot(total_slots: &std::sync::atomic::AtomicUsize, min_slots: usize) -> bool {
+fn try_retire_parked_slot(
+    total_slots: &std::sync::atomic::AtomicUsize,
+    busy_slots: &std::sync::atomic::AtomicUsize,
+    min_slots: usize,
+) -> bool {
     total_slots
         .fetch_update(
             std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
-            |current| (current > min_slots).then(|| current - 1),
+            |current| {
+                let busy = busy_slots.load(std::sync::atomic::Ordering::Relaxed);
+                (current > min_slots.saturating_add(busy)).then(|| current - 1)
+            },
         )
         .is_ok()
 }
@@ -1012,7 +1039,7 @@ where
                 let Some(job) = resp.job else {
                     consecutive_empty += 1;
                     if consecutive_empty >= retire_threshold
-                        && try_retire_parked_slot(&ctx.total_slots, ctx.min_slots)
+                        && try_retire_parked_slot(&ctx.total_slots, &ctx.busy_slots, ctx.min_slots)
                     {
                         debug!(
                             "Parked poll slot {} retiring after {} empty polls",
@@ -1138,6 +1165,7 @@ where
                     &current_session_id,
                     &ctx.registration,
                     slot_id,
+                    &ctx.session_refresh_lock,
                 )
                 .await
                 {
@@ -3446,6 +3474,7 @@ impl Worker {
                 total_slots: total_slots.clone(),
                 busy_slots: busy_slots.clone(),
                 events_tx,
+                session_refresh_lock: Arc::new(TokioMutex::new(())),
                 claim_timeout_ms,
                 min_slots,
                 retire_empty_polls,
@@ -3896,22 +3925,39 @@ mod tests {
     #[test]
     fn try_retire_parked_slot_never_drops_below_min_slots() {
         let total = std::sync::atomic::AtomicUsize::new(3);
-        assert!(try_retire_parked_slot(&total, 1));
-        assert!(try_retire_parked_slot(&total, 1));
+        let busy = std::sync::atomic::AtomicUsize::new(0);
+        assert!(try_retire_parked_slot(&total, &busy, 1));
+        assert!(try_retire_parked_slot(&total, &busy, 1));
         assert_eq!(total.load(std::sync::atomic::Ordering::Relaxed), 1);
         // At the floor: retirement is refused and the count is unchanged.
-        assert!(!try_retire_parked_slot(&total, 1));
+        assert!(!try_retire_parked_slot(&total, &busy, 1));
         assert_eq!(total.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn try_retire_parked_slot_keeps_min_idle_pollers_while_busy() {
+        // 1 busy + 2 idle, min_slots = 1: idle may shrink only to the floor, so
+        // exactly one idle slot retires and the other stays polling — a busy
+        // handler must never leave zero outstanding PollJob requests.
+        let total = std::sync::atomic::AtomicUsize::new(3);
+        let busy = std::sync::atomic::AtomicUsize::new(1);
+        assert!(try_retire_parked_slot(&total, &busy, 1)); // 3 -> 2 (idle 2 -> 1)
+        assert_eq!(total.load(std::sync::atomic::Ordering::Relaxed), 2);
+        // idle == min_slots now (total 2 - busy 1 == 1): further retirement refused.
+        assert!(!try_retire_parked_slot(&total, &busy, 1));
+        assert_eq!(total.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     #[test]
     fn try_retire_parked_slot_respects_floor_under_concurrent_callers() {
         let total = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(8));
+        let busy = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let min_slots = 2;
         let retired: usize = (0..8)
             .map(|_| {
                 let total = total.clone();
-                std::thread::spawn(move || try_retire_parked_slot(&total, min_slots))
+                let busy = busy.clone();
+                std::thread::spawn(move || try_retire_parked_slot(&total, &busy, min_slots))
             })
             .collect::<Vec<_>>()
             .into_iter()
