@@ -22,6 +22,9 @@ crate directly:
 - [TypeScript SDK](https://github.com/agnt5dev/sdk-typescript)
 - [Go SDK](https://github.com/agnt5dev/sdk-go)
 
+Platform concepts and deployment guidance are available in the
+[AGNT5 documentation](https://agnt5.com/docs).
+
 ## Installation
 
 Add the crate to a Rust project:
