@@ -121,8 +121,7 @@ impl LanguageModel for BedrockProvider {
     }
 
     async fn stream(&self, request: StreamRequest) -> SdkResult<StreamHandle> {
-        // Bedrock's streaming APIs require a different endpoint; for now, fall back to a
-        // single-response stream.
+        // This adapter exposes the non-streaming Bedrock response as one chunk.
         let response = self.generate(request).await?;
         let stream = stream::once(async move { Ok(StreamChunk::Completed(response)) });
         Ok(StreamHandle::new(Box::pin(stream)))

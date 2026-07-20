@@ -211,8 +211,7 @@ impl RemoteSandbox {
 
     /// Run a command with streaming output via SSE.
     pub async fn run_command_stream(&self, req: RunCommandRequest) -> Result<Vec<StreamEvent>> {
-        // FIXME: Return a proper async Stream instead of collecting all events.
-        // For now, collect all SSE events and return them.
+        // The trait returns a materialized event list, so collect the SSE stream.
         let resp = self
             .client
             .post(format!("{}/command/stream", self.base_url))

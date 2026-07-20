@@ -1,4 +1,4 @@
-//! Context scaffolding for the ADK.
+//! Context types for the ADK.
 //!
 //! Structured namespaces expose placeholder implementations that will be wired
 //! to the durable runtime in future milestones.

@@ -472,8 +472,7 @@ pub fn create_component_span(
             // Map known keys to their canonical names
             let attr_key = match key.as_str() {
                 // `metadata["tenant_id"]` carries the customer-facing
-                // sub-tenant (Phase B of the identity cleanup). Project
-                // identity flows on `metadata["project_id"]`.
+                // sub-tenant. Project identity uses `metadata["project_id"]`.
                 "tenant_id" => "tenant.id".to_string(),
                 "customer_tenant_id" => "tenant.id".to_string(),
                 "project_id" => "agnt5.project.id".to_string(),

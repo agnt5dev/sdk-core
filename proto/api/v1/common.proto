@@ -95,7 +95,7 @@ enum Priority {
 //   over it.
 //
 // Default behavior when UNSPECIFIED is PUSH so existing workers (built
-// before Phase 6) continue to receive dispatches without any client
+// before explicit worker modes) continue to receive dispatches without any client
 // changes.
 enum WorkerMode {
   WORKER_MODE_UNSPECIFIED = 0;

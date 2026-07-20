@@ -158,7 +158,7 @@ message RuntimeServiceRequest {
     AgentVersionGetRequest agent_version_get = 16;
     AgentListRequest agent_list = 17;
     AgentResolveActiveVersionRequest agent_resolve_active = 18;
-    // Session / Message operations (Phase 2)
+    // Session / Message operations
     SessionCreateRequest session_create = 19;
     SessionUpdateRequest session_update = 20;
     SessionGetRequest session_get = 21;
@@ -190,7 +190,7 @@ message RuntimeServiceResponse {
     AgentVersionGetResult agent_version_get = 17;
     AgentListResult agent_list = 18;
     AgentResolveActiveVersionResult agent_resolve_active = 19;
-    // Session / Message results (Phase 2)
+    // Session / Message results
     SessionCreateResult session_create = 20;
     SessionUpdateResult session_update = 21;
     SessionGetResult session_get = 22;
@@ -359,7 +359,7 @@ message EntityStateSaveResult {
 }
 
 // ---------------------------------------------------------------------------
-// Session / Message operations (for ConversationAccessor — Phase 2)
+// Session / Message operations (for ConversationAccessor)
 // ---------------------------------------------------------------------------
 
 // Create a new conversation session
@@ -506,20 +506,20 @@ message RegisterService {
   repeated ComponentInfo components = 4;
   map<string, string> metadata = 5;
 
-  // Phase 6: data-path mode declared at registration. Default
+  // data-path mode declared at registration. Default
   // (`WORKER_MODE_UNSPECIFIED`) is interpreted as `WORKER_MODE_PUSH`
   // by the coordinator so existing clients keep working unchanged.
   // PULL workers wait for `PollJobs` instead of receiving dispatches
   // over the bidirectional stream.
   WorkerMode mode = 6;
 
-  // Phase 6: deployment this worker serves. Mirrors what the gateway
+  // deployment this worker serves. Mirrors what the gateway
   // already stamps onto records as `deployment_id`. The coordinator
   // prefers this proto field but falls back to `metadata["AGNT5_DEPLOYMENT_ID"]`
   // for backward compat with older SDKs.
   string deployment_id = 7;
 
-  // Phase 7: declared concurrency budget for this worker (max in-flight
+  // declared concurrency budget for this worker (max in-flight
   // dispatches). The coordinator tracks `outstanding = dispatched -
   // responded` and uses this number as the denominator for headroom
   // reservation per priority class (INTERACTIVE up to 100%, NORMAL up to
@@ -621,7 +621,7 @@ message DispatchComponentRequest {
   // Streaming execution flag - when true, SDK should send spans/logs to journal for real-time SSE
   bool is_streaming = 17;        // True for /stream endpoint calls
 
-  // --- Dispatch routing / priority (Phase 4 of lease-based dispatch redesign) ---
+  // --- Dispatch routing / priority ---
 
   // Dispatch priority class — gateway tags by endpoint
   // (/run|/stream → INTERACTIVE, default → NORMAL, /submit|/batch → BATCH).
@@ -635,7 +635,7 @@ message DispatchComponentRequest {
   // so the scheduler only considers workers serving this exact deployment.
   string deployment_id = 19;
 
-  // Lease fence token (Phase 5 of lease-based dispatch redesign).
+  // Lease fence token.
   //
   // When non-empty, the coordinator has created a lease for this dispatch
   // and expects the worker to echo the same value on
@@ -645,7 +645,7 @@ message DispatchComponentRequest {
   // the coordinator is running under the legacy non-lease push path.
   string lease_id = 20;
 
-  // Failure-retry policy (Phase 7f of lease-based dispatch redesign).
+  // Failure-retry policy.
   //
   // Set at gateway ingress with defaults per priority class. Independent
   // from lease-expiry retries (which live in the expiry sweeper). When
@@ -705,13 +705,13 @@ message DispatchComponentResponse {
   int32 attempt = 11;            // Retry attempt number (0-indexed)
   int64 source_timestamp_ns = 12; // Nanosecond timestamp when event was created at source (for correct logical ordering)
 
-  // Lease fencing (Phase 5 of lease-based dispatch redesign).
+  // Lease fencing.
   //
   // Echoes the `lease_id` from the originating `DispatchComponentRequest`
   // so the coordinator can reject stale acks — only the current lease
-  // holder may complete a run. Pre-Phase-5 clients leave this empty; the
-  // coordinator treats an empty lease_id as "fencing disabled for this
-  // response" and falls through to the legacy path.
+  // holder may complete a run. Clients without lease-fencing support leave
+  // this empty; the coordinator treats an empty lease_id as "fencing
+  // disabled for this response" and uses the compatibility path.
   string lease_id = 13;
 }
 

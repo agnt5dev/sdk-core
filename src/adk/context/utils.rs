@@ -1,4 +1,4 @@
-//! Deterministic utility scaffolding.
+//! Deterministic context utilities.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

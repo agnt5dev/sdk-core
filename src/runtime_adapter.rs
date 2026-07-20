@@ -398,7 +398,7 @@ impl EntityStateManager {
     }
 
     // -------------------------------------------------------------------
-    // Session / Message operations (Phase 2 — conversation memory)
+    // Session / Message operations
     // -------------------------------------------------------------------
 
     /// Send a message to a conversation thread

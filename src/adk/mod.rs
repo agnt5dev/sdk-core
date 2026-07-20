@@ -1,9 +1,4 @@
-//! Agent Development Toolkit (ADK) core module scaffolding.
-//!
-//! This module tree currently provides placeholder types that will be expanded as
-//! the ADK implementation progresses. Keeping the structure in place allows the
-//! Python bindings and higher-level layers to compile while detailed behaviour is
-//! implemented incrementally.
+//! Core types for the Agent Development Toolkit (ADK).
 
 pub mod agent;
 pub mod context;

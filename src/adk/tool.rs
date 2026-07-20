@@ -1,4 +1,4 @@
-//! Tool scaffolding for the ADK.
+//! Tool definitions and registration for the ADK.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -32,7 +32,7 @@ impl ToolHandle {
     }
 }
 
-/// Tool registry used for scaffolding.
+/// Registry of ADK tool definitions.
 #[derive(Default)]
 pub struct ToolRegistry {
     inner: Mutex<HashMap<String, ToolDefinition>>,

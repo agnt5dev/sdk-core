@@ -365,7 +365,7 @@ pub struct Worker {
     /// Tracks which run_ids have is_streaming=true. Ephemeral events are skipped
     /// for non-streaming runs since nobody is listening via SSE.
     streaming_runs: Arc<std::sync::Mutex<HashMap<String, bool>>>,
-    /// Phase 5: lease_id stash keyed by invocation_id. Populated on
+    /// lease_id stash keyed by invocation_id. Populated on
     /// DispatchComponentRequest receipt (when req.lease_id is non-empty) and
     /// drained on response forward so the echoed lease_id lands in
     /// DispatchComponentResponse.lease_id without requiring language bindings
@@ -1692,7 +1692,7 @@ impl Worker {
                             meta.insert("pcid".to_string(), event.parent_correlation_id.clone());
                         }
 
-                        // Phase 5: look up stashed lease_id for this invocation so
+                        // look up stashed lease_id for this invocation so
                         // SSE passthrough events carry the fence token. Intermediate
                         // events don't drain the entry — terminal ack still needs it.
                         let stashed_lease_id = if let Ok(map) = self.pending_lease_ids.lock() {
@@ -2296,7 +2296,7 @@ impl Worker {
         let mut metadata = self.metadata.clone();
         metadata.extend(collect_agnt5_env_vars());
 
-        // Phase 6: declare data-path mode. Default PUSH;
+        // declare data-path mode. Default PUSH;
         // `AGNT5_WORKER_MODE=pull` now means parked long-poll assignment
         // (`RegisterWorkerSession` + `PollJob`). The legacy batch `PollJobs`
         // loop is intentionally gone.
@@ -2309,12 +2309,12 @@ impl Worker {
         } else {
             crate::pb::WorkerMode::Push as i32
         };
-        // Phase 6: stamp deployment_id from env so the coordinator's
+        // stamp deployment_id from env so the coordinator's
         // proto-field path picks it up. Falls back to metadata key on
         // older coordinators that haven't been rebuilt yet.
         let deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").unwrap_or_default();
 
-        // Phase 7a: declare concurrency budget so the coordinator can
+        // declare concurrency budget so the coordinator can
         // size headroom reservations per priority class. Resolved from
         // config (set by a language binding or seeded from the
         // `AGNT5_MAX_CONCURRENCY` env var in `WorkerConfig::new`), default
@@ -2632,7 +2632,7 @@ impl Worker {
                                             map.insert(run_id, true);
                                         }
                                     }
-                                    // Phase 5: stash lease_id keyed by invocation_id so we
+                                    // stash lease_id keyed by invocation_id so we
                                     // can echo it on the outbound response. This keeps
                                     // language bindings unaware of the fence token.
                                     if !req.lease_id.is_empty() {
@@ -2650,7 +2650,7 @@ impl Worker {
                                     if req.component_type == 10 {
                                         if let Some(result) = crate::eval::builtin_scorer::execute(&req.component_name, &req.input_data) {
                                             let output_data = serde_json::to_vec(&result).unwrap_or_default();
-                                            // Phase 5: drain stashed lease_id so the fast path
+                                            // drain stashed lease_id so the fast path
                                             // acks under the same fence as the request.
                                             let lease_id = if !req.lease_id.is_empty() {
                                                 if let Ok(mut map) = self.pending_lease_ids.lock() {
@@ -2851,7 +2851,7 @@ impl Worker {
         is_pull_mode: bool,
         tx: &flume::Sender<ServiceMessage>,
     ) -> Result<()> {
-        // Phase 5: stamp the stashed lease_id onto the response so the
+        // stamp the stashed lease_id onto the response so the
         // coordinator's fencing check passes. On terminal events we drain
         // the map entry; on intermediate streaming events we leave it so the
         // terminal ack still finds it. Also clean up streaming_runs tracking
@@ -2883,7 +2883,7 @@ impl Worker {
             }
         }
 
-        // Phase 8: route by declared worker mode, not by per-response metadata
+        // route by declared worker mode, not by per-response metadata
         // tagging. A PULL worker always acks via CompleteJob; a PUSH worker
         // always responds over the bidirectional stream.
         if is_pull_mode {
@@ -3215,7 +3215,7 @@ impl Worker {
                                         cached_deployment_id.clone(),
                                     );
                                 }
-                                // Phase 5: stamp stashed lease_id on SSE-only fallback responses.
+                                // stamp stashed lease_id on SSE-only fallback responses.
                                 let stashed_lease_id = match pending_lease_ids.lock() {
                                     Ok(map) => map.get(&event.run_id).cloned().unwrap_or_default(),
                                     Err(poisoned) => poisoned

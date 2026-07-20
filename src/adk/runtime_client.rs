@@ -42,10 +42,10 @@ impl RuntimeServiceClient {
         // Collect AGNT5_* environment variables for metadata
         let metadata = collect_agnt5_env_vars();
 
-        // Phase 6: ADK runtime client always registers as PUSH — it does
+        // ADK runtime client always registers as PUSH — it does
         // not poll for jobs. Stamp `deployment_id` from env so the
         // coordinator's proto-field path picks it up.
-        // Phase 7a: the runtime client is a control-plane shim that
+        // the runtime client is a control-plane shim that
         // doesn't run user code, so it has no concurrency budget to
         // declare. Report `0` (= unknown) so the coordinator's
         // headroom-aware picker treats it as no cap (and the picker
