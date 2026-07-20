@@ -1,5 +1,7 @@
 # AGNT5 SDK Core (Rust)
 
+[![CI](https://github.com/agnt5dev/sdk-core/actions/workflows/ci.yml/badge.svg)](https://github.com/agnt5dev/sdk-core/actions/workflows/ci.yml)
+
 The foundation Rust implementation that powers all AGNT5 language SDKs. Handles gRPC transport, event persistence, worker lifecycle, and the FFI boundary.
 
 ## Integration boundary

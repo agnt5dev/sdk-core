@@ -7,6 +7,15 @@ description = "High-performance Rust core for AGNT5 SDK"
 license = "Apache-2.0"
 repository = "https://github.com/agnt5dev/sdk-core"
 homepage = "https://agnt5.com"
+include = [
+    "src/**",
+    "proto/**",
+    "tests/**",
+    "test-fixtures/**",
+    "build.rs",
+    "README.md",
+    "LICENSE",
+]
 
 [lib]
 name = "agnt5_sdk_core"
