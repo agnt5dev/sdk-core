@@ -80,6 +80,12 @@ fn runtime_message_from_job_assignment(
     job: JobAssignment,
 ) -> (RuntimeMessage, bool, String, String) {
     let mut metadata = job.metadata.clone();
+    // A JobAssignment can only arrive through PollJob. Make that transport
+    // decision visible to component code even when older queued records did
+    // not carry the gateway's dispatch_mode stamp.
+    metadata
+        .entry("dispatch_mode".to_string())
+        .or_insert_with(|| "pull".to_string());
     if !job.trace_id.is_empty() {
         metadata.insert("trace_id".to_string(), job.trace_id.clone());
     }
@@ -387,6 +393,10 @@ pub struct Worker {
     /// Lazily-connected Engine gRPC client. When AGNT5_ENGINE_URL is set, all event paths
     /// route through this client instead of the Go EE.
     engine_client: Arc<TokioMutex<Option<EngineClient>>>,
+    /// Serializes background queue flushes with terminal checkpoint flushes.
+    /// A terminal event must not overtake transient output already drained by
+    /// the periodic flush task.
+    journal_flush_lock: Arc<TokioMutex<()>>,
 }
 
 // Implement Debug manually to avoid requiring Debug on JournalEventQueue's internals
@@ -519,6 +529,7 @@ struct PolledJobCompletion {
     output_data: Vec<u8>,
     error_message: String,
     error_code: String,
+    event_type: String,
     lease_id: String,
 }
 
@@ -556,6 +567,7 @@ fn polled_job_completion_from_service_message(
                 output_data,
                 error_message: resp.error_message.clone(),
                 error_code: resp.metadata.get("error_code").cloned().unwrap_or_default(),
+                event_type: resp.event_type.clone(),
                 lease_id,
             })
         }
@@ -582,7 +594,7 @@ async fn complete_polled_job_with_client(
             output_data: completion.output_data,
             error_message: completion.error_message,
             error_code: completion.error_code,
-            metadata: HashMap::new(),
+            metadata: HashMap::from([("completion_event_type".to_string(), completion.event_type)]),
             project_id: tenant_id.to_string(),
             lease_id: completion.lease_id,
             worker_session_id: worker_session_id.to_string(),
@@ -1276,6 +1288,7 @@ impl Worker {
             event_stream_tx: Arc::new(std::sync::Mutex::new(None)),
             dispatch_tx: Arc::new(std::sync::Mutex::new(None)),
             engine_client: Arc::new(TokioMutex::new(None)),
+            journal_flush_lock: Arc::new(TokioMutex::new(())),
         }
     }
 
@@ -1488,19 +1501,42 @@ impl Worker {
         timeout_ms: u64,
     ) -> Result<()> {
         let is_terminal = event_type == "run.completed" || event_type == "run.failed";
+        let _journal_flush_guard = if is_terminal {
+            Some(self.journal_flush_lock.lock().await)
+        } else {
+            None
+        };
 
         // ── Engine path: when AGNT5_ENGINE_URL is set, route directly to engine ──
         if let Some(mut engine) = self.ensure_engine_client().await? {
-            // Before terminal checkpoints, flush any pending events for this run
-            // directly to the engine via AppendBatch.
+            // Before terminal checkpoints, publish transient events through
+            // EventStream and persist only durable boundaries. Both calls are
+            // awaited while holding journal_flush_lock so the terminal cannot
+            // overtake a batch already drained by the periodic flush task.
             if is_terminal {
                 let pending = self.journal_queue.drain_run_events(&run_id);
                 if !pending.is_empty() {
                     let tenant_id = canonical_project_id_from_metadata(&metadata)
                         .or_else(|| canonical_project_id_from_metadata(&self.metadata))
                         .unwrap_or_default();
-                    let records: Vec<_> = pending
+                    let transient: Vec<_> = pending
                         .iter()
+                        .filter(|event| event.is_sse_only)
+                        .map(|event| EventStreamMessage {
+                            run_id: event.run_id.clone(),
+                            event_type: event.event_type.clone(),
+                            data: event.data.clone(),
+                            trace_id: event.correlation_id.clone(),
+                            span_id: event.parent_correlation_id.clone(),
+                            project_id: canonical_project_id_from_metadata(&event.metadata)
+                                .unwrap_or_else(|| tenant_id.clone()),
+                            source_timestamp_ns: event.source_timestamp_ns,
+                            worker_id: self.config.worker_id.clone(),
+                        })
+                        .collect();
+                    let durable_records: Vec<_> = pending
+                        .iter()
+                        .filter(|event| !event.is_sse_only)
                         .map(|e| {
                             client::build_engine_record(
                                 tenant_id.clone(),
@@ -1515,21 +1551,28 @@ impl Worker {
                             )
                         })
                         .collect();
-                    if let Err(e) = engine.append_batch(records).await {
+                    if let Err(e) = engine.stream_events(transient).await {
                         warn!(
-                            "Engine: failed to flush {} pre-checkpoint events for run_id={}: {}",
-                            pending.len(),
+                            "Engine: failed to publish pre-checkpoint transient events for run_id={}: {}",
                             run_id,
                             e
                         );
-                    } else {
-                        debug!(
-                            "Engine: flushed {} events before {} for run_id={}",
-                            pending.len(),
-                            event_type,
-                            run_id
-                        );
                     }
+                    if !durable_records.is_empty() {
+                        if let Err(e) = engine.append_batch(durable_records).await {
+                            warn!(
+                                "Engine: failed to persist pre-checkpoint boundary events for run_id={}: {}",
+                                run_id,
+                                e
+                            );
+                        }
+                    }
+                    debug!(
+                        "Engine: flushed {} events before {} for run_id={}",
+                        pending.len(),
+                        event_type,
+                        run_id
+                    );
                 }
             }
 
@@ -2816,7 +2859,7 @@ impl Worker {
         if let Some(crate::pb::service_message::MessageType::FunctionResponse(ref mut resp)) =
             service_message.message_type
         {
-            let is_terminal = resp.event_type == "run.completed" || resp.event_type == "run.failed";
+            let is_terminal = is_terminal_worker_response(&resp.event_type);
             if resp.lease_id.is_empty() {
                 if let Ok(mut map) = self.pending_lease_ids.lock() {
                     if is_terminal {
@@ -2920,6 +2963,7 @@ impl Worker {
         let journal_queue_outer = self.journal_queue.clone();
         let streaming_runs_outer = self.streaming_runs.clone();
         let pending_lease_ids_outer = self.pending_lease_ids.clone();
+        let journal_flush_lock_outer = self.journal_flush_lock.clone();
         let ee_endpoint_outer = self.config.ee_endpoint.clone();
         let engine_endpoint_outer = self.config.engine_endpoint.clone();
 
@@ -2946,6 +2990,7 @@ impl Worker {
                     .max(1);
                 let streaming_runs = streaming_runs_outer.clone();
                 let pending_lease_ids = pending_lease_ids_outer.clone();
+                let journal_flush_lock = journal_flush_lock_outer.clone();
                 let ee_endpoint = ee_endpoint_outer.clone();
                 let engine_endpoint = engine_endpoint_outer.clone();
                 let dispatch_tx = dispatch_tx.clone();
@@ -2970,6 +3015,8 @@ impl Worker {
                     loop {
                         interval.tick().await;
 
+                        let _flush_guard = journal_flush_lock.lock().await;
+
                         // Drain more than one nominal batch when backlog is already present.
                         // This preserves the normal small-batch latency path while allowing
                         // the flush task to catch up instead of hard-capping at one batch
@@ -2985,7 +3032,7 @@ impl Worker {
                             continue;
                         }
 
-                        // ── Engine path: send ALL events via AppendBatch ──
+                        // ── Engine path: transient stream + durable AppendBatch ──
                         if let Some(ref ep) = engine_endpoint {
                             // Ensure engine client is connected
                             if engine.is_none() {
@@ -3009,9 +3056,40 @@ impl Worker {
                                 }
                             }
 
-                            // Convert ALL events to engine Records (no SSE-only/boundary split)
-                            let originals: Vec<JournalEventMessage> = batch;
-                            let records: Vec<_> = originals
+                            let mut transient_events = Vec::new();
+                            let mut durable_originals = Vec::new();
+                            for event in batch {
+                                if event.is_sse_only {
+                                    let is_run_streaming = match streaming_runs.lock() {
+                                        Ok(map) => map.get(&event.run_id).copied().unwrap_or(false),
+                                        Err(poisoned) => poisoned
+                                            .into_inner()
+                                            .get(&event.run_id)
+                                            .copied()
+                                            .unwrap_or(false),
+                                    };
+                                    if is_run_streaming {
+                                        transient_events.push(EventStreamMessage {
+                                            run_id: event.run_id.clone(),
+                                            event_type: event.event_type.clone(),
+                                            data: event.data.clone(),
+                                            trace_id: event.correlation_id.clone(),
+                                            span_id: event.parent_correlation_id.clone(),
+                                            project_id: canonical_project_id_from_metadata(
+                                                &event.metadata,
+                                            )
+                                            .or_else(|| event.tenant_id.clone())
+                                            .unwrap_or_else(|| cached_project_id.clone()),
+                                            source_timestamp_ns: event.source_timestamp_ns,
+                                            worker_id: worker_id.clone(),
+                                        });
+                                    }
+                                } else {
+                                    durable_originals.push(event);
+                                }
+                            }
+
+                            let records: Vec<_> = durable_originals
                                 .iter()
                                 .map(|e| {
                                     let tenant = if let Some(ref tid) = e.tenant_id {
@@ -3034,19 +3112,36 @@ impl Worker {
                                 .collect();
 
                             if let Some(ref mut eng) = engine {
+                                let streamed = match eng.stream_events(transient_events).await {
+                                    Ok(count) => count as usize,
+                                    Err(e) => {
+                                        warn!("Flush task: Engine EventStream failed: {}", e);
+                                        journal_queue.record_error();
+                                        0
+                                    }
+                                };
+                                if records.is_empty() {
+                                    if streamed > 0 {
+                                        journal_queue.record_sent_batch(streamed, streamed);
+                                    }
+                                    continue;
+                                }
                                 match eng.append_batch(records).await {
                                     Ok(written) => {
-                                        journal_queue.record_sent_batch(written as usize, 0);
+                                        journal_queue.record_sent_batch(
+                                            written as usize + streamed,
+                                            streamed,
+                                        );
                                         debug!(
-                                            "Flush task: wrote {} events to Engine (queue_size={})",
-                                            written,
+                                            "Flush task: published {} transient and wrote {} durable events to Engine (queue_size={})",
+                                            streamed, written,
                                             journal_queue.len()
                                         );
                                     }
                                     Err(e) => {
                                         warn!("Flush task: Engine AppendBatch failed: {}", e);
                                         engine = None; // Clear for reconnection
-                                        for event in originals.into_iter().rev() {
+                                        for event in durable_originals.into_iter().rev() {
                                             journal_queue.push_front(event).ok();
                                         }
                                         journal_queue.record_error();
@@ -3557,7 +3652,7 @@ impl Worker {
     /// `:suffix` the worker appends for streaming invocations. Project identity
     /// comes from `AGNT5_PROJECT_ID`.
     async fn handle_polled_job_response(&self, service_message: ServiceMessage) {
-        let (job_id, success, output_data, error_message, error_code, lease_id) =
+        let (job_id, success, output_data, error_message, error_code, event_type, lease_id) =
             match &service_message.message_type {
                 Some(crate::pb::service_message::MessageType::FunctionResponse(resp)) => {
                     // Derive job_id from invocation_id (strip streaming suffix).
@@ -3582,6 +3677,7 @@ impl Worker {
                         output,
                         resp.error_message.clone(),
                         resp.metadata.get("error_code").cloned().unwrap_or_default(),
+                        resp.event_type.clone(),
                         resp.lease_id.clone(),
                     )
                 }
@@ -3620,7 +3716,7 @@ impl Worker {
                     output_data,
                     error_message,
                     error_code,
-                    metadata: HashMap::new(),
+                    metadata: HashMap::from([("completion_event_type".to_string(), event_type)]),
                     project_id: tenant_id,
                     lease_id,
                     worker_session_id: String::new(),
@@ -3712,19 +3808,34 @@ impl Worker {
     }
 }
 
+fn is_terminal_worker_response(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "run.completed" | "run.failed" | "run.cancelled" | "run.paused" | "workflow.paused"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        is_parked_worker_session_registration_rejection, is_worker_session_inactive_error,
-        parked_lease_danger_retry_ms, parked_lease_renew_interval_ms,
-        parked_lease_renew_interval_with_jitter_ms, parked_ramp_spawn_count,
-        parked_worker_session_was_refreshed, runtime_message_from_job_assignment,
-        take_correlation_ids, try_retire_parked_slot, worker_capabilities,
-        ParkedWorkerSessionRegistration, Worker, WorkerConfig,
+        is_parked_worker_session_registration_rejection, is_terminal_worker_response,
+        is_worker_session_inactive_error, parked_lease_danger_retry_ms,
+        parked_lease_renew_interval_ms, parked_lease_renew_interval_with_jitter_ms,
+        parked_ramp_spawn_count, parked_worker_session_was_refreshed,
+        runtime_message_from_job_assignment, take_correlation_ids, try_retire_parked_slot,
+        worker_capabilities, ParkedWorkerSessionRegistration, Worker, WorkerConfig,
     };
     use crate::error::{ErrorCode, SdkError};
     use crate::pb::{runtime_message, JobAssignment};
     use std::collections::HashMap;
+
+    #[test]
+    fn paused_worker_responses_are_terminal() {
+        for event_type in ["run.paused", "workflow.paused"] {
+            assert!(is_terminal_worker_response(event_type));
+        }
+        assert!(!is_terminal_worker_response("output.delta"));
+    }
 
     #[test]
     fn cleanup_run_tracking_removes_per_run_entries() {
@@ -3837,6 +3948,10 @@ mod tests {
                 assert_eq!(
                     req.metadata.get("trace_id").map(String::as_str),
                     Some("trace-1")
+                );
+                assert_eq!(
+                    req.metadata.get("dispatch_mode").map(String::as_str),
+                    Some("pull")
                 );
             }
             other => panic!("expected dispatch component, got {other:?}"),
