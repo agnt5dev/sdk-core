@@ -1,0 +1,14 @@
+version: 1
+coverage: shape
+component: ks_llm_echo
+component_type: function
+cases:
+- id: llm.echo
+  component_type: function
+  component: ks_llm_echo
+  input:
+    text: hello model
+  expect:
+    status: success
+    output_subset:
+      content: hello model

@@ -1,0 +1,13 @@
+version: 1
+component: ks_agent_with_tools
+component_type: function
+cases:
+- id: agent.with_tools
+  component_type: function
+  component: ks_agent_with_tools
+  input:
+    question: What is 15 * 23?
+  expect:
+    status: success
+    output_subset:
+      tool_calls: 1

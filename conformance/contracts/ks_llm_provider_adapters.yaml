@@ -1,0 +1,16 @@
+version: 1
+coverage: shape
+component: ks_llm_provider_adapters
+component_type: function
+cases:
+- id: llm.provider_adapters
+  component_type: function
+  component: ks_llm_provider_adapters
+  input: {}
+  expect:
+    status: success
+    output_subset:
+      provider_count: 11
+      openai_compatible: 10
+      anthropic_compatible: 1
+      local_compatible: 1

@@ -1,0 +1,12 @@
+version: 1
+component: ks_noop
+component_type: function
+cases:
+- id: function.noop.success
+  component_type: function
+  component: ks_noop
+  input: {}
+  expect:
+    status: success
+    output_subset:
+      ok: true

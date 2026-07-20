@@ -1,0 +1,14 @@
+version: 1
+component: ks_lookup
+component_type: tool
+cases:
+- id: tool.lookup
+  component_type: tool
+  component: ks_lookup
+  input:
+    key: user_123
+  expect:
+    status: success
+    output_subset:
+      id: user_123
+      name: Alice

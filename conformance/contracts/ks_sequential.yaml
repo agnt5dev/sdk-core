@@ -1,0 +1,22 @@
+version: 1
+component: ks_sequential
+component_type: workflow
+cases:
+- id: workflow.sequential.steps
+  component_type: workflow
+  component: ks_sequential
+  input:
+    texts:
+    - hello world
+    - foo bar baz
+  expect:
+    status: success
+    output_subset:
+      total_steps: 2
+    event_order:
+    - run.started
+    - workflow.started
+    - workflow.step.started
+    - workflow.step.completed
+    - workflow.completed
+    - run.completed

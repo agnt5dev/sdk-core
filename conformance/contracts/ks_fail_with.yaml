@@ -1,0 +1,26 @@
+version: 1
+component: ks_fail_with
+component_type: function
+cases:
+- id: function.fail.value
+  component_type: function
+  component: ks_fail_with
+  input:
+    error_type: value
+  expect:
+    status: failure
+    error_contains: invalid input
+    event_order:
+    - run.started
+    - function.started
+    - function.failed
+    - run.failed
+- id: function.fail.none
+  component_type: function
+  component: ks_fail_with
+  input:
+    error_type: none
+  expect:
+    status: success
+    output_subset:
+      status: no_error

@@ -1,0 +1,1350 @@
+syntax = "proto3";
+
+package api.v1;
+
+import "google/protobuf/timestamp.proto";
+import "api/v1/common.proto";
+import "api/v1/worker_coordinator.proto";
+
+option go_package = "agnt5.dev/platform/pkg/pb/api/v1;v1";
+
+// EngineService is the core orchestration and storage engine.
+// SDK workers connect here for all hot-path operations:
+// event writes, memoization lookups, run state reads.
+service EngineService {
+  // --- Write path ---
+
+  // Append a single record to the journal log.
+  rpc Append(AppendRequest) returns (AppendResponse);
+
+  // Append multiple records atomically.
+  rpc AppendBatch(AppendBatchRequest) returns (AppendBatchResponse);
+
+  // --- Durable execution (worker write path) ---
+
+  // Checkpoint persists a durable step checkpoint and returns memoization status.
+  // On STEP_STARTED, looks up prior completion by step_key and returns cached output
+  // if found. On STEP_COMPLETED/STEP_FAILED, appends a record to the journal.
+  rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse);
+
+  // EventStream accepts a stream of ephemeral events (tokens, progress, logs)
+  // from SDK workers. No journal persistence — real-time SSE delivery only.
+  rpc EventStream(stream EventStreamMessage) returns (EventStreamAck);
+
+  // --- Pull-based job queue ---
+
+  // PollJobs claims pending jobs from the durable queue for a worker.
+  rpc PollJobs(PollJobsRequest) returns (PollJobsResponse);
+
+  // RegisterWorkerSession binds a worker identity to a deployment lane before
+  // parked single-job polling. SPIFFE/SPIRE can later authenticate the same
+  // worker identity; the session remains useful for policy and rollout state.
+  rpc RegisterWorkerSession(RegisterWorkerSessionRequest) returns (RegisterWorkerSessionResponse);
+
+  // PollJob parks a single worker slot until one job is available or wait_ms
+  // elapses. Empty response means timeout.
+  rpc PollJob(PollJobRequest) returns (PollJobResponse);
+
+  // RenewJobLease extends the active lease for a currently assigned job.
+  rpc RenewJobLease(RenewJobLeaseRequest) returns (RenewJobLeaseResponse);
+
+  // ReportWorkerCapacity publishes the worker's current pull-slot state for
+  // autoscaling and heartbeat freshness.
+  rpc ReportWorkerCapacity(ReportWorkerCapacityRequest) returns (ReportWorkerCapacityResponse);
+
+  // CompleteJob reports the result of a previously polled job.
+  rpc CompleteJob(CompleteJobRequest) returns (CompleteJobResponse);
+
+  // --- Read path (record cache + materialized store) ---
+
+  // Read all events for a run, ordered by timestamp.
+  rpc ReadByRunID(ReadByRunIDRequest) returns (ReadByRunIDResponse);
+
+  // Find a completed step by its memoization key.
+  rpc FindByStepKey(FindByStepKeyRequest) returns (FindByStepKeyResponse);
+
+  // Get the current state of a run.
+  rpc GetRun(GetRunRequest) returns (GetRunResponse);
+
+  // List live worker routing entries for an exact route key.
+  rpc ListRoutingWorkers(ListRoutingWorkersRequest) returns (ListRoutingWorkersResponse);
+
+  // --- Tailing (real-time SSE replay, processor catch-up) ---
+
+  // Tail the log from a given offset. Server-streaming.
+  rpc Tail(TailRequest) returns (stream TailResponse);
+
+  // --- Entity state ---
+
+  // Get entity state by scoped key.
+  rpc GetEntityState(GetEntityStateRequest) returns (GetEntityStateResponse);
+
+  // Save entity state. Appends a workflow.state.changed record to the journal,
+  // which the processor materializes. Supports optimistic locking via expected_version.
+  rpc PutEntityState(PutEntityStateRequest) returns (PutEntityStateResponse);
+
+  // --- Approvals ---
+
+  rpc GetApproval(GetApprovalRequest) returns (GetApprovalResponse);
+  rpc ListApprovals(EngineListApprovalsRequest) returns (EngineListApprovalsResponse);
+
+  // --- Signals ---
+
+  rpc GetSignal(GetSignalRequest) returns (GetSignalResponse);
+  rpc LookupSignal(LookupSignalRequest) returns (LookupSignalResponse);
+  rpc ListSignals(ListSignalsRequest) returns (ListSignalsResponse);
+
+  // --- Timers ---
+
+  rpc GetTimer(GetTimerRequest) returns (GetTimerResponse);
+  rpc ListTimers(ListTimersRequest) returns (ListTimersResponse);
+  rpc ListDueTimers(ListDueTimersRequest) returns (ListDueTimersResponse);
+
+  // --- Jobs + Batches ---
+
+  rpc GetJob(GetJobRequest) returns (GetJobResponse);
+  rpc ListJobsByRun(ListJobsByRunRequest) returns (ListJobsByRunResponse);
+  rpc ListJobsByBatch(ListJobsByBatchRequest) returns (ListJobsByBatchResponse);
+  rpc GetBatch(GetBatchRequest) returns (GetBatchResponse);
+
+  // --- Sessions + Messages ---
+
+  rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  rpc GetMessage(GetMessageRequest) returns (GetMessageResponse);
+  rpc ListMessagesByCorrelation(ListMessagesByCorrelationRequest) returns (ListMessagesByCorrelationResponse);
+
+  // --- Run Listing (S3 Parquet + DuckDB query tier) ---
+
+  // List runs with filtering and pagination. Reads from S3 Parquet via DuckDB.
+  rpc ListRuns(ListRunsRequest) returns (ListRunsResponse);
+
+  // Get aggregated run statistics (count by status, component type).
+  rpc GetRunStats(GetRunStatsRequest) returns (GetRunStatsResponse);
+
+  // --- Inbound Event Listing (CF_EVENTS_HOT hot index) ---
+
+  // List inbound events a project received, newest-first. Backs the
+  // Studio "Events" page. Reads the local events hot index (no cold tier
+  // today); each item is a compact summary, full payload fetched via
+  // ReadByRunId on the event_run_id.
+  rpc ListEvents(ListEventsRequest) returns (ListEventsResponse);
+
+  // --- Admin ---
+
+  // Get engine cluster status.
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+}
+
+// ReplicationService handles node-to-node communication
+// for quorum replication within a cluster.
+service ReplicationService {
+  // Store a batch of records on a replica node.
+  rpc Store(StoreRequest) returns (StoreResponse);
+
+  // Read records from a replica (for catch-up).
+  // Server-streaming: response is split into bounded chunks so a large
+  // catch-up backlog (hundreds of MB) doesn't blow past h2 frame/buffer
+  // limits. Each GetRecordsResponse carries a slice of records; the
+  // client concatenates them in stream order.
+  rpc GetRecords(GetRecordsRequest) returns (stream GetRecordsResponse);
+
+  // Seal a segment on a replica node.
+  rpc Seal(SealRequest) returns (SealResponse);
+
+  // Heartbeat between cluster nodes (liveness + epoch propagation).
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // Vote request during sequencer election.
+  rpc RequestVote(VoteRequest) returns (VoteResponse);
+
+  // Announce new sequencer to all peers after winning election.
+  rpc AnnounceLeader(AnnounceLeaderRequest) returns (AnnounceLeaderResponse);
+
+  // Forward a write from a follower to the sequencer.
+  rpc ForwardAppend(ForwardAppendRequest) returns (ForwardAppendResponse);
+
+  // Add a member to the cluster (leader only).
+  rpc AddMember(AddMemberRequest) returns (AddMemberResponse);
+
+  // Remove a member from the cluster (leader only).
+  rpc RemoveMember(RemoveMemberRequest) returns (RemoveMemberResponse);
+
+  // Explicitly transfer partition leadership to another live node.
+  rpc TransferLeadership(TransferLeadershipRequest) returns (TransferLeadershipResponse);
+}
+
+// =============================================================================
+// Core Types
+// =============================================================================
+
+// Record is the fundamental unit stored in the journal log.
+// All orchestration state is derived from records.
+message Record {
+  // Offset assigned by the sequencer (monotonically increasing).
+  uint64 offset = 1;
+
+  // Tenant isolation.
+  string project_id = 2;
+
+  // Run this record belongs to.
+  string run_id = 3;
+
+  // Event type determines how the processor materializes this record.
+  // Examples: "run.enqueued", "run.started", "run.completed", "run.failed",
+  //           "step.completed", "workflow.state.changed",
+  //           "timer.scheduled", "timer.fired", "timer.canceled",
+  //           "approval.requested", "approval.resolved",
+  //           "signal.raised", "signal.received",
+  //           "batch.created", "job.enqueued", "job.claimed", "job.completed",
+  //           "session.created", "session.updated",
+  //           "message.sent", "message.delivered", "message.failed",
+  //           "lm.call.started", "lm.call.completed",
+  //           "tool.call.started", "tool.call.completed",
+  //           "agent.iteration.started", "agent.iteration.completed"
+  string event_type = 4;
+
+  // JSON-encoded event payload.
+  bytes data = 5;
+
+  // Nanosecond-precision timestamp (source time from SDK, or server time).
+  int64 timestamp_ns = 6;
+
+  // Step memoization key. Present for step completion events.
+  // Used for O(1) memoization lookup during workflow replay.
+  string step_key = 7;
+
+  // Correlation ID for pairing start/complete events.
+  string correlation_id = 8;
+
+  // Parent event ID for building event hierarchy.
+  string parent_event_id = 9;
+
+  // Display metadata for UI rendering.
+  map<string, string> metadata = 10;
+
+  // Data format: "json" or "binary".
+  string data_type = 11;
+
+  // xxHash64 checksum of data (before compression).
+  bytes data_checksum = 12;
+
+  // Whether data is zstd-compressed.
+  bool data_compressed = 13;
+}
+
+// =============================================================================
+// Write Path Messages
+// =============================================================================
+
+message AppendRequest {
+  Record record = 1;
+}
+
+message AppendResponse {
+  // Assigned offset in the log.
+  uint64 offset = 1;
+
+  // Nanosecond timestamp assigned by the engine.
+  int64 timestamp_ns = 2;
+}
+
+message AppendBatchRequest {
+  repeated Record records = 1;
+}
+
+message AppendBatchResponse {
+  // Offsets assigned to each record (same order as input).
+  repeated uint64 offsets = 1;
+
+  // Number of records successfully appended.
+  int32 written_count = 2;
+}
+
+// =============================================================================
+// Read Path Messages
+// =============================================================================
+
+message ReadByRunIDRequest {
+  string project_id = 1;
+  string run_id = 2;
+
+  // Optional: only return events after this timestamp.
+  int64 from_timestamp_ns = 3;
+
+  // Optional: filter by event types (empty = all).
+  repeated string event_types = 4;
+}
+
+message ReadByRunIDResponse {
+  repeated Record records = 1;
+}
+
+message FindByStepKeyRequest {
+  string project_id = 1;
+  string run_id = 2;
+  string step_key = 3;
+}
+
+message FindByStepKeyResponse {
+  // The step completion record, if found.
+  Record record = 1;
+
+  // Whether the step was found.
+  bool found = 2;
+}
+
+message GetRunRequest {
+  string project_id = 1;
+  string run_id = 2;
+}
+
+message GetRunResponse {
+  Run run = 1;
+  bool found = 2;
+}
+
+message ListRoutingWorkersRequest {
+  string project_id = 1;
+  string deployment_id = 2;
+  // COMPONENT_TYPE_UNSPECIFIED with empty component_name returns all routing
+  // worker snapshots for the deployment.
+  int32 component_type = 3;
+  string component_name = 4;
+}
+
+message ListRoutingWorkersResponse {
+  repeated WorkerInfo workers = 1;
+}
+
+// Run represents the materialized state of a workflow/function execution.
+message Run {
+  string project_id = 1;
+  string run_id = 2;
+  string deployment_id = 3;
+  string component_name = 4;
+  string component_type = 5;
+
+  // Lifecycle status: "enqueued", "started", "running", "completed", "failed", "cancelled", "paused"
+  string status = 6;
+
+  // Error details (present when status = "failed").
+  string error_message = 7;
+  string error_code = 8;
+
+  // Input/output data references.
+  bytes input_data = 9;
+  bytes output_data = 10;
+
+  // Timing.
+  google.protobuf.Timestamp submitted_at = 11;
+  google.protobuf.Timestamp started_at = 12;
+  google.protobuf.Timestamp completed_at = 13;
+  int64 duration_ms = 14;
+  google.protobuf.Timestamp gateway_received_at = 26;
+  google.protobuf.Timestamp assigned_at = 27;
+
+  // Trace context.
+  string trace_id = 15;
+
+  // Execution metadata.
+  map<string, string> metadata = 16;
+
+  // --- Lease / dispatch fields (unified lease-based dispatch) ---
+  //
+  // A run with a non-empty `lease_id` is currently leased to a worker.
+  // Only the holder of the current `lease_id` may complete the run — this
+  // is the fence token that prevents a stale worker from acking a run that
+  // has been re-leased to another worker after expiry.
+
+  // ULID — unique per lease creation. Empty when no active lease.
+  string lease_id             = 17;
+
+  // Worker that currently holds the lease. Empty when no active lease.
+  string lease_worker_id      = 18;
+
+  // Wall-clock expiry in milliseconds since Unix epoch.
+  int64  lease_expires_at_ms  = 19;
+
+  // Wall-clock lease creation time in milliseconds since Unix epoch.
+  int64  lease_created_at_ms  = 20;
+
+  // Monotonic counter incremented on each lease creation. Observability aid;
+  // fencing is done via lease_id.
+  uint32 lease_epoch          = 21;
+
+  // Total delivery attempts (incremented on re-lease after expiry/failure).
+  uint32 attempt              = 22;
+
+  // Dispatch priority class. Drives queueing and headroom reservation.
+  Priority priority           = 23;
+
+  // Effective lease timeout for this lease (ms). Resolved at lease creation
+  // time from the most-specific of: per-dispatch override → component
+  // registration default → system default.
+  int64  lease_timeout_ms     = 24;
+
+  // Per-model LLM usage breakdown, accumulated from lm.* journal events.
+  // Aggregates (total tokens / total cost) are NOT pre-computed — clients sum
+  // across this list when they need a single number. Different models have
+  // different pricing, so per-model is the correct granularity.
+  repeated ModelUsage model_usage = 25;
+
+  // Workspace UUID — the auth scope that owns this run. Stamped by the
+  // gateway from AuthContext.workspace_id onto run.queued metadata, then
+  // copied here by the projection. Used as a top-level Hive partition key
+  // in S3 Parquet (workspace=<id>/project=<id>/deployment=<id>/day=...).
+  string workspace_id = 29;
+}
+
+// LLM usage for a specific (provider, model) pair within a single run.
+message ModelUsage {
+  string provider = 1;
+  string model = 2;
+  int64 input_tokens = 3;
+  int64 output_tokens = 4;
+  int64 cached_tokens = 5;
+  // Cost in USD * 1_000_000. Already priced at this model's rates.
+  int64 cost_micros = 6;
+  // Number of LM events (lm.completed + lm.call.completed + lm.stream.completed)
+  // observed for this model in this run.
+  int32 call_count = 7;
+}
+
+// =============================================================================
+// Tail Messages
+// =============================================================================
+
+message TailRequest {
+  // Start tailing from this offset (inclusive).
+  uint64 from_offset = 1;
+
+  // Optional: filter by tenant.
+  string project_id = 2;
+
+  // Optional: filter by run.
+  string run_id = 3;
+}
+
+message TailResponse {
+  Record record = 1;
+}
+
+// =============================================================================
+// Admin Messages
+// =============================================================================
+
+message GetStatusRequest {}
+
+message GetStatusResponse {
+  // Node identity.
+  string node_id = 1;
+
+  // Cluster role: "sequencer", "follower", "standalone"
+  string role = 2;
+
+  // Current log tail offset.
+  uint64 tail_offset = 3;
+
+  // Processor checkpoint (last materialized offset).
+  uint64 processor_offset = 4;
+
+  // Number of active segments.
+  int32 active_segments = 5;
+
+  // Cache stats.
+  int64 cache_entries = 6;
+  int64 cache_bytes = 7;
+
+  // Uptime in seconds.
+  int64 uptime_seconds = 8;
+}
+
+// =============================================================================
+// Replication Messages
+// =============================================================================
+
+message StoreRequest {
+  // Segment this batch belongs to.
+  uint64 segment_id = 1;
+
+  // Records to replicate.
+  repeated Record records = 2;
+
+  // Sequencer epoch (reject if stale).
+  uint64 sequencer_epoch = 3;
+
+  // Partition this batch belongs to (0 = legacy single-partition).
+  uint32 partition_id = 4;
+
+  // Node ID of the sequencer sending this Store RPC. Used by followers
+  // for catch-up replication and to repair sequencer_node routing.
+  string sequencer_node = 5;
+}
+
+message StoreResponse {
+  // Whether the store succeeded.
+  bool success = 1;
+
+  // Highest offset stored.
+  uint64 stored_through = 2;
+
+  // True when the follower detected an offset gap and needs the leader
+  // to push missing records. When set, catch_up_from contains the
+  // follower's local tail (the next offset it needs). Valid at 0 for
+  // a fresh or empty replica.
+  bool needs_catch_up = 3;
+
+  // The follower's local tail offset (next offset it expects).
+  // Only meaningful when needs_catch_up is true.
+  uint64 catch_up_from = 4;
+}
+
+message GetRecordsRequest {
+  uint64 segment_id = 1;
+  uint64 from_offset = 2;
+  uint64 to_offset = 3;
+
+  // Partition to read from (0 = legacy single-partition).
+  uint32 partition_id = 4;
+}
+
+message GetRecordsResponse {
+  repeated Record records = 1;
+}
+
+message SealRequest {
+  uint64 segment_id = 1;
+  uint64 sequencer_epoch = 2;
+
+  // Partition to seal (0 = legacy single-partition).
+  uint32 partition_id = 3;
+}
+
+message SealResponse {
+  bool success = 1;
+
+  // The final offset in the sealed segment.
+  uint64 sealed_at_offset = 2;
+}
+
+// --- Cluster coordination ---
+
+message HeartbeatRequest {
+  string node_id = 1;
+  uint64 epoch = 2;
+  string role = 3;          // "sequencer" or "follower"
+  uint64 tail_offset = 4;
+
+  // Per-partition status (populated in multi-partition mode).
+  repeated PartitionStatus partition_statuses = 5;
+
+  // Protocol version for rolling upgrade compatibility.
+  uint32 protocol_version = 6;
+}
+
+message HeartbeatResponse {
+  string node_id = 1;
+  uint64 epoch = 2;
+  string role = 3;
+  uint64 tail_offset = 4;
+
+  // Per-partition status (populated in multi-partition mode).
+  repeated PartitionStatus partition_statuses = 5;
+
+  // Protocol version for rolling upgrade compatibility.
+  uint32 protocol_version = 6;
+}
+
+// Per-partition replication status, used in heartbeats.
+message PartitionStatus {
+  uint32 partition_id = 1;
+  uint64 tail_offset = 2;
+  uint64 epoch = 3;
+
+  // Highest offset confirmed by quorum (leader only). Followers use this
+  // to know the authoritative boundary during catch-up.
+  uint64 committed_through = 4;
+
+  // Per-partition leader identity. Set to local node_id if Leader,
+  // known leader if Follower, empty if NoLeader. Receivers use this
+  // for accurate per-partition leader installation instead of the
+  // aggregate node-level role field.
+  string leader_node_id = 5;
+
+  // Local lifecycle state for this partition on the sending node
+  // (for example: active, passive, replaying, draining, failed).
+  string lifecycle_state = 6;
+}
+
+message VoteRequest {
+  string candidate_id = 1;
+  uint64 proposed_epoch = 2;
+  uint64 tail_offset = 3;   // candidate's log length for this partition (most up-to-date wins)
+  uint32 partition_id = 4;  // partition this vote is for (0 = legacy single-partition)
+}
+
+message VoteResponse {
+  bool granted = 1;
+  uint64 current_epoch = 2;
+  string current_leader = 3; // non-empty if voter already has a leader
+}
+
+message AnnounceLeaderRequest {
+  string leader_id = 1;
+  uint64 epoch = 2;
+  // Serialized SegmentConfig JSON.
+  string segment_config_json = 3;
+  uint32 partition_id = 4;  // partition this announcement is for (0 = legacy single-partition)
+}
+
+message AnnounceLeaderResponse {
+  bool accepted = 1;
+}
+
+message ForwardAppendRequest {
+  repeated Record records = 1;
+
+  // Partition to append to (0 = legacy single-partition).
+  uint32 partition_id = 2;
+
+  // Epoch of the forwarding node — sequencer rejects if stale.
+  uint64 sequencer_epoch = 3;
+}
+
+message ForwardAppendResponse {
+  repeated uint64 offsets = 1;
+}
+
+// --- Dynamic membership ---
+
+message AddMemberRequest {
+  string node_id = 1;
+  string addr = 2;       // gRPC address (host:port)
+}
+
+message AddMemberResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message RemoveMemberRequest {
+  string node_id = 1;
+}
+
+message RemoveMemberResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message TransferLeadershipRequest {
+  uint32 partition_id = 1;
+  string target_node_id = 2;
+}
+
+message TransferLeadershipResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+// =============================================================================
+// Entity State Messages
+// =============================================================================
+
+message GetEntityStateRequest {
+  string project_id = 1;
+  string entity_type = 2;
+  string entity_key = 3;
+  string scope = 4;       // "global", "run", "session", "user"
+  string scope_id = 5;    // run_id, session_id, user_id (empty for global)
+}
+
+message GetEntityStateResponse {
+  // Whether the entity was found.
+  bool found = 1;
+
+  // JSON-encoded state data.
+  bytes state_json = 2;
+
+  // Current version for optimistic locking.
+  int64 version = 3;
+}
+
+message PutEntityStateRequest {
+  string project_id = 1;
+  string entity_type = 2;
+  string entity_key = 3;
+  string scope = 4;
+  string scope_id = 5;
+
+  // Full state snapshot (JSON).
+  bytes state_json = 6;
+
+  // Expected version for optimistic locking.
+  // Use 0 for initial creation.
+  int64 expected_version = 7;
+
+  // Run ID to associate the journal event with.
+  string run_id = 8;
+}
+
+message PutEntityStateResponse {
+  // New version after save.
+  int64 new_version = 1;
+}
+
+// =============================================================================
+// Approval Messages
+// =============================================================================
+
+message Approval {
+  string approval_id = 1;
+  string run_id = 2;
+  string project_id = 3;
+  string name = 4;
+  bytes payload = 5;
+  repeated string required_roles = 6;
+  repeated string notify_channels = 7;
+  string status = 8;              // pending, approved, rejected, expired
+  string decided_by = 9;
+  string decision_reason = 10;
+  bytes decision_payload = 11;
+  string dedupe_id = 12;
+  google.protobuf.Timestamp requested_at = 13;
+  google.protobuf.Timestamp expires_at = 14;
+  google.protobuf.Timestamp decided_at = 15;
+}
+
+message GetApprovalRequest {
+  string project_id = 1;
+  string approval_id = 2;
+  string run_id = 3;
+}
+
+message GetApprovalResponse {
+  Approval approval = 1;
+  bool found = 2;
+}
+
+message EngineListApprovalsRequest {
+  string project_id = 1;
+  string run_id = 2;
+  string status_filter = 3;  // empty = all
+}
+
+message EngineListApprovalsResponse {
+  repeated Approval approvals = 1;
+}
+
+// =============================================================================
+// Signal Messages
+// =============================================================================
+
+message Signal {
+  string signal_id = 1;
+  string run_id = 2;
+  string project_id = 3;
+  string signal_name = 4;
+  string waiting_step = 5;
+  bytes payload = 6;
+  string status = 7;              // waiting, received, acked, expired
+  string acked_by = 8;
+  int32 version = 9;
+  string event_id = 10;
+  google.protobuf.Timestamp received_at = 11;
+  google.protobuf.Timestamp acknowledged_at = 12;
+  google.protobuf.Timestamp expires_at = 13;
+}
+
+message GetSignalRequest {
+  string project_id = 1;
+  string signal_id = 2;
+  string run_id = 3;
+}
+
+message GetSignalResponse {
+  Signal signal = 1;
+  bool found = 2;
+}
+
+message LookupSignalRequest {
+  string project_id = 1;
+  string run_id = 2;
+  string signal_name = 3;
+  string waiting_step = 4;
+}
+
+message LookupSignalResponse {
+  Signal signal = 1;
+  bool found = 2;
+}
+
+message ListSignalsRequest {
+  string project_id = 1;
+  string run_id = 2;
+}
+
+message ListSignalsResponse {
+  repeated Signal signals = 1;
+}
+
+// =============================================================================
+// Timer Messages
+// =============================================================================
+
+message Timer {
+  string timer_id = 1;
+  string run_id = 2;
+  string component_id = 3;
+  string project_id = 4;
+  string timer_key = 5;
+  string waiting_step = 6;
+  string schedule_type = 7;       // delay, cron, absolute
+  bytes schedule_payload = 8;
+  bool recurring = 9;
+  string status = 10;             // scheduled, fired, canceled, expired
+  google.protobuf.Timestamp fire_at = 11;
+  google.protobuf.Timestamp fired_at = 12;
+  google.protobuf.Timestamp canceled_at = 13;
+  string canceled_by = 14;
+  google.protobuf.Timestamp expired_at = 15;
+  string event_id = 16;
+}
+
+message GetTimerRequest {
+  string project_id = 1;
+  string timer_id = 2;
+  string run_id = 3;
+}
+
+message GetTimerResponse {
+  Timer timer = 1;
+  bool found = 2;
+}
+
+message ListTimersRequest {
+  string project_id = 1;
+  string run_id = 2;
+}
+
+message ListTimersResponse {
+  repeated Timer timers = 1;
+}
+
+message ListDueTimersRequest {
+  string project_id = 1;
+  int64 now_ns = 2;
+  int32 limit = 3;
+}
+
+message ListDueTimersResponse {
+  repeated Timer timers = 1;
+}
+
+// =============================================================================
+// Job Messages
+// =============================================================================
+
+message Job {
+  string job_id = 1;
+  string run_id = 2;
+  string project_id = 3;
+  string component_id = 4;
+  string component_name = 5;
+  bytes input_data = 6;
+  string status = 7;              // pending, claimed, started, completed, failed, cancelled
+  int32 priority = 8;
+  string claimed_by = 9;
+  string batch_id = 10;
+  int32 batch_index = 11;
+  int64 timeout_ms = 12;
+  int32 attempt = 13;
+  int32 max_attempts = 14;
+  string error_message = 15;
+  string trace_id = 16;
+  map<string, string> metadata = 17;
+  google.protobuf.Timestamp created_at = 18;
+  google.protobuf.Timestamp claimed_at = 19;
+  google.protobuf.Timestamp completed_at = 20;
+}
+
+message GetJobRequest {
+  string project_id = 1;
+  string job_id = 2;
+  string run_id = 3;
+}
+
+message GetJobResponse {
+  Job job = 1;
+  bool found = 2;
+}
+
+message ListJobsByRunRequest {
+  string project_id = 1;
+  string run_id = 2;
+}
+
+message ListJobsByRunResponse {
+  repeated Job jobs = 1;
+}
+
+message ListJobsByBatchRequest {
+  string project_id = 1;
+  string batch_id = 2;
+}
+
+message ListJobsByBatchResponse {
+  repeated Job jobs = 1;
+}
+
+// =============================================================================
+// Batch Messages
+// =============================================================================
+
+message Batch {
+  string batch_id = 1;
+  string project_id = 2;
+  string service_name = 3;
+  string component_type = 4;
+  string component_name = 5;
+  string status = 6;              // pending, queued, running, completed, partial_failure, failed, cancelled
+  int32 total_items = 7;
+  int32 completed_items = 8;
+  int32 failed_items = 9;
+  int32 cancelled_items = 10;
+  int32 max_concurrency = 11;
+  bool continue_on_failure = 12;
+  int64 batch_timeout_ms = 13;
+  int64 default_item_timeout_ms = 14;
+  string trace_id = 15;
+  bytes metadata = 16;
+  google.protobuf.Timestamp submitted_at = 17;
+  google.protobuf.Timestamp started_at = 18;
+  google.protobuf.Timestamp completed_at = 19;
+}
+
+message GetBatchRequest {
+  string project_id = 1;
+  string batch_id = 2;
+}
+
+message GetBatchResponse {
+  Batch batch = 1;
+  bool found = 2;
+}
+
+// =============================================================================
+// Session Messages
+// =============================================================================
+
+message Session {
+  string session_id = 1;
+  string project_id = 2;
+  string session_type = 3;       // agent, workflow
+  string component_name = 4;
+  string service_name = 5;
+  bytes state = 6;
+  bytes metadata = 7;
+  google.protobuf.Timestamp created_at = 8;
+  google.protobuf.Timestamp updated_at = 9;
+  google.protobuf.Timestamp last_used_at = 10;
+  google.protobuf.Timestamp expires_at = 11;
+}
+
+message GetSessionRequest {
+  string project_id = 1;
+  string session_id = 2;
+}
+
+message GetSessionResponse {
+  Session session = 1;
+  bool found = 2;
+}
+
+message ListSessionsRequest {
+  string project_id = 1;
+  string component_name = 2;     // filter by component (empty = all)
+  string session_type = 3;       // filter by type (empty = all)
+}
+
+message ListSessionsResponse {
+  repeated Session sessions = 1;
+}
+
+// =============================================================================
+// Message Messages
+// =============================================================================
+
+message ChatMessage {
+  string message_id = 1;
+  string project_id = 2;
+  string message_type = 3;       // request, response, event
+  string message_key = 4;
+  string from_service = 5;
+  string to_service = 6;
+  string reply_to = 7;
+  bytes payload = 8;
+  string status = 9;             // pending, delivered, failed
+  int32 priority = 10;
+  bytes headers = 11;
+  string trace_id = 12;
+  string correlation_id = 13;
+  google.protobuf.Timestamp scheduled_at = 14;
+  google.protobuf.Timestamp delivered_at = 15;
+  google.protobuf.Timestamp created_at = 16;
+}
+
+message GetMessageRequest {
+  string project_id = 1;
+  string message_id = 2;
+  string run_id = 3;
+}
+
+message GetMessageResponse {
+  ChatMessage message = 1;
+  bool found = 2;
+}
+
+message ListMessagesByCorrelationRequest {
+  string project_id = 1;
+  string correlation_id = 2;
+}
+
+message ListMessagesByCorrelationResponse {
+  repeated ChatMessage messages = 1;
+}
+
+// =============================================================================
+// Run Listing (S3 Parquet + DuckDB)
+// =============================================================================
+
+message ListRunsRequest {
+  string project_id = 1;
+  optional string deployment_id = 2;
+  optional string status = 3;
+  optional string service_name = 4;
+  optional string component_name = 5;
+  optional string component_type = 6;
+  optional string session_id = 7;
+  optional string parent_run_id = 8;
+  optional int64 since_ms = 9;
+  optional int64 until_ms = 10;
+  int32 limit = 11;
+  // Deprecated: callers should drive pagination with `cursor`. Left in for
+  // back-compat during the migration window.
+  int32 offset = 12 [deprecated = true];
+  // Workspace UUID — required by the query layer to scope to the auth's
+  // workspace partition in S3 Parquet. Empty falls back to the legacy
+  // single-workspace path during transition.
+  string workspace_id = 13;
+  // Opaque cursor from a previous ListRunsResponse.next_cursor. Empty for
+  // the first page. Mutually exclusive with `offset` — when both are set,
+  // `cursor` wins.
+  string cursor = 14;
+}
+
+message ListRunsResponse {
+  repeated Run items = 1;
+  // Deprecated: globally-correct distinct counts across hot RocksDB + cold S3
+  // are expensive at scale and were N×inflated in HA mode (gap F5). Counts
+  // come from the analytics store; the runs list returns `has_more` +
+  // `next_cursor` instead. Field 2 retained at -1 sentinel for clients that
+  // still read it during the migration window.
+  int64 total_count = 2 [deprecated = true];
+  int32 limit = 3;
+  int32 offset = 4;
+  // Deprecated: callers should drive pagination with `next_cursor` /
+  // `has_more`. `next_offset` is left populated for back-compat.
+  optional int32 next_offset = 5 [deprecated = true];
+  // True if a subsequent page is available — drive "Load more" UX.
+  bool has_more = 6;
+  // Opaque cursor for the next page; pass back via ListRunsRequest.cursor.
+  // Empty when `has_more` is false. Today encodes
+  // `(submitted_at_ms, run_id)` per Decision 15; treat as opaque.
+  string next_cursor = 7;
+  // Phase 3 task 3.8: replication lag at the receiving node when this
+  // response was assembled, in milliseconds. Computed as
+  // `now_ms - last_applied_record_ts_ms` for the local processor's
+  // last-applied record. Exposes the eventually-consistent contract
+  // honestly so clients (Studio) can render a staleness banner above
+  // some threshold (Decision 19/20). Zero when no records have been
+  // tailed yet or the signal is unavailable.
+  int64 replication_lag_ms = 8;
+}
+
+message ListEventsRequest {
+  string project_id = 1;
+  // Optional post-scan filters. `source` / `event_name` / `deployment_id`
+  // are applied after the index scan (the hot-index key is project + time
+  // only), so a strict filter scans more rows per page.
+  optional string source = 2;
+  optional string event_name = 3;
+  optional string deployment_id = 4;
+  optional int64 since_ms = 5;
+  optional int64 until_ms = 6;
+  int32 limit = 7;
+  // Opaque cursor from a previous ListEventsResponse.next_cursor. Empty
+  // for the first page. Encodes `(timestamp_ms, event_run_id)`.
+  string cursor = 8;
+}
+
+// Compact inbound-event summary for the Events list. The full event
+// (payload, matched triggers) is fetched on demand via ReadByRunId using
+// `event_run_id`.
+message EventSummary {
+  string event_run_id = 1;
+  string event_id = 2;
+  string event_name = 3;
+  string source = 4;
+  string deployment_id = 5;
+  int64 timestamp_ns = 6;
+  // Number of triggers this event matched → number of runs it enqueued.
+  uint32 matched_count = 7;
+  // Triggers skipped because they use features not yet supported (CEL
+  // filters, input mapping, batching, delays).
+  uint32 skipped_unsupported_count = 8;
+  // Lifecycle status for the received event. Initial values are
+  // "received" and "rejected".
+  string status = 9;
+  // Human-readable reason when status is "rejected".
+  string error_message = 10;
+  // Dispatch path used after the event was received: "trigger" or
+  // "binding".
+  string dispatch_kind = 11;
+  // Bound component target for chat/binding dispatches.
+  string bound_component_name = 12;
+  string bound_component_type = 13;
+}
+
+message ListEventsResponse {
+  repeated EventSummary items = 1;
+  int32 limit = 2;
+  bool has_more = 3;
+  // Opaque cursor for the next page; pass back via ListEventsRequest.cursor.
+  // Empty when `has_more` is false.
+  string next_cursor = 4;
+}
+
+message GetRunStatsRequest {
+  string project_id = 1;
+  optional string deployment_id = 2;
+  optional int64 since_ms = 3;
+  optional int64 until_ms = 4;
+  // Workspace UUID — used to scope to the workspace partition prefix.
+  string workspace_id = 5;
+}
+
+message GetRunStatsResponse {
+  map<string, int64> count_by_status = 1;
+  map<string, int64> count_by_component_type = 2;
+  // Deprecated: was summed across distinct leader nodes in HA, producing
+  // up-to-N×inflated numbers (gap F5). Source counts from the analytics
+  // store; runtime returns only hot-tier in-flight tallies. Field 3
+  // retained at -1 sentinel for clients still reading it.
+  int64 total_count = 3 [deprecated = true];
+}
+
+// =============================================================================
+// Durable Execution Messages (Checkpoint + EventStream)
+// =============================================================================
+
+// CheckpointType represents the type of checkpoint event.
+enum CheckpointType {
+  CHECKPOINT_TYPE_UNSPECIFIED = 0;
+  CHECKPOINT_TYPE_STEP_STARTED = 1;
+  CHECKPOINT_TYPE_STEP_COMPLETED = 2;
+  CHECKPOINT_TYPE_STEP_FAILED = 3;
+  CHECKPOINT_TYPE_STATE_SNAPSHOT = 4;
+}
+
+// DurableStepCheckpoint represents a checkpoint for a workflow step with metrics.
+message DurableStepCheckpoint {
+  string run_id = 1;
+  string step_key = 2;
+  string step_name = 3;
+  string step_type = 4;            // "function", "activity", "child_workflow"
+  CheckpointType type = 5;
+  bytes payload = 6;               // Input for STARTED, output for COMPLETED
+  string error_message = 7;        // Only for FAILED
+  string error_type = 8;           // Error classification
+
+  // Metrics (populated on COMPLETED)
+  int64 tokens_in = 10;
+  int64 tokens_out = 11;
+  double cost_usd = 12;
+  int64 latency_ms = 13;
+  string model_provider = 14;
+  string model_version = 15;
+}
+
+// CheckpointRequest sent from SDK worker to engine.
+message CheckpointRequest {
+  DurableStepCheckpoint checkpoint = 1;
+  // Tenant the run belongs to. Required: the engine's journal + memoization
+  // lookups are keyed by (project_id, run_id).
+  string project_id = 2;
+}
+
+// CheckpointResponse from the engine.
+message CheckpointResponse {
+  bool success = 1;
+  string error_message = 2;
+
+  // For memoization: if step was already completed, return cached output.
+  bool memoized = 3;
+  bytes cached_output = 4;
+}
+
+// EventStreamMessage carries a single ephemeral event from worker to engine.
+// Used for SSE-only events (tokens, progress, logs, spans) that need real-time
+// delivery but not journal persistence.
+message EventStreamMessage {
+  string run_id = 1;              // Run this event belongs to
+  string event_type = 2;          // e.g., "output.delta", "lm.message.delta", "log.info"
+  bytes data = 3;                 // JSON event payload
+  string trace_id = 4;            // Trace context for correlation
+  string span_id = 5;             // Span context for correlation
+  string project_id = 6;           // Tenant context (for multi-tenant deployments)
+  int64 source_timestamp_ns = 7;  // Nanosecond timestamp when event was created at source
+  string worker_id = 8;           // Worker ID for stream ownership validation
+}
+
+// EventStreamAck is returned when the EventStream closes (client half-close or disconnect).
+// Provides summary statistics for the stream lifetime.
+message EventStreamAck {
+  bool success = 1;               // Whether the stream completed without errors
+  int64 events_received = 2;      // Total events received on this stream
+}
+
+// =============================================================================
+// Pull-Based Job Queue Messages
+// =============================================================================
+
+// PollJobsRequest is sent by workers to pull jobs from the durable queue.
+message PollJobsRequest {
+  // Worker ID (must be registered via WorkerStream on the coordinator).
+  string worker_id = 1;
+
+  // Component UUIDs or names this worker handles.
+  repeated string component_ids = 2;
+
+  // Maximum number of jobs to claim in this poll.
+  int32 max_jobs = 3;
+
+  // Tenant ID for multi-tenant isolation.
+  string project_id = 4;
+
+  // Optional deployment ID filter.
+  optional string deployment_id = 5;
+
+  // How long the claim is valid (ms). Default: 300000 (5 min).
+  int64 claim_timeout_ms = 6;
+}
+
+// PollJobsResponse contains jobs claimed by the worker.
+message PollJobsResponse {
+  repeated JobAssignment jobs = 1;
+}
+
+message WorkerSlotPolicy {
+  uint32 min_slots = 1;
+  uint32 max_slots = 2;
+  double target_cpu_usage = 3;
+  double target_memory_usage = 4;
+  int64 ramp_throttle_ms = 5;
+}
+
+message RegisterWorkerSessionRequest {
+  string worker_id = 1;
+  string project_id = 2;
+  string deployment_id = 3;
+  uint32 max_slots = 4;
+  WorkerSlotPolicy slot_policy = 5;
+  repeated WorkerCapability capabilities = 6;
+  repeated ComponentInfo components = 7;
+  string service_name = 8;
+  string service_version = 9;
+  string service_type = 10;
+}
+
+message RegisterWorkerSessionResponse {
+  string worker_session_id = 1;
+  int64 expires_at_ms = 2;
+  WorkerSlotPolicy effective_slot_policy = 3;
+}
+
+message PollJobRequest {
+  string worker_id = 1;
+  string worker_session_id = 2;
+  int64 wait_ms = 3;           // clamped to 30s
+  int64 claim_timeout_ms = 4;  // lease duration
+}
+
+message PollJobResponse {
+  JobAssignment job = 1;       // absent means timeout
+}
+
+// JobAssignment represents a single job assigned to a worker.
+message JobAssignment {
+  string job_id = 1;
+  string run_id = 2;
+  string component_id = 3;
+  ComponentType component_type = 4;   // Denormalized for worker routing
+  string component_name = 5;          // Denormalized for worker routing
+  bytes input_data = 6;
+  map<string, string> metadata = 7;
+  int32 attempt = 8;
+  int64 timeout_ms = 9;
+  string trace_id = 10;
+  string lease_id = 11;
+  int64 lease_expires_at_ms = 12;
+}
+
+message RenewJobLeaseRequest {
+  string worker_id = 1;
+  string worker_session_id = 2;
+  string run_id = 3;
+  string lease_id = 4;
+  int64 lease_timeout_ms = 5;
+}
+
+message RenewJobLeaseResponse {
+  bool renewed = 1;
+  int64 lease_expires_at_ms = 2;
+}
+
+message ReportWorkerCapacityRequest {
+  string worker_id = 1;
+  string worker_session_id = 2;
+  uint32 open_poll_slots = 3;
+  uint32 active_slots = 4;
+  uint32 desired_slots = 5;
+  uint32 effective_max_slots = 6;
+  double cpu_usage = 7;
+  double memory_usage = 8;
+  int64 observed_at_ms = 9;
+}
+
+message ReportWorkerCapacityResponse {
+  bool accepted = 1;
+  int64 recorded_at_ms = 2;
+}
+
+// CompleteJobRequest reports the result of a polled job.
+message CompleteJobRequest {
+  string job_id = 1;
+  string worker_id = 2;
+  bool success = 3;
+  bytes output_data = 4;
+  string error_message = 5;
+  string error_code = 6;
+  map<string, string> metadata = 7;
+  string project_id = 8;
+  string lease_id = 9;
+  string worker_session_id = 10;
+}
+
+// CompleteJobResponse acknowledges the job completion.
+message CompleteJobResponse {
+  bool acknowledged = 1;
+}

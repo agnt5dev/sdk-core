@@ -1,0 +1,14 @@
+version: 1
+coverage: shape
+component: ks_mcp_list_tools
+component_type: function
+cases:
+- id: mcp.list_tools
+  component_type: function
+  component: ks_mcp_list_tools
+  input: {}
+  expect:
+    status: success
+    output_subset:
+      tool_count: 1
+      first_tool: fetch

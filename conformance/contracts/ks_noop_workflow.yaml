@@ -1,0 +1,12 @@
+version: 1
+component: ks_noop_workflow
+component_type: workflow
+cases:
+- id: workflow.noop.success
+  component_type: workflow
+  component: ks_noop_workflow
+  input: {}
+  expect:
+    status: success
+    output_subset:
+      ok: true

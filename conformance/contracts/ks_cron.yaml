@@ -1,0 +1,12 @@
+version: 1
+component: ks_cron
+component_type: workflow
+cases:
+- id: workflow.cron.direct
+  component_type: workflow
+  component: ks_cron
+  input: {}
+  expect:
+    status: success
+    output_subset:
+      status: executed

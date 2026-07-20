@@ -1,0 +1,17 @@
+version: 1
+component: ks_realistic_agent
+component_type: workflow
+cases:
+- id: workflow.realistic_agent.profile
+  component_type: workflow
+  component: ks_realistic_agent
+  input:
+    steps: 3
+    min_call_ms: 1000
+    max_call_ms: 1200
+    seed: 7
+  timeout_seconds: 45
+  expect:
+    status: success
+    output_subset:
+      step_count: 3

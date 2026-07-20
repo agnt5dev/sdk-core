@@ -1,0 +1,13 @@
+version: 1
+component: ks_agent_as_tool
+component_type: function
+cases:
+- id: agent.as_tool
+  component_type: function
+  component: ks_agent_as_tool
+  input:
+    task: Look up user_123
+  expect:
+    status: success
+    output_subset:
+      tool_calls: 1

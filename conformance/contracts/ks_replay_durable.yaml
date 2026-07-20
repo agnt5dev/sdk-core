@@ -1,0 +1,20 @@
+version: 1
+component: ks_replay_durable
+component_type: workflow
+cases:
+- id: workflow.replay_durable.resume
+  component_type: workflow
+  component: ks_replay_durable
+  input: {}
+  timeout_seconds: 60
+  expect:
+    status: paused
+  resume_steps:
+  - user_response: continue
+    expect:
+      status: success
+      output_subset:
+        step_1_done: true
+        step_2_done: true
+        step_3_done: true
+        user_said: continue

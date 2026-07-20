@@ -1,0 +1,21 @@
+version: 1
+component: ks_agent_hitl
+component_type: workflow
+cases:
+- id: workflow.agent_hitl.resume
+  component_type: workflow
+  component: ks_agent_hitl
+  input:
+    task: pick a color
+  timeout_seconds: 60
+  expect:
+    status: paused
+  resume_steps:
+  - user_response: blue
+    expect:
+      status: paused
+  - user_response: approve
+    expect:
+      status: success
+      output_subset:
+        tool_calls: 2

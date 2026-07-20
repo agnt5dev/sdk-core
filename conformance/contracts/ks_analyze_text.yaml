@@ -1,0 +1,20 @@
+version: 1
+component: ks_analyze_text
+component_type: function
+cases:
+- id: function.analyze.success
+  component_type: function
+  component: ks_analyze_text
+  input:
+    text: hello durable go
+  expect:
+    status: success
+    output_subset:
+      word_count: 3
+      char_count: 16
+      uppercase: HELLO DURABLE GO
+    event_order:
+    - run.started
+    - function.started
+    - function.completed
+    - run.completed

@@ -1,0 +1,16 @@
+version: 1
+component: ks_webhook_events
+component_type: workflow
+cases:
+- id: workflow.webhook_events.direct
+  component_type: workflow
+  component: ks_webhook_events
+  input:
+    source: stripe
+    body:
+      type: payment_intent.succeeded
+  expect:
+    status: success
+    output_subset:
+      status: matched
+      source: stripe

@@ -1,0 +1,35 @@
+version: 1
+component: ks_hitl
+component_type: workflow
+cases:
+- id: hitl.pause_request
+  component_type: workflow
+  component: ks_hitl
+  input: {}
+  timeout_seconds: 60
+  expect:
+    status: paused
+    event_order:
+    - workflow.paused
+  resume_steps:
+  - user_response: Ada
+    expect:
+      status: paused
+  - user_response: blue
+    expect:
+      status: paused
+  - user_response: ai,web
+    expect:
+      status: paused
+  - user_response: approve
+    expect:
+      status: paused
+  - user_response: __skip__
+    expect:
+      status: success
+      output_subset:
+        name: Ada
+        color: blue
+        topics: ai,web
+        decision: approve
+        skipped_nickname: true

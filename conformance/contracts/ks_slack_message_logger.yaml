@@ -1,0 +1,15 @@
+version: 1
+component: ks_slack_message_logger
+component_type: workflow
+cases:
+- id: workflow.slack_logger.direct
+  component_type: workflow
+  component: ks_slack_message_logger
+  input:
+    body:
+      event:
+        text: hello from slack
+  expect:
+    status: success
+    output_subset:
+      status: logged

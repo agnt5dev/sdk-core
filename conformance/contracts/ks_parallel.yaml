@@ -1,0 +1,16 @@
+version: 1
+component: ks_parallel
+component_type: workflow
+cases:
+- id: workflow.parallel.success
+  component_type: workflow
+  component: ks_parallel
+  input:
+    texts:
+    - one
+    - two three
+    - four five six
+  expect:
+    status: success
+    output_subset:
+      total_steps: 3

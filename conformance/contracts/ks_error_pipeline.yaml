@@ -1,0 +1,20 @@
+version: 1
+component: ks_error_pipeline
+component_type: workflow
+cases:
+- id: workflow.error_pipeline.failure
+  component_type: workflow
+  component: ks_error_pipeline
+  input: {}
+  expect:
+    status: failure
+    error_contains: invalid input
+    event_order:
+    - run.started
+    - workflow.started
+    - workflow.step.started
+    - workflow.step.completed
+    - workflow.step.started
+    - workflow.step.failed
+    - workflow.failed
+    - run.failed

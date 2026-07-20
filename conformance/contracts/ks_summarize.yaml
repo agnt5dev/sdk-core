@@ -1,0 +1,12 @@
+version: 1
+coverage: shape
+component: ks_summarize
+component_type: function
+cases:
+- id: function.summarize.success
+  component_type: function
+  component: ks_summarize
+  input:
+    text: AGNT5 runs durable agent workflows with observable steps
+  expect:
+    status: success

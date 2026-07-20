@@ -1,0 +1,20 @@
+version: 1
+component: ks_conversational
+component_type: agent
+cases:
+- id: agent.component
+  component_type: agent
+  component: ks_conversational
+  input:
+    message: hello
+  expect:
+    status: success
+- id: agent.chat
+  operation: chat
+  component_type: agent
+  component: ks_conversational
+  input:
+    message: hello
+    session_id: contract
+  expect:
+    status: success

@@ -1,0 +1,13 @@
+version: 1
+component: ks_agent_tool_error
+component_type: function
+cases:
+- id: agent.tool_error
+  component_type: function
+  component: ks_agent_tool_error
+  input:
+    question: test query
+  expect:
+    status: success
+    output_subset:
+      tool_calls: 1

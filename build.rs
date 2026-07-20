@@ -7,12 +7,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(false)
         .compile_protos(
             &[
-                "../../protos/proto/api/v1/worker_coordinator.proto",
-                "../../protos/proto/api/v1/execution_engine.proto",
-                "../../protos/proto/api/v1/engine.proto",
-                "../../protos/proto/api/v1/common.proto",
+                "proto/api/v1/worker_coordinator.proto",
+                "proto/api/v1/execution_engine.proto",
+                "proto/api/v1/engine.proto",
+                "proto/api/v1/common.proto",
             ],
-            &["../../protos/proto"],
+            &["proto"],
         )?;
 
     // Modal sandbox provider: vendored gRPC contract (Modal has no REST API).

@@ -1,0 +1,11 @@
+version: 1
+component: ks_agent_handoff
+component_type: function
+cases:
+- id: agent.handoff
+  component_type: function
+  component: ks_agent_handoff
+  input:
+    query: Send this data lookup to the specialist
+  expect:
+    status: success

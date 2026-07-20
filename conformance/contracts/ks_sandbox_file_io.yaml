@@ -1,0 +1,19 @@
+version: 1
+group: sandbox
+coverage: behavior
+component: ks_sandbox_file_io
+component_type: function
+cases:
+- id: sandbox.file_io
+  component_type: function
+  component: ks_sandbox_file_io
+  input: {}
+  expect:
+    status: success
+    output_subset:
+      path: /tmp/kitchen.txt
+      content: hello sandbox
+      bytes: 13
+      listed: true
+      file_count: 1
+      backend: memory

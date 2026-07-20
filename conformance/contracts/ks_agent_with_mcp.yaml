@@ -1,0 +1,16 @@
+version: 1
+coverage: shape
+component: ks_agent_with_mcp
+component_type: function
+cases:
+- id: agent.with_mcp
+  component_type: function
+  component: ks_agent_with_mcp
+  input:
+    query: fetch docs
+  expect:
+    status: success
+    output_subset:
+      tool_count: 1
+      tool_names:
+      - fetch

@@ -1,0 +1,19 @@
+version: 1
+component: ks_fetch_data
+component_type: function
+cases:
+- id: function.fetch.gateway
+  component_type: function
+  component: ks_fetch_data
+  input:
+    url: '{{gateway_url}}/livez'
+  timeout_seconds: 20
+  expect:
+    status: success
+    output_subset:
+      status_code: 200
+    event_order:
+    - run.started
+    - function.started
+    - function.completed
+    - run.completed

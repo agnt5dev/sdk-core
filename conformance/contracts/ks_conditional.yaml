@@ -1,0 +1,28 @@
+version: 1
+component: ks_conditional
+component_type: workflow
+cases:
+- id: workflow.conditional.auto_approved
+  component_type: workflow
+  component: ks_conditional
+  input:
+    amount: 50
+  expect:
+    status: success
+    output_subset:
+      status: auto_approved
+      amount: 50
+- id: workflow.conditional.needs_review
+  component_type: workflow
+  component: ks_conditional
+  input:
+    amount: 250
+  expect:
+    status: success
+    output_subset:
+      status: needs_review
+      amount: 250
+    event_order:
+    - workflow.step.started
+    - workflow.step.completed
+    - workflow.completed

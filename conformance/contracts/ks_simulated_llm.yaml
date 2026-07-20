@@ -1,0 +1,18 @@
+version: 1
+coverage: shape
+component: ks_simulated_llm
+component_type: function
+cases:
+- id: function.simulated_llm.shape
+  component_type: function
+  component: ks_simulated_llm
+  input:
+    duration_ms: 1000
+    seed: 42
+    model: smoke-model
+  timeout_seconds: 20
+  expect:
+    status: success
+    output_subset:
+      model: smoke-model
+      duration_ms: 1000

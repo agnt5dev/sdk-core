@@ -4,6 +4,9 @@ version = "0.1.1"
 edition = "2021"
 authors = ["AGNT5 Team"]
 description = "High-performance Rust core for AGNT5 SDK"
+license = "Apache-2.0"
+repository = "https://github.com/agnt5dev/sdk-core"
+homepage = "https://agnt5.com"
 
 [lib]
 name = "agnt5_sdk_core"
@@ -122,14 +125,3 @@ wasm-sandbox = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:tempfile"]
 [build-dependencies]
 tonic-prost-build = "0.14"
 protobuf-src = "2.0"
-
-# Examples
-# (Files in examples/ are auto-discovered; entries here are only needed for
-# non-standard paths. Stale entries for deleted examples break cargo fmt.)
-[[example]]
-name = "debug_worker"
-path = "examples/debug_worker.rs"
-
-[[example]]
-name = "language_model_example"
-path = "examples/language_model_example.rs"

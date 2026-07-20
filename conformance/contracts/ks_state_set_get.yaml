@@ -1,0 +1,14 @@
+version: 1
+component: ks_state_set_get
+component_type: function
+cases:
+- id: state.roundtrip
+  component_type: function
+  component: ks_state_set_get
+  input:
+    key: contract
+  expect:
+    status: success
+    output_subset:
+      key: contract
+      value: stored:contract

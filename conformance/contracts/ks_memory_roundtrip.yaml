@@ -1,0 +1,14 @@
+version: 1
+component: ks_memory_roundtrip
+component_type: function
+cases:
+- id: memory.roundtrip
+  component_type: function
+  component: ks_memory_roundtrip
+  input:
+    text: remember this
+  expect:
+    status: success
+    output_subset:
+      working: remember this
+      messages: 1

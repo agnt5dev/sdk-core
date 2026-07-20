@@ -1,0 +1,14 @@
+version: 1
+component: ks_dispatch_context
+component_type: function
+cases:
+- id: function.dispatch_context.pull_mode
+  component_type: function
+  component: ks_dispatch_context
+  input: {}
+  expect:
+    status: success
+    output_subset:
+      component_name: ks_dispatch_context
+      component_type: function
+      dispatch_mode: pull

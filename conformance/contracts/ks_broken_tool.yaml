@@ -1,0 +1,12 @@
+version: 1
+component: ks_broken_tool
+component_type: tool
+cases:
+- id: tool.broken.failure
+  component_type: tool
+  component: ks_broken_tool
+  input:
+    query: smoke
+  expect:
+    status: failure
+    error_contains: tool failed

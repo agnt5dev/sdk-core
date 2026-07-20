@@ -1,0 +1,1079 @@
+syntax = "proto3";
+
+package api.v1;
+
+import "google/protobuf/timestamp.proto";
+import "api/v1/common.proto";
+
+option go_package = "agnt5.dev/platform/pkg/pb/api/v1;v1";
+
+// WorkerCoordinatorService manages worker lifecycle and task dispatch.
+//
+// All state operations (signals, approvals, timers, checkpoints, journal writes,
+// job queue, ephemeral event streams) are handled by EngineService. The coordinator
+// is responsible ONLY for:
+// - Worker stream lifecycle (registration, heartbeat, dispatch, response routing)
+// - Task dispatch and worker selection
+// - Inter-coordinator forwarding (disaggregated mode)
+service WorkerCoordinatorService {
+
+  // Main stream — bidirectional communication for worker lifecycle and task execution.
+  // First message from worker must be ServiceRegistration.
+  rpc WorkerStream(stream ServiceMessage) returns (stream RuntimeMessage);
+
+  // List registered workers.
+  rpc ListWorkers(ListWorkersRequest) returns (ListWorkersResponse);
+
+  // Dispatch a component to a registered worker (synchronous, waits for response).
+  rpc DispatchComponent(DispatchComponentRequest) returns (DispatchComponentResponse);
+
+  // Streaming dispatch for components that yield chunks.
+  rpc DispatchComponentStream(DispatchComponentRequest) returns (stream DispatchComponentResponse);
+
+  // ==== Inter-Coordinator Forwarding (Disaggregated Mode) ====
+
+  // Forward a dispatch to a peer coordinator that owns the target worker's stream.
+  rpc ForwardDispatch(ForwardDispatchRequest) returns (DispatchComponentResponse);
+
+  // Forward a streaming dispatch to a peer coordinator.
+  rpc ForwardDispatchStream(ForwardDispatchRequest) returns (stream DispatchComponentResponse);
+
+  // Forward a fire-and-forget dispatch to a peer coordinator.
+  // Returns immediately after the dispatch is sent to the worker stream,
+  // without waiting for the worker to complete execution.
+  rpc ForwardDispatchFireAndForget(ForwardDispatchRequest) returns (ForwardDispatchAck);
+
+  // Release an active dispatch entry after the run reaches a terminal state.
+  // Terminal records are observed by the partition owner, while the active
+  // dispatch entry lives on the coordinator that owns the worker stream.
+  rpc ReleaseActiveDispatch(ReleaseActiveDispatchRequest) returns (ReleaseActiveDispatchAck);
+}
+
+message ListWorkersRequest {
+  string capability_filter = 1;
+}
+
+message ListWorkersResponse {
+  repeated WorkerInfo workers = 1;
+}
+
+message WorkerInfo {
+  string worker_id = 1;
+  repeated ComponentInfo components = 2;
+  WorkerStatus status = 3;
+  int64 registered_at = 4;
+  map<string, string> metadata = 5;
+  string worker_coordinator_id = 6;
+}
+
+enum WorkerStatus {
+  WORKER_STATUS_UNSPECIFIED = 0;
+  WORKER_STATUS_ACTIVE = 1;
+  WORKER_STATUS_INACTIVE = 2;
+  WORKER_STATUS_ERROR = 3;
+}
+
+// Messages sent from Worker to Coordinator in WorkerStream
+message ServiceMessage {
+  string worker_id = 1;
+  map<string, string> metadata = 2;
+  oneof message_type {
+    RegisterService register_service = 3;
+    GetServiceComponents get_service_components = 4;
+    DispatchComponentResponse function_response = 5;
+    HealthCheck health_check = 6;
+    UnregisterService unregister_service = 7;
+    RuntimeServiceRequest runtime_service = 8;
+    WorkflowCheckpoint workflow_checkpoint = 9;  // Real-time workflow checkpoint streaming
+  }
+  
+}
+
+// Messages sent from Coordinator to Worker in WorkerStream
+message RuntimeMessage {
+  string worker_id = 1;
+  RuntimeMessageType message_type = 2;
+  map<string, string> metadata = 3;
+  oneof message_data {
+    RegisterServiceResponse register_service_response = 4;
+    GetServiceComponents get_components = 5;
+    DispatchComponentRequest dispatch_component = 6;
+    HealthResponse health_response = 7;
+    RuntimeServiceResponse runtime_service_response = 8;
+    CancelExecutionRequest cancel_execution = 9;
+    CheckpointAck checkpoint_ack = 10;  // Acknowledgement for sync checkpoint events
+    CoordinatorDraining coordinator_draining = 11;
+  }
+}
+
+enum RuntimeMessageType {
+  REGISTER_SERVICE_RESPONSE = 0;
+  GET_SERVICE_COMPONENTS = 1;
+  INVOKE_FUNCTION = 2;
+  HEALTH_RESPONSE = 3;
+  RUNTIME_SERVICE = 4;
+  CANCEL_EXECUTION = 5;
+  CHECKPOINT_ACK = 6;  // Acknowledgement that a checkpoint event was persisted
+  WORKER_REPLACED = 7; // Another connection registered with the same worker_id — shut down, do not reconnect
+  COORDINATOR_DRAINING = 8; // Current coordinator is draining — reconnect after local in-flight work completes
+}
+
+// Coordinator is leaving service. Workers should stop accepting new work on
+// this stream, finish already-started invocations, unregister, and reconnect
+// through their configured runtime endpoint.
+message CoordinatorDraining {
+  string coordinator_id = 1;
+  string reason = 2;
+  int64 drain_started_at_ms = 3;
+}
+
+// Session state scopes for durable session storage
+enum SessionStateScope {
+  SESSION_STATE_SCOPE_UNSPECIFIED = 0;
+  SESSION_STATE_SCOPE_SESSION = 1;
+  SESSION_STATE_SCOPE_USER = 2;
+  SESSION_STATE_SCOPE_APP = 3;
+  SESSION_STATE_SCOPE_TEMP = 4;
+}
+
+// Bidirectional runtime service request sent from worker to coordinator
+message RuntimeServiceRequest {
+  string request_id = 1;
+  string session_id = 2;
+
+  oneof operation {
+    EntityStateLoadRequest entity_state_load = 3;
+    EntityStateSaveRequest entity_state_save = 4;
+    RunCheckpointRequest run_checkpoint = 5;
+    RunFailRequest run_fail = 6;
+    SignalWaitRequest signal_wait = 7;
+    TimerSleepRequest timer_sleep = 8;
+    TaskSpawnRequest task_spawn = 9;
+    ToolRegisterRequest tool_register = 10;
+    ToolGetRequest tool_get = 11;
+    ToolListRequest tool_list = 12;
+    ToolDeploymentUpsertRequest tool_deployment_upsert = 13;
+    ToolDeploymentListRequest tool_deployment_list = 14;
+    AgentRegisterRequest agent_register = 15;
+    AgentVersionGetRequest agent_version_get = 16;
+    AgentListRequest agent_list = 17;
+    AgentResolveActiveVersionRequest agent_resolve_active = 18;
+    // Session / Message operations (Phase 2)
+    SessionCreateRequest session_create = 19;
+    SessionUpdateRequest session_update = 20;
+    SessionGetRequest session_get = 21;
+    MessageSendRequest message_send = 22;
+    MessageListRequest message_list = 23;
+  }
+}
+
+// Response to a runtime service request sent from coordinator to worker
+message RuntimeServiceResponse {
+  string request_id = 1;
+  bool success = 2;
+  string error_message = 3;
+
+  oneof result {
+    EntityStateLoadResult entity_state_load = 4;
+    EntityStateSaveResult entity_state_save = 5;
+    RunCheckpointResult run_checkpoint = 6;
+    RunFailResult run_fail = 7;
+    SignalWaitResult signal_wait = 8;
+    TimerSleepResult timer_sleep = 9;
+    TaskSpawnResult task_spawn = 10;
+    ToolRegisterResult tool_register = 11;
+    ToolGetResult tool_get = 12;
+    ToolListResult tool_list = 13;
+    ToolDeploymentUpsertResult tool_deployment_upsert = 14;
+    ToolDeploymentListResult tool_deployment_list = 15;
+    AgentRegisterResult agent_register = 16;
+    AgentVersionGetResult agent_version_get = 17;
+    AgentListResult agent_list = 18;
+    AgentResolveActiveVersionResult agent_resolve_active = 19;
+    // Session / Message results (Phase 2)
+    SessionCreateResult session_create = 20;
+    SessionUpdateResult session_update = 21;
+    SessionGetResult session_get = 22;
+    MessageSendResult message_send = 23;
+    MessageListResult message_list = 24;
+  }
+}
+
+message ToolDefinitionData {
+  string tool_id = 1;
+  string name = 2;
+  string version = 3;
+  string description = 4;
+  string input_schema_json = 5;
+  string output_schema_json = 6;
+  map<string, string> metadata = 7;
+  string owner = 8;
+  google.protobuf.Timestamp created_at = 9;
+  google.protobuf.Timestamp updated_at = 10;
+}
+
+message ToolRegisterRequest {
+  ToolDefinitionData definition = 1;
+  bool activate = 2;
+}
+
+message ToolRegisterResult {
+  ToolDefinitionData definition = 1;
+}
+
+message ToolGetRequest {
+  oneof selector {
+    string tool_id = 1;
+    ToolNameVersionSelector name_version = 2;
+  }
+}
+
+message ToolNameVersionSelector {
+  string name = 1;
+  string version = 2;
+}
+
+message ToolGetResult {
+  ToolDefinitionData definition = 1;
+}
+
+message ToolListRequest {
+  string prefix = 1;
+  bool active_only = 2;
+}
+
+message ToolListResult {
+  repeated ToolDefinitionData definitions = 1;
+}
+
+message ToolDeploymentData {
+  string tool_id = 1;
+  string version = 2;
+  string target = 3;
+  string image = 4;
+  map<string, string> metadata = 5;
+  string status = 6;
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp updated_at = 8;
+}
+
+message ToolDeploymentUpsertRequest {
+  ToolDeploymentData deployment = 1;
+}
+
+message ToolDeploymentUpsertResult {
+  ToolDeploymentData deployment = 1;
+}
+
+message ToolDeploymentListRequest {
+  string tool_id = 1;
+  string version = 2;
+  string status = 3;
+}
+
+message ToolDeploymentListResult {
+  repeated ToolDeploymentData deployments = 1;
+}
+
+message AgentDefinitionData {
+  string agent_id = 1;
+  string name = 2;
+  string description = 3;
+  string owner = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+}
+
+message AgentVersionData {
+  string agent_id = 1;
+  string version = 2;
+  string status = 3;
+  string spec_json = 4;
+  map<string, string> metadata = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp updated_at = 7;
+}
+
+message AgentRegisterRequest {
+  AgentDefinitionData agent = 1;
+  AgentVersionData version = 2;
+  bool make_active = 3;
+}
+
+message AgentRegisterResult {
+  AgentDefinitionData agent = 1;
+  AgentVersionData version = 2;
+}
+
+message AgentVersionGetRequest {
+  string agent_id = 1;
+  string version = 2;
+}
+
+message AgentVersionGetResult {
+  AgentVersionData version = 1;
+}
+
+message AgentListRequest {
+  string prefix = 1;
+}
+
+message AgentListResult {
+  repeated AgentDefinitionData agents = 1;
+}
+
+message AgentResolveActiveVersionRequest {
+  string agent_id = 1;
+  string channel = 2;
+}
+
+message AgentResolveActiveVersionResult {
+  AgentVersionData version = 1;
+}
+
+// Entity state operations for durable entity management
+message EntityStateLoadRequest {
+  string entity_type = 1;  // Entity class name (e.g., "ShoppingCart")
+  string entity_key = 2;   // Entity instance key (e.g., "user-123")
+  string scope = 3;        // Scope: "global", "run", "session", "user" (default: "global")
+  string scope_id = 4;     // Scope ID: run_id, session_id, user_id (empty for global)
+}
+
+message EntityStateLoadResult {
+  bool found = 1;
+  bytes state_json = 2;     // Entire state dict as JSON: {"items": {...}, "total": 100}
+  int64 version = 3;        // Current version for optimistic locking
+}
+
+message EntityStateSaveRequest {
+  string entity_type = 1;
+  string entity_key = 2;
+  bytes state_json = 3;        // Entire state dict to save
+  int64 expected_version = 4;  // Expected version (0 for new entity, current version for update)
+  string scope = 5;            // Scope: "global", "run", "session", "user" (default: "global")
+  string scope_id = 6;         // Scope ID: run_id, session_id, user_id (empty for global)
+}
+
+message EntityStateSaveResult {
+  int64 new_version = 1;  // New version after save
+}
+
+// ---------------------------------------------------------------------------
+// Session / Message operations (for ConversationAccessor — Phase 2)
+// ---------------------------------------------------------------------------
+
+// Create a new conversation session
+message SessionCreateRequest {
+  string session_id = 1;         // Unique session identifier
+  string component_name = 2;     // Agent or workflow name
+  string session_type = 3;       // "agent", "workflow", "conversation"
+  bytes state = 4;               // Initial session state (JSON)
+  bytes metadata = 5;            // Session metadata (JSON)
+  int64 expires_at_ns = 6;       // Optional TTL (nanoseconds since epoch, 0 = no expiry)
+}
+
+message SessionCreateResult {
+  string session_id = 1;
+}
+
+// Update an existing session's state/metadata
+message SessionUpdateRequest {
+  string session_id = 1;
+  bytes state = 2;               // New state (JSON, merged with existing)
+  bytes metadata = 3;            // New metadata (JSON, merged with existing)
+}
+
+message SessionUpdateResult {
+  bool success = 1;
+}
+
+// Get a session by ID
+message SessionGetRequest {
+  string session_id = 1;
+}
+
+message SessionGetResult {
+  bool found = 1;
+  bytes session_data = 2;        // Protobuf-encoded Session (from engine.proto)
+}
+
+// Send a message to a conversation (appended to message history)
+message MessageSendRequest {
+  string correlation_id = 1;     // Conversation thread ID (typically = session_id)
+  string message_type = 2;       // "user", "assistant", "system", "tool"
+  bytes payload = 3;             // Message content (JSON: {role, content, metadata, timestamp})
+  string from_service = 4;       // Service that sent the message
+}
+
+message MessageSendResult {
+  string message_id = 1;         // Unique message ID assigned by runtime
+}
+
+// List messages in a conversation by correlation ID
+message MessageListRequest {
+  string correlation_id = 1;     // Conversation thread ID
+  int32 limit = 2;               // Max messages to return (0 = default 50)
+  string after_message_id = 3;   // Pagination cursor (messages after this ID)
+}
+
+message MessageListResult {
+  repeated bytes messages = 1;   // Protobuf-encoded ChatMessage list
+  bool has_more = 2;             // Whether more messages exist
+}
+
+message RunCheckpointRequest {
+  string run_id = 1;
+  string step_id = 2;
+  string checkpoint_name = 3;
+  string checkpoint_key = 4;
+  string status = 5;
+  int32 attempt = 6;
+  bytes result = 7;
+  string note = 8;
+  map<string, string> metadata = 9;
+}
+
+message RunCheckpointResult {
+  StepCheckpoint checkpoint = 1;
+}
+
+message RunFailRequest {
+  string run_id = 1;
+  string step_id = 2;
+  string reason = 3;
+  string error_type = 4;
+  map<string, string> metadata = 5;
+}
+
+message RunFailResult {}
+
+message SignalWaitRequest {
+  string run_id = 1;
+  string step_id = 2;
+  string signal_name = 3;
+  string wait_id = 4;
+  string correlation_id = 5;
+  string dedupe_id = 6;
+  int64 timeout_ms = 7;
+  bool auto_ack = 8;
+  map<string, string> metadata = 9;
+}
+
+message SignalWaitResult {
+  bool delivered = 1;
+  bytes payload = 2;
+  google.protobuf.Timestamp received_at = 3;
+  string ack_event_id = 4;
+  string dedupe_id = 5;
+}
+
+message TimerSleepRequest {
+  string run_id = 1;
+  string step_id = 2;
+  string timer_key = 3;
+  int64 delay_ms = 4;
+  google.protobuf.Timestamp fire_at = 5;
+  string dedupe_id = 6;
+  map<string, string> metadata = 7;
+}
+
+message TimerSleepResult {
+  google.protobuf.Timestamp scheduled_for = 1;
+  google.protobuf.Timestamp completed_at = 2;
+  string timer_key = 3;
+}
+
+message TaskSpawnRequest {
+  string run_id = 1;
+  string step_id = 2;
+  string task_target = 3;
+  string invocation_id = 4;
+  bytes payload = 5;
+  string dedupe_id = 6;
+  map<string, string> metadata = 7;
+}
+
+message TaskSpawnResult {
+  string invocation_id = 1;
+  string status = 2;
+  google.protobuf.Timestamp enqueued_at = 3;
+}
+
+message RegisterService {
+  string service_name = 1;
+  string service_version = 2;
+  string service_type = 3;
+  repeated ComponentInfo components = 4;
+  map<string, string> metadata = 5;
+
+  // Phase 6: data-path mode declared at registration. Default
+  // (`WORKER_MODE_UNSPECIFIED`) is interpreted as `WORKER_MODE_PUSH`
+  // by the coordinator so existing clients keep working unchanged.
+  // PULL workers wait for `PollJobs` instead of receiving dispatches
+  // over the bidirectional stream.
+  WorkerMode mode = 6;
+
+  // Phase 6: deployment this worker serves. Mirrors what the gateway
+  // already stamps onto records as `deployment_id`. The coordinator
+  // prefers this proto field but falls back to `metadata["AGNT5_DEPLOYMENT_ID"]`
+  // for backward compat with older SDKs.
+  string deployment_id = 7;
+
+  // Phase 7: declared concurrency budget for this worker (max in-flight
+  // dispatches). The coordinator tracks `outstanding = dispatched -
+  // responded` and uses this number as the denominator for headroom
+  // reservation per priority class (INTERACTIVE up to 100%, NORMAL up to
+  // 85%, BATCH up to 60%). Older SDKs leave this 0; the coordinator
+  // interprets `0` as "unknown" and skips the cap, falling back to
+  // pure least-loaded selection.
+  uint32 max_concurrency = 8;
+
+  // Route capabilities advertised by the worker. This includes user components
+  // plus AGNT5-owned built-in capabilities that are routable but should not be
+  // registered as user components.
+  repeated WorkerCapability capabilities = 9;
+}
+
+message RegisterServiceResponse {
+  bool ack = 1;
+  string error = 2;
+}
+
+message GetServiceComponents {
+  repeated ComponentInfo components = 1;
+}
+
+// ComponentType is defined in common.proto (shared with Execution Engine)
+
+// Typed trigger declaration attached to a component registration.
+message TriggerSpec {
+  string trigger_id = 1;
+  string trigger_type = 2;
+  string event_name = 3;
+  string filter_expression = 4;
+  string input_mapping = 5;
+  int64 batch_window_ms = 6;
+  string delay_expression = 7;
+}
+
+// Component information for unified registry
+message ComponentInfo {
+  string name = 1;
+  ComponentType component_type = 2;
+  optional ComponentSchema input_schema = 3;
+  optional ComponentSchema output_schema = 4;
+  map<string, string> config = 5;
+  map<string, string> metadata = 6;
+  optional string definition = 7; // Entity/workflow/agent definitions as JSON string
+
+  // Retry configuration
+  optional int32 max_attempts = 8;
+  optional int32 initial_interval_ms = 9;
+  optional int32 max_interval_ms = 10;
+  optional string backoff_type = 11; // "constant", "linear", "exponential"
+  optional double backoff_multiplier = 12;
+  repeated TriggerSpec triggers = 13;
+} 
+
+// JSON Schema representation for component inputs/outputs
+message ComponentSchema {
+  string type = 1; // "object", "string", "number", "boolean", "array", etc.
+  map<string, ComponentSchema> properties = 2; // For object types
+  repeated string required = 3; // Required property names
+  optional ComponentSchema items = 4; // For array types
+  optional string description = 5;
+  optional string format = 6; // e.g., "date-time", "email", etc.
+  repeated string enum_values = 7; // For enum types
+}
+
+// Request to dispatch any component to a worker (extensible for all types)
+// Used for EE → WC → Worker communication
+message DispatchComponentRequest {
+  string invocation_id = 1;     // Unique ID for this invocation
+  string service_name = 2;       // Target service name
+  ComponentType component_type = 3; // Type of component to invoke
+  string component_name = 4;     // Component name (was handler_name)
+  bytes input_data = 5;          // Input payload (JSON encoded)
+
+  // Virtual Object specific fields
+  string object_id = 6;          // Object instance ID (e.g., "user:123")
+  string method_name = 7;        // Method to invoke on object
+
+  // Flow/Workflow specific fields
+  string flow_instance_id = 8;   // Flow instance identifier
+  int32 flow_step = 9;          // Current step in flow execution
+
+  // State management (for virtual objects and flows)
+  bytes state_snapshot = 10;     // Current state data
+  int64 journal_position = 11;   // Position in event journal
+
+  // Extensible metadata
+  map<string, string> metadata = 12; // Additional metadata
+  repeated StepCheckpoint step_checkpoints = 13; // Previously completed durable steps
+
+  // Memory scoping identifiers for agent context management
+  string session_id = 14;        // Session identifier for multi-turn conversations (default: run_id)
+  string user_id = 15;           // User identifier for user-scoped memory (optional)
+
+  // Retry orchestration
+  int32 attempt = 16;            // Current attempt number (0-indexed)
+
+  // Streaming execution flag - when true, SDK should send spans/logs to journal for real-time SSE
+  bool is_streaming = 17;        // True for /stream endpoint calls
+
+  // --- Dispatch routing / priority (Phase 4 of lease-based dispatch redesign) ---
+
+  // Dispatch priority class — gateway tags by endpoint
+  // (/run|/stream → INTERACTIVE, default → NORMAL, /submit|/batch → BATCH).
+  // UNSPECIFIED is canonicalized to NORMAL by the runtime.
+  Priority priority = 18;
+
+  // Target deployment — already resolved from environment_id at auth time.
+  // Used as part of the routing key (project_id, deployment_id, component_id).
+  // During the migration window the runtime may still carry project identity
+  // in a legacy `project_id` field at lower layers.
+  // so the scheduler only considers workers serving this exact deployment.
+  string deployment_id = 19;
+
+  // Lease fence token (Phase 5 of lease-based dispatch redesign).
+  //
+  // When non-empty, the coordinator has created a lease for this dispatch
+  // and expects the worker to echo the same value on
+  // `DispatchComponentResponse.lease_id`. Only the lease holder may
+  // complete the run — the coordinator rejects acks whose lease_id does
+  // not match the stored lease (stale / spoofed acks). Empty string when
+  // the coordinator is running under the legacy non-lease push path.
+  string lease_id = 20;
+
+  // Failure-retry policy (Phase 7f of lease-based dispatch redesign).
+  //
+  // Set at gateway ingress with defaults per priority class. Independent
+  // from lease-expiry retries (which live in the expiry sweeper). When
+  // the worker reports `success=false`, the coordinator consults this
+  // policy to decide whether to absorb the failure and re-queue the run
+  // (BOUNDED with budget remaining) or to surface the failure as the
+  // terminal outcome (TERMINAL or attempts exhausted).
+  //
+  // When unset (legacy ingress paths) the coordinator falls back to
+  // TERMINAL semantics — surface the failure immediately, never retry.
+  RetryPolicy retry_policy = 21;
+}
+
+message StepCheckpoint {
+  string name = 1;
+  string key = 2;
+  string status = 3;
+  int32 attempt = 4;
+  string updated_at = 5;
+  bytes result = 6;
+}
+
+// Response from component dispatch (extensible for all types)
+// Used for Worker → WC → EE communication
+message DispatchComponentResponse {
+  string invocation_id = 1;      // Echo back the invocation ID
+  bool success = 2;              // Whether invocation succeeded
+
+  oneof result {
+    bytes output_data = 3;       // Simple output (functions)
+    StateUpdate state_update = 4; // State changes (virtual objects)
+    FlowContinuation flow_continuation = 5; // Flow next step
+  }
+
+  string error_message = 6;      // Error message if failed
+  map<string, string> metadata = 7; // Response metadata
+
+  // Streaming support (v1.2) - typed event streaming for SSE
+  // Event types follow hierarchical naming: category.subcategory.action
+  //
+  // Categories:
+  //   - run.*        : Run lifecycle (run.started, run.completed, run.failed, run.paused, run.resumed)
+  //   - agent.*      : Agent events (agent.started, agent.completed, agent.failed, agent.tool_call.*)
+  //   - lm.*         : LM streaming (lm.message.*, lm.thinking.*, lm.tool_call.*, lm.stream.*)
+  //   - workflow.*   : Workflow steps (workflow.step.started, workflow.step.completed, workflow.step.failed)
+  //   - output.*     : User code output (output.start, output.delta, output.stop)
+  //   - approval.*   : HITL approvals (approval.requested, approval.resolved, approval.expired)
+  //   - input.*      : HITL input (input.requested, input.provided)
+  //   - progress.*   : Progress indicators (progress.update)
+  //
+  // See docs/guide/reference/events.md for complete documentation
+  // See platform/pkg/journal/types.go for Go constants
+  // See sdk/sdk-python/src/agnt5/events.py for Python EventType enum
+  string event_type = 8;         // Event type for SSE streaming (e.g., "lm.message.delta")
+  int32 content_index = 9;       // Index for parallel content blocks (e.g., thinking[0], message[0])
+  int64 sequence = 10;           // Global sequence number for ordering and resumability
+  int32 attempt = 11;            // Retry attempt number (0-indexed)
+  int64 source_timestamp_ns = 12; // Nanosecond timestamp when event was created at source (for correct logical ordering)
+
+  // Lease fencing (Phase 5 of lease-based dispatch redesign).
+  //
+  // Echoes the `lease_id` from the originating `DispatchComponentRequest`
+  // so the coordinator can reject stale acks — only the current lease
+  // holder may complete a run. Pre-Phase-5 clients leave this empty; the
+  // coordinator treats an empty lease_id as "fencing disabled for this
+  // response" and falls through to the legacy path.
+  string lease_id = 13;
+}
+
+// Cancellation request sent from coordinator to worker (v1.1)
+message CancelExecutionRequest {
+  string invocation_id = 1;  // Invocation to cancel
+  string reason = 2;         // Cancellation reason: "client_disconnect", "timeout", "manual"
+}
+
+// State update for virtual objects
+message StateUpdate {
+  bytes new_state = 1;          // Updated state snapshot
+  repeated StateTransition transitions = 2; // Individual state changes
+  bytes output_data = 3;        // Method return value
+}
+
+// State transition for auditing and replay
+message StateTransition {
+  string operation = 1;         // "set", "delete", "append", etc.
+  string key = 2;              // State key that changed
+  bytes old_value = 3;         // Previous value (optional)
+  bytes new_value = 4;         // New value
+  int64 timestamp = 5;         // When transition occurred
+}
+
+// Flow continuation for workflows
+message FlowContinuation {
+  string next_step = 1;         // Next step to execute
+  bytes checkpoint_data = 2;    // Checkpoint/state data
+  bool flow_completed = 3;      // Whether flow is done
+  bytes output_data = 4;        // Final result if completed
+}
+
+// Real-time workflow checkpoint for progressive durability
+// Published during workflow execution to preserve progress and enable crash recovery
+message WorkflowCheckpoint {
+  string invocation_id = 1;         // Run ID this checkpoint belongs to
+  string checkpoint_type = 2;       // Event type: "workflow.state.changed", "workflow.step.started", "workflow.step.completed"
+  bytes checkpoint_data = 3;        // JSON payload specific to checkpoint type
+  int64 sequence_number = 4;        // Local sequence number for ordering within execution
+  map<string, string> metadata = 5; // Additional metadata
+  int64 source_timestamp_ns = 6;    // Nanosecond timestamp when event was created at source (for correct logical ordering)
+}
+
+// Acknowledgement sent from coordinator to worker confirming checkpoint persistence
+// Used for synchronous checkpoint events that block until acknowledged
+message CheckpointAck {
+  string run_id = 1;           // The run ID this ack is for
+  int64 sequence_number = 2;   // Sequence number of the checkpoint being acknowledged
+  string event_type = 3;       // The event type that was persisted (e.g., "approval.requested")
+}
+
+// Health check message sent by worker to coordinator
+message HealthCheck {
+  int64 timestamp = 1;           // Unix timestamp when health check was sent
+  WorkerHealthStatus status = 2; // Current health status
+  map<string, string> metrics = 3; // Health metrics (memory, cpu, etc.)
+  string message = 4;            // Optional status message
+
+  // Worker's live in-flight count (handler invocations currently executing)
+  // at the moment the heartbeat was sent. The coordinator reconciles its
+  // per-worker routing load against this authoritative value so a missed
+  // dispatch-completion decrement cannot make the gossip `active_invocations`
+  // drift up unbounded and wedge the picker. `optional` so a worker reporting
+  // 0 (genuinely idle) is distinguishable from an older SDK that doesn't send
+  // the field at all — the coordinator only reconciles when it is present.
+  optional uint32 in_flight = 5;
+}
+
+message SendSignalRequest {
+  string run_id = 1;
+  string signal_name = 2;
+  bytes payload = 3;
+  string invocation_id = 4;
+  string dedupe_id = 5;
+}
+
+message SendSignalResponse {
+  string event_id = 1;
+}
+
+message AcknowledgeSignalRequest {
+  string run_id = 1;
+  string signal_name = 2;
+  string waiting_step = 3;
+  string dedupe_id = 4;
+  string acked_by = 5;
+}
+
+message AcknowledgeSignalResponse {
+  string event_id = 1;
+}
+
+message WaitSignalRequest {
+  string run_id = 1;
+  string signal_name = 2;
+  string waiting_step = 3;
+  string dedupe_id = 4;
+  int64 timeout_ms = 5;
+  bool auto_ack = 6;
+}
+
+message WaitSignalResponse {
+  bool delivered = 1;
+  string waiting_step = 2;
+  bytes payload = 3;
+  google.protobuf.Timestamp received_at = 4;
+  string dedupe_id = 5;
+  string ack_event_id = 6;
+}
+
+enum ApprovalDecisionType {
+  APPROVAL_DECISION_TYPE_UNSPECIFIED = 0;
+  APPROVAL_DECISION_TYPE_APPROVED = 1;
+  APPROVAL_DECISION_TYPE_REJECTED = 2;
+  APPROVAL_DECISION_TYPE_EXPIRED = 3;
+}
+
+message RequestApprovalRequest {
+  string run_id = 1;
+  string name = 2;
+  bytes payload = 3;
+  repeated string required_roles = 4;
+  repeated string notify_channels = 5;
+  int64 timeout_ms = 6;
+  string dedupe_id = 7;
+}
+
+message RequestApprovalResponse {
+  string approval_id = 1;
+  google.protobuf.Timestamp expires_at = 2;
+  string event_id = 3;
+}
+
+message ResolveApprovalRequest {
+  string approval_id = 1;
+  string run_id = 2;
+  ApprovalDecisionType decision = 3;
+  string decided_by = 4;
+  string reason = 5;
+  bytes payload = 6;
+  string dedupe_id = 7;
+}
+
+message ResolveApprovalResponse {
+  string event_id = 1;
+}
+
+message ListApprovalsRequest {
+  string run_id = 1;
+  string status_filter = 2; // pending, decided
+}
+
+message ApprovalView {
+  string approval_id = 1;
+  string name = 2;
+  bytes payload = 3;
+  repeated string required_roles = 4;
+  repeated string notify_channels = 5;
+  google.protobuf.Timestamp requested_at = 6;
+  google.protobuf.Timestamp expires_at = 7;
+  ApprovalDecisionType decision = 8;
+  string decided_by = 9;
+  string reason = 10;
+  google.protobuf.Timestamp decided_at = 11;
+}
+
+message ListApprovalsResponse {
+  repeated ApprovalView approvals = 1;
+}
+
+message ScheduleTimerRequest {
+  string run_id = 1;
+  string timer_key = 2;
+  string waiting_step = 3;
+  string schedule_type = 4;
+  bytes schedule_payload = 5;
+  string dedupe_id = 6;
+}
+
+message ScheduleTimerResponse {
+  string event_id = 1;
+  google.protobuf.Timestamp fire_at = 2;
+}
+
+message CancelTimerRequest {
+  string run_id = 1;
+  string timer_key = 2;
+  string waiting_step = 3;
+  string dedupe_id = 4;
+}
+
+message CancelTimerResponse {
+  string event_id = 1;
+}
+
+message ListPendingWaitsRequest {
+  string run_id = 1;
+}
+
+message ListPendingWaitsResponse {
+  repeated PendingSignal signals = 1;
+  repeated PendingTimer timers = 2;
+}
+
+message PendingSignal {
+  string signal_name = 1;
+  string waiting_step = 2;
+  google.protobuf.Timestamp received_at = 3;
+}
+
+message PendingTimer {
+  string timer_key = 1;
+  string waiting_step = 2;
+  google.protobuf.Timestamp fire_at = 3;
+  string schedule_type = 4;
+}
+
+// Health check response sent by coordinator to worker
+message HealthResponse {
+  int64 timestamp = 1;           // Coordinator's timestamp
+  bool ack = 2;                  // Acknowledgment of health check
+  string message = 3;            // Optional response message
+}
+
+// Graceful unregistration message
+message UnregisterService {
+  string reason = 1;             // Reason for unregistration (shutdown, error, etc.)
+  int64 timestamp = 2;           // When unregistration was initiated
+}
+
+// Worker health status enum
+enum WorkerHealthStatus {
+  WORKER_HEALTH_UNKNOWN = 0;
+  WORKER_HEALTH_HEALTHY = 1;
+  WORKER_HEALTH_DEGRADED = 2;
+  WORKER_HEALTH_UNHEALTHY = 3;
+}
+
+// ==== Inter-WC Forwarding Messages ====
+
+// ForwardDispatchRequest wraps a dispatch request with routing metadata for inter-WC forwarding.
+message ForwardDispatchRequest {
+  // The original dispatch request to forward
+  DispatchComponentRequest dispatch_request = 1;
+
+  // The worker ID that should handle this dispatch (connected to this WC)
+  string target_worker_id = 2;
+
+  // The coordinator ID that initiated the forward (for anti-loop detection)
+  string source_coordinator_id = 3;
+}
+
+// Ack for fire-and-forget dispatch forwarding.
+message ForwardDispatchAck {
+  // Whether the dispatch was accepted and sent to the worker stream.
+  bool accepted = 1;
+  // The worker ID that received the dispatch (empty if rejected).
+  string worker_id = 2;
+  // Lease metadata minted when lease-backed push dispatch is enabled.
+  string lease_id = 3;
+  string lease_worker_id = 4;
+  int64 lease_expires_at_ms = 5;
+  int64 lease_timeout_ms = 6;
+}
+
+// Inter-coordinator cleanup request for active_dispatches.
+message ReleaseActiveDispatchRequest {
+  // run_id == invocation_id for PUSH dispatches.
+  string invocation_id = 1;
+  // Terminal journal event type, e.g. run.completed, run.failed, run.cancelled.
+  string event_type = 2;
+  // Coordinator that observed the terminal event.
+  string source_coordinator_id = 3;
+}
+
+message ReleaseActiveDispatchAck {
+  // True if this coordinator owned and removed the active dispatch entry.
+  bool released = 1;
+  // Worker whose load was decremented when released is true.
+  string worker_id = 2;
+}
+
+// =============================================================================
+// Legacy Journal Event Messages
+// =============================================================================
+// These messages are referenced by the legacy ExecutionEngineService in
+// execution_engine.proto (WriteJournalEvent / WriteJournalEventsBatch RPCs).
+// They remain in this file for backwards compatibility during the migration
+// to EngineService.Append on engine.proto; once the SDK fully switches to the
+// Append path these messages and the ExecutionEngineService can be deleted.
+
+// WriteJournalEventRequest writes a span or log event to the journal.
+// Used by SDK to enable real-time SSE streaming of telemetry data.
+message WriteJournalEventRequest {
+  // Required: The run ID this event belongs to
+  string run_id = 1;
+
+  // Required: Event type - "span" or "log"
+  string event_type = 2;
+
+  // Required: JSON-encoded event data (SpanEventData or LogEventData)
+  bytes data = 3;
+
+  // Optional: Trace context for correlation
+  string trace_id = 4;
+  string span_id = 5;
+
+  // Optional: Tenant context (for multi-tenant deployments)
+  string project_id = 6;
+
+  // Optional: Source timestamp in nanoseconds since epoch.
+  // When provided, this is used instead of server time for correct logical ordering.
+  // SDK should set this to the actual time the log/span was generated.
+  int64 source_timestamp_ns = 7;
+
+  // Optional: Correlation ID for pairing start/complete events.
+  // Generated at operation start, same value for both started and completed events.
+  // Example: lm.call.started and lm.call.completed share the same correlation_id.
+  string correlation_id = 8;
+
+  // Optional: Parent event ID for building event hierarchy.
+  // Links child events to parent (e.g., lm.call.started → parent = agent.iteration.started).
+  // Use the correlation_id of the parent event.
+  string parent_event_id = 9;
+
+  // Optional: Display-friendly metadata for UI rendering.
+  // Key-value pairs like {"model": "gpt-4o-mini", "tokens": "1234", "agent_name": "travel_agent"}.
+  map<string, string> metadata = 10;
+}
+
+// WriteJournalEventResponse confirms the event was written.
+message WriteJournalEventResponse {
+  // Assigned sequence number (for resume capability via Last-Event-ID)
+  int64 sequence_num = 1;
+
+  // Success indicator
+  bool success = 2;
+
+  // Error message if not successful
+  string error_message = 3;
+}
+
+// WriteJournalEventsBatchRequest writes multiple events atomically.
+message WriteJournalEventsBatchRequest {
+  repeated WriteJournalEventRequest events = 1;
+}
+
+// WriteJournalEventsBatchResponse returns results for batch write.
+message WriteJournalEventsBatchResponse {
+  // Number of events successfully written
+  int32 written_count = 1;
+
+  // Last sequence number assigned
+  int64 last_sequence_num = 2;
+
+  // Per-event errors (empty if all succeeded)
+  repeated WriteJournalEventError errors = 3;
+}
+
+// WriteJournalEventError reports an error for a specific event in a batch.
+message WriteJournalEventError {
+  int32 index = 1;
+  string error_message = 2;
+}

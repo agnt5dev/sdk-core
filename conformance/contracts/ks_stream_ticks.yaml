@@ -1,0 +1,126 @@
+version: 1
+component: ks_stream_ticks
+component_type: function
+cases:
+- id: function.stream_ticks.incremental
+  operation: stream
+  component_type: function
+  component: ks_stream_ticks
+  input:
+    count: 3
+    interval_ms: 150
+  timeout_seconds: 30
+  expect:
+    status: success
+    event_order:
+    - output.delta
+    - output.delta
+    - output.delta
+    - run.completed
+    stream:
+      incremental: true
+      timed_event: output.delta
+      min_delivery_span_ms: 200
+      first_event_max_ms: 2000
+      terminal_max_ms: 3000
+      terminal_event: run.completed
+      terminal_once: true
+      forbid_events_after_terminal:
+      - output.delta
+      exact_counts:
+        output.delta: 3
+      data_sequences:
+        output.delta:
+        - content: tick-1
+        - content: tick-2
+        - content: tick-3
+      durable_required:
+      - run.completed
+      durable_forbidden:
+      - output.delta
+- id: function.stream_ticks.single
+  operation: stream
+  component_type: function
+  component: ks_stream_ticks
+  input:
+    count: 1
+    interval_ms: 0
+  timeout_seconds: 30
+  expect:
+    status: success
+    event_order:
+    - output.delta
+    - run.completed
+    stream:
+      terminal_event: run.completed
+      terminal_once: true
+      forbid_events_after_terminal:
+      - output.delta
+      exact_counts:
+        output.delta: 1
+      data_sequences:
+        output.delta:
+        - content: tick-1
+      durable_required:
+      - run.completed
+      durable_forbidden:
+      - output.delta
+- id: function.stream_ticks.burst
+  operation: stream
+  component_type: function
+  component: ks_stream_ticks
+  input:
+    count: 64
+    interval_ms: 0
+  timeout_seconds: 30
+  expect:
+    status: success
+    event_order:
+    - output.delta
+    - run.completed
+    stream:
+      timed_event: output.delta
+      first_event_max_ms: 2000
+      terminal_max_ms: 5000
+      terminal_event: run.completed
+      terminal_once: true
+      forbid_events_after_terminal:
+      - output.delta
+      exact_counts:
+        output.delta: 64
+      durable_required:
+      - run.completed
+      durable_forbidden:
+      - output.delta
+- id: function.stream_ticks.partial_failure
+  operation: stream
+  component_type: function
+  component: ks_stream_ticks
+  input:
+    count: 4
+    interval_ms: 75
+    fail_after: 2
+  timeout_seconds: 30
+  expect:
+    status: failure
+    event_order:
+    - output.delta
+    - output.delta
+    - run.failed
+    stream:
+      incremental: true
+      timed_event: output.delta
+      terminal_event: run.failed
+      terminal_once: true
+      forbid_events_after_terminal:
+      - output.delta
+      exact_counts:
+        output.delta: 2
+      data_sequences:
+        output.delta:
+        - content: tick-1
+        - content: tick-2
+      durable_required:
+      - run.failed
+      durable_forbidden:
+      - output.delta

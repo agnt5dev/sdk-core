@@ -1,0 +1,150 @@
+syntax = "proto3";
+
+package api.v1;
+
+import "google/protobuf/any.proto";
+import "google/protobuf/duration.proto";
+
+option go_package = "agnt5.dev/platform/pkg/pb/api/v1;v1";
+
+// Parameter definition
+message Param {
+  string name = 1;
+  string description = 2;
+
+  // Data type enumeration
+  enum DataType {
+    DATA_TYPE_UNSPECIFIED = 0;
+    DATA_TYPE_STRING = 1;
+    DATA_TYPE_INTEGER = 2;
+    DATA_TYPE_FLOAT = 3;
+    DATA_TYPE_BOOLEAN = 4;
+    DATA_TYPE_ARRAY = 5;
+    DATA_TYPE_OBJECT = 6;
+    DATA_TYPE_DATETIME = 7;
+    DATA_TYPE_DURATION = 8;
+  }
+  DataType data_type = 3;
+
+  // Default value using Any to support multiple types
+  google.protobuf.Any default_value = 4;
+
+  bool required = 5;
+  optional string class_name = 6;
+
+  // Nested parameters for complex types
+  map<string, Param> nested_fields = 7;
+}
+
+// Schedule configuration
+message Schedule {
+  oneof schedule_config {
+    string cron_expression = 1;
+    google.protobuf.Duration interval = 2;
+  }
+}
+
+message AGNT5Error {
+  string message = 1;
+  string error_code = 2;
+  string category = 3;
+  string severity = 4;
+  string traceback = 5;
+  string error_type = 6;
+}
+
+// ComponentType identifies the type of component being executed.
+// Shared between Execution Engine and Worker Coordinator.
+enum ComponentType {
+  COMPONENT_TYPE_UNSPECIFIED = 0;
+  COMPONENT_TYPE_FUNCTION = 1;
+  COMPONENT_TYPE_FLOW = 2;
+  COMPONENT_TYPE_OBJECT = 3;
+  COMPONENT_TYPE_TASK = 4;
+  COMPONENT_TYPE_WORKFLOW = 5;
+  COMPONENT_TYPE_AGENT = 6;
+  COMPONENT_TYPE_TOOL = 7;
+  COMPONENT_TYPE_MCP = 8;
+  COMPONENT_TYPE_ENTITY = 9;
+  COMPONENT_TYPE_SCORER = 10;
+}
+
+// Priority classifies dispatch SLA independently of delivery mechanism.
+// Gateway tags requests based on endpoint: /run|/stream → INTERACTIVE,
+// default → NORMAL, /submit|/batch → BATCH. Used by the scheduler's
+// headroom reservation model (see dispatch redesign plan).
+//
+// Shared between Engine and Worker Coordinator so both sides of the wire
+// can agree on the priority class without a cross-file import.
+enum Priority {
+  PRIORITY_UNSPECIFIED = 0;
+  PRIORITY_INTERACTIVE = 1;
+  PRIORITY_NORMAL      = 2;
+  PRIORITY_BATCH       = 3;
+}
+
+// WorkerMode declares the data-path style a worker uses to receive
+// dispatches. Declared once at registration time; mode mismatches do
+// not exist mid-session.
+//
+// - PUSH: the coordinator pushes dispatches to the worker over the
+//   bidirectional WorkerStream as soon as a slot is free.
+// - PULL: the worker calls PollJobs to claim work itself; the
+//   bidirectional WorkerStream is still kept open for control messages
+//   (heartbeat, cancellations, WORKER_REPLACED) but no dispatches flow
+//   over it.
+//
+// Default behavior when UNSPECIFIED is PUSH so existing workers (built
+// before Phase 6) continue to receive dispatches without any client
+// changes.
+enum WorkerMode {
+  WORKER_MODE_UNSPECIFIED = 0;
+  WORKER_MODE_PUSH        = 1;
+  WORKER_MODE_PULL        = 2;
+}
+
+message WorkerCapability {
+  ComponentType component_type = 1;
+  string component_name = 2;
+}
+
+// RetryPolicy controls how the coordinator handles a worker-reported
+// failure (`success=false`) on a dispatched run. It is independent
+// from the lease-expiry retry policy: expiry retries are timeout-driven
+// and live in the expiry sweeper; failure retries are response-driven
+// and live in the dispatch ack handler.
+//
+// Set on `DispatchComponentRequest` at gateway ingress with defaults
+// derived from the request's priority class:
+//   INTERACTIVE → TERMINAL  (no runtime retry; client handles)
+//   NORMAL      → BOUNDED(max=3, initial_backoff=1s, max_backoff=60s)
+//   BATCH       → BOUNDED(max=3, initial_backoff=1s, max_backoff=60s)
+//
+// Callers can override via request metadata if they need different
+// semantics for a specific dispatch.
+message RetryPolicy {
+  // RetryKind selects between "fail fast" and "retry with bounded budget".
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    // No coordinator-side retry. The failure response flows back to the
+    // caller as soon as it lands. Used for synchronous /run + /stream.
+    KIND_TERMINAL    = 1;
+    // Bounded retry with exponential backoff. The coordinator absorbs
+    // the failure response, re-queues the run with `ready_at_ms = now +
+    // backoff(attempt)`, and lets the next picker tick re-deliver.
+    // Once `attempt >= max_attempts`, the run dead-letters via
+    // `run.failed`.
+    KIND_BOUNDED     = 2;
+  }
+
+  Kind   kind                = 1;
+  // Total delivery budget. `attempt < max_attempts` still has at least
+  // one re-delivery left. Ignored when `kind = TERMINAL`.
+  uint32 max_attempts        = 2;
+  // First-retry backoff in milliseconds. Doubles per attempt up to
+  // `max_backoff_ms`. Ignored when `kind = TERMINAL`.
+  uint32 initial_backoff_ms  = 3;
+  // Backoff cap in milliseconds. Prevents the exponential schedule
+  // from blowing past a sane upper bound under high attempt counts.
+  uint32 max_backoff_ms      = 4;
+}

@@ -1,0 +1,14 @@
+version: 1
+component: ks_event_subscriber
+component_type: workflow
+cases:
+- id: workflow.event_subscriber.direct
+  component_type: workflow
+  component: ks_event_subscriber
+  input:
+    event: ks.event_demo
+    text: hello
+  expect:
+    status: success
+    output_subset:
+      status: matched

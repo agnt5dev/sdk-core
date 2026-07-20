@@ -1,0 +1,15 @@
+version: 1
+component: ks_sentry_issue
+component_type: workflow
+cases:
+- id: workflow.sentry_issue.direct
+  component_type: workflow
+  component: ks_sentry_issue
+  input:
+    source: sentry
+    body:
+      text: issue created
+  expect:
+    status: success
+    output_subset:
+      status: matched

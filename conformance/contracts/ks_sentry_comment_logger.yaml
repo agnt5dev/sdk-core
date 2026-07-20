@@ -1,0 +1,14 @@
+version: 1
+component: ks_sentry_comment_logger
+component_type: workflow
+cases:
+- id: workflow.sentry_comment.direct
+  component_type: workflow
+  component: ks_sentry_comment_logger
+  input:
+    body:
+      text: investigating
+  expect:
+    status: success
+    output_subset:
+      status: logged

@@ -1,0 +1,17 @@
+version: 1
+component: ks_length_scorer
+component_type: scorer
+cases:
+- id: scorer.length
+  component_type: scorer
+  component: ks_length_scorer
+  input:
+    output:
+      word_count: 3
+    expected:
+      word_count: 3
+  expect:
+    status: success
+    output_subset:
+      score: 1
+      passed: true

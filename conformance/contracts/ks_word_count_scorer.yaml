@@ -1,0 +1,17 @@
+version: 1
+component: ks_word_count_scorer
+component_type: scorer
+cases:
+- id: scorer.word_count
+  component_type: scorer
+  component: ks_word_count_scorer
+  input:
+    input:
+      text: one two three
+    output:
+      word_count: 3
+  expect:
+    status: success
+    output_subset:
+      score: 1
+      passed: true

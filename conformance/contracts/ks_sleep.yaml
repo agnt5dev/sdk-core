@@ -1,0 +1,29 @@
+version: 1
+component: ks_sleep
+component_type: function
+cases:
+- id: function.sleep.clamps_negative
+  component_type: function
+  component: ks_sleep
+  input:
+    duration_ms: -50
+  expect:
+    status: success
+    output_subset:
+      requested_ms: -50
+      slept_ms: 0
+      clamped: true
+- id: function.sleep.cancel
+  operation: submit_cancel
+  component_type: function
+  component: ks_sleep
+  input:
+    duration_ms: 60000
+  cancel_after_seconds: 0.25
+  cancel_reason: go-conformance
+  timeout_seconds: 20
+  expect:
+    status: failure
+    event_order:
+    - run.queued
+    - run.cancelled

@@ -1,0 +1,19 @@
+version: 1
+component: ks_mega_workflow
+component_type: workflow
+cases:
+- id: workflow.mega.step_count
+  component_type: workflow
+  component: ks_mega_workflow
+  input:
+    seed: 42
+  timeout_seconds: 120
+  expect:
+    status: success
+    output_subset:
+      step_count: 15
+    event_order:
+    - workflow.step.started
+    - workflow.step.completed
+    - workflow.completed
+    - run.completed
