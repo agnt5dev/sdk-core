@@ -1,0 +1,169 @@
+{
+  "_doc": [
+    "Cross-language golden fixtures for builtin scorers.",
+    "Used by Rust (sdk-core/tests/eval_goldens.rs), Python",
+    "(sdk-python/tests/unit/test_eval_goldens.py), and TypeScript",
+    "(sdk-typescript/src/__tests__/scorer-goldens.test.ts) tests.",
+    "",
+    "Each row asserts identical (score, passed) across all three SDKs.",
+    "Rows with a `label` key also assert label equality; we don't enforce",
+    "label parity on legacy scorers (exact_match / contains / json_valid /",
+    "regex_match / levenshtein) because TypeScript intentionally omits the",
+    "Rust-style 'match'/'found'/'valid' labels for those.",
+    "",
+    "`llm_judge` is not in this set — it's non-deterministic and needs an",
+    "LM fixture, which is out of scope for golden parity."
+  ],
+  "cases": [
+    {
+      "name": "exact_match: identical strings",
+      "scorer": "exact_match",
+      "input": {"output": "hello", "expected": "hello"},
+      "expect": {"score": 1.0, "passed": true}
+    },
+    {
+      "name": "exact_match: mismatch",
+      "scorer": "exact_match",
+      "input": {"output": "hello", "expected": "world"},
+      "expect": {"score": 0.0, "passed": false}
+    },
+    {
+      "name": "contains: substring present",
+      "scorer": "contains",
+      "input": {"output": "hello world", "config": {"pattern": "world"}},
+      "expect": {"score": 1.0, "passed": true}
+    },
+    {
+      "name": "contains: substring absent",
+      "scorer": "contains",
+      "input": {"output": "hello", "config": {"pattern": "world"}},
+      "expect": {"score": 0.0, "passed": false}
+    },
+    {
+      "name": "json_valid: valid JSON string",
+      "scorer": "json_valid",
+      "input": {"output": "{\"k\":\"v\"}"},
+      "expect": {"score": 1.0, "passed": true}
+    },
+    {
+      "name": "json_valid: invalid JSON string",
+      "scorer": "json_valid",
+      "input": {"output": "{not json"},
+      "expect": {"score": 0.0, "passed": false}
+    },
+    {
+      "name": "regex_match: pattern matches",
+      "scorer": "regex_match",
+      "input": {"output": "abc123", "config": {"pattern": "\\d+"}},
+      "expect": {"score": 1.0, "passed": true}
+    },
+    {
+      "name": "regex_match: pattern does not match",
+      "scorer": "regex_match",
+      "input": {"output": "abcdef", "config": {"pattern": "^\\d+$"}},
+      "expect": {"score": 0.0, "passed": false}
+    },
+    {
+      "name": "levenshtein: identical → 1.0",
+      "scorer": "levenshtein",
+      "input": {"output": "hello", "expected": "hello"},
+      "expect": {"score": 1.0, "passed": true}
+    },
+    {
+      "name": "json_schema: valid object",
+      "scorer": "json_schema",
+      "input": {
+        "output": {"name": "Ada", "age": 30},
+        "config": {
+          "schema": {
+            "type": "object",
+            "required": ["name", "age"],
+            "properties": {
+              "name": {"type": "string"},
+              "age": {"type": "integer", "minimum": 0}
+            }
+          }
+        }
+      },
+      "expect": {"score": 1.0, "passed": true, "label": "valid"}
+    },
+    {
+      "name": "json_schema: violates minimum constraint",
+      "scorer": "json_schema",
+      "input": {
+        "output": {"name": "Ada", "age": -1},
+        "config": {
+          "schema": {
+            "type": "object",
+            "required": ["name", "age"],
+            "properties": {
+              "name": {"type": "string"},
+              "age": {"type": "integer", "minimum": 0}
+            }
+          }
+        }
+      },
+      "expect": {"score": 0.0, "passed": false, "label": "invalid"}
+    },
+    {
+      "name": "json_schema: string output is parsed as JSON",
+      "scorer": "json_schema",
+      "input": {
+        "output": "[1, 2, 3]",
+        "config": {"schema": {"type": "array", "items": {"type": "integer"}}}
+      },
+      "expect": {"score": 1.0, "passed": true, "label": "valid"}
+    },
+    {
+      "name": "json_schema: unparseable string is parse_error",
+      "scorer": "json_schema",
+      "input": {
+        "output": "{not json",
+        "config": {"schema": {"type": "object"}}
+      },
+      "expect": {"score": 0.0, "passed": false, "label": "parse_error"}
+    },
+    {
+      "name": "numeric_range: in range (inclusive default)",
+      "scorer": "numeric_range",
+      "input": {"output": 5, "config": {"min": 1, "max": 10}},
+      "expect": {"score": 1.0, "passed": true, "label": "in_range"}
+    },
+    {
+      "name": "numeric_range: at upper bound (inclusive)",
+      "scorer": "numeric_range",
+      "input": {"output": 10, "config": {"min": 1, "max": 10}},
+      "expect": {"score": 1.0, "passed": true, "label": "in_range"}
+    },
+    {
+      "name": "numeric_range: at upper bound (exclusive)",
+      "scorer": "numeric_range",
+      "input": {"output": 10, "config": {"min": 1, "max": 10, "inclusive": false}},
+      "expect": {"score": 0.0, "passed": false, "label": "out_of_range"}
+    },
+    {
+      "name": "numeric_range: above max",
+      "scorer": "numeric_range",
+      "input": {"output": 11, "config": {"min": 1, "max": 10}},
+      "expect": {"score": 0.0, "passed": false, "label": "out_of_range"}
+    },
+    {
+      "name": "numeric_range: numeric string output",
+      "scorer": "numeric_range",
+      "input": {"output": "3.14", "config": {"min": 0, "max": 5}},
+      "expect": {"score": 1.0, "passed": true, "label": "in_range"}
+    },
+    {
+      "name": "numeric_range: non-numeric output is parse_error",
+      "scorer": "numeric_range",
+      "input": {"output": "not a number", "config": {"min": 0, "max": 5}},
+      "expect": {"score": 0.0, "passed": false, "label": "parse_error"}
+    },
+    {
+      "name": "numeric_range: missing bounds is config_error",
+      "scorer": "numeric_range",
+      "input": {"output": 1, "config": {}},
+      "expect": {"score": 0.0, "passed": false, "label": "config_error"}
+    }
+  ]
+}

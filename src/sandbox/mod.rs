@@ -26,15 +26,7 @@
 pub mod providers;
 pub mod types;
 
-pub use providers::daytona::{DaytonaProviderConfig, DaytonaSandbox, DaytonaSandboxProvider};
-pub use providers::e2b::{E2bProviderConfig, E2bSandbox, E2bSandboxProvider};
-pub use providers::modal::{ModalProviderConfig, ModalSandbox, ModalSandboxProvider};
-pub use providers::northflank::{
-    NorthflankProviderConfig, NorthflankSandbox, NorthflankSandboxProvider,
-};
 pub use providers::remote::{RemoteSandbox, RemoteSandboxConfig, SandboxAuth};
-pub use providers::together::{TogetherProviderConfig, TogetherSandbox, TogetherSandboxProvider};
-pub use providers::vercel::{VercelProviderConfig, VercelSandbox, VercelSandboxProvider};
 pub use types::*;
 
 #[cfg(feature = "wasm-sandbox")]
@@ -88,7 +80,7 @@ pub trait SandboxBackend: SandboxExecutor + SandboxWorkspace {}
 
 impl<T: SandboxExecutor + SandboxWorkspace> SandboxBackend for T {}
 
-/// Control plane for a managed sandbox provider (E2B, Daytona, Modal, ...).
+/// Control plane for a managed sandbox provider.
 ///
 /// While [`SandboxBackend`] is the data plane for a *running* sandbox,
 /// `SandboxProvider` manages sandbox lifecycle: provisioning new instances,
@@ -100,8 +92,7 @@ impl<T: SandboxExecutor + SandboxWorkspace> SandboxBackend for T {}
 /// universal trait.
 #[async_trait]
 pub trait SandboxProvider: Send + Sync {
-    /// Stable provider name ("e2b", "daytona", "modal", "northflank",
-    /// "vercel", "together"). Used as the registry key.
+    /// Stable provider name used as the registry key.
     fn name(&self) -> &'static str;
 
     /// Provision a new sandbox and return a connected backend handle.
@@ -240,44 +231,6 @@ impl SandboxRegistry {
             self.register("wasm".to_string(), Arc::new(wasm));
         }
 
-        Ok(())
-    }
-
-    /// Auto-register managed sandbox provider control planes from
-    /// environment variables.
-    ///
-    /// Registration is cheap (no network calls) — sandboxes are only
-    /// provisioned when [`SandboxProvider::create_sandbox`] is invoked.
-    /// A partially configured provider (e.g. `VERCEL_TOKEN` without
-    /// `VERCEL_TEAM_ID`) is an error rather than being silently skipped.
-    ///
-    /// | Provider | Trigger | Additional variables |
-    /// |---|---|---|
-    /// | `e2b` | `E2B_API_KEY` | `E2B_DOMAIN`, `E2B_API_URL`, `E2B_TEMPLATE` |
-    /// | `daytona` | `DAYTONA_API_KEY` | `DAYTONA_API_URL`, `DAYTONA_TARGET` |
-    /// | `vercel` | `VERCEL_OIDC_TOKEN` or `VERCEL_TOKEN` | `VERCEL_TEAM_ID`, `VERCEL_PROJECT_ID` |
-    /// | `northflank` | `NORTHFLANK_API_TOKEN` | `NORTHFLANK_PROJECT_ID` (required), `NORTHFLANK_TEAM_ID`, ... |
-    /// | `together` | `TOGETHER_API_KEY` | `TOGETHER_BASE_URL` |
-    /// | `modal` | `MODAL_TOKEN_ID` | `MODAL_TOKEN_SECRET` (required), `MODAL_APP_NAME`, ... |
-    pub fn load_providers_from_environment(&mut self) -> Result<()> {
-        if std::env::var("E2B_API_KEY").is_ok() {
-            self.register_provider(Arc::new(E2bSandboxProvider::from_env()?));
-        }
-        if std::env::var("DAYTONA_API_KEY").is_ok() {
-            self.register_provider(Arc::new(DaytonaSandboxProvider::from_env()?));
-        }
-        if std::env::var("VERCEL_OIDC_TOKEN").is_ok() || std::env::var("VERCEL_TOKEN").is_ok() {
-            self.register_provider(Arc::new(VercelSandboxProvider::from_env()?));
-        }
-        if std::env::var("NORTHFLANK_API_TOKEN").is_ok() {
-            self.register_provider(Arc::new(NorthflankSandboxProvider::from_env()?));
-        }
-        if std::env::var("TOGETHER_API_KEY").is_ok() {
-            self.register_provider(Arc::new(TogetherSandboxProvider::from_env()?));
-        }
-        if std::env::var("MODAL_TOKEN_ID").is_ok() {
-            self.register_provider(Arc::new(ModalSandboxProvider::from_env()?));
-        }
         Ok(())
     }
 }

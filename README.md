@@ -2,6 +2,14 @@
 
 The foundation Rust implementation that powers all AGNT5 language SDKs. Handles gRPC transport, event persistence, worker lifecycle, and the FFI boundary.
 
+## Integration boundary
+
+SDK Core owns vendor-neutral sandbox contracts, the generic remote sandbox
+backend, and the optional embedded WASM backend. Vendor-specific sandbox
+clients are maintained in
+[`agnt5dev/sdk-integrations`](https://github.com/agnt5dev/sdk-integrations).
+Core does not compile vendor credentials, endpoints, or vendored protocols.
+
 ## Event Persistence Architecture
 
 All events flow from SDK workers directly to the Execution Engine (EE). There are exactly **3 paths**, each serving a distinct purpose. All other components (language SDKs, built-in scorers, flush task) must use one of these.

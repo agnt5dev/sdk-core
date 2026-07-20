@@ -1,6 +1,6 @@
 //! Cross-language golden parity tests for the builtin scorer fast path.
 //!
-//! Reads `sdk/test-fixtures/eval/builtin_goldens.json` (shared across
+//! Reads `test-fixtures/eval/builtin_goldens.json` (shared across
 //! Rust / Python / TypeScript) and asserts each row produces the same
 //! `(score, passed)` here as it does in the other two SDKs. Rows that
 //! include a `label` field also enforce label equality.
@@ -34,7 +34,6 @@ struct ExpectedResult {
 
 fn load_goldens() -> Goldens {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
         .join("test-fixtures")
         .join("eval")
         .join("builtin_goldens.json");
