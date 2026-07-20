@@ -754,6 +754,37 @@ impl EngineClient {
 
         unreachable!("engine append batch retry loop always returns")
     }
+
+    /// Publish a bounded batch of ephemeral events and wait until the runtime
+    /// acknowledges every frame. Closing each batch supplies the ordering
+    /// barrier needed before a durable terminal event is appended.
+    pub async fn stream_events(&mut self, events: Vec<EventStreamMessage>) -> Result<i64> {
+        if events.is_empty() {
+            return Ok(0);
+        }
+        let expected = events.len() as i64;
+        let response = self
+            .next_client()
+            .event_stream(tokio_stream::iter(events))
+            .await
+            .map_err(|status| SdkError::Connection {
+                message: format!("Engine EventStream failed: {status}"),
+                code: crate::error::ErrorCode::ConnectionFailed,
+                source: None,
+            })?
+            .into_inner();
+        if !response.success || response.events_received != expected {
+            return Err(SdkError::Connection {
+                message: format!(
+                    "Engine EventStream acknowledged {} events, want {}",
+                    response.events_received, expected
+                ),
+                code: crate::error::ErrorCode::ConnectionFailed,
+                source: None,
+            });
+        }
+        Ok(response.events_received)
+    }
 }
 
 /// Build an engine `Record` from SDK event fields.
