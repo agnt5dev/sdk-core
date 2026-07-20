@@ -12,6 +12,7 @@ mod huggingface;
 mod interface;
 mod lepton;
 mod mistral;
+mod moonshot;
 mod ollama;
 mod openai;
 mod openai_chat;
@@ -42,6 +43,7 @@ pub use interface::{
 };
 pub use lepton::{LeptonConfig, LeptonProvider};
 pub use mistral::{MistralConfig, MistralProvider};
+pub use moonshot::{MoonshotConfig, MoonshotProvider};
 pub use ollama::{OllamaConfig, OllamaProvider};
 pub use openai::{OpenAiConfig, OpenAiProvider};
 pub use openai_chat::{OpenAiChatConfig, OpenAiChatProvider};
