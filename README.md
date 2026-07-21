@@ -1,6 +1,6 @@
 # AGNT5 SDK Core
 
-[![CI](https://github.com/agnt5dev/sdk-core/actions/workflows/ci.yml/badge.svg)](https://github.com/agnt5dev/sdk-core/actions/workflows/ci.yml)
+[![CI](https://github.com/agnt5dev/agnt5/actions/workflows/runtime-ci.yml/badge.svg)](https://github.com/agnt5dev/agnt5/actions/workflows/runtime-ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 `agnt5-sdk-core` is the shared Rust foundation for the AGNT5 language SDKs. It

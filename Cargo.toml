@@ -5,8 +5,13 @@ edition = "2021"
 authors = ["AGNT5 Team"]
 description = "High-performance Rust core for AGNT5 SDK"
 license = "Apache-2.0"
+readme = "README.md"
 repository = "https://github.com/agnt5dev/sdk-core"
 homepage = "https://agnt5.com"
+documentation = "https://docs.rs/agnt5-sdk-core"
+keywords = ["agents", "ai", "workflow", "runtime", "sdk"]
+categories = ["api-bindings", "asynchronous"]
+publish = ["crates-io"]
 include = [
     "src/**",
     "proto/**",
