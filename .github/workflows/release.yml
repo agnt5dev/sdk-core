@@ -1,0 +1,90 @@
+name: SDK Core Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      skip-publish:
+        description: "Validate the crate without publishing or tagging"
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Validate and publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require main branch
+        if: inputs.skip-publish != true
+        run: test "${GITHUB_REF_NAME}" = main
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Read and validate version
+        id: version
+        run: |
+          VERSION=$(sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)
+          if ! printf '%s\n' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Cargo.toml package version must be x.y.z: $VERSION" >&2
+            exit 1
+          fi
+          if git rev-parse "v${VERSION}" >/dev/null 2>&1; then
+            echo "Tag v${VERSION} already exists" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Lint
+        run: cargo clippy --all-targets --all-features --locked
+
+      - name: Test
+        run: cargo test --all-features --locked
+
+      - name: Verify crates.io package
+        run: cargo publish --dry-run --locked
+
+      - name: Publish to crates.io
+        if: inputs.skip-publish != true
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked
+
+      - name: Create and push release tag
+        if: inputs.skip-publish != true
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git config user.name "agnt5-release-bot"
+          git config user.email "release-bot@agnt5.com"
+          git tag -a "v${VERSION}" -m "v${VERSION}"
+          git push origin "v${VERSION}"
+
+      - name: Output release summary
+        run: |
+          {
+            echo "## SDK Core Release"
+            echo "**Crate:** \`agnt5-sdk-core\`"
+            echo "**Version:** \`v${{ steps.version.outputs.version }}\`"
+            echo "**Commit:** \`${{ github.sha }}\`"
+            echo "**Dry run:** \`${{ inputs.skip-publish && 'yes' || 'no' }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
