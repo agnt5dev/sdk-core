@@ -162,6 +162,7 @@ impl JournalEventMessage {
         // These are streaming/observability events that don't affect replay
         event_type.starts_with("output.")
             || event_type.starts_with("lm.stream.")
+            || event_type.starts_with("lm.content_block.")
             || event_type.starts_with("lm.message.")
             || event_type.starts_with("lm.thinking.")
             || event_type.starts_with("lm.tool_call.")  // LLM tool call content blocks (transient deltas)
@@ -561,6 +562,15 @@ mod tests {
         assert!(JournalEventMessage::is_sse_only_event_type("output.stop"));
         assert!(JournalEventMessage::is_sse_only_event_type(
             "lm.stream.delta"
+        ));
+        assert!(JournalEventMessage::is_sse_only_event_type(
+            "lm.content_block.started"
+        ));
+        assert!(JournalEventMessage::is_sse_only_event_type(
+            "lm.content_block.delta"
+        ));
+        assert!(JournalEventMessage::is_sse_only_event_type(
+            "lm.content_block.completed"
         ));
         assert!(JournalEventMessage::is_sse_only_event_type(
             "lm.message.delta"
