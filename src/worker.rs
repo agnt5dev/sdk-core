@@ -3,11 +3,12 @@ use crate::error::{Result, SdkError};
 use crate::journal_queue::{JournalEventMessage, JournalEventQueue, JournalQueueConfig};
 use crate::pb::{
     execution_engine_service_client::ExecutionEngineServiceClient, CompleteJobRequest,
-    ComponentInfo, DispatchComponentResponse, EventStreamMessage, HealthCheck, JobAssignment,
-    PollJobRequest, RegisterService, RegisterWorkerSessionRequest, RenewJobLeaseRequest,
-    ReportWorkerCapacityRequest, RuntimeMessage, RuntimeMessageType, ServiceMessage,
-    UnregisterService, WorkerCapability, WorkerHealthStatus, WorkerSlotPolicy,
-    WriteCheckpointRequest,
+    ComponentInfo, DispatchComponentResponse, EntityStateLoadResult, EntityStateSaveResult,
+    EventStreamMessage, GetEntityStateRequest, HealthCheck, JobAssignment, PollJobRequest,
+    PutEntityStateRequest, RegisterService, RegisterWorkerSessionRequest, RenewJobLeaseRequest,
+    ReportWorkerCapacityRequest, RuntimeMessage, RuntimeMessageType, RuntimeServiceRequest,
+    RuntimeServiceResponse, ServiceMessage, UnregisterService, WorkerCapability,
+    WorkerHealthStatus, WorkerSlotPolicy, WriteCheckpointRequest,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -387,15 +388,15 @@ pub struct Worker {
     /// EventStream sender for SSE-only events (EE path). Set during run().
     event_stream_tx: Arc<std::sync::Mutex<Option<flume::Sender<EventStreamMessage>>>>,
     /// Dispatch stream sender (bidirectional gRPC to WC). Used by emit_checkpoint_sync
-    /// to flush pending SSE-only events before terminal checkpoints, ensuring they
-    /// arrive while the invocation is still tracked in pendingStreamInvocations.
+    /// to flush pending SSE-only events before lifecycle checkpoints, ensuring a
+    /// checkpoint cannot overtake stream chunks emitted before it.
     dispatch_tx: Arc<std::sync::Mutex<Option<flume::Sender<ServiceMessage>>>>,
     /// Lazily-connected Engine gRPC client. When AGNT5_ENGINE_URL is set, all event paths
     /// route through this client instead of the Go EE.
     engine_client: Arc<TokioMutex<Option<EngineClient>>>,
-    /// Serializes background queue flushes with terminal checkpoint flushes.
-    /// A terminal event must not overtake transient output already drained by
-    /// the periodic flush task.
+    /// Serializes background queue flushes with synchronous checkpoint flushes.
+    /// A checkpoint must not overtake transient output already drained by the
+    /// periodic flush task.
     journal_flush_lock: Arc<TokioMutex<()>>,
 }
 
@@ -578,14 +579,115 @@ fn polled_job_completion_from_service_message(
     }
 }
 
+fn take_pull_runtime_service_request(
+    mut service_message: ServiceMessage,
+) -> std::result::Result<RuntimeServiceRequest, ServiceMessage> {
+    match service_message.message_type.take() {
+        Some(crate::pb::service_message::MessageType::RuntimeService(request)) => Ok(request),
+        other => {
+            service_message.message_type = other;
+            Err(service_message)
+        }
+    }
+}
+
+async fn handle_pull_runtime_service_request(
+    client: &mut WorkerCoordinatorClient,
+    project_id: &str,
+    request: RuntimeServiceRequest,
+) -> RuntimeServiceResponse {
+    let request_id = request.request_id;
+
+    match request.operation {
+        Some(crate::pb::runtime_service_request::Operation::EntityStateLoad(load)) => {
+            match client
+                .get_entity_state(GetEntityStateRequest {
+                    project_id: project_id.to_string(),
+                    entity_type: load.entity_type,
+                    entity_key: load.entity_key,
+                    scope: load.scope,
+                    scope_id: load.scope_id,
+                })
+                .await
+            {
+                Ok(result) => RuntimeServiceResponse {
+                    request_id,
+                    success: true,
+                    error_message: String::new(),
+                    result: Some(
+                        crate::pb::runtime_service_response::Result::EntityStateLoad(
+                            EntityStateLoadResult {
+                                found: result.found,
+                                state_json: result.state_json,
+                                version: result.version,
+                            },
+                        ),
+                    ),
+                },
+                Err(error) => RuntimeServiceResponse {
+                    request_id,
+                    success: false,
+                    error_message: error.to_string(),
+                    result: None,
+                },
+            }
+        }
+        Some(crate::pb::runtime_service_request::Operation::EntityStateSave(save)) => {
+            match client
+                .put_entity_state(PutEntityStateRequest {
+                    project_id: project_id.to_string(),
+                    entity_type: save.entity_type,
+                    entity_key: save.entity_key,
+                    scope: save.scope,
+                    scope_id: save.scope_id,
+                    state_json: save.state_json,
+                    expected_version: save.expected_version,
+                    run_id: request.session_id,
+                })
+                .await
+            {
+                Ok(result) => RuntimeServiceResponse {
+                    request_id,
+                    success: true,
+                    error_message: String::new(),
+                    result: Some(
+                        crate::pb::runtime_service_response::Result::EntityStateSave(
+                            EntityStateSaveResult {
+                                new_version: result.new_version,
+                            },
+                        ),
+                    ),
+                },
+                Err(error) => RuntimeServiceResponse {
+                    request_id,
+                    success: false,
+                    error_message: error.to_string(),
+                    result: None,
+                },
+            }
+        }
+        _ => RuntimeServiceResponse {
+            request_id,
+            success: false,
+            error_message:
+                "runtime service operation is not supported over pull-worker unary transport"
+                    .to_string(),
+            result: None,
+        },
+    }
+}
+
 async fn complete_polled_job_with_client(
     client: &mut WorkerCoordinatorClient,
     worker_id: &str,
     worker_session_id: &str,
     tenant_id: &str,
     completion: PolledJobCompletion,
+    assignment_metadata: &HashMap<String, String>,
 ) -> Result<()> {
     let job_id = completion.job_id.clone();
+    let mut metadata = assignment_metadata.clone();
+    metadata.insert("completion_event_type".to_string(), completion.event_type);
     match client
         .complete_job(CompleteJobRequest {
             job_id: completion.job_id,
@@ -594,7 +696,7 @@ async fn complete_polled_job_with_client(
             output_data: completion.output_data,
             error_message: completion.error_message,
             error_code: completion.error_code,
-            metadata: HashMap::from([("completion_event_type".to_string(), completion.event_type)]),
+            metadata,
             project_id: tenant_id.to_string(),
             lease_id: completion.lease_id,
             worker_session_id: worker_session_id.to_string(),
@@ -621,6 +723,7 @@ async fn complete_or_forward_parked_response(
     tenant_id: &str,
     slot_idx: usize,
     response_tx: &flume::Sender<ServiceMessage>,
+    assignment_metadata: &HashMap<String, String>,
 ) -> bool {
     let Some(completion) =
         polled_job_completion_from_service_message(&service_message, fallback_lease_id)
@@ -643,6 +746,7 @@ async fn complete_or_forward_parked_response(
         &current_session_id,
         tenant_id,
         completion,
+        assignment_metadata,
     )
     .await
     {
@@ -1074,6 +1178,7 @@ where
                     .and_then(|v| v.parse::<i64>().ok())
                     .filter(|v| *v > 0)
                     .unwrap_or(ctx.claim_timeout_ms);
+                let assignment_metadata = job.metadata.clone();
                 let (runtime_message, is_streaming, run_id, lease_id) =
                     runtime_message_from_job_assignment(job);
                 let completion_run_id = run_id.clone();
@@ -1101,15 +1206,66 @@ where
                 );
 
                 let (slot_response_tx, slot_response_rx) = flume::unbounded::<ServiceMessage>();
-                let returned_response = execute_runtime_message_for_response(
+                let execution = execute_runtime_message_for_response(
                     &worker_name,
                     runtime_message,
                     slot_response_tx.clone(),
                     handler.clone(),
                     ctx.in_flight.clone(),
                     ctx.cancel_tokens.clone(),
-                )
-                .await;
+                );
+                tokio::pin!(execution);
+
+                // A pull worker has no bidirectional WorkerStream. State calls
+                // made by the language handler still emit RuntimeService
+                // messages and await the matching response, so service those
+                // messages over the Engine unary API while the handler future
+                // is still running. Buffer ordinary component responses until
+                // the handler exits so a terminal event cannot complete the
+                // job before workflow state persistence finishes.
+                let mut buffered_responses = Vec::new();
+                let returned_response = loop {
+                    tokio::select! {
+                        response = &mut execution => break response,
+                        outbound = slot_response_rx.recv_async() => {
+                            let Ok(service_message) = outbound else {
+                                continue;
+                            };
+                            match take_pull_runtime_service_request(service_message) {
+                                Ok(request) => {
+                                    let response = handle_pull_runtime_service_request(
+                                        &mut client,
+                                        &ctx.project_id,
+                                        request,
+                                    )
+                                    .await;
+                                    let runtime_message = RuntimeMessage {
+                                        worker_id: ctx.worker_id.clone(),
+                                        message_type: RuntimeMessageType::RuntimeService as i32,
+                                        metadata: HashMap::new(),
+                                        message_data: Some(
+                                            crate::pb::runtime_message::MessageData::RuntimeServiceResponse(
+                                                response,
+                                            ),
+                                        ),
+                                    };
+                                    match handler
+                                        .clone()(runtime_message, slot_response_tx.clone())
+                                        .await
+                                    {
+                                        Ok(Some(response)) => buffered_responses.push(response),
+                                        Ok(None) => {}
+                                        Err(error) => warn!(
+                                            "Parked poll slot {} failed to deliver runtime service response: {}",
+                                            slot_id, error
+                                        ),
+                                    }
+                                }
+                                Err(response) => buffered_responses.push(response),
+                            }
+                        }
+                    }
+                };
                 drop(slot_response_tx);
 
                 let mut completed = false;
@@ -1123,10 +1279,14 @@ where
                         &ctx.project_id,
                         slot_id,
                         &ctx.response_tx,
+                        &assignment_metadata,
                     )
                     .await;
                 }
                 while let Ok(service_message) = slot_response_rx.try_recv() {
+                    buffered_responses.push(service_message);
+                }
+                for service_message in buffered_responses {
                     if completed
                         && polled_job_completion_from_service_message(
                             &service_message,
@@ -1149,6 +1309,7 @@ where
                         &ctx.project_id,
                         slot_id,
                         &ctx.response_tx,
+                        &assignment_metadata,
                     )
                     .await
                         || completed;
@@ -1501,19 +1662,18 @@ impl Worker {
         timeout_ms: u64,
     ) -> Result<()> {
         let is_terminal = event_type == "run.completed" || event_type == "run.failed";
-        let _journal_flush_guard = if is_terminal {
-            Some(self.journal_flush_lock.lock().await)
-        } else {
-            None
-        };
+        // Every durable checkpoint is an ordering boundary. Hold the same lock
+        // used by the periodic journal flusher, then publish events already
+        // queued for this run before persisting the checkpoint.
+        let _journal_flush_guard = self.journal_flush_lock.lock().await;
 
         // ── Engine path: when AGNT5_ENGINE_URL is set, route directly to engine ──
         if let Some(mut engine) = self.ensure_engine_client().await? {
-            // Before terminal checkpoints, publish transient events through
-            // EventStream and persist only durable boundaries. Both calls are
-            // awaited while holding journal_flush_lock so the terminal cannot
-            // overtake a batch already drained by the periodic flush task.
-            if is_terminal {
+            // Publish transient events through EventStream and persist any
+            // queued durable boundaries before this checkpoint. Both calls
+            // are awaited while holding journal_flush_lock so the checkpoint
+            // cannot overtake a batch already drained by the periodic task.
+            {
                 let pending = self.journal_queue.drain_run_events(&run_id);
                 if !pending.is_empty() {
                     let tenant_id = canonical_project_id_from_metadata(&metadata)
@@ -1652,11 +1812,11 @@ impl Worker {
 
         // ── Legacy EE path (AGNT5_ENGINE_URL not set) ──
 
-        // Before sending terminal checkpoints (run.completed/run.failed), flush any
-        // pending SSE-only events (logs, deltas) for this run.
+        // Before sending a checkpoint, flush pending SSE-only events (logs,
+        // deltas) for this run.
         // Route through EventStream (EE) which is the single SSE publisher.
         // Falls back to dispatch stream (WC) only if EventStream is unavailable.
-        if is_terminal {
+        {
             let pending = self.journal_queue.drain_run_events(&run_id);
             if !pending.is_empty() {
                 let es_tx = self.event_stream_tx.lock().ok().and_then(|g| g.clone());
@@ -3822,11 +3982,15 @@ mod tests {
         is_worker_session_inactive_error, parked_lease_danger_retry_ms,
         parked_lease_renew_interval_ms, parked_lease_renew_interval_with_jitter_ms,
         parked_ramp_spawn_count, parked_worker_session_was_refreshed,
-        runtime_message_from_job_assignment, take_correlation_ids, try_retire_parked_slot,
-        worker_capabilities, ParkedWorkerSessionRegistration, Worker, WorkerConfig,
+        runtime_message_from_job_assignment, take_correlation_ids,
+        take_pull_runtime_service_request, try_retire_parked_slot, worker_capabilities,
+        ParkedWorkerSessionRegistration, Worker, WorkerConfig,
     };
     use crate::error::{ErrorCode, SdkError};
-    use crate::pb::{runtime_message, JobAssignment};
+    use crate::pb::{
+        runtime_message, runtime_service_request, service_message, EntityStateLoadRequest,
+        JobAssignment, RuntimeServiceRequest, ServiceMessage,
+    };
     use std::collections::HashMap;
 
     #[test]
@@ -3835,6 +3999,31 @@ mod tests {
             assert!(is_terminal_worker_response(event_type));
         }
         assert!(!is_terminal_worker_response("output.delta"));
+    }
+
+    #[test]
+    fn pull_runtime_service_requests_are_not_treated_as_job_completions() {
+        let request = RuntimeServiceRequest {
+            request_id: "state-load-1".to_string(),
+            session_id: "run-1".to_string(),
+            operation: Some(runtime_service_request::Operation::EntityStateLoad(
+                EntityStateLoadRequest {
+                    entity_type: "Workflow".to_string(),
+                    entity_key: "run-1".to_string(),
+                    scope: "run".to_string(),
+                    scope_id: "run-1".to_string(),
+                },
+            )),
+        };
+        let message = ServiceMessage {
+            worker_id: "worker-1".to_string(),
+            metadata: HashMap::new(),
+            message_type: Some(service_message::MessageType::RuntimeService(request)),
+        };
+
+        let extracted =
+            take_pull_runtime_service_request(message).expect("runtime service request");
+        assert_eq!(extracted.request_id, "state-load-1");
     }
 
     #[test]

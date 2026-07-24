@@ -4,8 +4,9 @@ use crate::pb::{
     execution_engine_service_client::ExecutionEngineServiceClient,
     worker_coordinator_service_client::WorkerCoordinatorServiceClient, AppendBatchRequest,
     AppendRequest, CheckpointRequest, CheckpointType, CompleteJobRequest, CompleteJobResponse,
-    DurableStepCheckpoint, EventStreamMessage, FindByStepKeyRequest, PollJobRequest,
-    PollJobResponse, Record, RegisterService, RegisterWorkerSessionRequest,
+    DurableStepCheckpoint, EventStreamMessage, FindByStepKeyRequest, GetEntityStateRequest,
+    GetEntityStateResponse, PollJobRequest, PollJobResponse, PutEntityStateRequest,
+    PutEntityStateResponse, Record, RegisterService, RegisterWorkerSessionRequest,
     RegisterWorkerSessionResponse, RenewJobLeaseRequest, RenewJobLeaseResponse,
     ReportWorkerCapacityRequest, ReportWorkerCapacityResponse, RuntimeMessage, ServiceMessage,
 };
@@ -516,6 +517,54 @@ impl WorkerCoordinatorClient {
                 error!("CompleteJob RPC failed: {}", e);
                 SdkError::Connection {
                     message: format!("CompleteJob failed: {}", e),
+                    code: crate::error::ErrorCode::ConnectionFailed,
+                    source: None,
+                }
+            })?
+            .into_inner();
+
+        Ok(response)
+    }
+
+    /// Load entity state through the Engine unary API.
+    ///
+    /// Pull workers do not keep a bidirectional WorkerStream open, so runtime
+    /// service requests emitted while executing a parked job must use the
+    /// Engine RPC surface instead of the stream-only coordinator path.
+    pub async fn get_entity_state(
+        &mut self,
+        req: GetEntityStateRequest,
+    ) -> Result<GetEntityStateResponse> {
+        let response = self
+            .engine_client
+            .get_entity_state(req)
+            .await
+            .map_err(|e| {
+                debug!("GetEntityState RPC failed: {}", e);
+                SdkError::Connection {
+                    message: format!("GetEntityState failed: {}", e),
+                    code: crate::error::ErrorCode::ConnectionFailed,
+                    source: None,
+                }
+            })?
+            .into_inner();
+
+        Ok(response)
+    }
+
+    /// Save entity state through the Engine unary API for pull workers.
+    pub async fn put_entity_state(
+        &mut self,
+        req: PutEntityStateRequest,
+    ) -> Result<PutEntityStateResponse> {
+        let response = self
+            .engine_client
+            .put_entity_state(req)
+            .await
+            .map_err(|e| {
+                debug!("PutEntityState RPC failed: {}", e);
+                SdkError::Connection {
+                    message: format!("PutEntityState failed: {}", e),
                     code: crate::error::ErrorCode::ConnectionFailed,
                     source: None,
                 }
