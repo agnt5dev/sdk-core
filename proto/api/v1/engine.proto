@@ -17,7 +17,8 @@ service EngineService {
   // Append a single record to the journal log.
   rpc Append(AppendRequest) returns (AppendResponse);
 
-  // Append multiple records atomically.
+  // Append multiple records atomically when they route to one journal
+  // partition. A cross-partition request is rejected before mutation.
   rpc AppendBatch(AppendBatchRequest) returns (AppendBatchResponse);
 
   // --- Durable execution (worker write path) ---
@@ -164,6 +165,11 @@ service ReplicationService {
   // Forward a write from a follower to the sequencer.
   rpc ForwardAppend(ForwardAppendRequest) returns (ForwardAppendResponse);
 
+  // Forward a write while preserving the exact per-record append outcome.
+  // A distinct method makes mixed-version calls fail before an older server
+  // can mutate storage.
+  rpc ForwardAppendV2(ForwardAppendRequest) returns (ForwardAppendResponse);
+
   // Add a member to the cluster (leader only).
   rpc AddMember(AddMemberRequest) returns (AddMemberResponse);
 
@@ -257,7 +263,8 @@ message AppendBatchResponse {
   // Offsets assigned to each record (same order as input).
   repeated uint64 offsets = 1;
 
-  // Number of records successfully appended.
+  // Number of input records successfully appended. This is always in
+  // 0..=offsets.size(), even when the runtime expands an input internally.
   int32 written_count = 2;
 }
 
@@ -610,10 +617,17 @@ message ForwardAppendRequest {
 
   // Epoch of the forwarding node — sequencer rejects if stale.
   uint64 sequencer_epoch = 3;
+
+  // Must match the V2 forward-append protocol.
+  uint32 protocol_version = 4;
 }
 
 message ForwardAppendResponse {
+  // Retained for older readers. New readers require all three vectors to have
+  // exact input cardinality and verify input_indices before accepting them.
   repeated uint64 offsets = 1;
+  repeated bool appended = 2;
+  repeated uint32 input_indices = 3;
 }
 
 // --- Dynamic membership ---
@@ -1342,6 +1356,10 @@ message CompleteJobRequest {
   string project_id = 8;
   string lease_id = 9;
   string worker_session_id = 10;
+  // Exact zero-based attempt returned by PollJob. Presence is required for
+  // lease-fenced completion; optional preserves wire compatibility while
+  // allowing the runtime to distinguish attempt 0 from an old client.
+  optional uint32 attempt = 11;
 }
 
 // CompleteJobResponse acknowledges the job completion.

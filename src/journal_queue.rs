@@ -410,6 +410,17 @@ impl JournalEventQueue {
         self.len() == 0
     }
 
+    /// Whether this queue still contains an event for `run_id`.
+    ///
+    /// Pull completion uses this while holding the worker flush lock: an empty
+    /// result then means no flush for that run is queued or in flight.
+    pub fn contains_run(&self, run_id: &str) -> bool {
+        self.queue
+            .lock()
+            .map(|queue| queue.iter().any(|event| event.run_id == run_id))
+            .unwrap_or(true)
+    }
+
     /// Record a successful event send (for metrics)
     pub fn record_sent(&self, is_sse_only: bool) {
         if let Ok(mut metrics) = self.metrics.lock() {

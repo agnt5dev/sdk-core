@@ -3,9 +3,9 @@ use crate::pb::{
     engine_service_client::EngineServiceClient,
     execution_engine_service_client::ExecutionEngineServiceClient,
     worker_coordinator_service_client::WorkerCoordinatorServiceClient, AppendBatchRequest,
-    AppendRequest, CheckpointRequest, CheckpointType, CompleteJobRequest, CompleteJobResponse,
-    DurableStepCheckpoint, EventStreamMessage, FindByStepKeyRequest, PollJobRequest,
-    PollJobResponse, Record, RegisterService, RegisterWorkerSessionRequest,
+    AppendBatchResponse, AppendRequest, CheckpointRequest, CheckpointType, CompleteJobRequest,
+    CompleteJobResponse, DurableStepCheckpoint, EventStreamMessage, FindByStepKeyRequest,
+    PollJobRequest, PollJobResponse, Record, RegisterService, RegisterWorkerSessionRequest,
     RegisterWorkerSessionResponse, RenewJobLeaseRequest, RenewJobLeaseResponse,
     ReportWorkerCapacityRequest, ReportWorkerCapacityResponse, RuntimeMessage, ServiceMessage,
 };
@@ -608,6 +608,39 @@ fn is_retryable_engine_message(message: &str) -> bool {
         || message.contains("catch-up failed")
 }
 
+fn validate_append_batch_records(records: &[Record]) -> Result<()> {
+    let Some(first) = records.first() else {
+        return Ok(());
+    };
+    if records
+        .iter()
+        .skip(1)
+        .any(|record| record.run_id != first.run_id)
+    {
+        return Err(SdkError::InvalidArgument {
+            message: "AppendBatch records must share one run_id so the request cannot span journal partitions".to_string(),
+            argument: Some("records".to_string()),
+        });
+    }
+    Ok(())
+}
+
+fn validate_append_batch_response(response: &AppendBatchResponse, expected: usize) -> Result<i32> {
+    if response.offsets.len() != expected {
+        return Err(SdkError::Internal(format!(
+            "Engine AppendBatch response cardinality mismatch: expected {expected}, offsets={}",
+            response.offsets.len()
+        )));
+    }
+    if response.written_count < 0 || response.written_count as usize > expected {
+        return Err(SdkError::Internal(format!(
+            "Engine AppendBatch written_count out of range: expected 0..={expected}, got {}",
+            response.written_count
+        )));
+    }
+    Ok(response.written_count)
+}
+
 async fn sleep_engine_retry(attempt: usize) {
     let multiplier = (attempt + 1) as u32;
     tokio::time::sleep(ENGINE_RPC_RETRY_DELAY * multiplier).await;
@@ -720,6 +753,8 @@ impl EngineClient {
 
     /// Append a batch of records to the engine.
     pub async fn append_batch(&mut self, records: Vec<Record>) -> Result<i32> {
+        validate_append_batch_records(&records)?;
+        let expected = records.len();
         for attempt in 0..ENGINE_RPC_RETRY_ATTEMPTS {
             match self
                 .next_client()
@@ -728,7 +763,10 @@ impl EngineClient {
                 })
                 .await
             {
-                Ok(response) => return Ok(response.into_inner().written_count),
+                Ok(response) => {
+                    let response = response.into_inner();
+                    return validate_append_batch_response(&response, expected);
+                }
                 Err(status)
                     if attempt + 1 < ENGINE_RPC_RETRY_ATTEMPTS
                         && is_retryable_engine_status(&status) =>
@@ -835,6 +873,56 @@ mod tests {
     fn retryable_engine_status_does_not_retry_plain_internal_errors() {
         let status = tonic::Status::internal("serialization failed");
         assert!(!is_retryable_engine_status(&status));
+    }
+
+    #[tokio::test]
+    async fn append_batch_rejects_multi_run_before_retry_or_rpc() {
+        let mut client = EngineClient {
+            clients: Vec::new(),
+            next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let records = vec![
+            Record {
+                run_id: "run-a".into(),
+                event_type: "step.started".into(),
+                ..Default::default()
+            },
+            Record {
+                run_id: "run-b".into(),
+                event_type: "step.completed".into(),
+                ..Default::default()
+            },
+        ];
+
+        let error = client.append_batch(records).await.unwrap_err();
+
+        assert!(matches!(error, SdkError::InvalidArgument { .. }));
+        assert_eq!(
+            client.next.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "preflight rejection must happen before the retry loop selects a connection"
+        );
+    }
+
+    #[test]
+    fn append_batch_rejects_malformed_response_counts() {
+        for response in [
+            AppendBatchResponse {
+                offsets: vec![1],
+                written_count: 1,
+            },
+            AppendBatchResponse {
+                offsets: vec![1, 2],
+                written_count: -1,
+            },
+            AppendBatchResponse {
+                offsets: vec![1, 2],
+                written_count: 3,
+            },
+        ] {
+            let error = validate_append_batch_response(&response, 2).unwrap_err();
+            assert!(matches!(error, SdkError::Internal(_)));
+        }
     }
 }
 

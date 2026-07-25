@@ -3,10 +3,10 @@ use crate::error::{Result, SdkError};
 use crate::journal_queue::{JournalEventMessage, JournalEventQueue, JournalQueueConfig};
 use crate::pb::{
     execution_engine_service_client::ExecutionEngineServiceClient, CompleteJobRequest,
-    ComponentInfo, DispatchComponentResponse, EventStreamMessage, HealthCheck, JobAssignment,
-    PollJobRequest, RegisterService, RegisterWorkerSessionRequest, RenewJobLeaseRequest,
-    ReportWorkerCapacityRequest, RuntimeMessage, RuntimeMessageType, ServiceMessage,
-    UnregisterService, WorkerCapability, WorkerHealthStatus, WorkerSlotPolicy,
+    CompleteJobResponse, ComponentInfo, DispatchComponentResponse, EventStreamMessage, HealthCheck,
+    JobAssignment, PollJobRequest, RegisterService, RegisterWorkerSessionRequest,
+    RenewJobLeaseRequest, ReportWorkerCapacityRequest, RuntimeMessage, RuntimeMessageType,
+    ServiceMessage, UnregisterService, WorkerCapability, WorkerHealthStatus, WorkerSlotPolicy,
     WriteCheckpointRequest,
 };
 use std::collections::{HashMap, HashSet};
@@ -20,6 +20,10 @@ use uuid::Uuid;
 const PARKED_WORKER_SESSION_REGISTER_ATTEMPTS: usize = 3;
 const PARKED_WORKER_SESSION_REGISTER_RETRY_MS: u64 = 1_000;
 const PARKED_WORKER_SESSION_TRANSIENT_RETRY_MAX_MS: u64 = 32_000;
+const PARKED_COMPLETION_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+const PARKED_COMPLETE_JOB_ATTEMPTS: usize = 3;
+const PARKED_COMPLETE_JOB_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
+const PARKED_COMPLETE_JOB_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ParkedWorkerSessionRegistrationResult {
@@ -76,38 +80,143 @@ fn take_correlation_ids(metadata: &mut HashMap<String, String>) -> (String, Stri
     (correlation_id, parent_correlation_id)
 }
 
+fn record_groups_by_run(records: &[crate::pb::Record]) -> Vec<Vec<usize>> {
+    let mut group_by_run = HashMap::<String, usize>::new();
+    let mut groups = Vec::<Vec<usize>>::new();
+    for (index, record) in records.iter().enumerate() {
+        let group_index = match group_by_run.get(&record.run_id) {
+            Some(index) => *index,
+            None => {
+                let index = groups.len();
+                group_by_run.insert(record.run_id.clone(), index);
+                groups.push(Vec::new());
+                index
+            }
+        };
+        groups[group_index].push(index);
+    }
+    groups
+}
+
+struct AppendGroupProgress {
+    committed: Vec<bool>,
+    written_total: i32,
+}
+
+impl AppendGroupProgress {
+    fn new(record_count: usize) -> Self {
+        Self {
+            committed: vec![false; record_count],
+            written_total: 0,
+        }
+    }
+
+    fn acknowledge(&mut self, group: &[usize], written: i32) {
+        self.written_total = self.written_total.saturating_add(written);
+        for &index in group {
+            self.committed[index] = true;
+        }
+    }
+
+    fn failure(self, error: SdkError) -> (SdkError, Vec<bool>, i32) {
+        (error, self.committed, self.written_total)
+    }
+}
+
+fn uncommitted_records_in_reverse<T>(records: Vec<T>, committed: &[bool]) -> Vec<T> {
+    records
+        .into_iter()
+        .enumerate()
+        .rev()
+        .filter_map(|(index, record)| (!committed[index]).then_some(record))
+        .collect()
+}
+
+async fn append_records_by_run(
+    engine: &mut EngineClient,
+    records: &[crate::pb::Record],
+) -> std::result::Result<i32, (SdkError, Vec<bool>, i32)> {
+    let mut progress = AppendGroupProgress::new(records.len());
+    for group in record_groups_by_run(records) {
+        let batch = group.iter().map(|index| records[*index].clone()).collect();
+        match engine.append_batch(batch).await {
+            Ok(written) => progress.acknowledge(&group, written),
+            Err(error) => return Err(progress.failure(error)),
+        }
+    }
+    Ok(progress.written_total)
+}
+
+fn polled_job_attempt(job: &JobAssignment) -> Result<u32> {
+    u32::try_from(job.attempt).map_err(|_| SdkError::InvalidMessage {
+        message: format!(
+            "PollJob returned negative attempt {} for job {}",
+            job.attempt, job.job_id
+        ),
+        field: Some("attempt".to_string()),
+    })
+}
+
 fn runtime_message_from_job_assignment(
     job: JobAssignment,
-) -> (RuntimeMessage, bool, String, String) {
+    configured_claim_timeout_ms: i64,
+) -> Result<(RuntimeMessage, bool, String, String, u32, i64)> {
+    if job.job_id.is_empty() || job.run_id.is_empty() {
+        return Err(SdkError::InvalidMessage {
+            message: "PollJob assignment requires nonempty job_id and run_id".to_string(),
+            field: Some("job_id/run_id".to_string()),
+        });
+    }
+    if job.job_id != job.run_id {
+        return Err(SdkError::InvalidMessage {
+            message: format!(
+                "PollJob assignment job_id {} does not match run_id {}",
+                job.job_id, job.run_id
+            ),
+            field: Some("job_id/run_id".to_string()),
+        });
+    }
+    if job.lease_id.is_empty() {
+        return Err(SdkError::InvalidMessage {
+            message: format!(
+                "PollJob assignment for job {} has no typed lease_id",
+                job.job_id
+            ),
+            field: Some("lease_id".to_string()),
+        });
+    }
+    if configured_claim_timeout_ms <= 0 {
+        return Err(SdkError::Configuration {
+            message: "parked pull claim timeout must be positive".to_string(),
+            field: Some("AGNT5_CLAIM_TIMEOUT_MS".to_string()),
+        });
+    }
+    let attempt = polled_job_attempt(&job)?;
+
     let mut metadata = job.metadata.clone();
     // A JobAssignment can only arrive through PollJob. Make that transport
     // decision visible to component code even when older queued records did
     // not carry the gateway's dispatch_mode stamp.
-    metadata
-        .entry("dispatch_mode".to_string())
-        .or_insert_with(|| "pull".to_string());
+    // PollJob is the authority for this execution mode. Caller-authored queued
+    // metadata must not downgrade a leased pull assignment to the unfenced
+    // push response path in a language SDK.
+    metadata.insert("dispatch_mode".to_string(), "pull".to_string());
     if !job.trace_id.is_empty() {
         metadata.insert("trace_id".to_string(), job.trace_id.clone());
     }
-    if !job.lease_id.is_empty() {
-        metadata
-            .entry("lease_id".to_string())
-            .or_insert_with(|| job.lease_id.clone());
-    }
+    metadata.insert("lease_id".to_string(), job.lease_id.clone());
+    metadata.remove("lease_expires_at_ms");
     if job.lease_expires_at_ms > 0 {
-        metadata
-            .entry("lease_expires_at_ms".to_string())
-            .or_insert_with(|| job.lease_expires_at_ms.to_string());
+        metadata.insert(
+            "lease_expires_at_ms".to_string(),
+            job.lease_expires_at_ms.to_string(),
+        );
     }
 
     let is_streaming = metadata.get("stream_mode").map_or(false, |m| m == "full");
     let session_id = metadata.get("session_id").cloned().unwrap_or_default();
     let user_id = metadata.get("user_id").cloned().unwrap_or_default();
-    let lease_id = if !job.lease_id.is_empty() {
-        job.lease_id.clone()
-    } else {
-        metadata.get("lease_id").cloned().unwrap_or_default()
-    };
+    let lease_id = job.lease_id.clone();
     let deployment_id = metadata.get("deployment_id").cloned().unwrap_or_default();
     let priority = metadata
         .get("priority")
@@ -146,7 +255,14 @@ fn runtime_message_from_job_assignment(
         )),
     };
 
-    (runtime_message, is_streaming, run_id, lease_id)
+    Ok((
+        runtime_message,
+        is_streaming,
+        run_id,
+        lease_id,
+        attempt,
+        configured_claim_timeout_ms,
+    ))
 }
 
 fn env_usize(name: &str) -> Option<usize> {
@@ -429,6 +545,16 @@ fn dispatch_run_key(msg: &RuntimeMessage) -> Option<String> {
     }
 }
 
+fn stamp_dispatch_mode(runtime_message: &mut RuntimeMessage, dispatch_mode: &str) {
+    if let Some(crate::pb::runtime_message::MessageData::DispatchComponent(request)) =
+        runtime_message.message_data.as_mut()
+    {
+        request
+            .metadata
+            .insert("dispatch_mode".to_string(), dispatch_mode.to_string());
+    }
+}
+
 // RAII guard so the in-flight count is decremented even if a handler panics or
 // is cancelled. Parked polling uses this same guard so each parked slot maps to
 // one active handler invocation, not one queued local message.
@@ -449,11 +575,12 @@ impl Drop for InFlightGuard {
 
 async fn execute_runtime_message_for_response<F, Fut>(
     worker_name: &str,
-    runtime_message: RuntimeMessage,
+    mut runtime_message: RuntimeMessage,
     response_tx: flume::Sender<ServiceMessage>,
     handler: F,
     in_flight: Arc<std::sync::atomic::AtomicUsize>,
     cancel_tokens: Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
+    dispatch_mode: &'static str,
 ) -> Option<ServiceMessage>
 where
     F: Fn(RuntimeMessage, flume::Sender<ServiceMessage>) -> Fut + Send + Clone + 'static,
@@ -461,6 +588,7 @@ where
 {
     let _in_flight = InFlightGuard::enter(&in_flight);
     let tx_clone = response_tx.clone();
+    stamp_dispatch_mode(&mut runtime_message, dispatch_mode);
 
     let run_key = dispatch_run_key(&runtime_message);
     let result = if let Some(key) = run_key.clone() {
@@ -514,6 +642,7 @@ async fn execute_runtime_message<F, Fut>(
         handler,
         in_flight,
         cancel_tokens,
+        "push",
     )
     .await
     {
@@ -531,50 +660,131 @@ struct PolledJobCompletion {
     error_code: String,
     event_type: String,
     lease_id: String,
+    attempt: u32,
+}
+
+#[async_trait::async_trait]
+trait CompleteJobSender: Send {
+    async fn send_complete_job(
+        &mut self,
+        request: CompleteJobRequest,
+    ) -> Result<CompleteJobResponse>;
+}
+
+#[async_trait::async_trait]
+impl CompleteJobSender for WorkerCoordinatorClient {
+    async fn send_complete_job(
+        &mut self,
+        request: CompleteJobRequest,
+    ) -> Result<CompleteJobResponse> {
+        self.complete_job(request).await
+    }
+}
+
+async fn complete_job_with_retry<S: CompleteJobSender>(
+    sender: &mut S,
+    request: CompleteJobRequest,
+    attempts: usize,
+    attempt_timeout: Duration,
+    retry_delay: Duration,
+) -> Result<()> {
+    let attempts = attempts.max(1);
+    let job_id = request.job_id.clone();
+    let mut last_error = None;
+
+    for attempt in 1..=attempts {
+        let outcome =
+            tokio::time::timeout(attempt_timeout, sender.send_complete_job(request.clone())).await;
+        match outcome {
+            Ok(Ok(response)) if response.acknowledged => return Ok(()),
+            Ok(Ok(_)) => {
+                last_error = Some(SdkError::Internal(format!(
+                    "CompleteJob was not acknowledged for job {job_id}"
+                )));
+            }
+            Ok(Err(error)) => {
+                last_error = Some(error);
+            }
+            Err(_) => {
+                last_error = Some(SdkError::Timeout {
+                    message: format!("CompleteJob timed out for job {job_id}"),
+                    operation: "CompleteJob".to_string(),
+                    duration_ms: Some(attempt_timeout.as_millis() as u64),
+                });
+            }
+        }
+
+        if attempt < attempts {
+            warn!(
+                "CompleteJob attempt {}/{} failed for job_id={}; retrying",
+                attempt, attempts, job_id
+            );
+            tokio::time::sleep(retry_delay).await;
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        SdkError::Internal(format!(
+            "CompleteJob failed without an outcome for job {job_id}"
+        ))
+    }))
 }
 
 fn polled_job_completion_from_service_message(
     service_message: &ServiceMessage,
-    fallback_lease_id: &str,
+    assigned_job_id: &str,
+    assigned_lease_id: &str,
+    assigned_attempt: u32,
 ) -> Option<PolledJobCompletion> {
     match &service_message.message_type {
-        Some(crate::pb::service_message::MessageType::FunctionResponse(resp)) => {
-            let job_id = if let Some(idx) = resp.invocation_id.find(':') {
-                resp.invocation_id[..idx].to_string()
-            } else {
-                resp.invocation_id.clone()
-            };
-            if job_id.is_empty() {
-                warn!("Polled job response missing invocation_id; dropping");
-                return None;
-            }
-
+        Some(crate::pb::service_message::MessageType::FunctionResponse(resp))
+            if is_terminal_worker_response(&resp.event_type) =>
+        {
             let output_data = match &resp.result {
                 Some(crate::pb::dispatch_component_response::Result::OutputData(data)) => {
                     data.clone()
                 }
                 _ => Vec::new(),
             };
-            let lease_id = if resp.lease_id.is_empty() {
-                fallback_lease_id.to_string()
-            } else {
-                resp.lease_id.clone()
-            };
 
             Some(PolledJobCompletion {
-                job_id,
+                job_id: assigned_job_id.to_string(),
                 success: resp.success,
                 output_data,
                 error_message: resp.error_message.clone(),
                 error_code: resp.metadata.get("error_code").cloned().unwrap_or_default(),
                 event_type: resp.event_type.clone(),
-                lease_id,
+                lease_id: assigned_lease_id.to_string(),
+                attempt: assigned_attempt,
             })
         }
-        _ => {
-            warn!("Unexpected message type for polled job completion");
-            None
+        _ => None,
+    }
+}
+
+async fn wait_for_parked_run_events_flush(
+    journal_queue: &JournalEventQueue,
+    journal_flush_lock: &Arc<TokioMutex<()>>,
+    run_id: &str,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + PARKED_COMPLETION_FLUSH_TIMEOUT;
+    loop {
+        {
+            // The periodic sender holds this lock until its drained batch has
+            // been acknowledged or requeued. If this run is absent while we
+            // hold it, CompleteJob cannot overtake an in-flight child event.
+            let _flush_guard = journal_flush_lock.lock().await;
+            if !journal_queue.contains_run(run_id) {
+                return true;
+            }
         }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(
+            journal_queue.flush_interval_ms().max(1),
+        ))
+        .await;
     }
 }
 
@@ -586,22 +796,29 @@ async fn complete_polled_job_with_client(
     completion: PolledJobCompletion,
 ) -> Result<()> {
     let job_id = completion.job_id.clone();
-    match client
-        .complete_job(CompleteJobRequest {
-            job_id: completion.job_id,
-            worker_id: worker_id.to_string(),
-            success: completion.success,
-            output_data: completion.output_data,
-            error_message: completion.error_message,
-            error_code: completion.error_code,
-            metadata: HashMap::from([("completion_event_type".to_string(), completion.event_type)]),
-            project_id: tenant_id.to_string(),
-            lease_id: completion.lease_id,
-            worker_session_id: worker_session_id.to_string(),
-        })
-        .await
+    let request = CompleteJobRequest {
+        job_id: completion.job_id,
+        worker_id: worker_id.to_string(),
+        success: completion.success,
+        output_data: completion.output_data,
+        error_message: completion.error_message,
+        error_code: completion.error_code,
+        metadata: HashMap::from([("completion_event_type".to_string(), completion.event_type)]),
+        project_id: tenant_id.to_string(),
+        lease_id: completion.lease_id,
+        worker_session_id: worker_session_id.to_string(),
+        attempt: Some(completion.attempt),
+    };
+    match complete_job_with_retry(
+        client,
+        request,
+        PARKED_COMPLETE_JOB_ATTEMPTS,
+        PARKED_COMPLETE_JOB_ATTEMPT_TIMEOUT,
+        PARKED_COMPLETE_JOB_RETRY_DELAY,
+    )
+    .await
     {
-        Ok(_) => {
+        Ok(()) => {
             debug!("CompleteJob succeeded: job_id={}", job_id);
             Ok(())
         }
@@ -615,16 +832,23 @@ async fn complete_polled_job_with_client(
 async fn complete_or_forward_parked_response(
     client: &mut WorkerCoordinatorClient,
     service_message: ServiceMessage,
-    fallback_lease_id: &str,
+    assigned_job_id: &str,
+    assigned_lease_id: &str,
+    assigned_attempt: u32,
     worker_id: &str,
     worker_session_id: &Arc<TokioMutex<String>>,
     tenant_id: &str,
     slot_idx: usize,
     response_tx: &flume::Sender<ServiceMessage>,
+    journal_queue: &JournalEventQueue,
+    journal_flush_lock: &Arc<TokioMutex<()>>,
 ) -> bool {
-    let Some(completion) =
-        polled_job_completion_from_service_message(&service_message, fallback_lease_id)
-    else {
+    let Some(completion) = polled_job_completion_from_service_message(
+        &service_message,
+        assigned_job_id,
+        assigned_lease_id,
+        assigned_attempt,
+    ) else {
         if let Err(e) = response_tx.send_async(service_message).await {
             error!(
                 "Parked poll slot {} failed to send response: {}",
@@ -635,6 +859,13 @@ async fn complete_or_forward_parked_response(
     };
 
     let job_id = completion.job_id.clone();
+    if !wait_for_parked_run_events_flush(journal_queue, journal_flush_lock, &job_id).await {
+        warn!(
+            "Parked poll slot {} refusing to overtake unflushed events for job_id={}",
+            slot_idx, job_id
+        );
+        return false;
+    }
     let started = Instant::now();
     let current_session_id = worker_session_id.lock().await.clone();
     if let Err(e) = complete_polled_job_with_client(
@@ -943,6 +1174,8 @@ struct ParkedPollContext {
     cancel_tokens: Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
     streaming_runs: Arc<std::sync::Mutex<HashMap<String, bool>>>,
     pending_lease_ids: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    journal_queue: JournalEventQueue,
+    journal_flush_lock: Arc<TokioMutex<()>>,
     open_poll_slots: Arc<std::sync::atomic::AtomicUsize>,
     /// Live slot count (parked + busy), shared with the supervisor.
     total_slots: Arc<std::sync::atomic::AtomicUsize>,
@@ -1068,14 +1301,23 @@ where
                 // panics or is cancelled.
                 let _busy = InFlightGuard::enter(&ctx.busy_slots);
                 let _ = ctx.events_tx.send(ParkedSlotEvent::GotJob);
-                let lease_timeout_ms = job
-                    .metadata
-                    .get("lease_timeout_ms")
-                    .and_then(|v| v.parse::<i64>().ok())
-                    .filter(|v| *v > 0)
-                    .unwrap_or(ctx.claim_timeout_ms);
-                let (runtime_message, is_streaming, run_id, lease_id) =
-                    runtime_message_from_job_assignment(job);
+                let (
+                    runtime_message,
+                    is_streaming,
+                    run_id,
+                    lease_id,
+                    completion_attempt,
+                    lease_timeout_ms,
+                ) = match runtime_message_from_job_assignment(job, ctx.claim_timeout_ms) {
+                    Ok(assignment) => assignment,
+                    Err(error) => {
+                        error!(
+                            "Parked poll slot {} refusing invalid assignment: {}",
+                            slot_id, error
+                        );
+                        continue;
+                    }
+                };
                 let completion_run_id = run_id.clone();
                 let completion_lease_id = lease_id.clone();
                 if !lease_id.is_empty() {
@@ -1108,6 +1350,7 @@ where
                     handler.clone(),
                     ctx.in_flight.clone(),
                     ctx.cancel_tokens.clone(),
+                    "pull",
                 )
                 .await;
                 drop(slot_response_tx);
@@ -1117,12 +1360,16 @@ where
                     completed = complete_or_forward_parked_response(
                         &mut client,
                         service_message,
+                        &completion_run_id,
                         &completion_lease_id,
+                        completion_attempt,
                         &ctx.worker_id,
                         &ctx.worker_session_id,
                         &ctx.project_id,
                         slot_id,
                         &ctx.response_tx,
+                        &ctx.journal_queue,
+                        &ctx.journal_flush_lock,
                     )
                     .await;
                 }
@@ -1130,7 +1377,9 @@ where
                     if completed
                         && polled_job_completion_from_service_message(
                             &service_message,
+                            &completion_run_id,
                             &completion_lease_id,
+                            completion_attempt,
                         )
                         .is_some()
                     {
@@ -1143,12 +1392,16 @@ where
                     completed = complete_or_forward_parked_response(
                         &mut client,
                         service_message,
+                        &completion_run_id,
                         &completion_lease_id,
+                        completion_attempt,
                         &ctx.worker_id,
                         &ctx.worker_session_id,
                         &ctx.project_id,
                         slot_id,
                         &ctx.response_tx,
+                        &ctx.journal_queue,
+                        &ctx.journal_flush_lock,
                     )
                     .await
                         || completed;
@@ -1992,11 +2245,11 @@ impl Worker {
                 .collect();
 
             let count = originals.len();
-            match engine.append_batch(records).await {
+            match append_records_by_run(&mut engine, &records).await {
                 Ok(_) => {
                     debug!("Engine batch checkpoint: {} events persisted", count);
                 }
-                Err(e) => {
+                Err((e, committed, _written)) => {
                     warn!(
                         "Engine batch checkpoint failed for {} non-terminal events; queued for retry: {}",
                         count, e
@@ -2005,7 +2258,7 @@ impl Worker {
                         let mut guard = self.engine_client.lock().await;
                         *guard = None;
                     }
-                    for event in originals.into_iter().rev() {
+                    for event in uncommitted_records_in_reverse(originals, &committed) {
                         self.journal_queue.push_front(event).ok();
                     }
                     self.journal_queue.record_error();
@@ -3126,7 +3379,7 @@ impl Worker {
                                     }
                                     continue;
                                 }
-                                match eng.append_batch(records).await {
+                                match append_records_by_run(eng, &records).await {
                                     Ok(written) => {
                                         journal_queue.record_sent_batch(
                                             written as usize + streamed,
@@ -3138,11 +3391,20 @@ impl Worker {
                                             journal_queue.len()
                                         );
                                     }
-                                    Err(e) => {
+                                    Err((e, committed, written)) => {
                                         warn!("Flush task: Engine AppendBatch failed: {}", e);
                                         engine = None; // Clear for reconnection
-                                        for event in durable_originals.into_iter().rev() {
+                                        for event in uncommitted_records_in_reverse(
+                                            durable_originals,
+                                            &committed,
+                                        ) {
                                             journal_queue.push_front(event).ok();
+                                        }
+                                        if written > 0 || streamed > 0 {
+                                            journal_queue.record_sent_batch(
+                                                written as usize + streamed,
+                                                streamed,
+                                            );
                                         }
                                         journal_queue.record_error();
                                     }
@@ -3474,6 +3736,8 @@ impl Worker {
         let service_type = self.config.service_type.clone();
         let streaming_runs = self.streaming_runs.clone();
         let pending_lease_ids = self.pending_lease_ids.clone();
+        let journal_queue = self.journal_queue.clone();
+        let journal_flush_lock = self.journal_flush_lock.clone();
         let cancel_tokens = self.cancel_tokens.clone();
         let configured_max_slots = env_usize("AGNT5_MAX_SLOTS").unwrap_or(max_concurrency);
         let max_slots = configured_max_slots
@@ -3565,6 +3829,8 @@ impl Worker {
                 cancel_tokens,
                 streaming_runs,
                 pending_lease_ids,
+                journal_queue,
+                journal_flush_lock,
                 open_poll_slots,
                 total_slots: total_slots.clone(),
                 busy_slots: busy_slots.clone(),
@@ -3645,92 +3911,21 @@ impl Worker {
             }
         })
     }
-    /// Handle a polled job response by calling CompleteJob RPC.
-    ///
-    /// Called from parked long-poll workers. On the poll path `job_id == run_id`, so we
-    /// derive the job_id from `resp.invocation_id` — stripping any
-    /// `:suffix` the worker appends for streaming invocations. Project identity
-    /// comes from `AGNT5_PROJECT_ID`.
+    /// Reject the obsolete pull-response path, which has no parked slot
+    /// assignment and therefore cannot supply the required session + attempt
+    /// fence. Modern pull execution completes inside
+    /// `complete_or_forward_parked_response`.
     async fn handle_polled_job_response(&self, service_message: ServiceMessage) {
-        let (job_id, success, output_data, error_message, error_code, event_type, lease_id) =
-            match &service_message.message_type {
-                Some(crate::pb::service_message::MessageType::FunctionResponse(resp)) => {
-                    // Derive job_id from invocation_id (strip streaming suffix).
-                    let jid = if let Some(idx) = resp.invocation_id.find(':') {
-                        resp.invocation_id[..idx].to_string()
-                    } else {
-                        resp.invocation_id.clone()
-                    };
-                    if jid.is_empty() {
-                        warn!("Polled job response missing invocation_id; dropping");
-                        return;
-                    }
-                    let output = match &resp.result {
-                        Some(crate::pb::dispatch_component_response::Result::OutputData(data)) => {
-                            data.clone()
-                        }
-                        _ => Vec::new(),
-                    };
-                    (
-                        jid,
-                        resp.success,
-                        output,
-                        resp.error_message.clone(),
-                        resp.metadata.get("error_code").cloned().unwrap_or_default(),
-                        resp.event_type.clone(),
-                        resp.lease_id.clone(),
-                    )
-                }
-                _ => {
-                    warn!("Unexpected message type for polled job completion");
-                    return;
-                }
-            };
-
-        // Pull workers derive tenant_id from the same env var the parked
-        // PollJob task uses.
-        let tenant_id = canonical_project_id_from_env();
-
-        // Call CompleteJob RPC
-        let endpoint = self.config.resolved_coordinator_endpoint();
-        let worker_id = self.config.worker_id.clone();
-
-        // Spawn a task to avoid blocking the dispatch loop
-        tokio::spawn(async move {
-            let mut client = match WorkerCoordinatorClient::connect(endpoint).await {
-                Ok(c) => c,
-                Err(e) => {
-                    error!(
-                        "Failed to connect for CompleteJob: job_id={} error={}",
-                        job_id, e
-                    );
-                    return;
-                }
-            };
-
-            match client
-                .complete_job(CompleteJobRequest {
-                    job_id: job_id.clone(),
-                    worker_id,
-                    success,
-                    output_data,
-                    error_message,
-                    error_code,
-                    metadata: HashMap::from([("completion_event_type".to_string(), event_type)]),
-                    project_id: tenant_id,
-                    lease_id,
-                    worker_session_id: String::new(),
-                })
-                .await
-            {
-                Ok(_) => {
-                    debug!("CompleteJob succeeded: job_id={}", job_id);
-                }
-                Err(e) => {
-                    error!("CompleteJob failed: job_id={} error={}", job_id, e);
-                }
+        let invocation_id = match &service_message.message_type {
+            Some(crate::pb::service_message::MessageType::FunctionResponse(response)) => {
+                response.invocation_id.as_str()
             }
-        });
+            _ => "",
+        };
+        error!(
+            invocation_id,
+            "Dropping unfenced legacy pull completion; parked PollJob completion is required"
+        );
     }
 
     /// Write a health marker file so the K8s readiness probe passes.
@@ -3811,30 +4006,118 @@ impl Worker {
 fn is_terminal_worker_response(event_type: &str) -> bool {
     matches!(
         event_type,
-        "run.completed" | "run.failed" | "run.cancelled" | "run.paused" | "workflow.paused"
+        "run.completed" | "run.failed" | "run.paused" | "workflow.paused"
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        is_parked_worker_session_registration_rejection, is_terminal_worker_response,
-        is_worker_session_inactive_error, parked_lease_danger_retry_ms,
-        parked_lease_renew_interval_ms, parked_lease_renew_interval_with_jitter_ms,
-        parked_ramp_spawn_count, parked_worker_session_was_refreshed,
-        runtime_message_from_job_assignment, take_correlation_ids, try_retire_parked_slot,
-        worker_capabilities, ParkedWorkerSessionRegistration, Worker, WorkerConfig,
+        complete_job_with_retry, is_parked_worker_session_registration_rejection,
+        is_terminal_worker_response, is_worker_session_inactive_error,
+        parked_lease_danger_retry_ms, parked_lease_renew_interval_ms,
+        parked_lease_renew_interval_with_jitter_ms, parked_ramp_spawn_count,
+        parked_worker_session_was_refreshed, polled_job_completion_from_service_message,
+        record_groups_by_run, runtime_message_from_job_assignment, stamp_dispatch_mode,
+        take_correlation_ids, try_retire_parked_slot, uncommitted_records_in_reverse,
+        wait_for_parked_run_events_flush, worker_capabilities, AppendGroupProgress,
+        CompleteJobSender, ParkedWorkerSessionRegistration, Worker, WorkerConfig,
     };
     use crate::error::{ErrorCode, SdkError};
-    use crate::pb::{runtime_message, JobAssignment};
-    use std::collections::HashMap;
+    use crate::journal_queue::{JournalEventMessage, JournalEventQueue, JournalQueueConfig};
+    use crate::pb::{
+        dispatch_component_response, runtime_message, CompleteJobRequest, CompleteJobResponse,
+        DispatchComponentResponse, JobAssignment, ServiceMessage,
+    };
+    use std::collections::{HashMap, VecDeque};
+
+    struct ScriptedCompleteJobSender {
+        outcomes: VecDeque<crate::error::Result<CompleteJobResponse>>,
+        requests: Vec<CompleteJobRequest>,
+    }
+
+    #[async_trait::async_trait]
+    impl CompleteJobSender for ScriptedCompleteJobSender {
+        async fn send_complete_job(
+            &mut self,
+            request: CompleteJobRequest,
+        ) -> crate::error::Result<CompleteJobResponse> {
+            self.requests.push(request);
+            self.outcomes
+                .pop_front()
+                .unwrap_or_else(|| Err(SdkError::Internal("missing scripted outcome".to_string())))
+        }
+    }
 
     #[test]
     fn paused_worker_responses_are_terminal() {
         for event_type in ["run.paused", "workflow.paused"] {
             assert!(is_terminal_worker_response(event_type));
         }
+        assert!(!is_terminal_worker_response("run.cancelled"));
         assert!(!is_terminal_worker_response("output.delta"));
+    }
+
+    #[test]
+    fn push_dispatch_mode_overrides_caller_metadata() {
+        let mut message = crate::pb::RuntimeMessage {
+            message_data: Some(runtime_message::MessageData::DispatchComponent(
+                crate::pb::DispatchComponentRequest {
+                    metadata: HashMap::from([("dispatch_mode".to_string(), "pull".to_string())]),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+
+        stamp_dispatch_mode(&mut message, "push");
+
+        let Some(runtime_message::MessageData::DispatchComponent(request)) = message.message_data
+        else {
+            panic!("dispatch request");
+        };
+        assert_eq!(
+            request.metadata.get("dispatch_mode").map(String::as_str),
+            Some("push")
+        );
+    }
+
+    #[test]
+    fn durable_engine_records_are_grouped_by_run_without_reordering_each_run() {
+        let records = vec![
+            crate::pb::Record {
+                run_id: "run-a".into(),
+                event_type: "a-1".into(),
+                ..Default::default()
+            },
+            crate::pb::Record {
+                run_id: "run-b".into(),
+                event_type: "b-1".into(),
+                ..Default::default()
+            },
+            crate::pb::Record {
+                run_id: "run-a".into(),
+                event_type: "a-2".into(),
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(record_groups_by_run(&records), vec![vec![0, 2], vec![1]]);
+    }
+
+    #[test]
+    fn durable_engine_partial_group_failure_requeues_only_unacknowledged_records() {
+        let mut progress = AppendGroupProgress::new(4);
+        progress.acknowledge(&[0, 2], 2);
+        let (_error, committed, written) =
+            progress.failure(SdkError::Internal("run-b failed".to_string()));
+
+        assert_eq!(committed, vec![true, false, true, false]);
+        assert_eq!(written, 2);
+        assert_eq!(
+            uncommitted_records_in_reverse(vec![0, 1, 2, 3], &committed),
+            vec![3, 1]
+        );
     }
 
     #[test]
@@ -3917,6 +4200,10 @@ mod tests {
             metadata: HashMap::from([
                 ("stream_mode".to_string(), "full".to_string()),
                 ("deployment_id".to_string(), "dep-1".to_string()),
+                ("dispatch_mode".to_string(), "push".to_string()),
+                ("lease_id".to_string(), "forged-lease".to_string()),
+                ("lease_expires_at_ms".to_string(), "999999999".to_string()),
+                ("lease_timeout_ms".to_string(), "1".to_string()),
             ]),
             attempt: 2,
             timeout_ms: 0,
@@ -3925,11 +4212,14 @@ mod tests {
             lease_expires_at_ms: 123_456,
         };
 
-        let (message, is_streaming, run_id, lease_id) = runtime_message_from_job_assignment(job);
+        let (message, is_streaming, run_id, lease_id, attempt, renewal_timeout_ms) =
+            runtime_message_from_job_assignment(job, 60_000).expect("valid typed assignment");
 
         assert!(is_streaming);
         assert_eq!(run_id, "run-1");
         assert_eq!(lease_id, "lease-1");
+        assert_eq!(attempt, 2);
+        assert_eq!(renewal_timeout_ms, 60_000);
         match message.message_data {
             Some(runtime_message::MessageData::DispatchComponent(req)) => {
                 assert_eq!(req.invocation_id, "run-1");
@@ -3956,6 +4246,165 @@ mod tests {
             }
             other => panic!("expected dispatch component, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn negative_polled_job_attempt_is_rejected_before_execution() {
+        let error = runtime_message_from_job_assignment(
+            JobAssignment {
+                job_id: "run-negative-attempt".to_string(),
+                run_id: "run-negative-attempt".to_string(),
+                lease_id: "lease-negative-attempt".to_string(),
+                attempt: -1,
+                ..Default::default()
+            },
+            60_000,
+        )
+        .expect_err("negative attempt must fail closed");
+
+        assert!(error.to_string().contains("negative attempt -1"));
+    }
+
+    #[test]
+    fn assignment_does_not_fall_back_to_forged_lease_metadata() {
+        let error = runtime_message_from_job_assignment(
+            JobAssignment {
+                job_id: "run-forged-lease".to_string(),
+                run_id: "run-forged-lease".to_string(),
+                lease_id: String::new(),
+                lease_expires_at_ms: 0,
+                metadata: HashMap::from([
+                    ("lease_id".to_string(), "forged-lease".to_string()),
+                    ("lease_expires_at_ms".to_string(), "999999999".to_string()),
+                ]),
+                ..Default::default()
+            },
+            60_000,
+        )
+        .expect_err("typed lease is required before executing user code");
+
+        assert!(error.to_string().contains("no typed lease_id"));
+    }
+
+    #[test]
+    fn parked_completion_preserves_assignment_attempt_and_lease() {
+        let service_message = ServiceMessage {
+            message_type: Some(crate::pb::service_message::MessageType::FunctionResponse(
+                DispatchComponentResponse {
+                    invocation_id: "forged-run:component-0".to_string(),
+                    success: true,
+                    result: Some(dispatch_component_response::Result::OutputData(
+                        br#"{"ok":true}"#.to_vec(),
+                    )),
+                    event_type: "run.completed".to_string(),
+                    lease_id: "forged-lease".to_string(),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+
+        let completion =
+            polled_job_completion_from_service_message(&service_message, "run-1", "lease-7", 7)
+                .expect("function response should become a fenced completion");
+
+        assert_eq!(completion.job_id, "run-1");
+        assert_eq!(completion.lease_id, "lease-7");
+        assert_eq!(completion.attempt, 7);
+    }
+
+    #[test]
+    fn parked_nonterminal_response_does_not_complete_assignment() {
+        let service_message = ServiceMessage {
+            message_type: Some(crate::pb::service_message::MessageType::FunctionResponse(
+                DispatchComponentResponse {
+                    invocation_id: "run-1".to_string(),
+                    success: true,
+                    event_type: "output.delta".to_string(),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+
+        assert!(polled_job_completion_from_service_message(
+            &service_message,
+            "run-1",
+            "lease-7",
+            7,
+        )
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn parked_completion_retries_until_runtime_acknowledges() {
+        let mut sender = ScriptedCompleteJobSender {
+            outcomes: VecDeque::from([
+                Err(SdkError::Connection {
+                    message: "temporary CompleteJob failure".to_string(),
+                    code: ErrorCode::ConnectionFailed,
+                    source: None,
+                }),
+                Ok(CompleteJobResponse {
+                    acknowledged: false,
+                }),
+                Ok(CompleteJobResponse { acknowledged: true }),
+            ]),
+            requests: Vec::new(),
+        };
+        let request = CompleteJobRequest {
+            job_id: "run-1".to_string(),
+            lease_id: "lease-7".to_string(),
+            attempt: Some(7),
+            ..Default::default()
+        };
+
+        complete_job_with_retry(
+            &mut sender,
+            request,
+            3,
+            std::time::Duration::from_millis(50),
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect("third acknowledged response should succeed");
+
+        assert_eq!(sender.requests.len(), 3);
+        assert!(sender
+            .requests
+            .iter()
+            .all(|request| request.lease_id == "lease-7" && request.attempt == Some(7)));
+    }
+
+    #[tokio::test]
+    async fn parked_completion_waits_for_run_events_to_finish_flushing() {
+        let queue = JournalEventQueue::new(JournalQueueConfig {
+            flush_interval_ms: 1,
+            ..Default::default()
+        });
+        queue
+            .push(JournalEventMessage {
+                run_id: "run-1".to_string(),
+                event_type: "function.completed".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        let flush_lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        let queue_for_sender = queue.clone();
+        let lock_for_sender = flush_lock.clone();
+        let sender = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            let _guard = lock_for_sender.lock().await;
+            let drained = queue_for_sender.drain_run_events("run-1");
+            assert_eq!(drained.len(), 1);
+            // Model an acknowledged send while the periodic flush lock remains
+            // held. The completion barrier must not return during this window.
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        });
+
+        assert!(wait_for_parked_run_events_flush(&queue, &flush_lock, "run-1").await);
+        sender.await.unwrap();
+        assert!(!queue.contains_run("run-1"));
     }
 
     #[test]

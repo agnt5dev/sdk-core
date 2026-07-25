@@ -986,6 +986,8 @@ message ReleaseActiveDispatchRequest {
   string event_type = 2;
   // Coordinator that observed the terminal event.
   string source_coordinator_id = 3;
+  // Durable lease fence captured by the terminal projection.
+  string lease_id = 4;
 }
 
 message ReleaseActiveDispatchAck {
