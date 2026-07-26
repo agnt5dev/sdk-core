@@ -5,9 +5,11 @@ use crate::pb::{
     worker_coordinator_service_client::WorkerCoordinatorServiceClient, AppendBatchRequest,
     AppendBatchResponse, AppendRequest, CheckpointRequest, CheckpointType, CompleteJobRequest,
     CompleteJobResponse, DurableStepCheckpoint, EventStreamMessage, FindByStepKeyRequest,
-    PollJobRequest, PollJobResponse, Record, RegisterService, RegisterWorkerSessionRequest,
-    RegisterWorkerSessionResponse, RenewJobLeaseRequest, RenewJobLeaseResponse,
-    ReportWorkerCapacityRequest, ReportWorkerCapacityResponse, RuntimeMessage, ServiceMessage,
+    GetEntityStateRequest, GetEntityStateResponse, PollJobRequest, PollJobResponse,
+    PutEntityStateRequest, PutEntityStateResponse, Record, RegisterService,
+    RegisterWorkerSessionRequest, RegisterWorkerSessionResponse, RenewJobLeaseRequest,
+    RenewJobLeaseResponse, ReportWorkerCapacityRequest, ReportWorkerCapacityResponse,
+    RuntimeMessage, ServiceMessage,
 };
 use std::collections::HashMap;
 use std::time::Duration;
@@ -457,6 +459,39 @@ impl WorkerCoordinatorClient {
         .into_inner();
 
         Ok(response)
+    }
+
+    /// Read entity state through the same unary Engine service used by parked
+    /// polling. This is request-scoped and does not require a worker stream.
+    pub async fn get_entity_state(
+        &mut self,
+        req: GetEntityStateRequest,
+    ) -> Result<GetEntityStateResponse> {
+        self.engine_client
+            .get_entity_state(req)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|error| SdkError::Connection {
+                message: format!("GetEntityState failed: {error}"),
+                code: crate::error::ErrorCode::ConnectionFailed,
+                source: None,
+            })
+    }
+
+    /// Persist entity state through a unary, lease-fenced Engine request.
+    pub async fn put_entity_state(
+        &mut self,
+        req: PutEntityStateRequest,
+    ) -> Result<PutEntityStateResponse> {
+        self.engine_client
+            .put_entity_state(req)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|error| SdkError::Connection {
+                message: format!("PutEntityState failed: {error}"),
+                code: crate::error::ErrorCode::ConnectionFailed,
+                source: None,
+            })
     }
 
     /// Renew an active job lease for a parked-poll assignment.

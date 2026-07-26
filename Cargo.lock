@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "agnt5-sdk-core"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "async-stream",

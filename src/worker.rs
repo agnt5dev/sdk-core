@@ -2,10 +2,13 @@ use crate::client::{self, EngineClient, WorkerCoordinatorClient};
 use crate::error::{Result, SdkError};
 use crate::journal_queue::{JournalEventMessage, JournalEventQueue, JournalQueueConfig};
 use crate::pb::{
-    execution_engine_service_client::ExecutionEngineServiceClient, CompleteJobRequest,
-    CompleteJobResponse, ComponentInfo, DispatchComponentResponse, EventStreamMessage, HealthCheck,
-    JobAssignment, PollJobRequest, RegisterService, RegisterWorkerSessionRequest,
-    RenewJobLeaseRequest, ReportWorkerCapacityRequest, RuntimeMessage, RuntimeMessageType,
+    execution_engine_service_client::ExecutionEngineServiceClient, runtime_message,
+    runtime_service_request, runtime_service_response, service_message, CompleteJobRequest,
+    CompleteJobResponse, ComponentInfo, DispatchComponentResponse, EntityStateLoadResult,
+    EntityStateSaveResult, EventStreamMessage, GetEntityStateRequest, GetEntityStateResponse,
+    HealthCheck, JobAssignment, PollJobRequest, PutEntityStateRequest, PutEntityStateResponse,
+    RegisterService, RegisterWorkerSessionRequest, RenewJobLeaseRequest,
+    ReportWorkerCapacityRequest, RuntimeMessage, RuntimeMessageType, RuntimeServiceResponse,
     ServiceMessage, UnregisterService, WorkerCapability, WorkerHealthStatus, WorkerSlotPolicy,
     WriteCheckpointRequest,
 };
@@ -24,6 +27,14 @@ const PARKED_COMPLETION_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 const PARKED_COMPLETE_JOB_ATTEMPTS: usize = 3;
 const PARKED_COMPLETE_JOB_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 const PARKED_COMPLETE_JOB_RETRY_DELAY: Duration = Duration::from_millis(100);
+const ASSIGNMENT_AUTHORED_RETRY_METADATA_KEYS: &[&str] = &[
+    "attempt",
+    "max_attempts",
+    "initial_interval_ms",
+    "max_interval_ms",
+    "backoff_type",
+    "backoff_multiplier",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ParkedWorkerSessionRegistrationResult {
@@ -160,7 +171,15 @@ fn polled_job_attempt(job: &JobAssignment) -> Result<u32> {
 fn runtime_message_from_job_assignment(
     job: JobAssignment,
     configured_claim_timeout_ms: i64,
-) -> Result<(RuntimeMessage, bool, String, String, u32, i64)> {
+) -> Result<(
+    RuntimeMessage,
+    bool,
+    String,
+    String,
+    u32,
+    i64,
+    HashMap<String, String>,
+)> {
     if job.job_id.is_empty() || job.run_id.is_empty() {
         return Err(SdkError::InvalidMessage {
             message: "PollJob assignment requires nonempty job_id and run_id".to_string(),
@@ -223,6 +242,13 @@ fn runtime_message_from_job_assignment(
         .and_then(|v| v.parse::<i32>().ok())
         .unwrap_or(0);
     let run_id = job.run_id.clone();
+    let mut completion_metadata = HashMap::new();
+    for key in &ASSIGNMENT_AUTHORED_RETRY_METADATA_KEYS[1..] {
+        if let Some(value) = metadata.get(*key) {
+            completion_metadata.insert((*key).to_string(), value.clone());
+        }
+    }
+    completion_metadata.insert("attempt".to_string(), attempt.to_string());
 
     let runtime_message = RuntimeMessage {
         worker_id: String::new(),
@@ -262,6 +288,7 @@ fn runtime_message_from_job_assignment(
         lease_id,
         attempt,
         configured_claim_timeout_ms,
+        completion_metadata,
     ))
 }
 
@@ -659,6 +686,7 @@ struct PolledJobCompletion {
     error_message: String,
     error_code: String,
     event_type: String,
+    metadata: HashMap<String, String>,
     lease_id: String,
     attempt: u32,
 }
@@ -679,6 +707,142 @@ impl CompleteJobSender for WorkerCoordinatorClient {
     ) -> Result<CompleteJobResponse> {
         self.complete_job(request).await
     }
+}
+
+#[async_trait::async_trait]
+trait EntityStateSender: Send {
+    async fn send_get_entity_state(
+        &mut self,
+        request: GetEntityStateRequest,
+    ) -> Result<GetEntityStateResponse>;
+
+    async fn send_put_entity_state(
+        &mut self,
+        request: PutEntityStateRequest,
+    ) -> Result<PutEntityStateResponse>;
+}
+
+#[async_trait::async_trait]
+impl EntityStateSender for WorkerCoordinatorClient {
+    async fn send_get_entity_state(
+        &mut self,
+        request: GetEntityStateRequest,
+    ) -> Result<GetEntityStateResponse> {
+        self.get_entity_state(request).await
+    }
+
+    async fn send_put_entity_state(
+        &mut self,
+        request: PutEntityStateRequest,
+    ) -> Result<PutEntityStateResponse> {
+        self.put_entity_state(request).await
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn parked_runtime_service_response<S: EntityStateSender>(
+    sender: &mut S,
+    service_message: &ServiceMessage,
+    project_id: &str,
+    run_id: &str,
+    worker_id: &str,
+    worker_session_id: &str,
+    lease_id: &str,
+    attempt: u32,
+) -> Option<RuntimeMessage> {
+    let service_message::MessageType::RuntimeService(request) =
+        service_message.message_type.as_ref()?
+    else {
+        return None;
+    };
+
+    let request_id = request.request_id.clone();
+    let response = match request.operation.as_ref() {
+        Some(runtime_service_request::Operation::EntityStateLoad(load)) => {
+            match sender
+                .send_get_entity_state(GetEntityStateRequest {
+                    project_id: project_id.to_string(),
+                    entity_type: load.entity_type.clone(),
+                    entity_key: load.entity_key.clone(),
+                    scope: load.scope.clone(),
+                    scope_id: load.scope_id.clone(),
+                })
+                .await
+            {
+                Ok(result) => RuntimeServiceResponse {
+                    request_id,
+                    success: true,
+                    error_message: String::new(),
+                    result: Some(runtime_service_response::Result::EntityStateLoad(
+                        EntityStateLoadResult {
+                            found: result.found,
+                            state_json: result.state_json,
+                            version: result.version,
+                        },
+                    )),
+                },
+                Err(error) => RuntimeServiceResponse {
+                    request_id,
+                    success: false,
+                    error_message: error.to_string(),
+                    result: None,
+                },
+            }
+        }
+        Some(runtime_service_request::Operation::EntityStateSave(save)) => {
+            match sender
+                .send_put_entity_state(PutEntityStateRequest {
+                    project_id: project_id.to_string(),
+                    entity_type: save.entity_type.clone(),
+                    entity_key: save.entity_key.clone(),
+                    scope: save.scope.clone(),
+                    scope_id: save.scope_id.clone(),
+                    state_json: save.state_json.clone(),
+                    expected_version: save.expected_version,
+                    run_id: run_id.to_string(),
+                    worker_id: worker_id.to_string(),
+                    worker_session_id: worker_session_id.to_string(),
+                    lease_id: lease_id.to_string(),
+                    attempt: Some(attempt),
+                    operation_id: request.request_id.clone(),
+                })
+                .await
+            {
+                Ok(result) => RuntimeServiceResponse {
+                    request_id,
+                    success: true,
+                    error_message: String::new(),
+                    result: Some(runtime_service_response::Result::EntityStateSave(
+                        EntityStateSaveResult {
+                            new_version: result.new_version,
+                        },
+                    )),
+                },
+                Err(error) => RuntimeServiceResponse {
+                    request_id,
+                    success: false,
+                    error_message: error.to_string(),
+                    result: None,
+                },
+            }
+        }
+        _ => RuntimeServiceResponse {
+            request_id,
+            success: false,
+            error_message: "runtime service operation is not available through parked polling yet"
+                .to_string(),
+            result: None,
+        },
+    };
+
+    Some(RuntimeMessage {
+        worker_id: worker_id.to_string(),
+        message_type: RuntimeMessageType::RuntimeService as i32,
+        metadata: HashMap::new(),
+        message_data: Some(runtime_message::MessageData::RuntimeServiceResponse(
+            response,
+        )),
+    })
 }
 
 async fn complete_job_with_retry<S: CompleteJobSender>(
@@ -735,6 +899,7 @@ fn polled_job_completion_from_service_message(
     assigned_job_id: &str,
     assigned_lease_id: &str,
     assigned_attempt: u32,
+    assigned_completion_metadata: &HashMap<String, String>,
 ) -> Option<PolledJobCompletion> {
     match &service_message.message_type {
         Some(crate::pb::service_message::MessageType::FunctionResponse(resp))
@@ -747,13 +912,20 @@ fn polled_job_completion_from_service_message(
                 _ => Vec::new(),
             };
 
+            let mut metadata = resp.metadata.clone();
+            for key in ASSIGNMENT_AUTHORED_RETRY_METADATA_KEYS {
+                metadata.remove(*key);
+            }
+            metadata.extend(assigned_completion_metadata.clone());
+
             Some(PolledJobCompletion {
                 job_id: assigned_job_id.to_string(),
                 success: resp.success,
                 output_data,
                 error_message: resp.error_message.clone(),
-                error_code: resp.metadata.get("error_code").cloned().unwrap_or_default(),
+                error_code: metadata.get("error_code").cloned().unwrap_or_default(),
                 event_type: resp.event_type.clone(),
+                metadata,
                 lease_id: assigned_lease_id.to_string(),
                 attempt: assigned_attempt,
             })
@@ -788,6 +960,29 @@ async fn wait_for_parked_run_events_flush(
     }
 }
 
+fn complete_job_request_from_polled_completion(
+    worker_id: &str,
+    worker_session_id: &str,
+    tenant_id: &str,
+    completion: PolledJobCompletion,
+) -> CompleteJobRequest {
+    let mut metadata = completion.metadata;
+    metadata.insert("completion_event_type".to_string(), completion.event_type);
+    CompleteJobRequest {
+        job_id: completion.job_id,
+        worker_id: worker_id.to_string(),
+        success: completion.success,
+        output_data: completion.output_data,
+        error_message: completion.error_message,
+        error_code: completion.error_code,
+        metadata,
+        project_id: tenant_id.to_string(),
+        lease_id: completion.lease_id,
+        worker_session_id: worker_session_id.to_string(),
+        attempt: Some(completion.attempt),
+    }
+}
+
 async fn complete_polled_job_with_client(
     client: &mut WorkerCoordinatorClient,
     worker_id: &str,
@@ -796,19 +991,12 @@ async fn complete_polled_job_with_client(
     completion: PolledJobCompletion,
 ) -> Result<()> {
     let job_id = completion.job_id.clone();
-    let request = CompleteJobRequest {
-        job_id: completion.job_id,
-        worker_id: worker_id.to_string(),
-        success: completion.success,
-        output_data: completion.output_data,
-        error_message: completion.error_message,
-        error_code: completion.error_code,
-        metadata: HashMap::from([("completion_event_type".to_string(), completion.event_type)]),
-        project_id: tenant_id.to_string(),
-        lease_id: completion.lease_id,
-        worker_session_id: worker_session_id.to_string(),
-        attempt: Some(completion.attempt),
-    };
+    let request = complete_job_request_from_polled_completion(
+        worker_id,
+        worker_session_id,
+        tenant_id,
+        completion,
+    );
     match complete_job_with_retry(
         client,
         request,
@@ -835,6 +1023,7 @@ async fn complete_or_forward_parked_response(
     assigned_job_id: &str,
     assigned_lease_id: &str,
     assigned_attempt: u32,
+    assigned_completion_metadata: &HashMap<String, String>,
     worker_id: &str,
     worker_session_id: &Arc<TokioMutex<String>>,
     tenant_id: &str,
@@ -843,11 +1032,20 @@ async fn complete_or_forward_parked_response(
     journal_queue: &JournalEventQueue,
     journal_flush_lock: &Arc<TokioMutex<()>>,
 ) -> bool {
+    if is_cancelled_worker_response(&service_message) {
+        debug!(
+            "Parked poll slot {} observed runtime-authored cancellation for job_id={}",
+            slot_idx, assigned_job_id
+        );
+        return true;
+    }
+
     let Some(completion) = polled_job_completion_from_service_message(
         &service_message,
         assigned_job_id,
         assigned_lease_id,
         assigned_attempt,
+        assigned_completion_metadata,
     ) else {
         if let Err(e) = response_tx.send_async(service_message).await {
             error!(
@@ -1308,6 +1506,7 @@ where
                     lease_id,
                     completion_attempt,
                     lease_timeout_ms,
+                    completion_metadata,
                 ) = match runtime_message_from_job_assignment(job, ctx.claim_timeout_ms) {
                     Ok(assignment) => assignment,
                     Err(error) => {
@@ -1343,7 +1542,7 @@ where
                 );
 
                 let (slot_response_tx, slot_response_rx) = flume::unbounded::<ServiceMessage>();
-                let returned_response = execute_runtime_message_for_response(
+                let handler_future = execute_runtime_message_for_response(
                     &worker_name,
                     runtime_message,
                     slot_response_tx.clone(),
@@ -1351,9 +1550,55 @@ where
                     ctx.in_flight.clone(),
                     ctx.cancel_tokens.clone(),
                     "pull",
-                )
-                .await;
+                );
+                tokio::pin!(handler_future);
+                let mut buffered_responses = Vec::new();
+                let returned_response = loop {
+                    tokio::select! {
+                        response = &mut handler_future => break response,
+                        outgoing = slot_response_rx.recv_async() => {
+                            let Ok(outgoing) = outgoing else {
+                                break handler_future.await;
+                            };
+                            let current_session_id =
+                                ctx.worker_session_id.lock().await.clone();
+                            if let Some(runtime_response) = parked_runtime_service_response(
+                                &mut client,
+                                &outgoing,
+                                &ctx.project_id,
+                                &completion_run_id,
+                                &ctx.worker_id,
+                                &current_session_id,
+                                &completion_lease_id,
+                                completion_attempt,
+                            )
+                            .await
+                            {
+                                match handler.clone()(
+                                    runtime_response,
+                                    slot_response_tx.clone(),
+                                )
+                                .await
+                                {
+                                    Ok(Some(response)) => buffered_responses.push(response),
+                                    Ok(None) => {}
+                                    Err(error) => {
+                                        error!(
+                                            "Parked poll slot {} failed to deliver unary runtime response: {}",
+                                            slot_id, error
+                                        );
+                                    }
+                                }
+                            } else {
+                                buffered_responses.push(outgoing);
+                            }
+                        }
+                    }
+                };
                 drop(slot_response_tx);
+                while let Ok(service_message) = slot_response_rx.try_recv() {
+                    buffered_responses.push(service_message);
+                }
 
                 let mut completed = false;
                 if let Some(service_message) = returned_response {
@@ -1363,6 +1608,7 @@ where
                         &completion_run_id,
                         &completion_lease_id,
                         completion_attempt,
+                        &completion_metadata,
                         &ctx.worker_id,
                         &ctx.worker_session_id,
                         &ctx.project_id,
@@ -1373,13 +1619,14 @@ where
                     )
                     .await;
                 }
-                while let Ok(service_message) = slot_response_rx.try_recv() {
+                for service_message in buffered_responses {
                     if completed
                         && polled_job_completion_from_service_message(
                             &service_message,
                             &completion_run_id,
                             &completion_lease_id,
                             completion_attempt,
+                            &completion_metadata,
                         )
                         .is_some()
                     {
@@ -1395,6 +1642,7 @@ where
                         &completion_run_id,
                         &completion_lease_id,
                         completion_attempt,
+                        &completion_metadata,
                         &ctx.worker_id,
                         &ctx.worker_session_id,
                         &ctx.project_id,
@@ -1754,7 +2002,12 @@ impl Worker {
         timeout_ms: u64,
     ) -> Result<()> {
         let is_terminal = event_type == "run.completed" || event_type == "run.failed";
-        let _journal_flush_guard = if is_terminal {
+        let is_durable_checkpoint = JournalEventMessage::is_checkpoint_event_type(&event_type);
+        // A durable checkpoint is an ordering boundary for every transient
+        // event queued before it, not just for run.completed/run.failed.
+        // Holding the same lock as the periodic flush task prevents a drained,
+        // in-flight batch from being overtaken by the checkpoint.
+        let _journal_flush_guard = if is_durable_checkpoint {
             Some(self.journal_flush_lock.lock().await)
         } else {
             None
@@ -1762,11 +2015,10 @@ impl Worker {
 
         // ── Engine path: when AGNT5_ENGINE_URL is set, route directly to engine ──
         if let Some(mut engine) = self.ensure_engine_client().await? {
-            // Before terminal checkpoints, publish transient events through
-            // EventStream and persist only durable boundaries. Both calls are
-            // awaited while holding journal_flush_lock so the terminal cannot
-            // overtake a batch already drained by the periodic flush task.
-            if is_terminal {
+            // Publish pending transient events through EventStream and persist
+            // queued durable boundaries before appending this checkpoint.
+            // Both calls are acknowledged while journal_flush_lock is held.
+            if is_durable_checkpoint {
                 let pending = self.journal_queue.drain_run_events(&run_id);
                 if !pending.is_empty() {
                     let tenant_id = canonical_project_id_from_metadata(&metadata)
@@ -1804,20 +2056,26 @@ impl Worker {
                             )
                         })
                         .collect();
-                    if let Err(e) = engine.stream_events(transient).await {
-                        warn!(
-                            "Engine: failed to publish pre-checkpoint transient events for run_id={}: {}",
-                            run_id,
-                            e
-                        );
+                    if let Err(error) = engine.stream_events(transient).await {
+                        for event in pending.into_iter().rev() {
+                            self.journal_queue.push_front(event).ok();
+                        }
+                        self.journal_queue.record_error();
+                        let mut guard = self.engine_client.lock().await;
+                        *guard = None;
+                        return Err(error);
                     }
                     if !durable_records.is_empty() {
-                        if let Err(e) = engine.append_batch(durable_records).await {
-                            warn!(
-                                "Engine: failed to persist pre-checkpoint boundary events for run_id={}: {}",
-                                run_id,
-                                e
-                            );
+                        if let Err(error) = engine.append_batch(durable_records).await {
+                            for event in
+                                pending.into_iter().rev().filter(|event| !event.is_sse_only)
+                            {
+                                self.journal_queue.push_front(event).ok();
+                            }
+                            self.journal_queue.record_error();
+                            let mut guard = self.engine_client.lock().await;
+                            *guard = None;
+                            return Err(error);
                         }
                     }
                     debug!(
@@ -1905,11 +2163,11 @@ impl Worker {
 
         // ── Legacy EE path (AGNT5_ENGINE_URL not set) ──
 
-        // Before sending terminal checkpoints (run.completed/run.failed), flush any
-        // pending SSE-only events (logs, deltas) for this run.
+        // Before sending a durable checkpoint, flush any pending SSE-only
+        // events (logs, deltas) for this run.
         // Route through EventStream (EE) which is the single SSE publisher.
         // Falls back to dispatch stream (WC) only if EventStream is unavailable.
-        if is_terminal {
+        if is_durable_checkpoint {
             let pending = self.journal_queue.drain_run_events(&run_id);
             if !pending.is_empty() {
                 let es_tx = self.event_stream_tx.lock().ok().and_then(|g| g.clone());
@@ -4010,30 +4268,72 @@ fn is_terminal_worker_response(event_type: &str) -> bool {
     )
 }
 
+fn is_cancelled_worker_response(service_message: &ServiceMessage) -> bool {
+    matches!(
+        &service_message.message_type,
+        Some(crate::pb::service_message::MessageType::FunctionResponse(resp))
+            if resp.event_type == "run.cancelled"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        complete_job_with_retry, is_parked_worker_session_registration_rejection,
+        complete_job_request_from_polled_completion, complete_job_with_retry,
+        is_cancelled_worker_response, is_parked_worker_session_registration_rejection,
         is_terminal_worker_response, is_worker_session_inactive_error,
         parked_lease_danger_retry_ms, parked_lease_renew_interval_ms,
         parked_lease_renew_interval_with_jitter_ms, parked_ramp_spawn_count,
-        parked_worker_session_was_refreshed, polled_job_completion_from_service_message,
-        record_groups_by_run, runtime_message_from_job_assignment, stamp_dispatch_mode,
-        take_correlation_ids, try_retire_parked_slot, uncommitted_records_in_reverse,
-        wait_for_parked_run_events_flush, worker_capabilities, AppendGroupProgress,
-        CompleteJobSender, ParkedWorkerSessionRegistration, Worker, WorkerConfig,
+        parked_runtime_service_response, parked_worker_session_was_refreshed,
+        polled_job_completion_from_service_message, record_groups_by_run,
+        runtime_message_from_job_assignment, stamp_dispatch_mode, take_correlation_ids,
+        try_retire_parked_slot, uncommitted_records_in_reverse, wait_for_parked_run_events_flush,
+        worker_capabilities, AppendGroupProgress, CompleteJobSender, EntityStateSender,
+        ParkedWorkerSessionRegistration, Worker, WorkerConfig,
     };
     use crate::error::{ErrorCode, SdkError};
     use crate::journal_queue::{JournalEventMessage, JournalEventQueue, JournalQueueConfig};
     use crate::pb::{
-        dispatch_component_response, runtime_message, CompleteJobRequest, CompleteJobResponse,
-        DispatchComponentResponse, JobAssignment, ServiceMessage,
+        dispatch_component_response, runtime_message, runtime_service_request,
+        runtime_service_response, service_message, CompleteJobRequest, CompleteJobResponse,
+        DispatchComponentResponse, EntityStateSaveRequest, GetEntityStateRequest,
+        GetEntityStateResponse, JobAssignment, PutEntityStateRequest, PutEntityStateResponse,
+        RuntimeServiceRequest, ServiceMessage,
     };
     use std::collections::{HashMap, VecDeque};
 
     struct ScriptedCompleteJobSender {
         outcomes: VecDeque<crate::error::Result<CompleteJobResponse>>,
         requests: Vec<CompleteJobRequest>,
+    }
+
+    #[derive(Default)]
+    struct RecordingEntityStateSender {
+        get_requests: Vec<GetEntityStateRequest>,
+        put_requests: Vec<PutEntityStateRequest>,
+    }
+
+    #[async_trait::async_trait]
+    impl EntityStateSender for RecordingEntityStateSender {
+        async fn send_get_entity_state(
+            &mut self,
+            request: GetEntityStateRequest,
+        ) -> crate::error::Result<GetEntityStateResponse> {
+            self.get_requests.push(request);
+            Ok(GetEntityStateResponse {
+                found: false,
+                state_json: Vec::new(),
+                version: 0,
+            })
+        }
+
+        async fn send_put_entity_state(
+            &mut self,
+            request: PutEntityStateRequest,
+        ) -> crate::error::Result<PutEntityStateResponse> {
+            self.put_requests.push(request);
+            Ok(PutEntityStateResponse { new_version: 4 })
+        }
     }
 
     #[async_trait::async_trait]
@@ -4056,6 +4356,29 @@ mod tests {
         }
         assert!(!is_terminal_worker_response("run.cancelled"));
         assert!(!is_terminal_worker_response("output.delta"));
+    }
+
+    #[test]
+    fn cancelled_worker_response_is_consumed_without_completion() {
+        let message = ServiceMessage {
+            message_type: Some(crate::pb::service_message::MessageType::FunctionResponse(
+                DispatchComponentResponse {
+                    event_type: "run.cancelled".to_string(),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+
+        assert!(is_cancelled_worker_response(&message));
+        assert!(polled_job_completion_from_service_message(
+            &message,
+            "run-1",
+            "lease-1",
+            1,
+            &HashMap::new(),
+        )
+        .is_none());
     }
 
     #[test]
@@ -4204,6 +4527,7 @@ mod tests {
                 ("lease_id".to_string(), "forged-lease".to_string()),
                 ("lease_expires_at_ms".to_string(), "999999999".to_string()),
                 ("lease_timeout_ms".to_string(), "1".to_string()),
+                ("max_attempts".to_string(), "5".to_string()),
             ]),
             attempt: 2,
             timeout_ms: 0,
@@ -4212,14 +4536,29 @@ mod tests {
             lease_expires_at_ms: 123_456,
         };
 
-        let (message, is_streaming, run_id, lease_id, attempt, renewal_timeout_ms) =
-            runtime_message_from_job_assignment(job, 60_000).expect("valid typed assignment");
+        let (
+            message,
+            is_streaming,
+            run_id,
+            lease_id,
+            attempt,
+            renewal_timeout_ms,
+            completion_metadata,
+        ) = runtime_message_from_job_assignment(job, 60_000).expect("valid typed assignment");
 
         assert!(is_streaming);
         assert_eq!(run_id, "run-1");
         assert_eq!(lease_id, "lease-1");
         assert_eq!(attempt, 2);
         assert_eq!(renewal_timeout_ms, 60_000);
+        assert_eq!(
+            completion_metadata.get("attempt").map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            completion_metadata.get("max_attempts").map(String::as_str),
+            Some("5")
+        );
         match message.message_data {
             Some(runtime_message::MessageData::DispatchComponent(req)) => {
                 assert_eq!(req.invocation_id, "run-1");
@@ -4296,7 +4635,20 @@ mod tests {
                     result: Some(dispatch_component_response::Result::OutputData(
                         br#"{"ok":true}"#.to_vec(),
                     )),
-                    event_type: "run.completed".to_string(),
+                    metadata: HashMap::from([
+                        ("attempt".to_string(), "999".to_string()),
+                        ("max_attempts".to_string(), "999".to_string()),
+                        ("initial_interval_ms".to_string(), "999".to_string()),
+                        ("max_interval_ms".to_string(), "999".to_string()),
+                        ("backoff_type".to_string(), "forged".to_string()),
+                        ("backoff_multiplier".to_string(), "999".to_string()),
+                        ("pause_index".to_string(), "2".to_string()),
+                        (
+                            "step_events".to_string(),
+                            r#"{"0":"Ada","1":"blue"}"#.to_string(),
+                        ),
+                    ]),
+                    event_type: "workflow.paused".to_string(),
                     lease_id: "forged-lease".to_string(),
                     ..Default::default()
                 },
@@ -4304,13 +4656,164 @@ mod tests {
             ..Default::default()
         };
 
-        let completion =
-            polled_job_completion_from_service_message(&service_message, "run-1", "lease-7", 7)
-                .expect("function response should become a fenced completion");
+        let completion = polled_job_completion_from_service_message(
+            &service_message,
+            "run-1",
+            "lease-7",
+            7,
+            &HashMap::from([
+                ("attempt".to_string(), "7".to_string()),
+                ("max_attempts".to_string(), "5".to_string()),
+                ("initial_interval_ms".to_string(), "100".to_string()),
+                ("max_interval_ms".to_string(), "1000".to_string()),
+                ("backoff_type".to_string(), "exponential".to_string()),
+                ("backoff_multiplier".to_string(), "2".to_string()),
+            ]),
+        )
+        .expect("function response should become a fenced completion");
 
         assert_eq!(completion.job_id, "run-1");
         assert_eq!(completion.lease_id, "lease-7");
         assert_eq!(completion.attempt, 7);
+        assert_eq!(completion.event_type, "workflow.paused");
+        assert_eq!(
+            completion.metadata.get("attempt").map(String::as_str),
+            Some("7")
+        );
+        assert_eq!(
+            completion.metadata.get("max_attempts").map(String::as_str),
+            Some("5")
+        );
+        assert_eq!(
+            completion
+                .metadata
+                .get("initial_interval_ms")
+                .map(String::as_str),
+            Some("100")
+        );
+        assert_eq!(
+            completion
+                .metadata
+                .get("max_interval_ms")
+                .map(String::as_str),
+            Some("1000")
+        );
+        assert_eq!(
+            completion.metadata.get("backoff_type").map(String::as_str),
+            Some("exponential")
+        );
+        assert_eq!(
+            completion
+                .metadata
+                .get("backoff_multiplier")
+                .map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            completion.metadata.get("pause_index").map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            completion.metadata.get("step_events").map(String::as_str),
+            Some(r#"{"0":"Ada","1":"blue"}"#)
+        );
+    }
+
+    #[test]
+    fn parked_completion_drops_response_retry_policy_missing_from_assignment() {
+        let service_message = ServiceMessage {
+            message_type: Some(crate::pb::service_message::MessageType::FunctionResponse(
+                DispatchComponentResponse {
+                    success: false,
+                    metadata: HashMap::from([
+                        ("attempt".to_string(), "999".to_string()),
+                        ("max_attempts".to_string(), "999".to_string()),
+                        ("initial_interval_ms".to_string(), "999".to_string()),
+                        ("max_interval_ms".to_string(), "999".to_string()),
+                        ("backoff_type".to_string(), "forged".to_string()),
+                        ("backoff_multiplier".to_string(), "999".to_string()),
+                    ]),
+                    event_type: "run.failed".to_string(),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+
+        let completion = polled_job_completion_from_service_message(
+            &service_message,
+            "run-1",
+            "lease-7",
+            7,
+            &HashMap::from([("attempt".to_string(), "7".to_string())]),
+        )
+        .expect("terminal response should become a completion");
+
+        assert_eq!(
+            completion.metadata,
+            HashMap::from([("attempt".to_string(), "7".to_string())])
+        );
+    }
+
+    #[test]
+    fn parked_completion_builds_authoritative_complete_job_request() {
+        let completion = super::PolledJobCompletion {
+            job_id: "run-1".to_string(),
+            success: false,
+            output_data: Vec::new(),
+            error_message: "failed".to_string(),
+            error_code: "TEST_FAILURE".to_string(),
+            event_type: "run.failed".to_string(),
+            metadata: HashMap::from([
+                ("attempt".to_string(), "7".to_string()),
+                ("max_attempts".to_string(), "5".to_string()),
+                ("initial_interval_ms".to_string(), "100".to_string()),
+                ("max_interval_ms".to_string(), "1000".to_string()),
+                ("backoff_type".to_string(), "exponential".to_string()),
+                ("backoff_multiplier".to_string(), "2".to_string()),
+                (
+                    "completion_event_type".to_string(),
+                    "forged.event".to_string(),
+                ),
+            ]),
+            lease_id: "lease-7".to_string(),
+            attempt: 7,
+        };
+
+        let request = complete_job_request_from_polled_completion(
+            "worker-1",
+            "session-1",
+            "project-1",
+            completion,
+        );
+
+        assert_eq!(request.job_id, "run-1");
+        assert_eq!(request.worker_id, "worker-1");
+        assert_eq!(request.worker_session_id, "session-1");
+        assert_eq!(request.project_id, "project-1");
+        assert_eq!(request.lease_id, "lease-7");
+        assert_eq!(request.attempt, Some(7));
+        assert_eq!(
+            request
+                .metadata
+                .get("completion_event_type")
+                .map(String::as_str),
+            Some("run.failed")
+        );
+        for (key, expected) in [
+            ("attempt", "7"),
+            ("max_attempts", "5"),
+            ("initial_interval_ms", "100"),
+            ("max_interval_ms", "1000"),
+            ("backoff_type", "exponential"),
+            ("backoff_multiplier", "2"),
+        ] {
+            assert_eq!(
+                request.metadata.get(key).map(String::as_str),
+                Some(expected),
+                "unexpected CompleteJob metadata for {key}"
+            );
+        }
     }
 
     #[test]
@@ -4332,8 +4835,71 @@ mod tests {
             "run-1",
             "lease-7",
             7,
+            &HashMap::new(),
         )
         .is_none());
+    }
+
+    #[tokio::test]
+    async fn parked_entity_state_save_becomes_unary_fenced_engine_request() {
+        let service_message = ServiceMessage {
+            message_type: Some(service_message::MessageType::RuntimeService(
+                RuntimeServiceRequest {
+                    request_id: "state-request-1".to_string(),
+                    session_id: String::new(),
+                    operation: Some(runtime_service_request::Operation::EntityStateSave(
+                        EntityStateSaveRequest {
+                            entity_type: "WorkflowEntity".to_string(),
+                            entity_key: "ks_sequential".to_string(),
+                            state_json: br#"{"total_steps":2}"#.to_vec(),
+                            expected_version: 3,
+                            scope: "run".to_string(),
+                            scope_id: "run-1".to_string(),
+                        },
+                    )),
+                },
+            )),
+            ..Default::default()
+        };
+        let mut sender = RecordingEntityStateSender::default();
+
+        let runtime_response = parked_runtime_service_response(
+            &mut sender,
+            &service_message,
+            "project-1",
+            "run-1",
+            "worker-1",
+            "session-1",
+            "lease-1",
+            7,
+        )
+        .await
+        .expect("entity request should be handled inside the parked slot");
+
+        assert_eq!(sender.put_requests.len(), 1);
+        let request = &sender.put_requests[0];
+        assert_eq!(request.project_id, "project-1");
+        assert_eq!(request.run_id, "run-1");
+        assert_eq!(request.worker_id, "worker-1");
+        assert_eq!(request.worker_session_id, "session-1");
+        assert_eq!(request.lease_id, "lease-1");
+        assert_eq!(request.attempt, Some(7));
+        assert_eq!(request.operation_id, "state-request-1");
+        assert_eq!(request.expected_version, 3);
+
+        let runtime_message::MessageData::RuntimeServiceResponse(response) =
+            runtime_response.message_data.expect("runtime response")
+        else {
+            panic!("expected RuntimeServiceResponse");
+        };
+        assert!(response.success);
+        assert_eq!(response.request_id, "state-request-1");
+        match response.result {
+            Some(runtime_service_response::Result::EntityStateSave(result)) => {
+                assert_eq!(result.new_version, 4);
+            }
+            _ => panic!("expected entity-state save result"),
+        }
     }
 
     #[tokio::test]
