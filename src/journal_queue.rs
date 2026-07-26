@@ -650,10 +650,16 @@ mod tests {
             "lm.call.completed"
         ));
         assert!(JournalEventMessage::is_checkpoint_event_type(
+            "lm.completed"
+        ));
+        assert!(JournalEventMessage::is_checkpoint_event_type(
             "tool.call.started"
         ));
         assert!(JournalEventMessage::is_checkpoint_event_type(
             "tool.call.completed"
+        ));
+        assert!(JournalEventMessage::is_checkpoint_event_type(
+            "tool_call.started"
         ));
 
         // NOT checkpoint events (SSE-only)

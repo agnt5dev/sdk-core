@@ -700,6 +700,17 @@ message PutEntityStateRequest {
 
   // Run ID to associate the journal event with.
   string run_id = 8;
+
+  // Pull-worker authority. When run_id is set, every field below is required
+  // and must match the active parked-poll assignment.
+  string worker_id = 9;
+  string worker_session_id = 10;
+  string lease_id = 11;
+  optional uint32 attempt = 12;
+
+  // Stable across retries of one logical write. The journal uses this to
+  // collapse a lost-response retry without collapsing distinct state updates.
+  string operation_id = 13;
 }
 
 message PutEntityStateResponse {
