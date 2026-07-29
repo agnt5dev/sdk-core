@@ -26,6 +26,7 @@ cases:
     input: {text: hello durable sdk}
     expect:
       status: success
+      output_type: object
       events:
         required: [run.started, function.started, function.completed, run.completed]
         ordered: [run.started, function.started, function.completed, run.completed]
@@ -35,6 +36,11 @@ cases:
 The evaluator reports one result per SDK and compares the same event/output
 contract. SDK-specific component aliases belong in an adapter manifest, never
 in separate language contracts.
+
+`expect.output_type` may be `object`, `array`, `string`, `number`, `boolean`,
+or `null`. Use it when the cross-SDK envelope shape is itself part of the
+contract, even when provider-dependent values make an `output_subset`
+assertion inappropriate.
 
 Recommended groups are `functions`, `workflows`, `streaming`, `state`,
 `agents`, `tools`, and `hitl`.
