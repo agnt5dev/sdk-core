@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "agnt5-sdk-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -38,6 +38,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "crc32fast",
  "flate2",
  "flume",
  "futures",
