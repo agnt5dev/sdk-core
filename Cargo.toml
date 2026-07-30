@@ -1,6 +1,6 @@
 [package]
 name = "agnt5-sdk-core"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 authors = ["AGNT5 Team"]
 description = "High-performance Rust core for AGNT5 SDK"
@@ -112,6 +112,7 @@ unicode-segmentation = "1.10"
 hex = "0.4"
 hmac = "0.12"
 sha2 = "0.10"
+crc32fast = "1"
 
 # Base64 encoding for sandbox file operations
 base64 = "0.22"

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::pin::Pin;
 use std::time::Duration;
@@ -18,7 +19,7 @@ use super::http;
 use super::interface::{
     generate as generate_via_model, stream as stream_via_model, BuiltInTool, ContentBlockType,
     GenerateRequest, GenerateResponse, GenerationConfig, LanguageModel, Message, MessageRole,
-    ResponseFormat, StreamChunk, StreamHandle, StreamRequest, TokenUsage, ToolChoice,
+    ResponseFormat, StreamChunk, StreamHandle, StreamRequest, TokenUsage, ToolCall, ToolChoice,
     ToolDefinition,
 };
 use super::telemetry;
@@ -482,43 +483,23 @@ fn build_stream(
                 let parsed: GeminiStreamResponse = serde_json::from_str(trimmed)
                     .map_err(|err| SdkError::Other(anyhow!("failed to parse Google stream event: {err}")))?;
 
-                // Update usage info
-                if let Some(usage) = parsed.usage_metadata {
-                    partial.usage = Some(usage);
-                }
-
-                // Process candidates
-                if let Some(candidates) = parsed.candidates {
-                    for candidate in candidates {
-                        // Track finish reason
-                        if let Some(reason) = candidate.finish_reason {
-                            partial.finish_reason = Some(reason);
+                for text in partial.absorb(parsed) {
+                    if !text.is_empty() {
+                        // Start content block on first text
+                        if !block_started {
+                            yield StreamChunk::ContentBlockStart {
+                                index: 0,
+                                block_type: ContentBlockType::Text,
+                            };
+                            block_started = true;
                         }
 
-                        // Process content
-                        if let Some(content) = candidate.content {
-                            for part in content.parts {
-                                if let Some(text) = part.text {
-                                    if !text.is_empty() {
-                                        // Start content block on first text
-                                        if !block_started {
-                                            yield StreamChunk::ContentBlockStart {
-                                                index: 0,
-                                                block_type: ContentBlockType::Text,
-                                            };
-                                            block_started = true;
-                                        }
-
-                                        aggregate.push_str(&text);
-                                        yield StreamChunk::Delta {
-                                            content: text,
-                                            index: 0,
-                                            block_type: ContentBlockType::Text,
-                                        };
-                                    }
-                                }
-                            }
-                        }
+                        aggregate.push_str(&text);
+                        yield StreamChunk::Delta {
+                            content: text,
+                            index: 0,
+                            block_type: ContentBlockType::Text,
+                        };
                     }
                 }
             }
@@ -557,12 +538,26 @@ struct GeminiPayload {
 
 impl GeminiPayload {
     fn from_request(request: &GenerateRequest) -> SdkResult<Self> {
-        let contents = request
+        let mut contents = Vec::new();
+        let mut tool_call_names = HashMap::new();
+        for message in request
             .messages
             .iter()
             .filter(|msg| msg.role != MessageRole::System)
-            .map(GeminiContent::from_sdk_message)
-            .collect();
+        {
+            if let Some(tool_calls) = &message.tool_calls {
+                for tool_call in tool_calls {
+                    tool_call_names.insert(tool_call.id.clone(), tool_call.name.clone());
+                }
+            }
+
+            let function_name = message
+                .tool_call_id
+                .as_ref()
+                .and_then(|id| tool_call_names.get(id))
+                .map(String::as_str);
+            contents.push(GeminiContent::from_sdk_message(message, function_name));
+        }
 
         let system_instruction = request.system_prompt.as_ref().map(|prompt| GeminiContent {
             role: Some("user".to_string()), // System instructions use user role in Gemini
@@ -724,7 +719,7 @@ impl GeminiContent {
         }
     }
 
-    fn from_sdk_message(message: &Message) -> Self {
+    fn from_sdk_message(message: &Message, function_name: Option<&str>) -> Self {
         let mut parts = Vec::new();
 
         // Tool result message (functionResponse)
@@ -737,7 +732,7 @@ impl GeminiContent {
                 text: None,
                 function_call: None,
                 function_response: Some(GeminiFunctionResponse {
-                    name: tool_call_id.clone(), // Use tool_call_id as function name
+                    name: function_name.unwrap_or(tool_call_id).to_string(),
                     response: response_value,
                 }),
             });
@@ -813,6 +808,18 @@ struct GeminiPart {
 struct GeminiFunctionCall {
     name: String,
     args: JsonValue,
+}
+
+impl GeminiFunctionCall {
+    fn to_tool_call(&self, index: usize) -> ToolCall {
+        ToolCall {
+            // Gemini functionCall parts do not include IDs. Match the fallback
+            // convention used by the OpenAI-compatible streaming parser.
+            id: format!("call_{index}"),
+            name: self.name.clone(),
+            arguments: self.args.to_string(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -944,6 +951,7 @@ impl GeminiResponse {
 
         let mut text = String::new();
         let mut finish_reason = None;
+        let mut tool_calls = Vec::new();
 
         if let Some(candidates) = &self.candidates {
             if let Some(candidate) = candidates.first() {
@@ -952,6 +960,9 @@ impl GeminiResponse {
                     for part in &content.parts {
                         if let Some(t) = &part.text {
                             text.push_str(t);
+                        }
+                        if let Some(function_call) = &part.function_call {
+                            tool_calls.push(function_call.to_tool_call(tool_calls.len()));
                         }
                     }
                 }
@@ -978,7 +989,11 @@ impl GeminiResponse {
             text,
             usage,
             finish_reason,
-            tool_calls: None,
+            tool_calls: if tool_calls.is_empty() {
+                None
+            } else {
+                Some(tool_calls)
+            },
             object,
             raw,
             metadata: None,
@@ -1036,6 +1051,7 @@ struct PartialResponse {
     model: String,
     usage: Option<GeminiUsageMetadata>,
     finish_reason: Option<String>,
+    tool_calls: Vec<ToolCall>,
 }
 
 impl PartialResponse {
@@ -1044,7 +1060,37 @@ impl PartialResponse {
             model,
             usage: None,
             finish_reason: None,
+            tool_calls: Vec::new(),
         }
+    }
+
+    fn absorb(&mut self, response: GeminiStreamResponse) -> Vec<String> {
+        if let Some(usage) = response.usage_metadata {
+            self.usage = Some(usage);
+        }
+
+        let mut text_parts = Vec::new();
+        if let Some(candidates) = response.candidates {
+            for candidate in candidates {
+                if let Some(reason) = candidate.finish_reason {
+                    self.finish_reason = Some(reason);
+                }
+
+                if let Some(content) = candidate.content {
+                    for part in content.parts {
+                        if let Some(function_call) = part.function_call {
+                            self.tool_calls
+                                .push(function_call.to_tool_call(self.tool_calls.len()));
+                        }
+                        if let Some(text) = part.text {
+                            text_parts.push(text);
+                        }
+                    }
+                }
+            }
+        }
+
+        text_parts
     }
 
     fn into_generate_response(
@@ -1078,7 +1124,11 @@ impl PartialResponse {
             text,
             usage,
             finish_reason: self.finish_reason,
-            tool_calls: None,
+            tool_calls: if self.tool_calls.is_empty() {
+                None
+            } else {
+                Some(self.tool_calls)
+            },
             object,
             raw: None,
             metadata: None,
@@ -1181,6 +1231,123 @@ mod tests {
         assert_eq!(
             value["contents"][0]["parts"][0]["text"],
             "Large stable document"
+        );
+    }
+
+    #[test]
+    fn non_streaming_response_extracts_function_calls() {
+        let fixture = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"text": "I'll check."},
+                        {
+                            "functionCall": {
+                                "name": "lookup_weather",
+                                "args": {"city": "San Francisco"}
+                            }
+                        }
+                    ]
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 12,
+                "candidatesTokenCount": 4,
+                "totalTokenCount": 16
+            }
+        });
+        let response: GeminiResponse = serde_json::from_value(fixture).unwrap();
+
+        let response = response
+            .into_generate_response("gemini-2.5-flash", ResponseFormat::Text)
+            .unwrap();
+        let tool_calls = response.tool_calls.unwrap();
+
+        assert_eq!(response.text, "I'll check.");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_0");
+        assert_eq!(tool_calls[0].name, "lookup_weather");
+        assert_eq!(tool_calls[0].arguments, r#"{"city":"San Francisco"}"#);
+    }
+
+    #[test]
+    fn streaming_response_accumulates_function_calls_in_completed_response() {
+        let fixture = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "functionCall": {
+                            "name": "calculate",
+                            "args": {"expression": "15 * 7"}
+                        }
+                    }]
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 3,
+                "totalTokenCount": 13
+            }
+        });
+        let event: GeminiStreamResponse = serde_json::from_value(fixture).unwrap();
+        let mut partial = PartialResponse::new("gemini-2.5-flash".to_string());
+
+        let text = partial.absorb(event).join("");
+        let response = partial
+            .into_generate_response(text, ResponseFormat::Text)
+            .unwrap();
+        let tool_calls = response.tool_calls.unwrap();
+
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_0");
+        assert_eq!(tool_calls[0].name, "calculate");
+        assert_eq!(tool_calls[0].arguments, r#"{"expression":"15 * 7"}"#);
+        assert_eq!(response.finish_reason.as_deref(), Some("STOP"));
+    }
+
+    #[test]
+    fn text_only_response_keeps_tool_calls_empty() {
+        let fixture = json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "No tool needed."}]},
+                "finishReason": "STOP"
+            }]
+        });
+        let response: GeminiResponse = serde_json::from_value(fixture).unwrap();
+
+        let response = response
+            .into_generate_response("gemini-2.5-flash", ResponseFormat::Text)
+            .unwrap();
+
+        assert_eq!(response.text, "No tool needed.");
+        assert!(response.tool_calls.is_none());
+    }
+
+    #[test]
+    fn tool_result_resolves_synthetic_id_back_to_function_name() {
+        let request = GenerateRequest::new("google/gemini-2.5-flash")
+            .message(Message::assistant_with_tool_calls(
+                "",
+                vec![ToolCall {
+                    id: "call_0".to_string(),
+                    name: "calculate".to_string(),
+                    arguments: r#"{"expression":"15 * 7"}"#.to_string(),
+                }],
+            ))
+            .message(Message::tool_result("call_0", r#"{"value":105}"#));
+
+        let payload = GeminiPayload::from_request(&request).unwrap();
+        let value = serde_json::to_value(payload).unwrap();
+
+        assert_eq!(
+            value["contents"][1]["parts"][0]["functionResponse"]["name"],
+            "calculate"
+        );
+        assert_eq!(
+            value["contents"][1]["parts"][0]["functionResponse"]["response"]["value"],
+            105
         );
     }
 }
