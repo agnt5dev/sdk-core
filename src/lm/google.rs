@@ -1139,13 +1139,12 @@ impl PartialResponse {
 #[derive(Default)]
 struct SseDecoder {
     buffer: String,
+    incomplete_utf8: Vec<u8>,
 }
 
 impl SseDecoder {
     fn ingest(&mut self, chunk: &[u8]) -> SdkResult<Vec<String>> {
-        let chunk_str = std::str::from_utf8(chunk)
-            .map_err(|err| SdkError::Other(anyhow!("invalid UTF-8 in SSE stream: {err}")))?;
-        self.buffer.push_str(chunk_str);
+        super::sse::append_utf8(&mut self.buffer, &mut self.incomplete_utf8, chunk)?;
 
         let mut events = Vec::new();
         loop {
