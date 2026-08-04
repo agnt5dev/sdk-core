@@ -869,15 +869,14 @@ fn openai_streaming_error(data: &str) -> SdkError {
 #[derive(Default)]
 struct ResponsesSseDecoder {
     buffer: String,
+    incomplete_utf8: Vec<u8>,
 }
 
 impl ResponsesSseDecoder {
     /// Ingest raw bytes and return parsed SSE events.
     /// Each event is a tuple of (event_type, data_json).
     fn ingest(&mut self, chunk: &[u8]) -> SdkResult<Vec<(String, String)>> {
-        let chunk_str = std::str::from_utf8(chunk)
-            .map_err(|err| SdkError::Other(anyhow!("invalid UTF-8 in SSE stream: {err}")))?;
-        self.buffer.push_str(chunk_str);
+        super::sse::append_utf8(&mut self.buffer, &mut self.incomplete_utf8, chunk)?;
 
         let mut events = Vec::new();
 
@@ -912,7 +911,6 @@ impl ResponsesSseDecoder {
 
         Ok(events)
     }
-
     fn find_event_delimiter(&self) -> Option<usize> {
         self.buffer
             .find("\n\n")
@@ -1449,6 +1447,37 @@ mod tests {
         assert_eq!(events2.len(), 1);
         assert_eq!(events2[0].0, "response.output_text.delta");
         assert_eq!(events2[0].1, "{\"delta\": \"Hello\"}");
+    }
+
+    #[test]
+    fn test_sse_decoder_multibyte_utf8_split_across_chunks() {
+        let event = "event: response.output_text.delta\ndata: {\"delta\": \"hello—world\"}\n\n";
+        let bytes = event.as_bytes();
+        let em_dash_start = bytes
+            .windows("—".len())
+            .position(|window| window == "—".as_bytes())
+            .unwrap();
+
+        for split in (em_dash_start + 1)..(em_dash_start + "—".len()) {
+            let mut decoder = ResponsesSseDecoder::default();
+
+            assert!(decoder.ingest(&bytes[..split]).unwrap().is_empty());
+            let events = decoder.ingest(&bytes[split..]).unwrap();
+
+            assert_eq!(events.len(), 1, "failed at byte split {split}");
+            assert_eq!(events[0].0, "response.output_text.delta");
+            assert_eq!(events[0].1, "{\"delta\": \"hello—world\"}");
+        }
+    }
+
+    #[test]
+    fn test_sse_decoder_rejects_invalid_utf8() {
+        let mut decoder = ResponsesSseDecoder::default();
+        let err = decoder
+            .ingest(b"event: response.output_text.delta\ndata: {\"delta\": \"\xff\"}\n\n")
+            .unwrap_err();
+
+        assert!(err.to_string().contains("invalid UTF-8 in SSE stream"));
     }
 
     #[test]

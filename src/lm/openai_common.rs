@@ -593,13 +593,12 @@ impl PartialResponse {
 #[derive(Default)]
 struct SseDecoder {
     buffer: String,
+    incomplete_utf8: Vec<u8>,
 }
 
 impl SseDecoder {
     fn ingest(&mut self, chunk: &[u8]) -> SdkResult<Vec<String>> {
-        let chunk_str = std::str::from_utf8(chunk)
-            .map_err(|err| SdkError::Other(anyhow!("invalid UTF-8 in SSE stream: {err}")))?;
-        self.buffer.push_str(chunk_str);
+        super::sse::append_utf8(&mut self.buffer, &mut self.incomplete_utf8, chunk)?;
 
         let mut events = Vec::new();
         loop {
@@ -754,6 +753,39 @@ fn build_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sse_decoder_buffers_multibyte_utf8_split_across_chunks() {
+        let event = "data: {\"choices\":[{\"delta\":{\"content\":\"hello—world\"}}]}\n\n";
+        let bytes = event.as_bytes();
+        let em_dash_start = bytes
+            .windows("—".len())
+            .position(|window| window == "—".as_bytes())
+            .unwrap();
+
+        for split in (em_dash_start + 1)..(em_dash_start + "—".len()) {
+            let mut decoder = SseDecoder::default();
+
+            assert!(decoder.ingest(&bytes[..split]).unwrap().is_empty());
+            let events = decoder.ingest(&bytes[split..]).unwrap();
+
+            assert_eq!(events.len(), 1, "failed at byte split {split}");
+            assert_eq!(
+                events[0],
+                "{\"choices\":[{\"delta\":{\"content\":\"hello—world\"}}]}"
+            );
+        }
+    }
+
+    #[test]
+    fn sse_decoder_rejects_invalid_utf8() {
+        let mut decoder = SseDecoder::default();
+        let err = decoder
+            .ingest(b"data: {\"choices\":[{\"delta\":{\"content\":\"\xff\"}}]}\n\n")
+            .unwrap_err();
+
+        assert!(err.to_string().contains("invalid UTF-8 in SSE stream"));
+    }
 
     #[test]
     fn detects_reasoning_models() {
