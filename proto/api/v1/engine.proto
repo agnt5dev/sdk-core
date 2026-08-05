@@ -28,6 +28,17 @@ service EngineService {
   // if found. On STEP_COMPLETED/STEP_FAILED, appends a record to the journal.
   rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse);
 
+  // BeginActivation atomically admits or replays one logical durable activation.
+  // The journal aggregate, not a projection, decides the returned outcome.
+  rpc BeginActivation(BeginActivationRequest) returns (BeginActivationResponse);
+
+  // CompleteActivation commits one fenced logical result together with its state
+  // mutations and durable outbox intents.
+  rpc CompleteActivation(CompleteActivationRequest) returns (CompleteActivationResponse);
+
+  // FailActivation records one fenced failure and its retry/uncertainty decision.
+  rpc FailActivation(FailActivationRequest) returns (FailActivationResponse);
+
   // EventStream accepts a stream of ephemeral events (tokens, progress, logs)
   // from SDK workers. No journal persistence — real-time SSE delivery only.
   rpc EventStream(stream EventStreamMessage) returns (EventStreamAck);
@@ -1087,7 +1098,7 @@ message ListRunsResponse {
   // Empty when `has_more` is false. Today encodes
   // `(submitted_at_ms, run_id)` per Decision 15; treat as opaque.
   string next_cursor = 7;
-  // replication lag at the receiving node when this
+  // Phase 3 task 3.8: replication lag at the receiving node when this
   // response was assembled, in milliseconds. Computed as
   // `now_ms - last_applied_record_ts_ms` for the local processor's
   // last-applied record. Exposes the eventually-consistent contract
@@ -1218,6 +1229,340 @@ message CheckpointResponse {
   // For memoization: if step was already completed, return cached output.
   bool memoized = 3;
   bytes cached_output = 4;
+}
+
+// ActivationKind identifies the durable unit represented by an activation.
+enum ActivationKind {
+  ACTIVATION_KIND_UNSPECIFIED = 0;
+  ACTIVATION_KIND_STEP = 1;
+  ACTIVATION_KIND_FUNCTION = 2;
+  ACTIVATION_KIND_MODEL = 3;
+  ACTIVATION_KIND_TOOL = 4;
+  ACTIVATION_KIND_CHILD = 5;
+  ACTIVATION_KIND_APPROVAL = 6;
+  ACTIVATION_KIND_TIMER = 7;
+  ACTIVATION_KIND_EVAL = 8;
+  reserved 9 to 15;
+}
+
+// BeginActivationOutcome is the complete V1 begin decision surface.
+enum BeginActivationOutcome {
+  BEGIN_ACTIVATION_OUTCOME_UNSPECIFIED = 0;
+  BEGIN_ACTIVATION_OUTCOME_EXECUTE = 1;
+  BEGIN_ACTIVATION_OUTCOME_REPLAY = 2;
+  BEGIN_ACTIVATION_OUTCOME_WAIT = 3;
+  BEGIN_ACTIVATION_OUTCOME_CONFLICT = 4;
+  BEGIN_ACTIVATION_OUTCOME_CANCELLED = 5;
+  BEGIN_ACTIVATION_OUTCOME_UNKNOWN_OUTCOME = 6;
+}
+
+// ActivationRecoveryPolicy controls how interrupted or uncertain work settles.
+enum ActivationRecoveryPolicy {
+  ACTIVATION_RECOVERY_POLICY_UNSPECIFIED = 0;
+  ACTIVATION_RECOVERY_POLICY_IDEMPOTENT_RETRY = 1;
+  ACTIVATION_RECOVERY_POLICY_DURABLE_STEPS = 2;
+  ACTIVATION_RECOVERY_POLICY_UNKNOWN_OUTCOME = 3;
+  ACTIVATION_RECOVERY_POLICY_COMPENSATE = 4;
+  ACTIVATION_RECOVERY_POLICY_FAIL = 5;
+}
+
+// ActivationExternalOutcomeCertainty describes whether an external effect is known.
+enum ActivationExternalOutcomeCertainty {
+  ACTIVATION_EXTERNAL_OUTCOME_CERTAINTY_UNSPECIFIED = 0;
+  ACTIVATION_EXTERNAL_OUTCOME_CERTAINTY_NO_EFFECT = 1;
+  ACTIVATION_EXTERNAL_OUTCOME_CERTAINTY_EFFECT_COMMITTED = 2;
+  ACTIVATION_EXTERNAL_OUTCOME_CERTAINTY_UNKNOWN = 3;
+}
+
+// ActivationStatus is the durable aggregate status.
+enum ActivationStatus {
+  ACTIVATION_STATUS_UNSPECIFIED = 0;
+  ACTIVATION_STATUS_ACTIVE = 1;
+  ACTIVATION_STATUS_RETRY_READY = 2;
+  ACTIVATION_STATUS_COMPLETED = 3;
+  ACTIVATION_STATUS_FAILED = 4;
+  ACTIVATION_STATUS_SUSPENDED = 5;
+  ACTIVATION_STATUS_CANCELLED = 6;
+  ACTIVATION_STATUS_UNKNOWN_OUTCOME = 7;
+}
+
+// ActivationErrorCode is stable across runtime and SDK implementations.
+enum ActivationErrorCode {
+  ACTIVATION_ERROR_CODE_UNSPECIFIED = 0;
+  ACTIVATION_ERROR_CODE_NONDETERMINISTIC_REPLAY = 1;
+  ACTIVATION_ERROR_CODE_STALE_AUTHORITY = 2;
+  ACTIVATION_ERROR_CODE_UNKNOWN_WRITE_OUTCOME = 3;
+  ACTIVATION_ERROR_CODE_PAYLOAD_CONFLICT = 4;
+  ACTIVATION_ERROR_CODE_ILLEGAL_TRANSITION = 5;
+  ACTIVATION_ERROR_CODE_INVALID_ARGUMENT = 6;
+  ACTIVATION_ERROR_CODE_INLINE_PAYLOAD_TOO_LARGE = 7;
+  ACTIVATION_ERROR_CODE_REFERENCE_REQUIRED = 8;
+  ACTIVATION_ERROR_CODE_STATE_VERSION_CONFLICT = 9;
+}
+
+// ActivationErrorDetail is encoded in gRPC status details for failed writes.
+message ActivationErrorDetail {
+  ActivationErrorCode code = 1;
+  string activation_id = 2;
+  uint32 attempt = 3;
+  string message = 4;
+}
+
+// ImmutablePayloadReference addresses a project-scoped immutable value.
+message ImmutablePayloadReference {
+  string project_id = 1;
+  string kind = 2;
+  string uri = 3;
+  uint64 size_bytes = 4;
+  bytes sha256 = 5;
+  string content_type = 6;
+}
+
+// ActivationPayload contains either bounded inline bytes or an immutable reference.
+message ActivationPayload {
+  oneof value {
+    bytes inline_data = 1;
+    ImmutablePayloadReference reference = 2;
+  }
+}
+
+// ActivationStateMutation is committed as part of an accepted completion.
+message ActivationStateMutation {
+  string operation_id = 1;
+  string entity_type = 2;
+  string entity_key = 3;
+  string scope = 4;
+  string scope_id = 5;
+  bytes data = 6;
+  string data_type = 7;
+  int64 expected_version = 8;
+}
+
+// ActivationOutboxIntent is a durable effect intent accepted with a completion.
+message ActivationOutboxIntent {
+  string intent_id = 1;
+  string kind = 2;
+  string idempotency_key = 3;
+  ActivationPayload payload = 4;
+}
+
+// ActivationUsage contains bounded provider/runtime accounting.
+message ActivationUsage {
+  int64 tokens_in = 1;
+  int64 tokens_out = 2;
+  double cost_usd = 3;
+  int64 latency_ms = 4;
+  string provider = 5;
+  string model = 6;
+}
+
+// ActivationEvidence contains bounded diagnostic evidence for an accepted outcome.
+message ActivationEvidence {
+  string evidence_type = 1;
+  ActivationPayload payload = 2;
+  bytes sha256 = 3;
+}
+
+// BeginActivationRequest identifies one logical activation independently of attempts.
+message BeginActivationRequest {
+  string project_id = 1;
+  string run_id = 2;
+  string parent_activation_id = 3;
+  ActivationKind kind = 4;
+  string stable_key = 5;
+  bytes input_digest = 6;
+  bytes definition_digest = 7;
+  ActivationRecoveryPolicy recovery_policy = 8;
+  string worker_session_id = 9;
+  bytes run_authority = 10;
+  bytes lease_authority = 11;
+}
+
+// ActivationConflictReceipt describes deterministic-key reuse with new semantics.
+message ActivationConflictReceipt {
+  ActivationErrorCode error_code = 1;
+  bytes expected_input_digest = 2;
+  bytes provided_input_digest = 3;
+  bytes expected_definition_digest = 4;
+  bytes provided_definition_digest = 5;
+  string message = 6;
+}
+
+// ActivationWaitReceipt identifies the active attempt a caller must not duplicate.
+message ActivationWaitReceipt {
+  uint32 attempt = 1;
+  string active_worker_session_id = 2;
+  uint64 accepted_journal_offset = 3;
+}
+
+// ActivationUnknownOutcomeReceipt explains why the runtime refuses to retry.
+message ActivationUnknownOutcomeReceipt {
+  string error_code = 1;
+  ActivationPayload error_data = 2;
+  uint64 accepted_journal_offset = 3;
+}
+
+// BeginActivationResponse carries the complete journal-authoritative decision.
+message BeginActivationResponse {
+  BeginActivationOutcome outcome = 1;
+  string activation_id = 2;
+  uint32 attempt = 3;
+  bytes fence_token = 4;
+  uint64 accepted_journal_offset = 5;
+  ActivationPayload replay_result = 6;
+  ActivationConflictReceipt conflict = 7;
+  ActivationWaitReceipt wait = 8;
+  ActivationUnknownOutcomeReceipt unknown_outcome = 9;
+}
+
+// CompleteActivationRequest commits one fenced logical completion.
+message CompleteActivationRequest {
+  string project_id = 1;
+  string run_id = 2;
+  string activation_id = 3;
+  uint32 attempt = 4;
+  bytes fence_token = 5;
+  ActivationPayload output = 6;
+  bytes output_digest = 7;
+  repeated ActivationStateMutation state_mutations = 8;
+  repeated ActivationOutboxIntent outbox_intents = 9;
+  ActivationUsage usage = 10;
+  repeated ActivationEvidence evidence = 11;
+}
+
+// CompleteActivationResponse acknowledges the canonical completion offset.
+message CompleteActivationResponse {
+  bool accepted = 1;
+  bool replayed = 2;
+  string activation_id = 3;
+  uint32 attempt = 4;
+  uint64 accepted_journal_offset = 5;
+}
+
+// FailActivationRequest records one fenced failure or uncertain external outcome.
+message FailActivationRequest {
+  string project_id = 1;
+  string run_id = 2;
+  string activation_id = 3;
+  uint32 attempt = 4;
+  bytes fence_token = 5;
+  string error_code = 6;
+  ActivationPayload error_data = 7;
+  bool retryable = 8;
+  ActivationExternalOutcomeCertainty external_outcome_certainty = 9;
+  repeated ActivationEvidence evidence = 10;
+}
+
+// FailActivationResponse acknowledges the canonical failure decision.
+message FailActivationResponse {
+  bool accepted = 1;
+  bool replayed = 2;
+  string activation_id = 3;
+  uint32 attempt = 4;
+  ActivationStatus status = 5;
+  uint64 accepted_journal_offset = 6;
+}
+
+// ActivationStartedRecord is the canonical journal event for a new attempt.
+message ActivationStartedRecord {
+  string project_id = 1;
+  string run_id = 2;
+  string parent_activation_id = 3;
+  string activation_id = 4;
+  ActivationKind kind = 5;
+  string stable_key = 6;
+  bytes input_digest = 7;
+  bytes definition_digest = 8;
+  ActivationRecoveryPolicy recovery_policy = 9;
+  uint32 attempt = 10;
+  bytes fence_token = 11;
+  string worker_session_id = 12;
+  bytes run_authority = 13;
+  bytes lease_authority = 14;
+  uint32 previous_attempt = 15;
+}
+
+// ActivationCompletedRecord is the canonical all-or-nothing completion bundle.
+message ActivationCompletedRecord {
+  string project_id = 1;
+  string run_id = 2;
+  string activation_id = 3;
+  uint32 attempt = 4;
+  bytes fence_token = 5;
+  ActivationPayload output = 6;
+  bytes output_digest = 7;
+  repeated ActivationStateMutation state_mutations = 8;
+  repeated ActivationOutboxIntent outbox_intents = 9;
+  ActivationUsage usage = 10;
+  repeated ActivationEvidence evidence = 11;
+}
+
+// ActivationFailedRecord is the canonical failure bundle.
+message ActivationFailedRecord {
+  string project_id = 1;
+  string run_id = 2;
+  string activation_id = 3;
+  uint32 attempt = 4;
+  bytes fence_token = 5;
+  string error_code = 6;
+  ActivationPayload error_data = 7;
+  bool retryable = 8;
+  ActivationExternalOutcomeCertainty external_outcome_certainty = 9;
+  repeated ActivationEvidence evidence = 10;
+}
+
+// ActivationSuspendedRecord records a durable nonterminal suspension.
+message ActivationSuspendedRecord {
+  string project_id = 1;
+  string run_id = 2;
+  string activation_id = 3;
+  uint32 attempt = 4;
+  bytes fence_token = 5;
+  string resume_source = 6;
+}
+
+// ActivationCancelledRecord records the canonical cancellation winner.
+message ActivationCancelledRecord {
+  string project_id = 1;
+  string run_id = 2;
+  string activation_id = 3;
+  uint32 attempt = 4;
+  string reason = 5;
+}
+
+// ActivationUnknownOutcomeRecord records an effect whose external result is uncertain.
+message ActivationUnknownOutcomeRecord {
+  ActivationFailedRecord failure = 1;
+}
+
+// ActivationSnapshotRecord is a journal-owned compaction snapshot.
+message ActivationSnapshotRecord {
+  string project_id = 1;
+  string run_id = 2;
+  string activation_id = 3;
+  ActivationStatus status = 4;
+  ActivationStartedRecord current_attempt = 5;
+  ActivationCompletedRecord completion = 6;
+  ActivationFailedRecord failure = 7;
+  uint64 accepted_journal_offset = 8;
+  ActivationSuspendedRecord suspension = 9;
+  ActivationCancelledRecord cancellation = 10;
+}
+
+// ActivationJournalRecord is the canonical Durable Activation V1 encoding.
+// It intentionally contains no map fields so deterministic protobuf encoding
+// is byte-identical across supported languages.
+message ActivationJournalRecord {
+  uint32 version = 1;
+  oneof event {
+    ActivationStartedRecord started = 10;
+    ActivationCompletedRecord completed = 11;
+    ActivationFailedRecord failed = 12;
+    ActivationSuspendedRecord suspended = 13;
+    ActivationCancelledRecord cancelled = 14;
+    ActivationSnapshotRecord snapshot = 15;
+    ActivationUnknownOutcomeRecord unknown_outcome = 16;
+  }
 }
 
 // EventStreamMessage carries a single ephemeral event from worker to engine.
