@@ -13,6 +13,7 @@ use crate::pb::{
     ReportWorkerCapacityRequest, ReportWorkerCapacityResponse, RuntimeMessage, ServiceMessage,
 };
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tonic::transport::Channel;
 use tonic::Code;
@@ -83,6 +84,21 @@ pub(crate) fn validate_protocol_capabilities(
     Ok(())
 }
 
+fn negotiated_protocol_capabilities(
+    worker_supported: &[String],
+    runtime_supported: &[String],
+) -> Vec<String> {
+    worker_supported
+        .iter()
+        .filter(|capability| runtime_supported.contains(capability))
+        .fold(Vec::new(), |mut negotiated, capability| {
+            if !negotiated.contains(capability) {
+                negotiated.push(capability.clone());
+            }
+            negotiated
+        })
+}
+
 fn activation_status(operation: &str, status: tonic::Status) -> SdkError {
     crate::runtime_adapter::activation_status_error(operation, status)
 }
@@ -102,6 +118,7 @@ fn activation_status(operation: &str, status: tonic::Status) -> SdkError {
 pub struct WorkerCoordinatorClient {
     client: WorkerCoordinatorServiceClient<Channel>,
     engine_client: EngineServiceClient<Channel>,
+    negotiated_protocol_capabilities: Arc<RwLock<Vec<String>>>,
 }
 
 const WORKER_COORDINATOR_RPC_TIMEOUT: Duration = Duration::from_secs(45);
@@ -146,7 +163,31 @@ impl WorkerCoordinatorClient {
         Ok(Self {
             client,
             engine_client,
+            negotiated_protocol_capabilities: Arc::new(RwLock::new(Vec::new())),
         })
+    }
+
+    pub(crate) fn retain_negotiated_protocol_capabilities(
+        &self,
+        worker_supported: &[String],
+        runtime_supported: &[String],
+    ) {
+        let negotiated = negotiated_protocol_capabilities(worker_supported, runtime_supported);
+        let mut capabilities = self
+            .negotiated_protocol_capabilities
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *capabilities = negotiated;
+    }
+
+    /// Return whether this worker session actually negotiated a protocol
+    /// capability with the runtime. Clones share the same session state.
+    pub fn negotiated_protocol_capability(&self, capability: &str) -> bool {
+        self.negotiated_protocol_capabilities
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|negotiated| negotiated == capability)
     }
 
     /// Create a worker stream with immediate registration (based on working pattern)
@@ -260,6 +301,10 @@ impl WorkerCoordinatorClient {
                         &resp.supported_protocol_capabilities,
                         &resp.required_protocol_capabilities,
                     )?;
+                    self.retain_negotiated_protocol_capabilities(
+                        &worker_supported_protocols,
+                        &resp.supported_protocol_capabilities,
+                    );
                 }
                 _ => {
                     error!("Unexpected response type to registration");
@@ -1097,6 +1142,24 @@ mod tests {
             &[],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn protocol_capability_negotiation_retains_only_the_intersection() {
+        assert_eq!(
+            negotiated_protocol_capabilities(
+                &[
+                    DURABLE_ACTIVATION_V1_CAPABILITY.into(),
+                    "worker_only".into(),
+                    DURABLE_ACTIVATION_V1_CAPABILITY.into(),
+                ],
+                &[
+                    DURABLE_ACTIVATION_V1_CAPABILITY.into(),
+                    "runtime_only".into(),
+                ],
+            ),
+            vec![DURABLE_ACTIVATION_V1_CAPABILITY.to_string()]
+        );
     }
 }
 

@@ -611,6 +611,154 @@ fn stamp_dispatch_mode(runtime_message: &mut RuntimeMessage, dispatch_mode: &str
     }
 }
 
+fn canonical_activation_component_config(config: &HashMap<String, String>) -> String {
+    let mut entries = config.iter().collect::<Vec<_>>();
+    entries.sort_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
+    serde_json::to_string(&serde_json::json!([
+        "object",
+        entries
+            .into_iter()
+            .map(|(key, value)| serde_json::json!([key, ["string", value]]))
+            .collect::<Vec<_>>()
+    ]))
+    .expect("canonical activation component config must serialize")
+}
+
+fn configured_activation_artifact_sha256(metadata: &HashMap<String, String>) -> Option<String> {
+    metadata
+        .get("activation_artifact_sha256")
+        .cloned()
+        .or_else(|| std::env::var("AGNT5_ACTIVATION_ARTIFACT_SHA256").ok())
+        .filter(|value| !value.is_empty())
+}
+
+fn valid_activation_artifact_sha256(value: &str) -> bool {
+    use base64::Engine as _;
+
+    if hex::decode(value).is_ok_and(|decoded| decoded.len() == 32) {
+        return true;
+    }
+    [
+        base64::engine::general_purpose::STANDARD.decode(value),
+        base64::engine::general_purpose::STANDARD_NO_PAD.decode(value),
+        base64::engine::general_purpose::URL_SAFE.decode(value),
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(value),
+    ]
+    .into_iter()
+    .any(|decoded| decoded.is_ok_and(|bytes| bytes.len() == 32))
+}
+
+fn worker_protocol_capabilities_for_metadata(
+    metadata: &HashMap<String, String>,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let (supported, required) = crate::client::worker_protocol_capabilities();
+    if !supported
+        .iter()
+        .any(|capability| capability == crate::client::DURABLE_ACTIVATION_V1_CAPABILITY)
+    {
+        return Ok((supported, required));
+    }
+    if configured_activation_artifact_sha256(metadata)
+        .as_deref()
+        .is_some_and(valid_activation_artifact_sha256)
+    {
+        return Ok((supported, required));
+    }
+
+    let message = "durable_activation_v1 requires a valid 32-byte activation artifact SHA-256";
+    if required
+        .iter()
+        .any(|capability| capability == crate::client::DURABLE_ACTIVATION_V1_CAPABILITY)
+    {
+        return Err(SdkError::Activation {
+            message: message.to_string(),
+            code: crate::error::ErrorCode::DurabilityUnavailable,
+            activation_id: None,
+            attempt: None,
+        });
+    }
+    eprintln!(
+        "[WARN] agnt5 durable activation degraded: {message}; legacy checkpoints remain enabled"
+    );
+    Ok((Vec::new(), Vec::new()))
+}
+
+fn activation_definition_configs(components: &[ComponentInfo]) -> HashMap<String, String> {
+    components
+        .iter()
+        .map(|component| {
+            (
+                component.name.clone(),
+                canonical_activation_component_config(&component.config),
+            )
+        })
+        .collect()
+}
+
+fn stamp_activation_dispatch_metadata(
+    runtime_message: &mut RuntimeMessage,
+    worker_id: &str,
+    worker_session_id: &str,
+    service_version: &str,
+    worker_metadata: &HashMap<String, String>,
+    definition_configs: &HashMap<String, String>,
+) {
+    let Some(crate::pb::runtime_message::MessageData::DispatchComponent(request)) =
+        runtime_message.message_data.as_mut()
+    else {
+        return;
+    };
+
+    request.metadata.insert(
+        crate::client::DURABLE_ACTIVATION_V1_CAPABILITY.to_string(),
+        "true".to_string(),
+    );
+    request
+        .metadata
+        .insert("worker_id".to_string(), worker_id.to_string());
+    request.metadata.insert(
+        "worker_session_id".to_string(),
+        worker_session_id.to_string(),
+    );
+    request
+        .metadata
+        .insert("lease_id".to_string(), request.lease_id.clone());
+    request
+        .metadata
+        .entry("run_authority".to_string())
+        .or_insert_with(|| request.invocation_id.clone());
+    request
+        .metadata
+        .entry("lease_authority".to_string())
+        .or_insert_with(|| request.lease_id.clone());
+    request
+        .metadata
+        .insert("component_name".to_string(), request.component_name.clone());
+    request.metadata.insert(
+        "activation_definition_version".to_string(),
+        service_version.to_string(),
+    );
+    request.metadata.insert(
+        "activation_definition_config".to_string(),
+        definition_configs
+            .get(&request.component_name)
+            .cloned()
+            .unwrap_or_else(|| "[\"object\",[]]".to_string()),
+    );
+
+    if let Some(value) = worker_metadata.get("project_id") {
+        request
+            .metadata
+            .entry("project_id".to_string())
+            .or_insert_with(|| value.clone());
+    }
+    if let Some(value) = configured_activation_artifact_sha256(worker_metadata) {
+        request
+            .metadata
+            .insert("activation_artifact_sha256".to_string(), value);
+    }
+}
+
 // RAII guard so the in-flight count is decremented even if a handler panics or
 // is cancelled. Parked polling uses this same guard so each parked slot maps to
 // one active handler invocation, not one queued local message.
@@ -1279,6 +1427,10 @@ async fn register_parked_worker_session_with_retries(
                     warn!("{} protocol negotiation failed: {}", reason, error);
                     return ParkedWorkerSessionRegistrationResult::Rejected;
                 }
+                client.retain_negotiated_protocol_capabilities(
+                    &registration.supported_protocol_capabilities,
+                    &session.supported_protocol_capabilities,
+                );
                 return ParkedWorkerSessionRegistrationResult::Registered(
                     session.worker_session_id,
                 );
@@ -1404,6 +1556,9 @@ struct ParkedPollContext {
     worker_id: String,
     worker_session_id: Arc<TokioMutex<String>>,
     registration: ParkedWorkerSessionRegistration,
+    service_version: String,
+    worker_metadata: HashMap<String, String>,
+    activation_definition_configs: HashMap<String, String>,
     project_id: String,
     response_tx: flume::Sender<ServiceMessage>,
     in_flight: Arc<std::sync::atomic::AtomicUsize>,
@@ -1538,7 +1693,7 @@ where
                 let _busy = InFlightGuard::enter(&ctx.busy_slots);
                 let _ = ctx.events_tx.send(ParkedSlotEvent::GotJob);
                 let (
-                    runtime_message,
+                    mut runtime_message,
                     is_streaming,
                     run_id,
                     lease_id,
@@ -1555,6 +1710,18 @@ where
                         continue;
                     }
                 };
+                if client
+                    .negotiated_protocol_capability(crate::client::DURABLE_ACTIVATION_V1_CAPABILITY)
+                {
+                    stamp_activation_dispatch_metadata(
+                        &mut runtime_message,
+                        &ctx.worker_id,
+                        &current_session_id,
+                        &ctx.service_version,
+                        &ctx.worker_metadata,
+                        &ctx.activation_definition_configs,
+                    );
+                }
                 let completion_run_id = run_id.clone();
                 let completion_lease_id = lease_id.clone();
                 if !lease_id.is_empty() {
@@ -2852,6 +3019,9 @@ impl Worker {
         // Merge user-provided metadata with auto-collected AGNT5_* env vars
         let mut metadata = self.metadata.clone();
         metadata.extend(collect_agnt5_env_vars());
+        if let Some(artifact) = configured_activation_artifact_sha256(&metadata) {
+            metadata.insert("activation_artifact_sha256".to_string(), artifact);
+        }
 
         // declare data-path mode. Default PUSH;
         // `AGNT5_WORKER_MODE=pull` now means parked long-poll assignment
@@ -2880,7 +3050,10 @@ impl Worker {
 
         let capabilities = worker_capabilities(&self.components);
         let (supported_protocol_capabilities, required_protocol_capabilities) =
-            crate::client::worker_protocol_capabilities();
+            worker_protocol_capabilities_for_metadata(&metadata)?;
+        let dispatch_worker_metadata = metadata.clone();
+        let dispatch_activation_definition_configs =
+            activation_definition_configs(&self.components);
         let registration = RegisterService {
             service_name: self.config.service_name.clone(),
             service_version: self.config.service_version.clone(),
@@ -3067,6 +3240,8 @@ impl Worker {
                 poll_shutdown,
                 max_concurrency,
                 in_flight.clone(),
+                supported_protocol_capabilities.clone(),
+                required_protocol_capabilities.clone(),
             ))
         } else {
             None
@@ -3078,7 +3253,7 @@ impl Worker {
                 // Dispatch incoming messages to worker pool
                 result = rx.recv_async() => {
                     match result {
-                        Ok(runtime_message) => {
+                        Ok(mut runtime_message) => {
                             // Legacy CheckpointAck messages from older WC — ignore silently.
                             // Checkpoints now use WriteCheckpoint unary RPC to EE directly.
                             if runtime_message.message_type == RuntimeMessageType::CheckpointAck as i32 {
@@ -3116,6 +3291,19 @@ impl Worker {
                                     code: crate::error::ErrorCode::ConnectionFailed,
                                     source: None,
                                 });
+                            }
+
+                            if client.negotiated_protocol_capability(
+                                crate::client::DURABLE_ACTIVATION_V1_CAPABILITY,
+                            ) {
+                                stamp_activation_dispatch_metadata(
+                                    &mut runtime_message,
+                                    &self.config.worker_id,
+                                    &self.config.worker_id,
+                                    &self.config.service_version,
+                                    &dispatch_worker_metadata,
+                                    &dispatch_activation_definition_configs,
+                                );
                             }
 
                             // CancelExecution: fire the soft-cancel channel for
@@ -4028,6 +4216,8 @@ impl Worker {
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
         max_concurrency: usize,
         in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        supported_protocol_capabilities: Vec<String>,
+        required_protocol_capabilities: Vec<String>,
     ) -> tokio::task::JoinHandle<()>
     where
         F: Fn(RuntimeMessage, flume::Sender<ServiceMessage>) -> Fut + Send + Clone + 'static,
@@ -4039,11 +4229,14 @@ impl Worker {
         let deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").unwrap_or_default();
         let capabilities = worker_capabilities(&self.components);
         let components = self.components.clone();
+        let activation_definition_configs = activation_definition_configs(&components);
+        let mut worker_metadata = self.metadata.clone();
+        if let Some(artifact) = configured_activation_artifact_sha256(&worker_metadata) {
+            worker_metadata.insert("activation_artifact_sha256".to_string(), artifact);
+        }
         let service_name = self.config.service_name.clone();
         let service_version = self.config.service_version.clone();
         let service_type = self.config.service_type.clone();
-        let (supported_protocol_capabilities, required_protocol_capabilities) =
-            crate::client::worker_protocol_capabilities();
         let streaming_runs = self.streaming_runs.clone();
         let pending_lease_ids = self.pending_lease_ids.clone();
         let journal_queue = self.journal_queue.clone();
@@ -4090,7 +4283,7 @@ impl Worker {
                 capabilities,
                 components,
                 service_name,
-                service_version,
+                service_version: service_version.clone(),
                 service_type,
                 supported_protocol_capabilities,
                 required_protocol_capabilities,
@@ -4135,6 +4328,9 @@ impl Worker {
                 worker_id,
                 worker_session_id,
                 registration,
+                service_version,
+                worker_metadata,
+                activation_definition_configs,
                 project_id,
                 response_tx,
                 in_flight,
@@ -4333,17 +4529,20 @@ fn is_cancelled_worker_response(service_message: &ServiceMessage) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        await_checkpoint_ack, complete_job_request_from_polled_completion, complete_job_with_retry,
+        activation_definition_configs, await_checkpoint_ack, canonical_activation_component_config,
+        complete_job_request_from_polled_completion, complete_job_with_retry,
         is_cancelled_worker_response, is_parked_worker_session_registration_rejection,
         is_terminal_worker_response, is_worker_session_inactive_error,
         parked_lease_danger_retry_ms, parked_lease_renew_interval_ms,
         parked_lease_renew_interval_with_jitter_ms, parked_ramp_spawn_count,
         parked_runtime_service_response, parked_worker_session_was_refreshed,
         polled_job_completion_from_service_message, record_groups_by_run,
-        runtime_message_from_job_assignment, stamp_dispatch_mode, take_correlation_ids,
-        try_retire_parked_slot, uncommitted_records_in_reverse, wait_for_parked_run_events_flush,
-        worker_capabilities, AppendGroupProgress, CompleteJobSender, EntityStateSender,
-        ParkedWorkerSessionRegistration, Worker, WorkerConfig,
+        runtime_message_from_job_assignment, stamp_activation_dispatch_metadata,
+        stamp_dispatch_mode, take_correlation_ids, try_retire_parked_slot,
+        uncommitted_records_in_reverse, valid_activation_artifact_sha256,
+        wait_for_parked_run_events_flush, worker_capabilities, AppendGroupProgress,
+        CompleteJobSender, EntityStateSender, ParkedWorkerSessionRegistration, Worker,
+        WorkerConfig,
     };
     use crate::error::{ErrorCode, SdkError};
     use crate::journal_queue::{JournalEventMessage, JournalEventQueue, JournalQueueConfig};
@@ -4518,6 +4717,112 @@ mod tests {
         assert_eq!(
             request.metadata.get("dispatch_mode").map(String::as_str),
             Some("push")
+        );
+    }
+
+    #[test]
+    fn activation_component_config_is_canonical_and_sorted() {
+        assert_eq!(
+            canonical_activation_component_config(&HashMap::from([
+                ("z".to_string(), "last".to_string()),
+                ("a".to_string(), "first\nline".to_string()),
+            ])),
+            r#"["object",[["a",["string","first\nline"]],["z",["string","last"]]]]"#
+        );
+    }
+
+    #[test]
+    fn activation_artifact_identity_accepts_exactly_32_encoded_bytes() {
+        assert!(valid_activation_artifact_sha256(
+            "6161616161616161616161616161616161616161616161616161616161616161"
+        ));
+        assert!(valid_activation_artifact_sha256(
+            "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE="
+        ));
+        assert!(!valid_activation_artifact_sha256("6161"));
+        assert!(!valid_activation_artifact_sha256("not-a-digest"));
+    }
+
+    #[test]
+    fn negotiated_activation_metadata_uses_typed_dispatch_authority() {
+        let mut message = crate::pb::RuntimeMessage {
+            message_data: Some(runtime_message::MessageData::DispatchComponent(
+                crate::pb::DispatchComponentRequest {
+                    invocation_id: "run-1".to_string(),
+                    component_name: "workflow".to_string(),
+                    lease_id: "lease-1".to_string(),
+                    metadata: HashMap::from([
+                        (
+                            "run_authority".to_string(),
+                            "runtime-run-authority".to_string(),
+                        ),
+                        (
+                            "lease_authority".to_string(),
+                            "runtime-lease-authority".to_string(),
+                        ),
+                    ]),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        let components = vec![crate::pb::ComponentInfo {
+            name: "workflow".to_string(),
+            config: HashMap::from([("model".to_string(), "gpt-5".to_string())]),
+            ..Default::default()
+        }];
+
+        stamp_activation_dispatch_metadata(
+            &mut message,
+            "worker-1",
+            "session-1",
+            "1.2.3",
+            &HashMap::from([
+                ("project_id".to_string(), "project-1".to_string()),
+                (
+                    "activation_artifact_sha256".to_string(),
+                    "artifact-digest".to_string(),
+                ),
+            ]),
+            &activation_definition_configs(&components),
+        );
+
+        let Some(runtime_message::MessageData::DispatchComponent(request)) = message.message_data
+        else {
+            panic!("dispatch request");
+        };
+        assert_eq!(
+            request
+                .metadata
+                .get(crate::client::DURABLE_ACTIVATION_V1_CAPABILITY)
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            request
+                .metadata
+                .get("worker_session_id")
+                .map(String::as_str),
+            Some("session-1")
+        );
+        assert_eq!(
+            request.metadata.get("lease_id").map(String::as_str),
+            Some("lease-1")
+        );
+        assert_eq!(
+            request.metadata.get("run_authority").map(String::as_str),
+            Some("runtime-run-authority")
+        );
+        assert_eq!(
+            request.metadata.get("lease_authority").map(String::as_str),
+            Some("runtime-lease-authority")
+        );
+        assert_eq!(
+            request
+                .metadata
+                .get("activation_definition_config")
+                .map(String::as_str),
+            Some(r#"["object",[["model",["string","gpt-5"]]]]"#)
         );
     }
 
