@@ -620,6 +620,40 @@ fn stamp_dispatch_mode(runtime_message: &mut RuntimeMessage, dispatch_mode: &str
     }
 }
 
+/// Stamp the durable execution authority carried by one dispatch onto the
+/// metadata visible to language handlers. Lifecycle records emitted by those
+/// handlers reuse these fields so the runtime can reject writes after the
+/// lease expires or moves to another worker.
+fn stamp_execution_authority_metadata(
+    runtime_message: &mut RuntimeMessage,
+    worker_id: &str,
+    worker_session_id: &str,
+    dispatch_mode: &str,
+) {
+    let Some(crate::pb::runtime_message::MessageData::DispatchComponent(request)) =
+        runtime_message.message_data.as_mut()
+    else {
+        return;
+    };
+
+    request
+        .metadata
+        .insert("dispatch_mode".to_string(), dispatch_mode.to_string());
+    request
+        .metadata
+        .insert("worker_id".to_string(), worker_id.to_string());
+    request.metadata.insert(
+        "worker_session_id".to_string(),
+        worker_session_id.to_string(),
+    );
+    request
+        .metadata
+        .insert("lease_id".to_string(), request.lease_id.clone());
+    request
+        .metadata
+        .insert("lease_attempt".to_string(), request.attempt.to_string());
+}
+
 fn canonical_activation_component_config(config: &HashMap<String, String>) -> String {
     let mut entries = config.iter().collect::<Vec<_>>();
     entries.sort_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
@@ -1828,6 +1862,12 @@ where
                         continue;
                     }
                 };
+                stamp_execution_authority_metadata(
+                    &mut runtime_message,
+                    &ctx.worker_id,
+                    &current_session_id,
+                    "pull",
+                );
                 if client
                     .negotiated_protocol_capability(crate::client::DURABLE_ACTIVATION_V1_CAPABILITY)
                 {
@@ -3617,6 +3657,13 @@ impl Worker {
                                 );
                             }
 
+                            stamp_execution_authority_metadata(
+                                &mut runtime_message,
+                                &self.config.worker_id,
+                                &self.config.worker_id,
+                                "push",
+                            );
+
                             // CancelExecution: fire the soft-cancel channel for
                             // the invocation if it's running locally. Handled
                             // here (not in the pool) so it can't queue behind
@@ -4879,8 +4926,8 @@ mod tests {
         parked_runtime_service_response, parked_worker_session_was_refreshed,
         polled_job_completion_from_service_message, record_groups_by_run,
         runtime_message_from_job_assignment, stamp_activation_dispatch_metadata,
-        stamp_dispatch_mode, take_correlation_ids, try_retire_parked_slot,
-        uncommitted_records_in_reverse, valid_activation_artifact_sha256,
+        stamp_dispatch_mode, stamp_execution_authority_metadata, take_correlation_ids,
+        try_retire_parked_slot, uncommitted_records_in_reverse, valid_activation_artifact_sha256,
         wait_for_parked_run_events_flush, worker_capabilities, ActiveLeaseAuthority,
         ActiveLeaseSession, AppendGroupProgress, CompleteJobSender, EntityStateSender,
         ParkedWorkerSessionRegistration, Worker, WorkerConfig,
@@ -5147,6 +5194,56 @@ mod tests {
         assert_eq!(
             request.metadata.get("dispatch_mode").map(String::as_str),
             Some("push")
+        );
+    }
+
+    #[test]
+    fn execution_authority_metadata_overrides_caller_values() {
+        let mut message = crate::pb::RuntimeMessage {
+            message_data: Some(runtime_message::MessageData::DispatchComponent(
+                crate::pb::DispatchComponentRequest {
+                    lease_id: "lease-7".to_string(),
+                    attempt: 7,
+                    metadata: HashMap::from([
+                        ("dispatch_mode".to_string(), "push".to_string()),
+                        ("worker_id".to_string(), "forged-worker".to_string()),
+                        ("lease_id".to_string(), "forged-lease".to_string()),
+                        ("lease_attempt".to_string(), "99".to_string()),
+                    ]),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+
+        stamp_execution_authority_metadata(&mut message, "worker-1", "session-1", "pull");
+
+        let Some(runtime_message::MessageData::DispatchComponent(request)) = message.message_data
+        else {
+            panic!("dispatch request");
+        };
+        assert_eq!(
+            request.metadata.get("dispatch_mode").map(String::as_str),
+            Some("pull")
+        );
+        assert_eq!(
+            request.metadata.get("worker_id").map(String::as_str),
+            Some("worker-1")
+        );
+        assert_eq!(
+            request
+                .metadata
+                .get("worker_session_id")
+                .map(String::as_str),
+            Some("session-1")
+        );
+        assert_eq!(
+            request.metadata.get("lease_id").map(String::as_str),
+            Some("lease-7")
+        );
+        assert_eq!(
+            request.metadata.get("lease_attempt").map(String::as_str),
+            Some("7")
         );
     }
 
