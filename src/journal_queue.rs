@@ -7,7 +7,8 @@
 //!
 //! - **JournalEventQueue**: Thread-safe buffer with configurable max size
 //! - **JournalEventMessage**: Unified event with classification flags
-//! - **Overflow policy**: Drop oldest when buffer full (FIFO)
+//! - **Overflow policy**: Drop telemetry only; reject correctness events when
+//!   no telemetry slot can be reclaimed
 //! - **Metrics**: Track queued, sent, dropped, errors
 //!
 //! ## Event Classification
@@ -218,8 +219,9 @@ pub struct JournalQueueMetrics {
 
 /// Thread-safe unified journal event queue
 ///
-/// Buffers all event types in memory and provides FIFO access with automatic
-/// oldest-event dropping when buffer is full.
+/// Buffers all event types in memory and provides FIFO access. When the buffer
+/// is full, only SSE-only telemetry can be evicted. Correctness events are
+/// rejected if no telemetry slot can be reclaimed.
 #[derive(Clone)]
 pub struct JournalEventQueue {
     /// Internal queue protected by mutex
@@ -249,28 +251,54 @@ impl JournalEventQueue {
 
     /// Push an event to the queue
     ///
-    /// If the queue is at capacity, the oldest event is dropped (FIFO).
+    /// If the queue is at capacity, the oldest SSE-only event is dropped. A
+    /// correctness event is never evicted: if the queue contains only
+    /// correctness events, a new correctness event is rejected and new
+    /// telemetry is dropped.
     pub fn push(&self, event: JournalEventMessage) -> Result<(), String> {
         let mut queue = self
             .queue
             .lock()
             .map_err(|e| format!("Failed to lock journal queue for push: {}", e))?;
 
-        // Check if buffer is full
-        if queue.len() >= self.config.max_size {
-            // Drop oldest event to make room
-            if let Some(dropped) = queue.pop_front() {
+        // Reclaim telemetry until the buffer has room. push_front() may have
+        // temporarily taken the queue over capacity while preserving a failed
+        // correctness batch, so this can require more than one eviction.
+        while queue.len() >= self.config.max_size {
+            let oldest_telemetry = queue
+                .iter()
+                .position(|queued| JournalEventMessage::is_sse_only_event_type(&queued.event_type));
+
+            if let Some(index) = oldest_telemetry {
+                let dropped = queue
+                    .remove(index)
+                    .expect("telemetry position came from the same queue");
                 log::warn!(
-                    "Journal queue full ({}), dropped oldest event: type={} run_id={}",
+                    "Journal queue full ({}), dropped oldest telemetry event: type={} run_id={}",
                     self.config.max_size,
                     dropped.event_type,
                     dropped.run_id
                 );
 
-                // Update metrics
                 if let Ok(mut metrics) = self.metrics.lock() {
                     metrics.events_dropped += 1;
                 }
+            } else if JournalEventMessage::is_sse_only_event_type(&event.event_type) {
+                log::warn!(
+                    "Journal queue full ({}), dropped incoming telemetry event: type={} run_id={}",
+                    self.config.max_size,
+                    event.event_type,
+                    event.run_id
+                );
+                if let Ok(mut metrics) = self.metrics.lock() {
+                    metrics.events_dropped += 1;
+                }
+                return Ok(());
+            } else {
+                return Err(format!(
+                    "Journal queue full ({}) with correctness events; rejected event: type={} run_id={}",
+                    self.config.max_size, event.event_type, event.run_id
+                ));
             }
         }
 
@@ -522,33 +550,107 @@ mod tests {
     }
 
     #[test]
-    fn test_journal_queue_overflow() {
+    fn test_journal_queue_overflow_drops_oldest_telemetry() {
         let queue = JournalEventQueue::new(JournalQueueConfig {
             max_size: 3,
             ..Default::default()
         });
 
         // Fill queue
+        queue.push(create_test_event("output.delta", 1)).unwrap();
+        queue.push(create_test_event("log.info", 2)).unwrap();
+        queue.push(create_test_event("progress.update", 3)).unwrap();
+        assert_eq!(queue.len(), 3);
+
+        // Overflow - should drop oldest telemetry (seq=1)
+        queue.push(create_test_event("output.delta", 4)).unwrap();
+        assert_eq!(queue.len(), 3);
+
+        // Verify oldest was dropped
+        let event = queue.pop().unwrap();
+        assert_eq!(event.sequence, 2);
+        assert_eq!(queue.metrics().events_dropped, 1);
+    }
+
+    #[test]
+    fn test_journal_queue_overflow_never_evicts_correctness_event() {
+        let queue = JournalEventQueue::new(JournalQueueConfig {
+            max_size: 3,
+            ..Default::default()
+        });
+
+        queue
+            .push(create_test_event("workflow.started", 1))
+            .unwrap();
+        queue.push(create_test_event("output.delta", 2)).unwrap();
+        queue
+            .push(create_test_event("workflow.step.started", 3))
+            .unwrap();
+
+        queue
+            .push(create_test_event("workflow.step.completed", 4))
+            .unwrap();
+
+        let sequences: Vec<_> = queue
+            .drain_all()
+            .into_iter()
+            .map(|event| event.sequence)
+            .collect();
+        assert_eq!(sequences, vec![1, 3, 4]);
+        assert_eq!(queue.metrics().events_dropped, 1);
+    }
+
+    #[test]
+    fn test_journal_queue_rejects_correctness_when_only_correctness_is_buffered() {
+        let queue = JournalEventQueue::new(JournalQueueConfig {
+            max_size: 2,
+            ..Default::default()
+        });
+
         queue
             .push(create_test_event("workflow.started", 1))
             .unwrap();
         queue
             .push(create_test_event("workflow.step.started", 2))
             .unwrap();
-        queue
+
+        let error = queue
             .push(create_test_event("workflow.step.completed", 3))
-            .unwrap();
-        assert_eq!(queue.len(), 3);
+            .unwrap_err();
 
-        // Overflow - should drop oldest (seq=1)
+        assert!(error.contains("rejected event: type=workflow.step.completed"));
+        let sequences: Vec<_> = queue
+            .drain_all()
+            .into_iter()
+            .map(|event| event.sequence)
+            .collect();
+        assert_eq!(sequences, vec![1, 2]);
+        assert_eq!(queue.metrics().events_dropped, 0);
+    }
+
+    #[test]
+    fn test_journal_queue_drops_incoming_telemetry_before_correctness() {
+        let queue = JournalEventQueue::new(JournalQueueConfig {
+            max_size: 2,
+            ..Default::default()
+        });
+
         queue
-            .push(create_test_event("workflow.completed", 4))
+            .push(create_test_event("workflow.started", 1))
             .unwrap();
-        assert_eq!(queue.len(), 3);
+        queue
+            .push(create_test_event("workflow.step.started", 2))
+            .unwrap();
 
-        // Verify oldest was dropped
-        let event = queue.pop().unwrap();
-        assert_eq!(event.sequence, 2); // seq=1 was dropped
+        queue.push(create_test_event("output.delta", 3)).unwrap();
+
+        let sequences: Vec<_> = queue
+            .drain_all()
+            .into_iter()
+            .map(|event| event.sequence)
+            .collect();
+        assert_eq!(sequences, vec![1, 2]);
+        assert_eq!(queue.metrics().events_dropped, 1);
     }
 
     #[test]
