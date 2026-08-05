@@ -838,6 +838,28 @@ pub fn record_worker_memory_bytes(
     gauge.record(value, &attrs);
 }
 
+/// Counter for bounded execution-lease renewal outcomes. Run and lease IDs
+/// are intentionally excluded to keep metric cardinality stable.
+static LEASE_RENEWAL_COUNTER: OnceLock<Counter<u64>> = OnceLock::new();
+
+pub fn record_lease_renewal(mode: &'static str, outcome: &'static str) {
+    let counter = LEASE_RENEWAL_COUNTER.get_or_init(|| {
+        let meter = global::meter("agnt5-sdk-core");
+        meter
+            .u64_counter("agnt5.worker.lease_renewals")
+            .with_description("Execution lease renewal attempts by mode and bounded outcome")
+            .with_unit("attempts")
+            .build()
+    });
+    counter.add(
+        1,
+        &[
+            KeyValue::new("worker.mode", mode),
+            KeyValue::new("outcome", outcome),
+        ],
+    );
+}
+
 // =============================================================================
 // Reconnection Metrics
 // =============================================================================

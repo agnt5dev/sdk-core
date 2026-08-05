@@ -617,7 +617,7 @@ impl WorkerCoordinatorClient {
             })
     }
 
-    /// Renew an active job lease for a parked-poll assignment.
+    /// Renew an active push or pull execution lease.
     pub async fn renew_job_lease(
         &mut self,
         req: RenewJobLeaseRequest,

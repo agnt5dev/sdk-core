@@ -1676,17 +1676,36 @@ message JobAssignment {
   int64 lease_expires_at_ms = 12;
 }
 
+// LeaseRenewalOutcome distinguishes a committed renewal from a definite loss
+// of execution authority. Transport/status failures remain indeterminate and
+// must be retried only while the caller's current lease is still valid.
+enum LeaseRenewalOutcome {
+  LEASE_RENEWAL_OUTCOME_UNSPECIFIED = 0;
+  LEASE_RENEWAL_OUTCOME_RENEWED = 1;
+  LEASE_RENEWAL_OUTCOME_AUTHORITY_LOST = 2;
+  LEASE_RENEWAL_OUTCOME_TERMINAL = 3;
+  LEASE_RENEWAL_OUTCOME_SESSION_INACTIVE = 4;
+}
+
 message RenewJobLeaseRequest {
   string worker_id = 1;
   string worker_session_id = 2;
   string run_id = 3;
   string lease_id = 4;
   int64 lease_timeout_ms = 5;
+
+  // Additive authority fields used by push workers. Legacy pull workers omit
+  // them and continue to be fenced by worker_session_id.
+  optional uint32 attempt = 6;
+  WorkerMode mode = 7;
+  string project_id = 8;
+  string deployment_id = 9;
 }
 
 message RenewJobLeaseResponse {
   bool renewed = 1;
   int64 lease_expires_at_ms = 2;
+  LeaseRenewalOutcome outcome = 3;
 }
 
 message ReportWorkerCapacityRequest {

@@ -4,13 +4,13 @@ use crate::journal_queue::{JournalEventMessage, JournalEventQueue, JournalQueueC
 use crate::pb::{
     execution_engine_service_client::ExecutionEngineServiceClient, runtime_message,
     runtime_service_request, runtime_service_response, service_message, CompleteJobRequest,
-    CompleteJobResponse, ComponentInfo, DispatchComponentResponse, EntityStateLoadResult,
-    EntityStateSaveResult, EventStreamMessage, GetEntityStateRequest, GetEntityStateResponse,
-    HealthCheck, JobAssignment, PollJobRequest, PutEntityStateRequest, PutEntityStateResponse,
-    RegisterService, RegisterWorkerSessionRequest, RenewJobLeaseRequest,
-    ReportWorkerCapacityRequest, RuntimeMessage, RuntimeMessageType, RuntimeServiceResponse,
-    ServiceMessage, UnregisterService, WorkerCapability, WorkerHealthStatus, WorkerSlotPolicy,
-    WriteCheckpointRequest,
+    CompleteJobResponse, ComponentInfo, DispatchComponentRequest, DispatchComponentResponse,
+    EntityStateLoadResult, EntityStateSaveResult, EventStreamMessage, GetEntityStateRequest,
+    GetEntityStateResponse, HealthCheck, JobAssignment, LeaseRenewalOutcome, PollJobRequest,
+    PutEntityStateRequest, PutEntityStateResponse, RegisterService, RegisterWorkerSessionRequest,
+    RenewJobLeaseRequest, ReportWorkerCapacityRequest, RuntimeMessage, RuntimeMessageType,
+    RuntimeServiceResponse, ServiceMessage, UnregisterService, WorkerCapability,
+    WorkerHealthStatus, WorkerMode, WorkerSlotPolicy, WriteCheckpointRequest,
 };
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -207,6 +207,7 @@ fn runtime_message_from_job_assignment(
     String,
     u32,
     i64,
+    i64,
     HashMap<String, String>,
 )> {
     if job.job_id.is_empty() || job.run_id.is_empty() {
@@ -317,6 +318,7 @@ fn runtime_message_from_job_assignment(
         lease_id,
         attempt,
         configured_claim_timeout_ms,
+        job.lease_expires_at_ms,
         completion_metadata,
     ))
 }
@@ -543,6 +545,13 @@ pub struct Worker {
     /// DispatchComponentResponse.lease_id without requiring language bindings
     /// to thread the value through their handler code.
     pending_lease_ids: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    /// Executions whose last known durable lease authority was revoked. The
+    /// entry survives handler cancellation so a late language response cannot
+    /// be forwarded after a cooperative cancellation race.
+    revoked_executions: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Per-execution stop handles for push lease renewal tasks. Pull slots own
+    /// their stop handles directly because each slot awaits one job at a time.
+    lease_renewal_stops: Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
     /// Per-invocation soft-cancel channels keyed by run_id. A oneshot sender
     /// is registered while a dispatched invocation runs; a CancelExecution
     /// message from the coordinator fires it, the pool task's `select!` drops
@@ -784,6 +793,7 @@ async fn execute_runtime_message_for_response<F, Fut>(
     handler: F,
     in_flight: Arc<std::sync::atomic::AtomicUsize>,
     cancel_tokens: Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
+    revoked_executions: Arc<std::sync::Mutex<HashSet<String>>>,
     dispatch_mode: &'static str,
 ) -> Option<ServiceMessage>
 where
@@ -795,6 +805,16 @@ where
     stamp_dispatch_mode(&mut runtime_message, dispatch_mode);
 
     let run_key = dispatch_run_key(&runtime_message);
+    if run_key
+        .as_deref()
+        .is_some_and(|run_id| execution_is_revoked(&revoked_executions, run_id))
+    {
+        warn!(
+            "Worker {} refusing dispatch after local execution authority was revoked",
+            worker_name
+        );
+        return None;
+    }
     let result = if let Some(key) = run_key.clone() {
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
         if let Ok(mut m) = cancel_tokens.lock() {
@@ -811,6 +831,17 @@ where
     } else {
         Some(handler(runtime_message, tx_clone).await)
     };
+
+    if run_key
+        .as_deref()
+        .is_some_and(|run_id| execution_is_revoked(&revoked_executions, run_id))
+    {
+        warn!(
+            "Worker {} suppressing response after execution authority loss",
+            worker_name
+        );
+        return None;
+    }
 
     let response = match result {
         Some(Ok(Some(response))) => Some(response),
@@ -835,6 +866,7 @@ async fn execute_runtime_message<F, Fut>(
     handler: F,
     in_flight: Arc<std::sync::atomic::AtomicUsize>,
     cancel_tokens: Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
+    revoked_executions: Arc<std::sync::Mutex<HashSet<String>>>,
 ) where
     F: Fn(RuntimeMessage, flume::Sender<ServiceMessage>) -> Fut + Send + Clone + 'static,
     Fut: std::future::Future<Output = Result<Option<ServiceMessage>>> + Send + 'static,
@@ -846,6 +878,7 @@ async fn execute_runtime_message<F, Fut>(
         handler,
         in_flight,
         cancel_tokens,
+        revoked_executions,
         "push",
     )
     .await
@@ -1276,21 +1309,104 @@ async fn complete_or_forward_parked_response(
     true
 }
 
-fn parked_lease_renew_interval_ms(lease_timeout_ms: i64) -> u64 {
+fn active_lease_renew_interval_ms(lease_timeout_ms: i64) -> u64 {
     let timeout_ms = lease_timeout_ms.max(10_000) as u64;
     let renewal_ms = (timeout_ms / 2).clamp(5_000, 60_000);
     renewal_ms.min(timeout_ms.saturating_sub(1_000).max(1_000))
 }
 
-fn parked_lease_renew_interval_with_jitter_ms(lease_timeout_ms: i64) -> u64 {
-    let base = parked_lease_renew_interval_ms(lease_timeout_ms);
+fn active_lease_renew_interval_with_jitter_ms(lease_timeout_ms: i64) -> u64 {
+    let base = active_lease_renew_interval_ms(lease_timeout_ms);
     let jitter = rand::random::<f64>() * 0.20 - 0.10;
     ((base as f64) * (1.0 + jitter)).round().max(1_000.0) as u64
 }
 
-fn parked_lease_danger_retry_ms(lease_timeout_ms: i64) -> u64 {
+fn active_lease_danger_retry_ms(lease_timeout_ms: i64) -> u64 {
     let timeout_ms = lease_timeout_ms.max(10_000) as u64;
     (timeout_ms / 10).clamp(500, 5_000)
+}
+
+#[derive(Clone)]
+enum ActiveLeaseSession {
+    Push,
+    Pull(Arc<TokioMutex<String>>),
+}
+
+#[derive(Clone)]
+struct ActiveLeaseAuthority {
+    worker_id: String,
+    project_id: String,
+    deployment_id: String,
+    run_id: String,
+    lease_id: String,
+    attempt: u32,
+    lease_timeout_ms: i64,
+    lease_expires_at_ms: i64,
+    session: ActiveLeaseSession,
+}
+
+impl ActiveLeaseAuthority {
+    fn mode_label(&self) -> &'static str {
+        match &self.session {
+            ActiveLeaseSession::Push => "push",
+            ActiveLeaseSession::Pull(_) => "pull",
+        }
+    }
+
+    async fn renewal_request(&self) -> RenewJobLeaseRequest {
+        let (worker_session_id, mode) = match &self.session {
+            ActiveLeaseSession::Push => (String::new(), WorkerMode::Push),
+            ActiveLeaseSession::Pull(session_id) => {
+                (session_id.lock().await.clone(), WorkerMode::Pull)
+            }
+        };
+        RenewJobLeaseRequest {
+            worker_id: self.worker_id.clone(),
+            worker_session_id,
+            run_id: self.run_id.clone(),
+            lease_id: self.lease_id.clone(),
+            lease_timeout_ms: self.lease_timeout_ms,
+            attempt: Some(self.attempt),
+            mode: mode as i32,
+            project_id: self.project_id.clone(),
+            deployment_id: self.deployment_id.clone(),
+        }
+    }
+}
+
+fn execution_is_revoked(
+    revoked_executions: &Arc<std::sync::Mutex<HashSet<String>>>,
+    run_id: &str,
+) -> bool {
+    revoked_executions
+        .lock()
+        .map(|runs| runs.contains(run_id))
+        .unwrap_or(true)
+}
+
+fn revoke_execution_authority(
+    run_id: &str,
+    revoked_executions: &Arc<std::sync::Mutex<HashSet<String>>>,
+    cancel_tokens: &Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
+    cancel_hook: &Arc<std::sync::Mutex<Option<Box<dyn Fn(String) + Send + Sync>>>>,
+) {
+    if let Ok(mut runs) = revoked_executions.lock() {
+        runs.insert(run_id.to_string());
+    }
+    let hooked = cancel_hook
+        .lock()
+        .ok()
+        .and_then(|hook| hook.as_ref().map(|hook| hook(run_id.to_string())))
+        .is_some();
+    if !hooked {
+        if let Some(cancel) = cancel_tokens
+            .lock()
+            .ok()
+            .and_then(|mut tokens| tokens.remove(run_id))
+        {
+            let _ = cancel.send(());
+        }
+    }
 }
 
 async fn report_worker_capacity_with_client(
@@ -1563,6 +1679,8 @@ struct ParkedPollContext {
     response_tx: flume::Sender<ServiceMessage>,
     in_flight: Arc<std::sync::atomic::AtomicUsize>,
     cancel_tokens: Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
+    cancel_hook: Arc<std::sync::Mutex<Option<Box<dyn Fn(String) + Send + Sync>>>>,
+    revoked_executions: Arc<std::sync::Mutex<HashSet<String>>>,
     streaming_runs: Arc<std::sync::Mutex<HashMap<String, bool>>>,
     pending_lease_ids: Arc<std::sync::Mutex<HashMap<String, String>>>,
     journal_queue: JournalEventQueue,
@@ -1699,6 +1817,7 @@ where
                     lease_id,
                     completion_attempt,
                     lease_timeout_ms,
+                    lease_expires_at_ms,
                     completion_metadata,
                 ) = match runtime_message_from_job_assignment(job, ctx.claim_timeout_ms) {
                     Ok(assignment) => assignment,
@@ -1734,15 +1853,27 @@ where
                         map.insert(run_id.clone(), true);
                     }
                 }
+                if let Ok(mut revoked) = ctx.revoked_executions.lock() {
+                    revoked.remove(&run_id);
+                }
 
                 let (renew_stop_tx, renew_handle) = tokio::sync::oneshot::channel::<()>();
-                let renewal = spawn_parked_lease_renewal(
+                let renewal = spawn_active_lease_renewal(
                     client.clone(),
-                    ctx.worker_id.clone(),
-                    ctx.worker_session_id.clone(),
-                    run_id.clone(),
-                    lease_id.clone(),
-                    lease_timeout_ms,
+                    ActiveLeaseAuthority {
+                        worker_id: ctx.worker_id.clone(),
+                        project_id: ctx.project_id.clone(),
+                        deployment_id: ctx.registration.deployment_id.clone(),
+                        run_id: run_id.clone(),
+                        lease_id: lease_id.clone(),
+                        attempt: completion_attempt,
+                        lease_timeout_ms,
+                        lease_expires_at_ms,
+                        session: ActiveLeaseSession::Pull(ctx.worker_session_id.clone()),
+                    },
+                    ctx.revoked_executions.clone(),
+                    ctx.cancel_tokens.clone(),
+                    ctx.cancel_hook.clone(),
                     renew_handle,
                 );
 
@@ -1754,6 +1885,7 @@ where
                     handler.clone(),
                     ctx.in_flight.clone(),
                     ctx.cancel_tokens.clone(),
+                    ctx.revoked_executions.clone(),
                     "pull",
                 );
                 tokio::pin!(handler_future);
@@ -1806,7 +1938,9 @@ where
                 }
 
                 let mut completed = false;
-                if let Some(service_message) = returned_response {
+                if let Some(service_message) = returned_response
+                    .filter(|_| !execution_is_revoked(&ctx.revoked_executions, &run_id))
+                {
                     completed = complete_or_forward_parked_response(
                         &mut client,
                         service_message,
@@ -1825,6 +1959,13 @@ where
                     .await;
                 }
                 for service_message in buffered_responses {
+                    if execution_is_revoked(&ctx.revoked_executions, &run_id) {
+                        warn!(
+                            "Parked poll slot {} suppressing response after lease authority loss for run_id={}",
+                            slot_id, completion_run_id
+                        );
+                        continue;
+                    }
                     if completed
                         && polled_job_completion_from_service_message(
                             &service_message,
@@ -1860,7 +2001,7 @@ where
                         || completed;
                 }
 
-                if completed {
+                if completed || execution_is_revoked(&ctx.revoked_executions, &run_id) {
                     if let Ok(mut map) = ctx.pending_lease_ids.lock() {
                         map.remove(&completion_run_id);
                     }
@@ -1901,63 +2042,114 @@ where
     }
 }
 
-fn spawn_parked_lease_renewal(
+fn spawn_active_lease_renewal(
     mut client: WorkerCoordinatorClient,
-    worker_id: String,
-    worker_session_id: Arc<TokioMutex<String>>,
-    run_id: String,
-    lease_id: String,
-    lease_timeout_ms: i64,
+    authority: ActiveLeaseAuthority,
+    revoked_executions: Arc<std::sync::Mutex<HashSet<String>>>,
+    cancel_tokens: Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
+    cancel_hook: Arc<std::sync::Mutex<Option<Box<dyn Fn(String) + Send + Sync>>>>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    if lease_id.is_empty() {
+    if authority.lease_id.is_empty() {
         return None;
     }
 
     Some(tokio::spawn(async move {
-        let mut interval =
-            Duration::from_millis(parked_lease_renew_interval_with_jitter_ms(lease_timeout_ms));
+        let mut lease_expires_at_ms = if authority.lease_expires_at_ms > 0 {
+            authority.lease_expires_at_ms
+        } else {
+            current_time_ms().saturating_add(authority.lease_timeout_ms)
+        };
+        let mut delay_ms = active_lease_renew_interval_with_jitter_ms(authority.lease_timeout_ms);
         loop {
+            let now_ms = current_time_ms();
+            if now_ms >= lease_expires_at_ms {
+                crate::telemetry::record_lease_renewal(authority.mode_label(), "expired");
+                warn!(
+                    "Execution lease expired before renewal was confirmed: run_id={} lease_id={}",
+                    authority.run_id, authority.lease_id
+                );
+                revoke_execution_authority(
+                    &authority.run_id,
+                    &revoked_executions,
+                    &cancel_tokens,
+                    &cancel_hook,
+                );
+                return;
+            }
+            let remaining_ms = lease_expires_at_ms.saturating_sub(now_ms) as u64;
+            let sleep_ms = delay_ms.min(remaining_ms.max(1));
             tokio::select! {
                 _ = &mut stop_rx => {
                     return;
                 }
-                _ = tokio::time::sleep(interval) => {}
+                _ = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {}
+            }
+
+            if current_time_ms() >= lease_expires_at_ms {
+                crate::telemetry::record_lease_renewal(authority.mode_label(), "danger_expired");
+                warn!(
+                    "Execution entered the lease danger boundary without a confirmed renewal: run_id={} lease_id={}",
+                    authority.run_id, authority.lease_id
+                );
+                revoke_execution_authority(
+                    &authority.run_id,
+                    &revoked_executions,
+                    &cancel_tokens,
+                    &cancel_hook,
+                );
+                return;
             }
 
             match client
-                .renew_job_lease(RenewJobLeaseRequest {
-                    worker_id: worker_id.clone(),
-                    worker_session_id: worker_session_id.lock().await.clone(),
-                    run_id: run_id.clone(),
-                    lease_id: lease_id.clone(),
-                    lease_timeout_ms,
-                })
+                .renew_job_lease(authority.renewal_request().await)
                 .await
             {
                 Ok(resp) if resp.renewed => {
+                    crate::telemetry::record_lease_renewal(authority.mode_label(), "renewed");
                     debug!(
-                        "Renewed parked poll lease run_id={} lease_id={} expires_at_ms={}",
-                        run_id, lease_id, resp.lease_expires_at_ms
+                        "Renewed execution lease run_id={} lease_id={} expires_at_ms={}",
+                        authority.run_id, authority.lease_id, resp.lease_expires_at_ms
                     );
-                    interval = Duration::from_millis(parked_lease_renew_interval_with_jitter_ms(
-                        lease_timeout_ms,
-                    ));
+                    lease_expires_at_ms = resp.lease_expires_at_ms;
+                    delay_ms =
+                        active_lease_renew_interval_with_jitter_ms(authority.lease_timeout_ms);
                 }
-                Ok(_) => {
+                Ok(resp) => {
+                    let outcome = LeaseRenewalOutcome::try_from(resp.outcome)
+                        .unwrap_or(LeaseRenewalOutcome::Unspecified);
                     warn!(
-                        "Parked poll lease renewal returned renewed=false: run_id={} lease_id={}",
-                        run_id, lease_id
+                        "Execution lease authority was revoked: run_id={} lease_id={} outcome={}",
+                        authority.run_id,
+                        authority.lease_id,
+                        outcome.as_str_name(),
+                    );
+                    crate::telemetry::record_lease_renewal(
+                        authority.mode_label(),
+                        match outcome {
+                            LeaseRenewalOutcome::AuthorityLost => "authority_lost",
+                            LeaseRenewalOutcome::Terminal => "terminal",
+                            LeaseRenewalOutcome::SessionInactive => "session_inactive",
+                            LeaseRenewalOutcome::Unspecified | LeaseRenewalOutcome::Renewed => {
+                                "rejected"
+                            }
+                        },
+                    );
+                    revoke_execution_authority(
+                        &authority.run_id,
+                        &revoked_executions,
+                        &cancel_tokens,
+                        &cancel_hook,
                     );
                     return;
                 }
                 Err(e) => {
+                    crate::telemetry::record_lease_renewal(authority.mode_label(), "indeterminate");
                     warn!(
-                        "Parked poll lease renewal failed: run_id={} lease_id={} error={}",
-                        run_id, lease_id, e
+                        "Execution lease renewal is indeterminate; retrying inside the known lease window: run_id={} lease_id={} error={}",
+                        authority.run_id, authority.lease_id, e
                     );
-                    interval =
-                        Duration::from_millis(parked_lease_danger_retry_ms(lease_timeout_ms));
+                    delay_ms = active_lease_danger_retry_ms(authority.lease_timeout_ms);
                 }
             }
         }
@@ -1989,6 +2181,8 @@ impl Worker {
             tokio_handle: Arc::new(std::sync::Mutex::new(None)),
             streaming_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pending_lease_ids: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            revoked_executions: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            lease_renewal_stops: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cancel_hook: Arc::new(std::sync::Mutex::new(None)),
             event_stream_tx: Arc::new(std::sync::Mutex::new(None)),
@@ -2159,6 +2353,115 @@ impl Worker {
         Ok(Some(client))
     }
 
+    fn start_push_lease_renewal(
+        &self,
+        client: WorkerCoordinatorClient,
+        request: &DispatchComponentRequest,
+    ) {
+        if request.lease_id.is_empty() {
+            return;
+        }
+        let run_id = request
+            .invocation_id
+            .split(':')
+            .next()
+            .unwrap_or(&request.invocation_id)
+            .to_string();
+        let Ok(attempt) = u32::try_from(request.attempt) else {
+            warn!(
+                "Refusing push lease renewal with negative attempt: run_id={} attempt={}",
+                run_id, request.attempt
+            );
+            revoke_execution_authority(
+                &run_id,
+                &self.revoked_executions,
+                &self.cancel_tokens,
+                &self.cancel_hook,
+            );
+            return;
+        };
+        let project_id = request
+            .metadata
+            .get("project_id")
+            .cloned()
+            .or_else(|| canonical_project_id_from_metadata(&self.metadata))
+            .unwrap_or_default();
+        let deployment_id = if request.deployment_id.is_empty() {
+            request
+                .metadata
+                .get("deployment_id")
+                .cloned()
+                .or_else(|| self.metadata.get("deployment_id").cloned())
+                .unwrap_or_default()
+        } else {
+            request.deployment_id.clone()
+        };
+        if project_id.is_empty() || deployment_id.is_empty() {
+            warn!(
+                "Push lease has incomplete routing authority; cancelling execution: run_id={}",
+                run_id
+            );
+            revoke_execution_authority(
+                &run_id,
+                &self.revoked_executions,
+                &self.cancel_tokens,
+                &self.cancel_hook,
+            );
+            return;
+        }
+        let lease_timeout_ms = request
+            .metadata
+            .get("lease_timeout_ms")
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(120_000);
+        let lease_expires_at_ms = request
+            .metadata
+            .get("lease_expires_at_ms")
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or_else(|| current_time_ms().saturating_add(lease_timeout_ms));
+
+        if let Ok(mut revoked) = self.revoked_executions.lock() {
+            revoked.remove(&run_id);
+        }
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        if let Ok(mut stops) = self.lease_renewal_stops.lock() {
+            if let Some(previous) = stops.insert(run_id.clone(), stop_tx) {
+                let _ = previous.send(());
+            }
+        }
+        let _ = spawn_active_lease_renewal(
+            client,
+            ActiveLeaseAuthority {
+                worker_id: self.config.worker_id.clone(),
+                project_id,
+                deployment_id,
+                run_id,
+                lease_id: request.lease_id.clone(),
+                attempt,
+                lease_timeout_ms,
+                lease_expires_at_ms,
+                session: ActiveLeaseSession::Push,
+            },
+            self.revoked_executions.clone(),
+            self.cancel_tokens.clone(),
+            self.cancel_hook.clone(),
+            stop_rx,
+        );
+    }
+
+    fn stop_execution_lease_renewal(&self, run_id: &str) {
+        if let Some(stop) = self
+            .lease_renewal_stops
+            .lock()
+            .ok()
+            .and_then(|mut stops| stops.remove(run_id))
+        {
+            let _ = stop.send(());
+        }
+    }
+
     /// Remove per-run tracking entries (lease stash, streaming flag) for a
     /// finished invocation.
     ///
@@ -2173,6 +2476,7 @@ impl Worker {
             map.remove(invocation_id);
         }
         let run_id = invocation_id.split(':').next().unwrap_or(invocation_id);
+        self.stop_execution_lease_renewal(run_id);
         if let Ok(mut map) = self.streaming_runs.lock() {
             map.remove(run_id);
         }
@@ -2206,6 +2510,12 @@ impl Worker {
         source_timestamp_ns: i64,
         timeout_ms: u64,
     ) -> Result<()> {
+        let authority_run_id = run_id.split(':').next().unwrap_or(&run_id);
+        if execution_is_revoked(&self.revoked_executions, authority_run_id) {
+            return Err(SdkError::Internal(format!(
+                "execution authority was revoked for run_id={authority_run_id}"
+            )));
+        }
         let is_terminal = event_type == "run.completed" || event_type == "run.failed";
         let is_durable_checkpoint = JournalEventMessage::is_checkpoint_event_type(&event_type);
         // A durable checkpoint is an ordering boundary for every transient
@@ -2364,7 +2674,7 @@ impl Worker {
                 experiment_id.as_deref(),
             );
 
-            if is_terminal {
+            if is_terminal && result.is_ok() {
                 self.cleanup_run_tracking(&run_id);
             }
 
@@ -2558,7 +2868,7 @@ impl Worker {
             experiment_id.as_deref(),
         );
 
-        if is_terminal {
+        if is_terminal && result.is_ok() {
             self.cleanup_run_tracking(&run_id);
         }
 
@@ -3212,6 +3522,7 @@ impl Worker {
             let worker_name = format!("{}-{}", self.config.worker_id, worker_id);
             let in_flight = in_flight.clone();
             let cancel_tokens = self.cancel_tokens.clone();
+            let revoked_executions = self.revoked_executions.clone();
 
             let handle = tokio::spawn(async move {
                 while let Ok(runtime_message) = task_rx.recv_async().await {
@@ -3222,6 +3533,7 @@ impl Worker {
                         handler.clone(),
                         in_flight.clone(),
                         cancel_tokens.clone(),
+                        revoked_executions.clone(),
                     )
                     .await;
                 }
@@ -3371,6 +3683,7 @@ impl Worker {
                             // Track is_streaming per run for ephemeral event gating
                             if let Some(ref msg_data) = runtime_message.message_data {
                                 if let crate::pb::runtime_message::MessageData::DispatchComponent(ref req) = msg_data {
+                                    self.start_push_lease_renewal(client.clone(), req);
                                     if req.is_streaming {
                                         let run_id = if let Some(idx) = req.invocation_id.find(':') {
                                             req.invocation_id[..idx].to_string()
@@ -3590,6 +3903,14 @@ impl Worker {
         if let Ok(mut map) = self.pending_lease_ids.lock() {
             map.clear();
         }
+        if let Ok(mut stops) = self.lease_renewal_stops.lock() {
+            for (_, stop) in stops.drain() {
+                let _ = stop.send(());
+            }
+        }
+        if let Ok(mut revoked) = self.revoked_executions.lock() {
+            revoked.clear();
+        }
 
         dispatch_result
     }
@@ -3608,6 +3929,20 @@ impl Worker {
         if let Some(crate::pb::service_message::MessageType::FunctionResponse(ref mut resp)) =
             service_message.message_type
         {
+            let run_id = resp
+                .invocation_id
+                .split(':')
+                .next()
+                .unwrap_or(&resp.invocation_id)
+                .to_string();
+            if execution_is_revoked(&self.revoked_executions, &run_id) {
+                warn!(
+                    "Suppressing worker response after lease authority loss: run_id={}",
+                    run_id
+                );
+                self.cleanup_run_tracking(&resp.invocation_id);
+                return Ok(());
+            }
             let is_terminal = is_terminal_worker_response(&resp.event_type);
             if resp.lease_id.is_empty() {
                 if let Ok(mut map) = self.pending_lease_ids.lock() {
@@ -3621,14 +3956,7 @@ impl Worker {
                 }
             }
             if is_terminal {
-                let run_id = if let Some(idx) = resp.invocation_id.find(':') {
-                    resp.invocation_id[..idx].to_string()
-                } else {
-                    resp.invocation_id.clone()
-                };
-                if let Ok(mut map) = self.streaming_runs.lock() {
-                    map.remove(&run_id);
-                }
+                self.cleanup_run_tracking(&resp.invocation_id);
             }
         }
 
@@ -3712,6 +4040,7 @@ impl Worker {
         let journal_queue_outer = self.journal_queue.clone();
         let streaming_runs_outer = self.streaming_runs.clone();
         let pending_lease_ids_outer = self.pending_lease_ids.clone();
+        let revoked_executions_outer = self.revoked_executions.clone();
         let journal_flush_lock_outer = self.journal_flush_lock.clone();
         let ee_endpoint_outer = self.config.ee_endpoint.clone();
         let engine_endpoint_outer = self.config.engine_endpoint.clone();
@@ -3739,6 +4068,7 @@ impl Worker {
                     .max(1);
                 let streaming_runs = streaming_runs_outer.clone();
                 let pending_lease_ids = pending_lease_ids_outer.clone();
+                let revoked_executions = revoked_executions_outer.clone();
                 let journal_flush_lock = journal_flush_lock_outer.clone();
                 let ee_endpoint = ee_endpoint_outer.clone();
                 let engine_endpoint = engine_endpoint_outer.clone();
@@ -3776,7 +4106,15 @@ impl Worker {
                         } else {
                             batch_size
                         };
-                        let batch = journal_queue.drain_batch(drain_limit);
+                        let batch: Vec<_> = journal_queue
+                            .drain_batch(drain_limit)
+                            .into_iter()
+                            .filter(|event| {
+                                let run_id =
+                                    event.run_id.split(':').next().unwrap_or(&event.run_id);
+                                !execution_is_revoked(&revoked_executions, run_id)
+                            })
+                            .collect();
                         if batch.is_empty() {
                             continue;
                         }
@@ -4242,6 +4580,8 @@ impl Worker {
         let journal_queue = self.journal_queue.clone();
         let journal_flush_lock = self.journal_flush_lock.clone();
         let cancel_tokens = self.cancel_tokens.clone();
+        let cancel_hook = self.cancel_hook.clone();
+        let revoked_executions = self.revoked_executions.clone();
         let configured_max_slots = env_usize("AGNT5_MAX_SLOTS").unwrap_or(max_concurrency);
         let max_slots = configured_max_slots
             .clamp(1, max_concurrency.max(1))
@@ -4335,6 +4675,8 @@ impl Worker {
                 response_tx,
                 in_flight,
                 cancel_tokens,
+                cancel_hook,
+                revoked_executions,
                 streaming_runs,
                 pending_lease_ids,
                 journal_queue,
@@ -4529,20 +4871,20 @@ fn is_cancelled_worker_response(service_message: &ServiceMessage) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        activation_definition_configs, await_checkpoint_ack, canonical_activation_component_config,
-        complete_job_request_from_polled_completion, complete_job_with_retry,
+        activation_definition_configs, active_lease_danger_retry_ms,
+        active_lease_renew_interval_ms, active_lease_renew_interval_with_jitter_ms,
+        await_checkpoint_ack, canonical_activation_component_config,
+        complete_job_request_from_polled_completion, complete_job_with_retry, execution_is_revoked,
         is_cancelled_worker_response, is_parked_worker_session_registration_rejection,
-        is_terminal_worker_response, is_worker_session_inactive_error,
-        parked_lease_danger_retry_ms, parked_lease_renew_interval_ms,
-        parked_lease_renew_interval_with_jitter_ms, parked_ramp_spawn_count,
+        is_terminal_worker_response, is_worker_session_inactive_error, parked_ramp_spawn_count,
         parked_runtime_service_response, parked_worker_session_was_refreshed,
         polled_job_completion_from_service_message, record_groups_by_run,
         runtime_message_from_job_assignment, stamp_activation_dispatch_metadata,
         stamp_dispatch_mode, take_correlation_ids, try_retire_parked_slot,
         uncommitted_records_in_reverse, valid_activation_artifact_sha256,
-        wait_for_parked_run_events_flush, worker_capabilities, AppendGroupProgress,
-        CompleteJobSender, EntityStateSender, ParkedWorkerSessionRegistration, Worker,
-        WorkerConfig,
+        wait_for_parked_run_events_flush, worker_capabilities, ActiveLeaseAuthority,
+        ActiveLeaseSession, AppendGroupProgress, CompleteJobSender, EntityStateSender,
+        ParkedWorkerSessionRegistration, Worker, WorkerConfig,
     };
     use crate::error::{ErrorCode, SdkError};
     use crate::journal_queue::{JournalEventMessage, JournalEventQueue, JournalQueueConfig};
@@ -4551,7 +4893,7 @@ mod tests {
         runtime_service_response, service_message, CompleteJobRequest, CompleteJobResponse,
         DispatchComponentResponse, EntityStateSaveRequest, GetEntityStateRequest,
         GetEntityStateResponse, JobAssignment, PutEntityStateRequest, PutEntityStateResponse,
-        RuntimeServiceRequest, ServiceMessage,
+        RuntimeServiceRequest, ServiceMessage, WorkerMode,
     };
     use std::collections::{HashMap, VecDeque};
 
@@ -4662,6 +5004,95 @@ mod tests {
             result,
             Err(SdkError::Internal(message)) if message == "append rejected"
         ));
+    }
+
+    #[tokio::test]
+    async fn active_push_lease_request_carries_complete_authority_tuple() {
+        let authority = ActiveLeaseAuthority {
+            worker_id: "worker-1".to_string(),
+            project_id: "project-1".to_string(),
+            deployment_id: "deployment-1".to_string(),
+            run_id: "run-1".to_string(),
+            lease_id: "lease-1".to_string(),
+            attempt: 3,
+            lease_timeout_ms: 120_000,
+            lease_expires_at_ms: 200_000,
+            session: ActiveLeaseSession::Push,
+        };
+
+        let request = authority.renewal_request().await;
+
+        assert_eq!(request.worker_id, "worker-1");
+        assert!(request.worker_session_id.is_empty());
+        assert_eq!(request.project_id, "project-1");
+        assert_eq!(request.deployment_id, "deployment-1");
+        assert_eq!(request.run_id, "run-1");
+        assert_eq!(request.lease_id, "lease-1");
+        assert_eq!(request.attempt, Some(3));
+        assert_eq!(request.mode, WorkerMode::Push as i32);
+    }
+
+    #[tokio::test]
+    async fn revoked_execution_suppresses_late_push_response() {
+        let config = WorkerConfig::new(
+            "svc".to_string(),
+            "1.0.0".to_string(),
+            "standalone".to_string(),
+        );
+        let worker = Worker::new(config, Vec::new(), HashMap::new());
+        worker
+            .revoked_executions
+            .lock()
+            .unwrap()
+            .insert("run-1".to_string());
+        let (tx, rx) = flume::bounded(1);
+        let message = ServiceMessage {
+            worker_id: "worker-1".to_string(),
+            metadata: HashMap::new(),
+            message_type: Some(service_message::MessageType::FunctionResponse(
+                DispatchComponentResponse {
+                    invocation_id: "run-1".to_string(),
+                    success: true,
+                    event_type: "run.completed".to_string(),
+                    lease_id: "lease-stale".to_string(),
+                    ..Default::default()
+                },
+            )),
+        };
+
+        worker
+            .forward_worker_response(message, false, &tx)
+            .await
+            .unwrap();
+
+        assert!(rx.try_recv().is_err());
+        assert!(execution_is_revoked(&worker.revoked_executions, "run-1"));
+    }
+
+    #[test]
+    fn authority_revocation_invokes_language_cancel_hook() {
+        let config = WorkerConfig::new(
+            "svc".to_string(),
+            "1.0.0".to_string(),
+            "standalone".to_string(),
+        );
+        let worker = Worker::new(config, Vec::new(), HashMap::new());
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled_by_hook = cancelled.clone();
+        worker.set_cancel_hook(move |run_id| {
+            assert_eq!(run_id, "run-1");
+            cancelled_by_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        super::revoke_execution_authority(
+            "run-1",
+            &worker.revoked_executions,
+            &worker.cancel_tokens,
+            &worker.cancel_hook,
+        );
+
+        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(execution_is_revoked(&worker.revoked_executions, "run-1"));
     }
 
     #[test]
@@ -4964,6 +5395,7 @@ mod tests {
             lease_id,
             attempt,
             renewal_timeout_ms,
+            lease_expires_at_ms,
             completion_metadata,
         ) = runtime_message_from_job_assignment(job, 60_000).expect("valid typed assignment");
 
@@ -4972,6 +5404,7 @@ mod tests {
         assert_eq!(lease_id, "lease-1");
         assert_eq!(attempt, 2);
         assert_eq!(renewal_timeout_ms, 60_000);
+        assert_eq!(lease_expires_at_ms, 123_456);
         assert_eq!(
             completion_metadata.get("attempt").map(String::as_str),
             Some("2")
@@ -5395,14 +5828,14 @@ mod tests {
     }
 
     #[test]
-    fn parked_lease_renew_intervals_are_bounded() {
-        assert_eq!(parked_lease_renew_interval_ms(120_000), 60_000);
-        assert_eq!(parked_lease_danger_retry_ms(120_000), 5_000);
-        assert_eq!(parked_lease_renew_interval_ms(2_000), 5_000);
-        assert_eq!(parked_lease_danger_retry_ms(2_000), 1_000);
+    fn active_lease_renew_intervals_are_bounded() {
+        assert_eq!(active_lease_renew_interval_ms(120_000), 60_000);
+        assert_eq!(active_lease_danger_retry_ms(120_000), 5_000);
+        assert_eq!(active_lease_renew_interval_ms(2_000), 5_000);
+        assert_eq!(active_lease_danger_retry_ms(2_000), 1_000);
 
         for _ in 0..100 {
-            let jittered = parked_lease_renew_interval_with_jitter_ms(120_000);
+            let jittered = active_lease_renew_interval_with_jitter_ms(120_000);
             assert!(
                 (54_000..=66_000).contains(&jittered),
                 "jittered interval out of ±10% range: {jittered}"
