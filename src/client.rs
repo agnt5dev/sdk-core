@@ -3,19 +3,24 @@ use crate::pb::{
     engine_service_client::EngineServiceClient,
     execution_engine_service_client::ExecutionEngineServiceClient,
     worker_coordinator_service_client::WorkerCoordinatorServiceClient, AppendBatchRequest,
-    AppendBatchResponse, AppendRequest, CheckpointRequest, CheckpointType, CompleteJobRequest,
-    CompleteJobResponse, DurableStepCheckpoint, EventStreamMessage, FindByStepKeyRequest,
-    GetEntityStateRequest, GetEntityStateResponse, PollJobRequest, PollJobResponse,
-    PutEntityStateRequest, PutEntityStateResponse, Record, RegisterService,
-    RegisterWorkerSessionRequest, RegisterWorkerSessionResponse, RenewJobLeaseRequest,
-    RenewJobLeaseResponse, ReportWorkerCapacityRequest, ReportWorkerCapacityResponse,
-    RuntimeMessage, ServiceMessage,
+    AppendBatchResponse, AppendRequest, BeginActivationRequest, BeginActivationResponse,
+    CheckpointRequest, CheckpointType, CompleteActivationRequest, CompleteActivationResponse,
+    CompleteJobRequest, CompleteJobResponse, DurableStepCheckpoint, EventStreamMessage,
+    FailActivationRequest, FailActivationResponse, FindByStepKeyRequest, GetEntityStateRequest,
+    GetEntityStateResponse, PollJobRequest, PollJobResponse, PutEntityStateRequest,
+    PutEntityStateResponse, Record, RegisterService, RegisterWorkerSessionRequest,
+    RegisterWorkerSessionResponse, RenewJobLeaseRequest, RenewJobLeaseResponse,
+    ReportWorkerCapacityRequest, ReportWorkerCapacityResponse, RuntimeMessage, ServiceMessage,
 };
 use std::collections::HashMap;
 use std::time::Duration;
 use tonic::transport::Channel;
 use tonic::Code;
 use tracing::{debug, error};
+
+fn activation_status(operation: &str, status: tonic::Status) -> SdkError {
+    crate::runtime_adapter::activation_status_error(operation, status)
+}
 
 /// Simple client for communicating with the Worker Coordinator service.
 ///
@@ -744,6 +749,42 @@ impl EngineClient {
     fn next_client(&mut self) -> &mut EngineServiceClient<Channel> {
         let idx = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.clients.len();
         &mut self.clients[idx]
+    }
+
+    /// Admit one logical activation and return the journal-authoritative decision.
+    pub async fn begin_activation(
+        &mut self,
+        request: BeginActivationRequest,
+    ) -> Result<BeginActivationResponse> {
+        self.next_client()
+            .begin_activation(request)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|status| activation_status("BeginActivation", status))
+    }
+
+    /// Commit one fenced activation completion and wait for its durability acknowledgement.
+    pub async fn complete_activation(
+        &mut self,
+        request: CompleteActivationRequest,
+    ) -> Result<CompleteActivationResponse> {
+        self.next_client()
+            .complete_activation(request)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|status| activation_status("CompleteActivation", status))
+    }
+
+    /// Commit one fenced activation failure and wait for its durability acknowledgement.
+    pub async fn fail_activation(
+        &mut self,
+        request: FailActivationRequest,
+    ) -> Result<FailActivationResponse> {
+        self.next_client()
+            .fail_activation(request)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|status| activation_status("FailActivation", status))
     }
 
     /// Append a single record to the engine.
