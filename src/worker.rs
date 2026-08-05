@@ -13,6 +13,7 @@ use crate::pb::{
     WriteCheckpointRequest,
 };
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as TokioMutex;
@@ -35,6 +36,30 @@ const ASSIGNMENT_AUTHORED_RETRY_METADATA_KEYS: &[&str] = &[
     "backoff_type",
     "backoff_multiplier",
 ];
+
+async fn await_checkpoint_ack<F, T>(
+    future: F,
+    timeout_ms: u64,
+    operation: &str,
+    run_id: &str,
+    event_type: &str,
+    sequence_number: i64,
+) -> Result<T>
+where
+    F: Future<Output = T>,
+{
+    tokio::time::timeout(Duration::from_millis(timeout_ms), future)
+        .await
+        .map_err(|_| SdkError::Timeout {
+            message: format!(
+                "{operation} acknowledgement timed out after {timeout_ms}ms for \
+                 run_id={run_id} event_type={event_type} seq={sequence_number}; \
+                 persistence outcome is unknown"
+            ),
+            operation: operation.to_string(),
+            duration_ms: Some(timeout_ms),
+        })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ParkedWorkerSessionRegistrationResult {
@@ -2115,9 +2140,17 @@ impl Worker {
                 merged_metadata,
             );
 
-            let timeout = Duration::from_millis(timeout_ms);
             let start = Instant::now();
-            let result = match tokio::time::timeout(timeout, engine.append(record)).await {
+            let result = match await_checkpoint_ack(
+                engine.append(record),
+                timeout_ms,
+                "Engine.Append",
+                &run_id,
+                &event_type,
+                sequence_number,
+            )
+            .await
+            {
                 Ok(Ok((_offset, _ts))) => {
                     debug!(
                         "Engine checkpoint persisted: run_id={} event_type={} seq={}",
@@ -2137,12 +2170,9 @@ impl Worker {
                     }
                     Err(e)
                 }
-                Err(_) => {
-                    warn!(
-                        "Engine Append timeout after {}ms: run_id={} event_type={} seq={}",
-                        timeout_ms, run_id, event_type, sequence_number
-                    );
-                    Ok(()) // Graceful degradation
+                Err(error) => {
+                    warn!("{error}");
+                    Err(error)
                 }
             };
 
@@ -2287,9 +2317,16 @@ impl Worker {
         // Get EE client and call WriteCheckpoint with timeout
         let mut ee_client = self.ensure_ee_client().await?;
 
-        let timeout = Duration::from_millis(timeout_ms);
         let start = Instant::now();
-        let result = match tokio::time::timeout(timeout, ee_client.write_checkpoint(request)).await
+        let result = match await_checkpoint_ack(
+            ee_client.write_checkpoint(request),
+            timeout_ms,
+            "ExecutionEngine.WriteCheckpoint",
+            &run_id,
+            &event_type,
+            sequence_number,
+        )
+        .await
         {
             Ok(Ok(response)) => {
                 let resp = response.into_inner();
@@ -2326,13 +2363,9 @@ impl Worker {
                     source: None,
                 })
             }
-            Err(_) => {
-                warn!(
-                    "WriteCheckpoint timeout after {}ms: run_id={} event_type={} seq={}",
-                    timeout_ms, run_id, event_type, sequence_number
-                );
-                // Return Ok for graceful degradation — event may have been persisted
-                Ok(())
+            Err(error) => {
+                warn!("{error}");
+                Err(error)
             }
         };
 
@@ -4279,7 +4312,7 @@ fn is_cancelled_worker_response(service_message: &ServiceMessage) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        complete_job_request_from_polled_completion, complete_job_with_retry,
+        await_checkpoint_ack, complete_job_request_from_polled_completion, complete_job_with_retry,
         is_cancelled_worker_response, is_parked_worker_session_registration_rejection,
         is_terminal_worker_response, is_worker_session_inactive_error,
         parked_lease_danger_retry_ms, parked_lease_renew_interval_ms,
@@ -4347,6 +4380,68 @@ mod tests {
                 .pop_front()
                 .unwrap_or_else(|| Err(SdkError::Internal("missing scripted outcome".to_string())))
         }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_ack_timeout_fails_closed_with_unknown_outcome() {
+        let error = await_checkpoint_ack(
+            std::future::pending::<()>(),
+            0,
+            "Engine.Append",
+            "run-1",
+            "workflow.step.completed",
+            7,
+        )
+        .await
+        .expect_err("checkpoint acknowledgement timeout must fail closed");
+
+        match error {
+            SdkError::Timeout {
+                message,
+                operation,
+                duration_ms,
+            } => {
+                assert_eq!(operation, "Engine.Append");
+                assert_eq!(duration_ms, Some(0));
+                assert!(message.contains("run_id=run-1"));
+                assert!(message.contains("event_type=workflow.step.completed"));
+                assert!(message.contains("seq=7"));
+                assert!(message.contains("persistence outcome is unknown"));
+            }
+            other => panic!("expected typed timeout error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_ack_timeout_wrapper_preserves_completed_and_inner_error_outcomes() {
+        let result = await_checkpoint_ack(
+            async { Ok::<_, SdkError>(42) },
+            100,
+            "ExecutionEngine.WriteCheckpoint",
+            "run-1",
+            "run.completed",
+            8,
+        )
+        .await
+        .expect("completed future should not time out");
+
+        assert_eq!(result.expect("inner result should be unchanged"), 42);
+
+        let result = await_checkpoint_ack(
+            async { Err::<(), _>(SdkError::Internal("append rejected".to_string())) },
+            100,
+            "Engine.Append",
+            "run-1",
+            "run.completed",
+            9,
+        )
+        .await
+        .expect("completed future should not time out");
+
+        assert!(matches!(
+            result,
+            Err(SdkError::Internal(message)) if message == "append rejected"
+        ));
     }
 
     #[test]
