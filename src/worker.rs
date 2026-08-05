@@ -1310,20 +1310,19 @@ async fn complete_or_forward_parked_response(
 }
 
 fn active_lease_renew_interval_ms(lease_timeout_ms: i64) -> u64 {
-    let timeout_ms = lease_timeout_ms.max(10_000) as u64;
-    let renewal_ms = (timeout_ms / 2).clamp(5_000, 60_000);
-    renewal_ms.min(timeout_ms.saturating_sub(1_000).max(1_000))
+    let timeout_ms = lease_timeout_ms.max(2) as u64;
+    (timeout_ms / 2).clamp(1, 60_000)
 }
 
 fn active_lease_renew_interval_with_jitter_ms(lease_timeout_ms: i64) -> u64 {
     let base = active_lease_renew_interval_ms(lease_timeout_ms);
     let jitter = rand::random::<f64>() * 0.20 - 0.10;
-    ((base as f64) * (1.0 + jitter)).round().max(1_000.0) as u64
+    ((base as f64) * (1.0 + jitter)).round().max(1.0) as u64
 }
 
 fn active_lease_danger_retry_ms(lease_timeout_ms: i64) -> u64 {
-    let timeout_ms = lease_timeout_ms.max(10_000) as u64;
-    (timeout_ms / 10).clamp(500, 5_000)
+    let timeout_ms = lease_timeout_ms.max(2) as u64;
+    (timeout_ms / 10).clamp(1, 5_000)
 }
 
 #[derive(Clone)]
@@ -5831,8 +5830,10 @@ mod tests {
     fn active_lease_renew_intervals_are_bounded() {
         assert_eq!(active_lease_renew_interval_ms(120_000), 60_000);
         assert_eq!(active_lease_danger_retry_ms(120_000), 5_000);
-        assert_eq!(active_lease_renew_interval_ms(2_000), 5_000);
-        assert_eq!(active_lease_danger_retry_ms(2_000), 1_000);
+        assert_eq!(active_lease_renew_interval_ms(2_000), 1_000);
+        assert_eq!(active_lease_danger_retry_ms(2_000), 200);
+        assert_eq!(active_lease_renew_interval_ms(6), 3);
+        assert_eq!(active_lease_danger_retry_ms(6), 1);
 
         for _ in 0..100 {
             let jittered = active_lease_renew_interval_with_jitter_ms(120_000);
