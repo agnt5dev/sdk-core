@@ -1635,12 +1635,18 @@ message RegisterWorkerSessionRequest {
   string service_name = 8;
   string service_version = 9;
   string service_type = 10;
+  // Typed runtime protocol capabilities. These are separate from routable
+  // WorkerCapability entries, which describe user and built-in components.
+  repeated string supported_protocol_capabilities = 11;
+  repeated string required_protocol_capabilities = 12;
 }
 
 message RegisterWorkerSessionResponse {
   string worker_session_id = 1;
   int64 expires_at_ms = 2;
   WorkerSlotPolicy effective_slot_policy = 3;
+  repeated string supported_protocol_capabilities = 4;
+  repeated string required_protocol_capabilities = 5;
 }
 
 message PollJobRequest {

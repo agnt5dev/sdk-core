@@ -532,11 +532,18 @@ message RegisterService {
   // plus AGNT5-owned built-in capabilities that are routable but should not be
   // registered as user components.
   repeated WorkerCapability capabilities = 9;
+
+  // Typed runtime protocol capabilities. Keep these separate from routable
+  // component capabilities so protocol negotiation cannot affect routing.
+  repeated string supported_protocol_capabilities = 10;
+  repeated string required_protocol_capabilities = 11;
 }
 
 message RegisterServiceResponse {
   bool ack = 1;
   string error = 2;
+  repeated string supported_protocol_capabilities = 3;
+  repeated string required_protocol_capabilities = 4;
 }
 
 message GetServiceComponents {

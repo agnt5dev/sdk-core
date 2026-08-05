@@ -79,6 +79,8 @@ struct ParkedWorkerSessionRegistration {
     service_name: String,
     service_version: String,
     service_type: String,
+    supported_protocol_capabilities: Vec<String>,
+    required_protocol_capabilities: Vec<String>,
 }
 
 impl ParkedWorkerSessionRegistration {
@@ -100,6 +102,8 @@ impl ParkedWorkerSessionRegistration {
             service_name: self.service_name.clone(),
             service_version: self.service_version.clone(),
             service_type: self.service_type.clone(),
+            supported_protocol_capabilities: self.supported_protocol_capabilities.clone(),
+            required_protocol_capabilities: self.required_protocol_capabilities.clone(),
         }
     }
 }
@@ -1266,6 +1270,15 @@ async fn register_parked_worker_session_with_retries(
     loop {
         match client.register_worker_session(registration.request()).await {
             Ok(session) => {
+                if let Err(error) = crate::client::validate_protocol_capabilities(
+                    &registration.supported_protocol_capabilities,
+                    &registration.required_protocol_capabilities,
+                    &session.supported_protocol_capabilities,
+                    &session.required_protocol_capabilities,
+                ) {
+                    warn!("{} protocol negotiation failed: {}", reason, error);
+                    return ParkedWorkerSessionRegistrationResult::Rejected;
+                }
                 return ParkedWorkerSessionRegistrationResult::Registered(
                     session.worker_session_id,
                 );
@@ -2866,6 +2879,8 @@ impl Worker {
         let max_concurrency: u32 = self.config.max_concurrency.unwrap_or(100);
 
         let capabilities = worker_capabilities(&self.components);
+        let (supported_protocol_capabilities, required_protocol_capabilities) =
+            crate::client::worker_protocol_capabilities();
         let registration = RegisterService {
             service_name: self.config.service_name.clone(),
             service_version: self.config.service_version.clone(),
@@ -2876,6 +2891,8 @@ impl Worker {
             deployment_id,
             max_concurrency,
             capabilities,
+            supported_protocol_capabilities: supported_protocol_capabilities.clone(),
+            required_protocol_capabilities: required_protocol_capabilities.clone(),
         };
 
         // Pull workers do not need the stateful dispatch stream for work
@@ -4025,6 +4042,8 @@ impl Worker {
         let service_name = self.config.service_name.clone();
         let service_version = self.config.service_version.clone();
         let service_type = self.config.service_type.clone();
+        let (supported_protocol_capabilities, required_protocol_capabilities) =
+            crate::client::worker_protocol_capabilities();
         let streaming_runs = self.streaming_runs.clone();
         let pending_lease_ids = self.pending_lease_ids.clone();
         let journal_queue = self.journal_queue.clone();
@@ -4073,6 +4092,8 @@ impl Worker {
                 service_name,
                 service_version,
                 service_type,
+                supported_protocol_capabilities,
+                required_protocol_capabilities,
             };
             let initial_session_id = match register_parked_worker_session_with_retries(
                 &mut client,
@@ -5213,6 +5234,10 @@ mod tests {
             service_name: "svc".into(),
             service_version: "1.2.3".into(),
             service_type: "worker".into(),
+            supported_protocol_capabilities: vec![
+                crate::client::DURABLE_ACTIVATION_V1_CAPABILITY.into()
+            ],
+            required_protocol_capabilities: Vec::new(),
         };
 
         let first = registration.request();

@@ -50,6 +50,8 @@ impl RuntimeServiceClient {
         // declare. Report `0` (= unknown) so the coordinator's
         // headroom-aware picker treats it as no cap (and the picker
         // never targets it for dispatch since it has no components).
+        let (supported_protocol_capabilities, required_protocol_capabilities) =
+            crate::client::worker_protocol_capabilities();
         let register = crate::pb::RegisterService {
             service_name: config.service_name.clone(),
             service_version: config.service_version.clone(),
@@ -60,6 +62,8 @@ impl RuntimeServiceClient {
             mode: crate::pb::WorkerMode::Push as i32,
             deployment_id: std::env::var("AGNT5_DEPLOYMENT_ID").unwrap_or_default(),
             max_concurrency: 0,
+            supported_protocol_capabilities,
+            required_protocol_capabilities,
         };
 
         let (sender, receiver) = client

@@ -18,6 +18,71 @@ use tonic::transport::Channel;
 use tonic::Code;
 use tracing::{debug, error};
 
+pub const DURABLE_ACTIVATION_V1_CAPABILITY: &str = "durable_activation_v1";
+
+pub fn worker_protocol_capabilities() -> (Vec<String>, Vec<String>) {
+    match std::env::var("AGNT5_DURABLE_ACTIVATION_MODE")
+        .unwrap_or_else(|_| "preferred".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "disabled" => (Vec::new(), Vec::new()),
+        "required" => (
+            vec![DURABLE_ACTIVATION_V1_CAPABILITY.to_string()],
+            vec![DURABLE_ACTIVATION_V1_CAPABILITY.to_string()],
+        ),
+        _ => (
+            vec![DURABLE_ACTIVATION_V1_CAPABILITY.to_string()],
+            Vec::new(),
+        ),
+    }
+}
+
+pub(crate) fn validate_protocol_capabilities(
+    worker_supported: &[String],
+    worker_required: &[String],
+    runtime_supported: &[String],
+    runtime_required: &[String],
+) -> Result<()> {
+    if let Some(required) = worker_required
+        .iter()
+        .find(|required| !runtime_supported.contains(required))
+    {
+        return Err(SdkError::Activation {
+            message: format!("runtime did not negotiate required protocol capability: {required}"),
+            code: crate::error::ErrorCode::DurabilityUnavailable,
+            activation_id: None,
+            attempt: None,
+        });
+    }
+    if let Some(required) = runtime_required
+        .iter()
+        .find(|required| !worker_supported.contains(required))
+    {
+        return Err(SdkError::Activation {
+            message: format!("runtime requires unsupported worker protocol capability: {required}"),
+            code: crate::error::ErrorCode::DurabilityUnavailable,
+            activation_id: None,
+            attempt: None,
+        });
+    }
+    if worker_supported
+        .iter()
+        .any(|capability| capability == DURABLE_ACTIVATION_V1_CAPABILITY)
+        && !worker_required
+            .iter()
+            .any(|capability| capability == DURABLE_ACTIVATION_V1_CAPABILITY)
+        && !runtime_supported
+            .iter()
+            .any(|capability| capability == DURABLE_ACTIVATION_V1_CAPABILITY)
+    {
+        eprintln!(
+            "[WARN] agnt5 durable activation degraded: runtime did not advertise durable_activation_v1; legacy checkpoints remain enabled"
+        );
+    }
+    Ok(())
+}
+
 fn activation_status(operation: &str, status: tonic::Status) -> SdkError {
     crate::runtime_adapter::activation_status_error(operation, status)
 }
@@ -93,6 +158,8 @@ impl WorkerCoordinatorClient {
         flume::Sender<ServiceMessage>,
         flume::Receiver<RuntimeMessage>,
     )> {
+        let worker_supported_protocols = registration.supported_protocol_capabilities.clone();
+        let worker_required_protocols = registration.required_protocol_capabilities.clone();
         // Create the registration message first
         let registration_message = ServiceMessage {
             worker_id: worker_id.clone(),
@@ -187,6 +254,12 @@ impl WorkerCoordinatorClient {
                             source: None,
                         });
                     }
+                    validate_protocol_capabilities(
+                        &worker_supported_protocols,
+                        &worker_required_protocols,
+                        &resp.supported_protocol_capabilities,
+                        &resp.required_protocol_capabilities,
+                    )?;
                 }
                 _ => {
                     error!("Unexpected response type to registration");
@@ -999,6 +1072,31 @@ mod tests {
             let error = validate_append_batch_response(&response, 2).unwrap_err();
             assert!(matches!(error, SdkError::Internal(_)));
         }
+    }
+
+    #[test]
+    fn protocol_capability_negotiation_fails_closed_when_required() {
+        let durable = DURABLE_ACTIVATION_V1_CAPABILITY.to_string();
+        let error = validate_protocol_capabilities(
+            std::slice::from_ref(&durable),
+            std::slice::from_ref(&durable),
+            &[],
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), crate::error::ErrorCode::DurabilityUnavailable);
+
+        let error =
+            validate_protocol_capabilities(&[], &[], &[], &["runtime_v2".into()]).unwrap_err();
+        assert_eq!(error.code(), crate::error::ErrorCode::DurabilityUnavailable);
+
+        validate_protocol_capabilities(
+            std::slice::from_ref(&durable),
+            std::slice::from_ref(&durable),
+            std::slice::from_ref(&durable),
+            &[],
+        )
+        .unwrap();
     }
 }
 
