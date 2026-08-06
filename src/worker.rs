@@ -39,6 +39,59 @@ const ASSIGNMENT_AUTHORED_RETRY_METADATA_KEYS: &[&str] = &[
     "backoff_multiplier",
 ];
 
+/// Per-run ordering barriers for journal flushes and acknowledged checkpoints.
+/// Cross-run ordering is not part of the journal contract, so unrelated runs
+/// must not share a network-duration critical section.
+#[derive(Clone, Default)]
+struct RunFlushLocks {
+    locks: Arc<std::sync::Mutex<HashMap<String, std::sync::Weak<TokioMutex<()>>>>>,
+}
+
+impl RunFlushLocks {
+    fn lock_for_run(&self, run_id: &str) -> Arc<TokioMutex<()>> {
+        let mut locks = match self.locks.lock() {
+            Ok(locks) => locks,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        if let Some(lock) = locks.get(run_id).and_then(std::sync::Weak::upgrade) {
+            return lock;
+        }
+
+        // Weak entries let completed runs disappear without coordinating a
+        // cleanup with the final guard. Compact stale keys opportunistically.
+        if locks.len() >= 4096 {
+            locks.retain(|_, lock| lock.strong_count() > 0);
+        }
+
+        let lock = Arc::new(TokioMutex::new(()));
+        locks.insert(run_id.to_string(), Arc::downgrade(&lock));
+        lock
+    }
+
+    async fn lock_run(&self, run_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        self.lock_for_run(run_id).lock_owned().await
+    }
+
+    async fn lock_runs<I>(&self, run_ids: I) -> Vec<tokio::sync::OwnedMutexGuard<()>>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut run_ids: Vec<_> = run_ids.into_iter().collect();
+        run_ids.sort_unstable();
+        run_ids.dedup();
+        let locks: Vec<_> = run_ids
+            .iter()
+            .map(|run_id| self.lock_for_run(run_id))
+            .collect();
+        let mut guards = Vec::with_capacity(locks.len());
+        for lock in locks {
+            guards.push(lock.lock_owned().await);
+        }
+        guards
+    }
+}
+
 async fn await_checkpoint_ack<F, T>(
     future: F,
     timeout_ms: u64,
@@ -576,10 +629,9 @@ pub struct Worker {
     /// Lazily-connected Engine gRPC client. When AGNT5_ENGINE_URL is set, all event paths
     /// route through this client instead of the Go EE.
     engine_client: Arc<TokioMutex<Option<EngineClient>>>,
-    /// Serializes background queue flushes with terminal checkpoint flushes.
-    /// A terminal event must not overtake transient output already drained by
-    /// the periodic flush task.
-    journal_flush_lock: Arc<TokioMutex<()>>,
+    /// Serializes queue flushes and checkpoints within each run. Unrelated
+    /// runs can persist checkpoints concurrently.
+    journal_flush_locks: RunFlushLocks,
 }
 
 // Implement Debug manually to avoid requiring Debug on JournalEventQueue's internals
@@ -1347,16 +1399,16 @@ fn polled_job_suspension_request(
 
 async fn wait_for_parked_run_events_flush(
     journal_queue: &JournalEventQueue,
-    journal_flush_lock: &Arc<TokioMutex<()>>,
+    journal_flush_locks: &RunFlushLocks,
     run_id: &str,
 ) -> bool {
     let deadline = tokio::time::Instant::now() + PARKED_COMPLETION_FLUSH_TIMEOUT;
     loop {
         {
-            // The periodic sender holds this lock until its drained batch has
-            // been acknowledged or requeued. If this run is absent while we
-            // hold it, CompleteJob cannot overtake an in-flight child event.
-            let _flush_guard = journal_flush_lock.lock().await;
+            // The periodic sender holds this run's barrier until its drained
+            // events have been acknowledged or requeued. If this run is absent
+            // while we hold it, CompleteJob cannot overtake a child event.
+            let _flush_guard = journal_flush_locks.lock_run(run_id).await;
             if !journal_queue.contains_run(run_id) {
                 return true;
             }
@@ -1441,7 +1493,7 @@ async fn complete_or_forward_parked_response(
     slot_idx: usize,
     response_tx: &flume::Sender<ServiceMessage>,
     journal_queue: &JournalEventQueue,
-    journal_flush_lock: &Arc<TokioMutex<()>>,
+    journal_flush_locks: &RunFlushLocks,
 ) -> bool {
     if is_cancelled_worker_response(&service_message) {
         debug!(
@@ -1496,7 +1548,7 @@ async fn complete_or_forward_parked_response(
     };
 
     let job_id = completion.job_id.clone();
-    if !wait_for_parked_run_events_flush(journal_queue, journal_flush_lock, &job_id).await {
+    if !wait_for_parked_run_events_flush(journal_queue, journal_flush_locks, &job_id).await {
         warn!(
             "Parked poll slot {} refusing to overtake unflushed events for job_id={}",
             slot_idx, job_id
@@ -1912,7 +1964,7 @@ struct ParkedPollContext {
     streaming_runs: Arc<std::sync::Mutex<HashMap<String, bool>>>,
     pending_lease_ids: Arc<std::sync::Mutex<HashMap<String, String>>>,
     journal_queue: JournalEventQueue,
-    journal_flush_lock: Arc<TokioMutex<()>>,
+    journal_flush_locks: RunFlushLocks,
     open_poll_slots: Arc<std::sync::atomic::AtomicUsize>,
     /// Live slot count (parked + busy), shared with the supervisor.
     total_slots: Arc<std::sync::atomic::AtomicUsize>,
@@ -2204,7 +2256,7 @@ where
                         slot_id,
                         &ctx.response_tx,
                         &ctx.journal_queue,
-                        &ctx.journal_flush_lock,
+                        &ctx.journal_flush_locks,
                     )
                     .await;
                 }
@@ -2245,7 +2297,7 @@ where
                         slot_id,
                         &ctx.response_tx,
                         &ctx.journal_queue,
-                        &ctx.journal_flush_lock,
+                        &ctx.journal_flush_locks,
                     )
                     .await
                         || completed;
@@ -2438,7 +2490,7 @@ impl Worker {
             event_stream_tx: Arc::new(std::sync::Mutex::new(None)),
             dispatch_tx: Arc::new(std::sync::Mutex::new(None)),
             engine_client: Arc::new(TokioMutex::new(None)),
-            journal_flush_lock: Arc::new(TokioMutex::new(())),
+            journal_flush_locks: RunFlushLocks::default(),
         }
     }
 
@@ -2770,10 +2822,10 @@ impl Worker {
         let is_durable_checkpoint = JournalEventMessage::is_checkpoint_event_type(&event_type);
         // A durable checkpoint is an ordering boundary for every transient
         // event queued before it, not just for run.completed/run.failed.
-        // Holding the same lock as the periodic flush task prevents a drained,
-        // in-flight batch from being overtaken by the checkpoint.
+        // Holding the same per-run barrier as the periodic flush task prevents
+        // a drained, in-flight batch from being overtaken by the checkpoint.
         let _journal_flush_guard = if is_durable_checkpoint {
-            Some(self.journal_flush_lock.lock().await)
+            Some(self.journal_flush_locks.lock_run(&run_id).await)
         } else {
             None
         };
@@ -2782,7 +2834,7 @@ impl Worker {
         if let Some(mut engine) = self.ensure_engine_client().await? {
             // Publish pending transient events through EventStream and persist
             // queued durable boundaries before appending this checkpoint.
-            // Both calls are acknowledged while journal_flush_lock is held.
+            // Both calls are acknowledged while this run's flush barrier is held.
             if is_durable_checkpoint {
                 let pending = self.journal_queue.drain_run_events(&run_id);
                 if !pending.is_empty() {
@@ -4310,7 +4362,7 @@ impl Worker {
         let streaming_runs_outer = self.streaming_runs.clone();
         let pending_lease_ids_outer = self.pending_lease_ids.clone();
         let revoked_executions_outer = self.revoked_executions.clone();
-        let journal_flush_lock_outer = self.journal_flush_lock.clone();
+        let journal_flush_locks_outer = self.journal_flush_locks.clone();
         let ee_endpoint_outer = self.config.ee_endpoint.clone();
         let engine_endpoint_outer = self.config.engine_endpoint.clone();
 
@@ -4338,7 +4390,7 @@ impl Worker {
                 let streaming_runs = streaming_runs_outer.clone();
                 let pending_lease_ids = pending_lease_ids_outer.clone();
                 let revoked_executions = revoked_executions_outer.clone();
-                let journal_flush_lock = journal_flush_lock_outer.clone();
+                let journal_flush_locks = journal_flush_locks_outer.clone();
                 let ee_endpoint = ee_endpoint_outer.clone();
                 let engine_endpoint = engine_endpoint_outer.clone();
                 let dispatch_tx = dispatch_tx.clone();
@@ -4363,8 +4415,6 @@ impl Worker {
                     loop {
                         interval.tick().await;
 
-                        let _flush_guard = journal_flush_lock.lock().await;
-
                         // Drain more than one nominal batch when backlog is already present.
                         // This preserves the normal small-batch latency path while allowing
                         // the flush task to catch up instead of hard-capping at one batch
@@ -4375,8 +4425,11 @@ impl Worker {
                         } else {
                             batch_size
                         };
+                        let run_ids = journal_queue.peek_batch_run_ids(drain_limit);
+                        let _flush_guards = journal_flush_locks.lock_runs(run_ids.clone()).await;
+                        let protected_runs: HashSet<_> = run_ids.into_iter().collect();
                         let batch: Vec<_> = journal_queue
-                            .drain_batch(drain_limit)
+                            .drain_batch_for_runs(drain_limit, &protected_runs)
                             .into_iter()
                             .filter(|event| {
                                 let run_id =
@@ -4847,7 +4900,7 @@ impl Worker {
         let streaming_runs = self.streaming_runs.clone();
         let pending_lease_ids = self.pending_lease_ids.clone();
         let journal_queue = self.journal_queue.clone();
-        let journal_flush_lock = self.journal_flush_lock.clone();
+        let journal_flush_locks = self.journal_flush_locks.clone();
         let cancel_tokens = self.cancel_tokens.clone();
         let cancel_hook = self.cancel_hook.clone();
         let revoked_executions = self.revoked_executions.clone();
@@ -4949,7 +5002,7 @@ impl Worker {
                 streaming_runs,
                 pending_lease_ids,
                 journal_queue,
-                journal_flush_lock,
+                journal_flush_locks,
                 open_poll_slots,
                 total_slots: total_slots.clone(),
                 busy_slots: busy_slots.clone(),
@@ -5155,7 +5208,7 @@ mod tests {
         try_retire_parked_slot, uncommitted_records_in_reverse, valid_activation_artifact_sha256,
         wait_for_parked_run_events_flush, worker_capabilities, ActiveLeaseAuthority,
         ActiveLeaseSession, AppendGroupProgress, CompleteJobSender, EntityStateSender,
-        ParkedWorkerSessionRegistration, Worker, WorkerConfig,
+        ParkedWorkerSessionRegistration, RunFlushLocks, Worker, WorkerConfig,
     };
     use crate::error::{ErrorCode, SdkError};
     use crate::journal_queue::{JournalEventMessage, JournalEventQueue, JournalQueueConfig};
@@ -6287,12 +6340,12 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        let flush_lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        let flush_locks = RunFlushLocks::default();
         let queue_for_sender = queue.clone();
-        let lock_for_sender = flush_lock.clone();
+        let locks_for_sender = flush_locks.clone();
         let sender = tokio::spawn(async move {
             tokio::task::yield_now().await;
-            let _guard = lock_for_sender.lock().await;
+            let _guard = locks_for_sender.lock_run("run-1").await;
             let drained = queue_for_sender.drain_run_events("run-1");
             assert_eq!(drained.len(), 1);
             // Model an acknowledged send while the periodic flush lock remains
@@ -6300,9 +6353,43 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         });
 
-        assert!(wait_for_parked_run_events_flush(&queue, &flush_lock, "run-1").await);
+        assert!(wait_for_parked_run_events_flush(&queue, &flush_locks, "run-1").await);
         sender.await.unwrap();
         assert!(!queue.contains_run("run-1"));
+    }
+
+    #[tokio::test]
+    async fn run_flush_locks_serialize_same_run_without_blocking_other_runs() {
+        let locks = RunFlushLocks::default();
+        let run_a_guard = locks.lock_run("run-a").await;
+
+        let same_run = tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            locks.lock_run("run-a"),
+        )
+        .await;
+        assert!(
+            same_run.is_err(),
+            "same run must wait for its ordering barrier"
+        );
+
+        let other_run = tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            locks.lock_run("run-b"),
+        )
+        .await;
+        assert!(
+            other_run.is_ok(),
+            "unrelated run must not share the barrier"
+        );
+
+        drop(run_a_guard);
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            locks.lock_run("run-a"),
+        )
+        .await
+        .is_ok());
     }
 
     #[test]

@@ -45,7 +45,7 @@
 //! let batch = queue.drain_batch(100);
 //! ```
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -456,6 +456,82 @@ impl JournalEventQueue {
         batch
     }
 
+    /// Return the distinct run IDs represented by the next `max` live events.
+    /// The background sender uses this to acquire ordering barriers before it
+    /// removes those events from the queue.
+    pub fn peek_batch_run_ids(&self, max: usize) -> Vec<String> {
+        let queue = match self.queue.lock() {
+            Ok(queue) => queue,
+            Err(error) => {
+                log::error!("Failed to lock journal queue for peek_batch_run_ids: {error}");
+                return Vec::new();
+            }
+        };
+
+        let mut run_ids = Vec::new();
+        let mut seen = HashSet::new();
+        for event in queue
+            .order
+            .iter()
+            .filter_map(|id| queue.events.get(id))
+            .take(max)
+        {
+            if seen.insert(event.run_id.clone()) {
+                run_ids.push(event.run_id.clone());
+            }
+        }
+        run_ids
+    }
+
+    /// Drain up to `max` events belonging to runs whose ordering barriers are
+    /// already held. Events from other runs retain their relative FIFO order.
+    pub fn drain_batch_for_runs(
+        &self,
+        max: usize,
+        allowed_run_ids: &HashSet<String>,
+    ) -> Vec<JournalEventMessage> {
+        let mut queue = match self.queue.lock() {
+            Ok(queue) => queue,
+            Err(error) => {
+                log::error!("Failed to lock journal queue for drain_batch_for_runs: {error}");
+                return Vec::new();
+            }
+        };
+        let mut batch = Vec::with_capacity(std::cmp::min(max, queue.events.len()));
+        let mut skipped = VecDeque::new();
+        let mut examined = 0;
+
+        while examined < max {
+            let Some(id) = queue.order.pop_front() else {
+                break;
+            };
+            let Some(event) = queue.events.get(&id) else {
+                continue;
+            };
+            examined += 1;
+            if allowed_run_ids.contains(&event.run_id) {
+                if let Some(event) = queue.remove_event(id) {
+                    batch.push(event);
+                }
+            } else {
+                skipped.push_back(id);
+            }
+        }
+
+        while let Some(id) = skipped.pop_back() {
+            queue.order.push_front(id);
+        }
+
+        if !batch.is_empty() {
+            log::debug!(
+                "Drained {} barrier-protected events from journal queue (remaining={})",
+                batch.len(),
+                queue.events.len()
+            );
+        }
+        batch
+    }
+
     /// Drain all events from the queue
     pub fn drain_all(&self) -> Vec<JournalEventMessage> {
         let mut queue = match self.queue.lock() {
@@ -523,8 +599,8 @@ impl JournalEventQueue {
 
     /// Whether this queue still contains an event for `run_id`.
     ///
-    /// Pull completion uses this while holding the worker flush lock: an empty
-    /// result then means no flush for that run is queued or in flight.
+    /// Pull completion uses this while holding the run's flush barrier: an
+    /// empty result then means no flush for that run is queued or in flight.
     pub fn contains_run(&self, run_id: &str) -> bool {
         self.queue
             .lock()
@@ -946,6 +1022,40 @@ mod tests {
             .collect();
         assert_eq!(remaining, vec![2, 4]);
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn test_drain_batch_for_runs_does_not_take_unlocked_front_event() {
+        let queue = JournalEventQueue::new(JournalQueueConfig {
+            max_size: 10,
+            ..Default::default()
+        });
+        queue
+            .push(create_run_event("run-a", "output.delta", 1))
+            .unwrap();
+        queue
+            .push(create_run_event("run-b", "output.delta", 2))
+            .unwrap();
+        queue
+            .push(create_run_event("run-a", "output.delta", 3))
+            .unwrap();
+
+        assert_eq!(queue.peek_batch_run_ids(2), vec!["run-a", "run-b"]);
+
+        let allowed = HashSet::from(["run-a".to_string()]);
+        let drained: Vec<_> = queue
+            .drain_batch_for_runs(2, &allowed)
+            .into_iter()
+            .map(|event| event.sequence)
+            .collect();
+        assert_eq!(drained, vec![1]);
+
+        let remaining: Vec<_> = queue
+            .drain_all()
+            .into_iter()
+            .map(|event| event.sequence)
+            .collect();
+        assert_eq!(remaining, vec![2, 3]);
     }
 
     #[test]
