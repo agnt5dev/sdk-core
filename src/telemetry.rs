@@ -790,6 +790,16 @@ pub fn record_execution_request_with_attrs(
 /// Gauge for worker process memory snapshots.
 static WORKER_MEMORY_BYTES_GAUGE: OnceLock<Gauge<u64>> = OnceLock::new();
 
+/// Gauges for the current pull-slot lifecycle. These split the existing
+/// aggregate active-slot signal into bounded worker-local phases so a saturated
+/// worker can distinguish language-scheduler backlog from user-code execution
+/// and terminal persistence.
+static WORKER_CLAIMED_NOT_STARTED_GAUGE: OnceLock<Gauge<u64>> = OnceLock::new();
+static WORKER_EXECUTING_SLOTS_GAUGE: OnceLock<Gauge<u64>> = OnceLock::new();
+static WORKER_TERMINALIZING_SLOTS_GAUGE: OnceLock<Gauge<u64>> = OnceLock::new();
+static WORKER_CLAIM_TO_START_HISTOGRAM: OnceLock<Histogram<f64>> = OnceLock::new();
+static WORKER_SLOT_RESIDENCY_HISTOGRAM: OnceLock<Histogram<f64>> = OnceLock::new();
+
 fn get_worker_memory_bytes_gauge() -> &'static Gauge<u64> {
     WORKER_MEMORY_BYTES_GAUGE.get_or_init(|| {
         let meter = global::meter("agnt5-sdk-core");
@@ -801,6 +811,96 @@ fn get_worker_memory_bytes_gauge() -> &'static Gauge<u64> {
             .with_unit("By")
             .build()
     })
+}
+
+fn worker_slot_attrs(mode: &'static str) -> Vec<KeyValue> {
+    let mut attrs = vec![KeyValue::new("worker.mode", mode)];
+    if let Some(pid) = get_project_id() {
+        attrs.push(KeyValue::new("agnt5.project.id", pid.to_string()));
+    }
+    if let Some(wid) = get_workspace_id() {
+        attrs.push(KeyValue::new("agnt5.workspace.id", wid.to_string()));
+    }
+    if let Some(did) = get_deployment_id() {
+        attrs.push(KeyValue::new("agnt5.deployment.id", did.to_string()));
+    }
+    attrs
+}
+
+/// Record the current pull-slot phase counts.
+///
+/// Run IDs are intentionally excluded so these gauges retain bounded
+/// cardinality under sustained load.
+pub fn record_worker_slot_phases(
+    mode: &'static str,
+    claimed_not_started: u64,
+    executing: u64,
+    terminalizing: u64,
+) {
+    let meter = global::meter("agnt5-sdk-core");
+    let claimed = WORKER_CLAIMED_NOT_STARTED_GAUGE.get_or_init(|| {
+        meter
+            .u64_gauge("agnt5.worker.slots.claimed_not_started")
+            .with_description(
+                "Pull jobs claimed by the worker but not yet started by the language runtime",
+            )
+            .with_unit("slots")
+            .build()
+    });
+    let executing_gauge = WORKER_EXECUTING_SLOTS_GAUGE.get_or_init(|| {
+        meter
+            .u64_gauge("agnt5.worker.slots.executing")
+            .with_description("Worker slots currently executing language handler code")
+            .with_unit("slots")
+            .build()
+    });
+    let terminalizing_gauge = WORKER_TERMINALIZING_SLOTS_GAUGE.get_or_init(|| {
+        meter
+            .u64_gauge("agnt5.worker.slots.terminalizing")
+            .with_description(
+                "Worker slots waiting for terminal event flush or completion acknowledgement",
+            )
+            .with_unit("slots")
+            .build()
+    });
+    let attrs = worker_slot_attrs(mode);
+    claimed.record(claimed_not_started, &attrs);
+    executing_gauge.record(executing, &attrs);
+    terminalizing_gauge.record(terminalizing, &attrs);
+}
+
+/// Record how long a claimed pull job waited for the language runtime to begin
+/// processing it.
+pub fn record_worker_claim_to_start(mode: &'static str, duration_secs: f64) {
+    let histogram = WORKER_CLAIM_TO_START_HISTOGRAM.get_or_init(|| {
+        let meter = global::meter("agnt5-sdk-core");
+        meter
+            .f64_histogram("agnt5.worker.slot.claim_to_start.duration.seconds")
+            .with_description("Time from pull-job claim to language runtime execution start")
+            .with_unit("s")
+            .with_boundaries(vec![
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+            ])
+            .build()
+    });
+    histogram.record(duration_secs, &worker_slot_attrs(mode));
+}
+
+/// Record the full time a pull job occupied a worker slot, including terminal
+/// persistence and CompleteJob acknowledgement.
+pub fn record_worker_slot_residency(mode: &'static str, duration_secs: f64) {
+    let histogram = WORKER_SLOT_RESIDENCY_HISTOGRAM.get_or_init(|| {
+        let meter = global::meter("agnt5-sdk-core");
+        meter
+            .f64_histogram("agnt5.worker.slot.residency.duration.seconds")
+            .with_description("Time from pull-job claim until the worker slot is released")
+            .with_unit("s")
+            .with_boundaries(vec![
+                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0,
+            ])
+            .build()
+    });
+    histogram.record(duration_secs, &worker_slot_attrs(mode));
 }
 
 /// Record one worker process memory sample.

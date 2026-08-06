@@ -39,6 +39,185 @@ const ASSIGNMENT_AUTHORED_RETRY_METADATA_KEYS: &[&str] = &[
     "backoff_multiplier",
 ];
 
+/// Slot lifecycle events sent from parked poll slots to the ramp supervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParkedSlotEvent {
+    /// A claimed job has reached the language runtime and begun execution.
+    Started,
+    /// A surplus idle slot retired itself (`total_slots` already decremented).
+    Retired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerSlotPhase {
+    ClaimedNotStarted,
+    Executing,
+    Terminalizing,
+}
+
+#[derive(Debug)]
+struct WorkerSlotEntry {
+    generation: u64,
+    phase: WorkerSlotPhase,
+    claimed_at: Instant,
+}
+
+#[derive(Default)]
+struct WorkerSlotPhaseState {
+    entries: HashMap<String, WorkerSlotEntry>,
+    next_generation: u64,
+    started_notifier: Option<tokio::sync::mpsc::UnboundedSender<ParkedSlotEvent>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct WorkerSlotPhaseSnapshot {
+    claimed_not_started: usize,
+    executing: usize,
+    terminalizing: usize,
+}
+
+impl WorkerSlotPhaseState {
+    fn snapshot(&self) -> WorkerSlotPhaseSnapshot {
+        let mut snapshot = WorkerSlotPhaseSnapshot::default();
+        for entry in self.entries.values() {
+            match entry.phase {
+                WorkerSlotPhase::ClaimedNotStarted => snapshot.claimed_not_started += 1,
+                WorkerSlotPhase::Executing => snapshot.executing += 1,
+                WorkerSlotPhase::Terminalizing => snapshot.terminalizing += 1,
+            }
+        }
+        snapshot
+    }
+}
+
+/// Tracks pull jobs from claim through language start and terminal acknowledgement.
+/// The state mutex is never held across I/O and contains at most one entry per
+/// active pull slot.
+#[derive(Clone, Default)]
+struct WorkerSlotPhases {
+    state: Arc<std::sync::Mutex<WorkerSlotPhaseState>>,
+}
+
+impl WorkerSlotPhases {
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, WorkerSlotPhaseState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn publish(snapshot: WorkerSlotPhaseSnapshot) {
+        crate::telemetry::record_worker_slot_phases(
+            "pull",
+            snapshot.claimed_not_started as u64,
+            snapshot.executing as u64,
+            snapshot.terminalizing as u64,
+        );
+    }
+
+    fn set_started_notifier(&self, notifier: tokio::sync::mpsc::UnboundedSender<ParkedSlotEvent>) {
+        self.lock_state().started_notifier = Some(notifier);
+    }
+
+    fn claim(&self, run_id: String) -> WorkerSlotPhaseGuard {
+        let (generation, replaced, snapshot) = {
+            let mut state = self.lock_state();
+            let generation = state.next_generation;
+            state.next_generation = state.next_generation.wrapping_add(1);
+            let replaced = state
+                .entries
+                .insert(
+                    run_id.clone(),
+                    WorkerSlotEntry {
+                        generation,
+                        phase: WorkerSlotPhase::ClaimedNotStarted,
+                        claimed_at: Instant::now(),
+                    },
+                )
+                .is_some();
+            (generation, replaced, state.snapshot())
+        };
+        if replaced {
+            warn!(run_id, "Replacing duplicate active pull-slot phase entry");
+        }
+        Self::publish(snapshot);
+        WorkerSlotPhaseGuard {
+            phases: self.clone(),
+            run_id,
+            generation,
+        }
+    }
+
+    fn mark_started(&self, run_id: &str) {
+        let transition = {
+            let mut state = self.lock_state();
+            let Some(entry) = state.entries.get_mut(run_id) else {
+                return;
+            };
+            if entry.phase != WorkerSlotPhase::ClaimedNotStarted {
+                return;
+            }
+            entry.phase = WorkerSlotPhase::Executing;
+            let claim_to_start = entry.claimed_at.elapsed();
+            let notifier = state.started_notifier.clone();
+            (claim_to_start, notifier, state.snapshot())
+        };
+        crate::telemetry::record_worker_claim_to_start("pull", transition.0.as_secs_f64());
+        Self::publish(transition.2);
+        if let Some(notifier) = transition.1 {
+            let _ = notifier.send(ParkedSlotEvent::Started);
+        }
+    }
+
+    fn mark_terminalizing(&self, run_id: &str) {
+        let snapshot = {
+            let mut state = self.lock_state();
+            let Some(entry) = state.entries.get_mut(run_id) else {
+                return;
+            };
+            if entry.phase == WorkerSlotPhase::Terminalizing {
+                return;
+            }
+            entry.phase = WorkerSlotPhase::Terminalizing;
+            state.snapshot()
+        };
+        Self::publish(snapshot);
+    }
+
+    fn finish(&self, run_id: &str, generation: u64) {
+        let result = {
+            let mut state = self.lock_state();
+            let Some(entry) = state.entries.get(run_id) else {
+                return;
+            };
+            if entry.generation != generation {
+                return;
+            }
+            let residency = entry.claimed_at.elapsed();
+            state.entries.remove(run_id);
+            (residency, state.snapshot())
+        };
+        crate::telemetry::record_worker_slot_residency("pull", result.0.as_secs_f64());
+        Self::publish(result.1);
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> WorkerSlotPhaseSnapshot {
+        self.lock_state().snapshot()
+    }
+}
+
+struct WorkerSlotPhaseGuard {
+    phases: WorkerSlotPhases,
+    run_id: String,
+    generation: u64,
+}
+
+impl Drop for WorkerSlotPhaseGuard {
+    fn drop(&mut self) {
+        self.phases.finish(&self.run_id, self.generation);
+    }
+}
+
 /// Per-run ordering barriers for journal flushes and acknowledged checkpoints.
 /// Cross-run ordering is not part of the journal contract, so unrelated runs
 /// must not share a network-duration critical section.
@@ -632,6 +811,10 @@ pub struct Worker {
     /// Serializes queue flushes and checkpoints within each run. Unrelated
     /// runs can persist checkpoints concurrently.
     journal_flush_locks: RunFlushLocks,
+    /// Pull-slot phase state shared with language event emitters. Ramping is
+    /// triggered only after `run.started`, preventing a blocked language event
+    /// loop from claiming the worker's full concurrency budget.
+    slot_phases: WorkerSlotPhases,
 }
 
 // Implement Debug manually to avoid requiring Debug on JournalEventQueue's internals
@@ -1934,15 +2117,6 @@ async fn refresh_parked_worker_session(
     .await
 }
 
-/// Slot lifecycle events sent from parked poll slots to the ramp supervisor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ParkedSlotEvent {
-    /// A parked slot received a job and is about to execute it.
-    GotJob,
-    /// A surplus idle slot retired itself (`total_slots` already decremented).
-    Retired,
-}
-
 /// Shared state for one parked polling session. Bundled behind an `Arc` so the
 /// supervisor can spawn additional slots with a single clone while ramping.
 /// The message handler stays outside: each slot owns its own clone so the
@@ -1965,6 +2139,7 @@ struct ParkedPollContext {
     pending_lease_ids: Arc<std::sync::Mutex<HashMap<String, String>>>,
     journal_queue: JournalEventQueue,
     journal_flush_locks: RunFlushLocks,
+    slot_phases: WorkerSlotPhases,
     open_poll_slots: Arc<std::sync::atomic::AtomicUsize>,
     /// Live slot count (parked + busy), shared with the supervisor.
     total_slots: Arc<std::sync::atomic::AtomicUsize>,
@@ -2040,9 +2215,10 @@ fn spawn_parked_slot<F, Fut>(
 }
 
 /// One parked poll slot: owns exactly one outstanding PollJob request or one
-/// active handler invocation. Emits `GotJob` before executing so the supervisor
-/// can ramp capacity, and retires itself after enough consecutive empty polls
-/// once the fleet is above `min_slots`.
+/// active handler invocation. The language runtime emits `Started` through the
+/// shared phase tracker before the supervisor ramps capacity, so a job stuck
+/// waiting to enter the Python/Node event loop cannot cause additional claims.
+/// Surplus idle slots retire after enough consecutive empty polls.
 async fn run_parked_poll_slot<F, Fut>(ctx: Arc<ParkedPollContext>, handler: F, slot_id: usize)
 where
     F: Fn(RuntimeMessage, flume::Sender<ServiceMessage>) -> Fut + Send + Clone + 'static,
@@ -2089,7 +2265,6 @@ where
                 // ramp decisions must see accurate demand even if the handler
                 // panics or is cancelled.
                 let _busy = InFlightGuard::enter(&ctx.busy_slots);
-                let _ = ctx.events_tx.send(ParkedSlotEvent::GotJob);
                 let (
                     mut runtime_message,
                     is_streaming,
@@ -2109,6 +2284,7 @@ where
                         continue;
                     }
                 };
+                let _slot_phase = ctx.slot_phases.claim(run_id.clone());
                 stamp_execution_authority_metadata(
                     &mut runtime_message,
                     &ctx.worker_id,
@@ -2238,6 +2414,11 @@ where
                 while let Ok(service_message) = slot_response_rx.try_recv() {
                     buffered_responses.push(service_message);
                 }
+
+                // The language handler has returned. Any remaining slot time is
+                // terminal event flushing, CompleteJob acknowledgement, or lease
+                // cleanup rather than user-code execution.
+                ctx.slot_phases.mark_terminalizing(&run_id);
 
                 let mut completed = false;
                 if let Some(service_message) = returned_response
@@ -2491,6 +2672,7 @@ impl Worker {
             dispatch_tx: Arc::new(std::sync::Mutex::new(None)),
             engine_client: Arc::new(TokioMutex::new(None)),
             journal_flush_locks: RunFlushLocks::default(),
+            slot_phases: WorkerSlotPhases::default(),
         }
     }
 
@@ -2542,10 +2724,20 @@ impl Worker {
     ///
     /// * `event` - The journal event message to queue
     pub fn queue_event(&self, event: JournalEventMessage) -> Result<()> {
+        if event.event_type == "run.started" {
+            self.mark_execution_started(&event.run_id);
+        }
         self.journal_queue.push(event).map_err(|e| {
             crate::error::SdkError::Internal(format!("Failed to queue journal event: {}", e))
         })?;
         Ok(())
+    }
+
+    /// Signal that a claimed pull job has reached the language runtime.
+    /// Language bindings call this at `run.started` before checkpoint I/O.
+    pub fn mark_execution_started(&self, run_id: &str) {
+        let run_id = run_id.split(':').next().unwrap_or(run_id);
+        self.slot_phases.mark_started(run_id);
     }
 
     /// Queue a workflow checkpoint for progressive durability (legacy API)
@@ -2817,6 +3009,9 @@ impl Worker {
             return Err(SdkError::Internal(format!(
                 "execution authority was revoked for run_id={authority_run_id}"
             )));
+        }
+        if event_type == "run.started" {
+            self.mark_execution_started(&run_id);
         }
         let is_terminal = event_type == "run.completed" || event_type == "run.failed";
         let is_durable_checkpoint = JournalEventMessage::is_checkpoint_event_type(&event_type);
@@ -3270,6 +3465,12 @@ impl Worker {
     ) -> Result<()> {
         if events.is_empty() {
             return Ok(());
+        }
+
+        for (run_id, event_type, ..) in &events {
+            if event_type == "run.started" {
+                self.mark_execution_started(run_id);
+            }
         }
 
         let mut run_ids: Vec<_> = events.iter().map(|event| event.0.clone()).collect();
@@ -4979,6 +5180,7 @@ impl Worker {
         let pending_lease_ids = self.pending_lease_ids.clone();
         let journal_queue = self.journal_queue.clone();
         let journal_flush_locks = self.journal_flush_locks.clone();
+        let slot_phases = self.slot_phases.clone();
         let cancel_tokens = self.cancel_tokens.clone();
         let cancel_hook = self.cancel_hook.clone();
         let revoked_executions = self.revoked_executions.clone();
@@ -5063,6 +5265,7 @@ impl Worker {
 
             let (events_tx, mut events_rx) =
                 tokio::sync::mpsc::unbounded_channel::<ParkedSlotEvent>();
+            slot_phases.set_started_notifier(events_tx.clone());
             let ctx = Arc::new(ParkedPollContext {
                 client,
                 worker_id,
@@ -5081,6 +5284,7 @@ impl Worker {
                 pending_lease_ids,
                 journal_queue,
                 journal_flush_locks,
+                slot_phases,
                 open_poll_slots,
                 total_slots: total_slots.clone(),
                 busy_slots: busy_slots.clone(),
@@ -5108,7 +5312,7 @@ impl Worker {
                     }
                     // `ctx` holds an `events_tx` clone, so recv() never yields None here.
                     event = events_rx.recv() => {
-                        if let Some(ParkedSlotEvent::GotJob) = event {
+                        if let Some(ParkedSlotEvent::Started) = event {
                             let spawn = parked_ramp_spawn_count(
                                 total_slots.load(std::sync::atomic::Ordering::Relaxed),
                                 busy_slots.load(std::sync::atomic::Ordering::Relaxed),
@@ -5286,7 +5490,8 @@ mod tests {
         try_retire_parked_slot, uncommitted_records_in_reverse, valid_activation_artifact_sha256,
         wait_for_parked_run_events_flush, worker_capabilities, ActiveLeaseAuthority,
         ActiveLeaseSession, AppendGroupProgress, CompleteJobSender, EntityStateSender,
-        ParkedWorkerSessionRegistration, RunFlushLocks, Worker, WorkerConfig,
+        ParkedSlotEvent, ParkedWorkerSessionRegistration, RunFlushLocks, Worker, WorkerConfig,
+        WorkerSlotPhaseSnapshot, WorkerSlotPhases,
     };
     use crate::error::{ErrorCode, SdkError};
     use crate::journal_queue::{JournalEventMessage, JournalEventQueue, JournalQueueConfig};
@@ -5298,6 +5503,7 @@ mod tests {
         RuntimeServiceRequest, ServiceMessage, WorkerMode,
     };
     use std::collections::{HashMap, VecDeque};
+    use std::time::Duration;
 
     struct ScriptedCompleteJobSender {
         outcomes: VecDeque<crate::error::Result<CompleteJobResponse>>,
@@ -6549,6 +6755,59 @@ mod tests {
         assert_eq!(parked_ramp_spawn_count(12, 10, 10), 0);
         // Idle fleet spawns nothing.
         assert_eq!(parked_ramp_spawn_count(4, 0, 10), 0);
+    }
+
+    #[tokio::test]
+    async fn stalled_claim_does_not_signal_slot_ramp_before_language_start() {
+        let phases = WorkerSlotPhases::default();
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        phases.set_started_notifier(events_tx);
+
+        // Model a deliberately stalled language scheduler: the pull job is
+        // claimed and occupies its current slot, but run.started has not been
+        // emitted. The supervisor must receive no ramp signal in this state.
+        let guard = phases.claim("slow-run".to_string());
+        assert_eq!(
+            phases.snapshot(),
+            WorkerSlotPhaseSnapshot {
+                claimed_not_started: 1,
+                executing: 0,
+                terminalizing: 0,
+            }
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), events_rx.recv())
+                .await
+                .is_err()
+        );
+
+        phases.mark_started("slow-run");
+        assert_eq!(events_rx.recv().await, Some(ParkedSlotEvent::Started));
+        assert_eq!(
+            phases.snapshot(),
+            WorkerSlotPhaseSnapshot {
+                claimed_not_started: 0,
+                executing: 1,
+                terminalizing: 0,
+            }
+        );
+
+        // Duplicate run.started events are idempotent and cannot cause extra
+        // ramp waves.
+        phases.mark_started("slow-run");
+        assert!(events_rx.try_recv().is_err());
+
+        phases.mark_terminalizing("slow-run");
+        assert_eq!(
+            phases.snapshot(),
+            WorkerSlotPhaseSnapshot {
+                claimed_not_started: 0,
+                executing: 0,
+                terminalizing: 1,
+            }
+        );
+        drop(guard);
+        assert_eq!(phases.snapshot(), WorkerSlotPhaseSnapshot::default());
     }
 
     #[test]
