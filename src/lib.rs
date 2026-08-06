@@ -51,9 +51,9 @@ pub use logging::{clear_error_buffer, get_error_buffer, init_logging};
 pub use runtime_adapter::{
     activation_decision, ActivationAdapter, ActivationCompletionReceipt, ActivationDecision,
     ActivationExecutionReceipt, ActivationFailureReceipt, ActivationReplayReceipt,
-    DummyStateManager, EntityStateLoadResult, EntityStateManager, EntityStateSaveResult,
-    InvocationRequest, InvocationResponse, RuntimeAdapter, RuntimeCapabilities, RuntimeContext,
-    StateManager,
+    ActivationSuspensionReceipt, DummyStateManager, EntityStateLoadResult, EntityStateManager,
+    EntityStateSaveResult, InvocationRequest, InvocationResponse, RuntimeAdapter,
+    RuntimeCapabilities, RuntimeContext, StateManager,
 };
 pub use sandbox::{
     CreateSandboxOptions, ExecuteCodeRequest, ExecuteCodeResult, FileInfo, Language,

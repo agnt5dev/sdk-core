@@ -39,6 +39,10 @@ service EngineService {
   // FailActivation records one fenced failure and its retry/uncertainty decision.
   rpc FailActivation(FailActivationRequest) returns (FailActivationResponse);
 
+  // SuspendActivation atomically parks one fenced activation, pauses its run,
+  // and schedules the durable timer that may resume it.
+  rpc SuspendActivation(SuspendActivationRequest) returns (SuspendActivationResponse);
+
   // EventStream accepts a stream of ephemeral events (tokens, progress, logs)
   // from SDK workers. No journal persistence — real-time SSE delivery only.
   rpc EventStream(stream EventStreamMessage) returns (EventStreamAck);
@@ -1463,6 +1467,34 @@ message FailActivationResponse {
   uint64 accepted_journal_offset = 6;
 }
 
+// SuspendActivationRequest parks one active activation until a durable timer
+// generation becomes due. The input and definition digests bind the request to
+// the logical activation that BeginActivation admitted.
+message SuspendActivationRequest {
+  string project_id = 1;
+  string run_id = 2;
+  string activation_id = 3;
+  uint32 attempt = 4;
+  bytes fence_token = 5;
+  string timer_key = 6;
+  int64 ready_at_ms = 7;
+  bytes input_digest = 8;
+  bytes definition_digest = 9;
+  bytes continuation = 10;
+  int64 delay_ms = 11; // Requested duration; runtime derives ready_at_ms
+}
+
+// SuspendActivationResponse acknowledges the canonical suspension offset and
+// the runtime-derived timer generation.
+message SuspendActivationResponse {
+  bool accepted = 1;
+  bool replayed = 2;
+  string activation_id = 3;
+  uint32 attempt = 4;
+  uint64 accepted_journal_offset = 5;
+  string timer_id = 6;
+}
+
 // ActivationStartedRecord is the canonical journal event for a new attempt.
 message ActivationStartedRecord {
   string project_id = 1;
@@ -1519,6 +1551,11 @@ message ActivationSuspendedRecord {
   uint32 attempt = 4;
   bytes fence_token = 5;
   string resume_source = 6;
+  string timer_key = 7;
+  int64 ready_at_ms = 8;
+  bytes input_digest = 9;
+  bytes definition_digest = 10;
+  bytes continuation = 11;
 }
 
 // ActivationCancelledRecord records the canonical cancellation winner.

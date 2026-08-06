@@ -4,7 +4,7 @@ use crate::pb::{
     ActivationConflictReceipt, ActivationErrorCode, ActivationErrorDetail, ActivationPayload,
     ActivationStatus, ActivationUnknownOutcomeReceipt, ActivationWaitReceipt,
     BeginActivationOutcome, BeginActivationRequest, BeginActivationResponse,
-    CompleteActivationRequest, FailActivationRequest,
+    CompleteActivationRequest, FailActivationRequest, SuspendActivationRequest,
 };
 use opentelemetry::trace::TraceContextExt;
 use opentelemetry::Context;
@@ -72,6 +72,15 @@ pub struct ActivationFailureReceipt {
     pub replayed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActivationSuspensionReceipt {
+    pub activation_id: String,
+    pub attempt: u32,
+    pub accepted_journal_offset: u64,
+    pub timer_id: String,
+    pub replayed: bool,
+}
+
 /// Language-neutral durable activation adapter over the engine client.
 #[derive(Debug, Clone)]
 pub struct ActivationAdapter {
@@ -135,6 +144,28 @@ impl ActivationAdapter {
             attempt: response.attempt,
             status,
             accepted_journal_offset: response.accepted_journal_offset,
+            replayed: response.replayed,
+        })
+    }
+
+    pub async fn suspend(
+        &mut self,
+        request: SuspendActivationRequest,
+    ) -> Result<ActivationSuspensionReceipt> {
+        let response = self.client.suspend_activation(request).await?;
+        if !response.accepted || response.timer_id.is_empty() {
+            return Err(activation_error(
+                ErrorCode::UnknownOutcome,
+                "SuspendActivation returned without an accepted timer receipt",
+                &response.activation_id,
+                response.attempt,
+            ));
+        }
+        Ok(ActivationSuspensionReceipt {
+            activation_id: response.activation_id,
+            attempt: response.attempt,
+            accepted_journal_offset: response.accepted_journal_offset,
+            timer_id: response.timer_id,
             replayed: response.replayed,
         })
     }

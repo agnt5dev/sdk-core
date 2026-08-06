@@ -654,6 +654,17 @@ fn stamp_execution_authority_metadata(
         .insert("lease_attempt".to_string(), request.attempt.to_string());
 }
 
+fn stamp_protocol_capability(runtime_message: &mut RuntimeMessage, capability: &str) {
+    let Some(crate::pb::runtime_message::MessageData::DispatchComponent(request)) =
+        runtime_message.message_data.as_mut()
+    else {
+        return;
+    };
+    request
+        .metadata
+        .insert(capability.to_string(), "true".to_string());
+}
+
 fn canonical_activation_component_config(config: &HashMap<String, String>) -> String {
     let mut entries = config.iter().collect::<Vec<_>>();
     entries.sort_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
@@ -1178,6 +1189,36 @@ fn polled_job_completion_from_service_message(
     }
 }
 
+fn polled_job_suspension_request(
+    service_message: &ServiceMessage,
+    project_id: &str,
+    run_id: &str,
+) -> Option<crate::pb::SuspendActivationRequest> {
+    let Some(crate::pb::service_message::MessageType::FunctionResponse(response)) =
+        &service_message.message_type
+    else {
+        return None;
+    };
+    let Some(crate::pb::dispatch_component_response::Result::WorkerSuspension(suspension)) =
+        &response.result
+    else {
+        return None;
+    };
+    Some(crate::pb::SuspendActivationRequest {
+        project_id: project_id.to_string(),
+        run_id: run_id.to_string(),
+        activation_id: suspension.activation_id.clone(),
+        attempt: suspension.attempt,
+        fence_token: suspension.fence_token.clone(),
+        timer_key: suspension.timer_key.clone(),
+        ready_at_ms: suspension.ready_at_ms,
+        input_digest: suspension.input_digest.clone(),
+        definition_digest: suspension.definition_digest.clone(),
+        continuation: suspension.continuation.clone(),
+        delay_ms: suspension.delay_ms,
+    })
+}
+
 async fn wait_for_parked_run_events_flush(
     journal_queue: &JournalEventQueue,
     journal_flush_lock: &Arc<TokioMutex<()>>,
@@ -1282,6 +1323,34 @@ async fn complete_or_forward_parked_response(
             slot_idx, assigned_job_id
         );
         return true;
+    }
+
+    if let Some(request) =
+        polled_job_suspension_request(&service_message, tenant_id, assigned_job_id)
+    {
+        match client.suspend_activation(request).await {
+            Ok(receipt) if receipt.accepted => {
+                debug!(
+                    "Parked poll slot {} suspended job_id={} timer_id={}",
+                    slot_idx, assigned_job_id, receipt.timer_id
+                );
+                return true;
+            }
+            Ok(_) => {
+                warn!(
+                    "Parked poll slot {} received an unaccepted suspension receipt for job_id={}",
+                    slot_idx, assigned_job_id
+                );
+                return false;
+            }
+            Err(error) => {
+                warn!(
+                    "Parked poll slot {} failed to suspend job_id={}: {}",
+                    slot_idx, assigned_job_id, error
+                );
+                return false;
+            }
+        }
     }
 
     let Some(completion) = polled_job_completion_from_service_message(
@@ -1878,6 +1947,14 @@ where
                         &ctx.service_version,
                         &ctx.worker_metadata,
                         &ctx.activation_definition_configs,
+                    );
+                }
+                if client
+                    .negotiated_protocol_capability(crate::client::DURABLE_SUSPENSION_V1_CAPABILITY)
+                {
+                    stamp_protocol_capability(
+                        &mut runtime_message,
+                        crate::client::DURABLE_SUSPENSION_V1_CAPABILITY,
                     );
                 }
                 let completion_run_id = run_id.clone();
@@ -3656,6 +3733,14 @@ impl Worker {
                                     &dispatch_activation_definition_configs,
                                 );
                             }
+                            if client.negotiated_protocol_capability(
+                                crate::client::DURABLE_SUSPENSION_V1_CAPABILITY,
+                            ) {
+                                stamp_protocol_capability(
+                                    &mut runtime_message,
+                                    crate::client::DURABLE_SUSPENSION_V1_CAPABILITY,
+                                );
+                            }
 
                             stamp_execution_authority_metadata(
                                 &mut runtime_message,
@@ -4924,9 +5009,10 @@ mod tests {
         is_cancelled_worker_response, is_parked_worker_session_registration_rejection,
         is_terminal_worker_response, is_worker_session_inactive_error, parked_ramp_spawn_count,
         parked_runtime_service_response, parked_worker_session_was_refreshed,
-        polled_job_completion_from_service_message, record_groups_by_run,
-        runtime_message_from_job_assignment, stamp_activation_dispatch_metadata,
-        stamp_dispatch_mode, stamp_execution_authority_metadata, take_correlation_ids,
+        polled_job_completion_from_service_message, polled_job_suspension_request,
+        record_groups_by_run, runtime_message_from_job_assignment,
+        stamp_activation_dispatch_metadata, stamp_dispatch_mode,
+        stamp_execution_authority_metadata, stamp_protocol_capability, take_correlation_ids,
         try_retire_parked_slot, uncommitted_records_in_reverse, valid_activation_artifact_sha256,
         wait_for_parked_run_events_flush, worker_capabilities, ActiveLeaseAuthority,
         ActiveLeaseSession, AppendGroupProgress, CompleteJobSender, EntityStateSender,
@@ -5354,6 +5440,31 @@ mod tests {
     }
 
     #[test]
+    fn negotiated_suspension_capability_is_visible_to_language_handlers() {
+        let mut message = crate::pb::RuntimeMessage {
+            message_data: Some(runtime_message::MessageData::DispatchComponent(
+                crate::pb::DispatchComponentRequest::default(),
+            )),
+            ..Default::default()
+        };
+        stamp_protocol_capability(
+            &mut message,
+            crate::client::DURABLE_SUSPENSION_V1_CAPABILITY,
+        );
+        let Some(runtime_message::MessageData::DispatchComponent(request)) = message.message_data
+        else {
+            panic!("dispatch request");
+        };
+        assert_eq!(
+            request
+                .metadata
+                .get(crate::client::DURABLE_SUSPENSION_V1_CAPABILITY)
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
     fn durable_engine_records_are_grouped_by_run_without_reordering_each_run() {
         let records = vec![
             crate::pb::Record {
@@ -5764,6 +5875,43 @@ mod tests {
                 "unexpected CompleteJob metadata for {key}"
             );
         }
+    }
+
+    #[test]
+    fn parked_suspension_uses_assignment_owned_project_and_run_scope() {
+        let suspension = crate::pb::WorkerSuspension {
+            activation_id: "activation-1".into(),
+            attempt: 2,
+            fence_token: b"fence-2".to_vec(),
+            timer_key: "sleep:backoff".into(),
+            ready_at_ms: 0,
+            input_digest: vec![1; 32],
+            definition_digest: vec![2; 32],
+            continuation: br#"{"step":2}"#.to_vec(),
+            delay_ms: 5_000,
+        };
+        let response = ServiceMessage {
+            worker_id: "worker-1".into(),
+            metadata: HashMap::new(),
+            message_type: Some(service_message::MessageType::FunctionResponse(
+                DispatchComponentResponse {
+                    invocation_id: "worker-supplied-run".into(),
+                    success: true,
+                    result: Some(dispatch_component_response::Result::WorkerSuspension(
+                        suspension.clone(),
+                    )),
+                    ..Default::default()
+                },
+            )),
+        };
+
+        let request = polled_job_suspension_request(&response, "project-1", "run-1")
+            .expect("typed suspension");
+        assert_eq!(request.project_id, "project-1");
+        assert_eq!(request.run_id, "run-1");
+        assert_eq!(request.activation_id, suspension.activation_id);
+        assert_eq!(request.delay_ms, suspension.delay_ms);
+        assert_eq!(request.ready_at_ms, 0);
     }
 
     #[test]

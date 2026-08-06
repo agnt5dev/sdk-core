@@ -11,6 +11,7 @@ use crate::pb::{
     PutEntityStateResponse, Record, RegisterService, RegisterWorkerSessionRequest,
     RegisterWorkerSessionResponse, RenewJobLeaseRequest, RenewJobLeaseResponse,
     ReportWorkerCapacityRequest, ReportWorkerCapacityResponse, RuntimeMessage, ServiceMessage,
+    SuspendActivationRequest, SuspendActivationResponse,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -20,6 +21,7 @@ use tonic::Code;
 use tracing::{debug, error};
 
 pub const DURABLE_ACTIVATION_V1_CAPABILITY: &str = "durable_activation_v1";
+pub const DURABLE_SUSPENSION_V1_CAPABILITY: &str = "durable_suspension_v1";
 
 pub fn worker_protocol_capabilities() -> (Vec<String>, Vec<String>) {
     match std::env::var("AGNT5_DURABLE_ACTIVATION_MODE")
@@ -29,11 +31,17 @@ pub fn worker_protocol_capabilities() -> (Vec<String>, Vec<String>) {
     {
         "disabled" => (Vec::new(), Vec::new()),
         "required" => (
-            vec![DURABLE_ACTIVATION_V1_CAPABILITY.to_string()],
+            vec![
+                DURABLE_ACTIVATION_V1_CAPABILITY.to_string(),
+                DURABLE_SUSPENSION_V1_CAPABILITY.to_string(),
+            ],
             vec![DURABLE_ACTIVATION_V1_CAPABILITY.to_string()],
         ),
         _ => (
-            vec![DURABLE_ACTIVATION_V1_CAPABILITY.to_string()],
+            vec![
+                DURABLE_ACTIVATION_V1_CAPABILITY.to_string(),
+                DURABLE_SUSPENSION_V1_CAPABILITY.to_string(),
+            ],
             Vec::new(),
         ),
     }
@@ -682,6 +690,20 @@ impl WorkerCoordinatorClient {
 
         Ok(response)
     }
+
+    /// Suspend a polled job through the Engine RPC. Pull workers do not keep a
+    /// bidirectional dispatch stream, so they cannot return this typed result
+    /// through WorkerStream like push workers do.
+    pub async fn suspend_activation(
+        &mut self,
+        req: SuspendActivationRequest,
+    ) -> Result<SuspendActivationResponse> {
+        self.engine_client
+            .suspend_activation(req)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|status| activation_status("SuspendActivation", status))
+    }
 }
 
 /// Open an EventStream on the Execution Engine for sending ephemeral events (SSE-only).
@@ -903,6 +925,19 @@ impl EngineClient {
             .await
             .map(|response| response.into_inner())
             .map_err(|status| activation_status("FailActivation", status))
+    }
+
+    /// Atomically park one fenced activation and its parent run until a
+    /// durable timer generation is ready.
+    pub async fn suspend_activation(
+        &mut self,
+        request: SuspendActivationRequest,
+    ) -> Result<SuspendActivationResponse> {
+        self.next_client()
+            .suspend_activation(request)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|status| activation_status("SuspendActivation", status))
     }
 
     /// Append a single record to the engine.
