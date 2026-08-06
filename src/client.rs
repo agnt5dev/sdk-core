@@ -754,6 +754,7 @@ pub async fn create_ee_event_stream(
 /// the h2 PoisonError that occurs when 100+ concurrent requests share one connection.
 const ENGINE_POOL_SIZE: usize = 8;
 const ENGINE_RPC_RETRY_ATTEMPTS: usize = 20;
+const ENGINE_ACTIVATION_RPC_ATTEMPTS: usize = 6;
 const ENGINE_RPC_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 fn is_retryable_engine_status(status: &tonic::Status) -> bool {
@@ -826,6 +827,10 @@ async fn sleep_engine_retry(attempt: usize) {
     tokio::time::sleep(ENGINE_RPC_RETRY_DELAY * multiplier).await;
 }
 
+fn should_retry_activation_status(status: &tonic::Status, attempt: usize) -> bool {
+    attempt + 1 < ENGINE_ACTIVATION_RPC_ATTEMPTS && is_retryable_engine_status(status)
+}
+
 /// Client for communicating with the AGNT5 Engine.
 ///
 /// Uses a pool of N independent gRPC connections with round-robin selection.
@@ -896,11 +901,21 @@ impl EngineClient {
         &mut self,
         request: BeginActivationRequest,
     ) -> Result<BeginActivationResponse> {
-        self.next_client()
-            .begin_activation(request)
-            .await
-            .map(|response| response.into_inner())
-            .map_err(|status| activation_status("BeginActivation", status))
+        for attempt in 0..ENGINE_ACTIVATION_RPC_ATTEMPTS {
+            match self.next_client().begin_activation(request.clone()).await {
+                Ok(response) => return Ok(response.into_inner()),
+                Err(status) if should_retry_activation_status(&status, attempt) => {
+                    debug!(
+                        attempt = attempt + 1,
+                        status = %status,
+                        "BeginActivation hit a transient gRPC status; retrying the exact command"
+                    );
+                    sleep_engine_retry(attempt).await;
+                }
+                Err(status) => return Err(activation_status("BeginActivation", status)),
+            }
+        }
+        unreachable!("activation retry loop always returns")
     }
 
     /// Commit one fenced activation completion and wait for its durability acknowledgement.
@@ -908,11 +923,25 @@ impl EngineClient {
         &mut self,
         request: CompleteActivationRequest,
     ) -> Result<CompleteActivationResponse> {
-        self.next_client()
-            .complete_activation(request)
-            .await
-            .map(|response| response.into_inner())
-            .map_err(|status| activation_status("CompleteActivation", status))
+        for attempt in 0..ENGINE_ACTIVATION_RPC_ATTEMPTS {
+            match self
+                .next_client()
+                .complete_activation(request.clone())
+                .await
+            {
+                Ok(response) => return Ok(response.into_inner()),
+                Err(status) if should_retry_activation_status(&status, attempt) => {
+                    debug!(
+                        attempt = attempt + 1,
+                        status = %status,
+                        "CompleteActivation hit a transient gRPC status; retrying the exact command"
+                    );
+                    sleep_engine_retry(attempt).await;
+                }
+                Err(status) => return Err(activation_status("CompleteActivation", status)),
+            }
+        }
+        unreachable!("activation retry loop always returns")
     }
 
     /// Commit one fenced activation failure and wait for its durability acknowledgement.
@@ -920,11 +949,21 @@ impl EngineClient {
         &mut self,
         request: FailActivationRequest,
     ) -> Result<FailActivationResponse> {
-        self.next_client()
-            .fail_activation(request)
-            .await
-            .map(|response| response.into_inner())
-            .map_err(|status| activation_status("FailActivation", status))
+        for attempt in 0..ENGINE_ACTIVATION_RPC_ATTEMPTS {
+            match self.next_client().fail_activation(request.clone()).await {
+                Ok(response) => return Ok(response.into_inner()),
+                Err(status) if should_retry_activation_status(&status, attempt) => {
+                    debug!(
+                        attempt = attempt + 1,
+                        status = %status,
+                        "FailActivation hit a transient gRPC status; retrying the exact command"
+                    );
+                    sleep_engine_retry(attempt).await;
+                }
+                Err(status) => return Err(activation_status("FailActivation", status)),
+            }
+        }
+        unreachable!("activation retry loop always returns")
     }
 
     /// Atomically park one fenced activation and its parent run until a
@@ -933,11 +972,21 @@ impl EngineClient {
         &mut self,
         request: SuspendActivationRequest,
     ) -> Result<SuspendActivationResponse> {
-        self.next_client()
-            .suspend_activation(request)
-            .await
-            .map(|response| response.into_inner())
-            .map_err(|status| activation_status("SuspendActivation", status))
+        for attempt in 0..ENGINE_ACTIVATION_RPC_ATTEMPTS {
+            match self.next_client().suspend_activation(request.clone()).await {
+                Ok(response) => return Ok(response.into_inner()),
+                Err(status) if should_retry_activation_status(&status, attempt) => {
+                    debug!(
+                        attempt = attempt + 1,
+                        status = %status,
+                        "SuspendActivation hit a transient gRPC status; retrying the exact command"
+                    );
+                    sleep_engine_retry(attempt).await;
+                }
+                Err(status) => return Err(activation_status("SuspendActivation", status)),
+            }
+        }
+        unreachable!("activation retry loop always returns")
     }
 
     /// Append a single record to the engine.
@@ -1102,6 +1151,20 @@ mod tests {
     fn retryable_engine_status_does_not_retry_plain_internal_errors() {
         let status = tonic::Status::internal("serialization failed");
         assert!(!is_retryable_engine_status(&status));
+    }
+
+    #[test]
+    fn activation_rpc_retry_is_bounded_to_transient_statuses() {
+        let lagging_replica =
+            tonic::Status::unavailable("activation actv1_test is not yet visible on this replica");
+        assert!(should_retry_activation_status(&lagging_replica, 0));
+        assert!(!should_retry_activation_status(
+            &lagging_replica,
+            ENGINE_ACTIVATION_RPC_ATTEMPTS - 1
+        ));
+
+        let conflict = tonic::Status::already_exists("payload conflict");
+        assert!(!should_retry_activation_status(&conflict, 0));
     }
 
     #[tokio::test]
