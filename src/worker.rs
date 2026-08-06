@@ -43,7 +43,7 @@ const ASSIGNMENT_AUTHORED_RETRY_METADATA_KEYS: &[&str] = &[
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParkedSlotEvent {
     /// A claimed job has reached the language runtime and begun execution.
-    Started,
+    Started { active_started: usize },
     /// A surplus idle slot retired itself (`total_slots` already decremented).
     Retired,
 }
@@ -164,7 +164,8 @@ impl WorkerSlotPhases {
         crate::telemetry::record_worker_claim_to_start("pull", transition.0.as_secs_f64());
         Self::publish(transition.2);
         if let Some(notifier) = transition.1 {
-            let _ = notifier.send(ParkedSlotEvent::Started);
+            let active_started = transition.2.executing + transition.2.terminalizing;
+            let _ = notifier.send(ParkedSlotEvent::Started { active_started });
         }
     }
 
@@ -5312,10 +5313,10 @@ impl Worker {
                     }
                     // `ctx` holds an `events_tx` clone, so recv() never yields None here.
                     event = events_rx.recv() => {
-                        if let Some(ParkedSlotEvent::Started) = event {
+                        if let Some(ParkedSlotEvent::Started { active_started }) = event {
                             let spawn = parked_ramp_spawn_count(
                                 total_slots.load(std::sync::atomic::Ordering::Relaxed),
-                                busy_slots.load(std::sync::atomic::Ordering::Relaxed),
+                                active_started,
                                 max_slots,
                             );
                             for _ in 0..spawn {
@@ -6763,14 +6764,16 @@ mod tests {
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
         phases.set_started_notifier(events_tx);
 
-        // Model a deliberately stalled language scheduler: the pull job is
-        // claimed and occupies its current slot, but run.started has not been
-        // emitted. The supervisor must receive no ramp signal in this state.
-        let guard = phases.claim("slow-run".to_string());
+        // Model a deliberately stalled language scheduler: four pull jobs are
+        // claimed, but none has emitted run.started. The supervisor must
+        // receive no ramp signal in this state.
+        let guards: Vec<_> = (0..4)
+            .map(|index| phases.claim(format!("slow-run-{index}")))
+            .collect();
         assert_eq!(
             phases.snapshot(),
             WorkerSlotPhaseSnapshot {
-                claimed_not_started: 1,
+                claimed_not_started: 4,
                 executing: 0,
                 terminalizing: 0,
             }
@@ -6781,12 +6784,17 @@ mod tests {
                 .is_err()
         );
 
-        phases.mark_started("slow-run");
-        assert_eq!(events_rx.recv().await, Some(ParkedSlotEvent::Started));
+        phases.mark_started("slow-run-0");
+        let event = events_rx.recv().await;
+        assert_eq!(event, Some(ParkedSlotEvent::Started { active_started: 1 }));
+        let Some(ParkedSlotEvent::Started { active_started }) = event else {
+            unreachable!();
+        };
+        assert_eq!(parked_ramp_spawn_count(4, active_started, 16), 0);
         assert_eq!(
             phases.snapshot(),
             WorkerSlotPhaseSnapshot {
-                claimed_not_started: 0,
+                claimed_not_started: 3,
                 executing: 1,
                 terminalizing: 0,
             }
@@ -6794,19 +6802,19 @@ mod tests {
 
         // Duplicate run.started events are idempotent and cannot cause extra
         // ramp waves.
-        phases.mark_started("slow-run");
+        phases.mark_started("slow-run-0");
         assert!(events_rx.try_recv().is_err());
 
-        phases.mark_terminalizing("slow-run");
+        phases.mark_terminalizing("slow-run-0");
         assert_eq!(
             phases.snapshot(),
             WorkerSlotPhaseSnapshot {
-                claimed_not_started: 0,
+                claimed_not_started: 3,
                 executing: 0,
                 terminalizing: 1,
             }
         );
-        drop(guard);
+        drop(guards);
         assert_eq!(phases.snapshot(), WorkerSlotPhaseSnapshot::default());
     }
 
