@@ -3272,7 +3272,84 @@ impl Worker {
             return Ok(());
         }
 
+        let mut run_ids: Vec<_> = events.iter().map(|event| event.0.clone()).collect();
+        run_ids.sort_unstable();
+        run_ids.dedup();
+        let _journal_flush_guards = self
+            .journal_flush_locks
+            .lock_runs(run_ids.iter().cloned())
+            .await;
+
         if let Some(mut engine) = self.ensure_engine_client().await? {
+            // The batch is an ordering boundary just like a single acknowledged
+            // checkpoint. Flush anything already queued for these runs before
+            // appending the batch so an earlier stream frame cannot be overtaken.
+            for run_id in &run_ids {
+                let pending = self.journal_queue.drain_run_events(run_id);
+                if pending.is_empty() {
+                    continue;
+                }
+
+                let tenant_id = pending
+                    .iter()
+                    .find_map(|event| canonical_project_id_from_metadata(&event.metadata))
+                    .or_else(|| canonical_project_id_from_metadata(&self.metadata))
+                    .unwrap_or_default();
+                let transient: Vec<_> = pending
+                    .iter()
+                    .filter(|event| event.is_sse_only)
+                    .map(|event| EventStreamMessage {
+                        run_id: event.run_id.clone(),
+                        event_type: event.event_type.clone(),
+                        data: event.data.clone(),
+                        trace_id: event.correlation_id.clone(),
+                        span_id: event.parent_correlation_id.clone(),
+                        project_id: canonical_project_id_from_metadata(&event.metadata)
+                            .unwrap_or_else(|| tenant_id.clone()),
+                        source_timestamp_ns: event.source_timestamp_ns,
+                        worker_id: self.config.worker_id.clone(),
+                    })
+                    .collect();
+                let durable_records: Vec<_> = pending
+                    .iter()
+                    .filter(|event| !event.is_sse_only)
+                    .map(|event| {
+                        client::build_engine_record(
+                            tenant_id.clone(),
+                            event.run_id.clone(),
+                            event.event_type.clone(),
+                            event.data.clone(),
+                            event.source_timestamp_ns,
+                            String::new(),
+                            event.correlation_id.clone(),
+                            event.parent_correlation_id.clone(),
+                            event.metadata.clone(),
+                        )
+                    })
+                    .collect();
+
+                if let Err(error) = engine.stream_events(transient).await {
+                    for event in pending.into_iter().rev() {
+                        self.journal_queue.push_front(event).ok();
+                    }
+                    self.journal_queue.record_error();
+                    let mut guard = self.engine_client.lock().await;
+                    *guard = None;
+                    return Err(error);
+                }
+                if !durable_records.is_empty() {
+                    if let Err(error) = engine.append_batch(durable_records).await {
+                        for event in pending.into_iter().rev().filter(|event| !event.is_sse_only) {
+                            self.journal_queue.push_front(event).ok();
+                        }
+                        self.journal_queue.record_error();
+                        let mut guard = self.engine_client.lock().await;
+                        *guard = None;
+                        return Err(error);
+                    }
+                }
+            }
+
             let originals: Vec<_> = events
                 .into_iter()
                 .map(|(run_id, event_type, data, sequence, metadata, ts)| {
@@ -3345,6 +3422,7 @@ impl Worker {
                         self.journal_queue.push_front(event).ok();
                     }
                     self.journal_queue.record_error();
+                    return Err(e);
                 }
             }
             return Ok(());
