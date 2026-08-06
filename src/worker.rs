@@ -12,6 +12,7 @@ use crate::pb::{
     RuntimeServiceResponse, ServiceMessage, UnregisterService, WorkerCapability,
     WorkerHealthStatus, WorkerMode, WorkerSlotPolicy, WriteCheckpointRequest,
 };
+use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
@@ -28,6 +29,7 @@ const PARKED_COMPLETION_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 const PARKED_COMPLETE_JOB_ATTEMPTS: usize = 3;
 const PARKED_COMPLETE_JOB_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 const PARKED_COMPLETE_JOB_RETRY_DELAY: Duration = Duration::from_millis(100);
+const DEPLOYMENT_ARTIFACT_DOMAIN: &[u8] = b"agnt5.deployment-artifact.v1\0";
 const ASSIGNMENT_AUTHORED_RETRY_METADATA_KEYS: &[&str] = &[
     "attempt",
     "max_attempts",
@@ -686,11 +688,13 @@ fn configured_activation_artifact_sha256(metadata: &HashMap<String, String>) -> 
         .filter(|value| !value.is_empty())
 }
 
-fn valid_activation_artifact_sha256(value: &str) -> bool {
+fn decode_activation_artifact_sha256(value: &str) -> Option<[u8; 32]> {
     use base64::Engine as _;
 
-    if hex::decode(value).is_ok_and(|decoded| decoded.len() == 32) {
-        return true;
+    if let Ok(decoded) = hex::decode(value) {
+        if let Ok(digest) = decoded.try_into() {
+            return Some(digest);
+        }
     }
     [
         base64::engine::general_purpose::STANDARD.decode(value),
@@ -699,7 +703,33 @@ fn valid_activation_artifact_sha256(value: &str) -> bool {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(value),
     ]
     .into_iter()
-    .any(|decoded| decoded.is_ok_and(|bytes| bytes.len() == 32))
+    .filter_map(|decoded| decoded.ok())
+    .find_map(|decoded| decoded.try_into().ok())
+}
+
+fn valid_activation_artifact_sha256(value: &str) -> bool {
+    decode_activation_artifact_sha256(value).is_some()
+}
+
+fn deployment_artifact_sha256(deployment_id: &str) -> Option<[u8; 32]> {
+    let deployment_id = Uuid::parse_str(deployment_id).ok()?.to_string();
+    let mut digest = Sha256::new();
+    digest.update(DEPLOYMENT_ARTIFACT_DOMAIN);
+    digest.update(deployment_id.as_bytes());
+    Some(digest.finalize().into())
+}
+
+fn configured_deployment_artifact_sha256(metadata: &HashMap<String, String>) -> Option<[u8; 32]> {
+    ["AGNT5_DEPLOYMENT_ID", "deployment_id"]
+        .into_iter()
+        .filter_map(|key| metadata.get(key))
+        .map(String::as_str)
+        .find_map(deployment_artifact_sha256)
+        .or_else(|| {
+            std::env::var("AGNT5_DEPLOYMENT_ID")
+                .ok()
+                .and_then(|value| deployment_artifact_sha256(&value))
+        })
 }
 
 fn worker_protocol_capabilities_for_metadata(
@@ -712,14 +742,19 @@ fn worker_protocol_capabilities_for_metadata(
     {
         return Ok((supported, required));
     }
-    if configured_activation_artifact_sha256(metadata)
-        .as_deref()
-        .is_some_and(valid_activation_artifact_sha256)
-    {
-        return Ok((supported, required));
+    if let Some(configured) = configured_activation_artifact_sha256(metadata) {
+        if valid_activation_artifact_sha256(&configured) {
+            let configured = decode_activation_artifact_sha256(&configured)
+                .expect("validated activation artifact digest");
+            if configured_deployment_artifact_sha256(metadata)
+                .is_none_or(|expected| expected == configured)
+            {
+                return Ok((supported, required));
+            }
+        }
     }
 
-    let message = "durable_activation_v1 requires a valid 32-byte activation artifact SHA-256";
+    let message = "durable_activation_v1 requires the control-plane deployment artifact identity";
     if required
         .iter()
         .any(|capability| capability == crate::client::DURABLE_ACTIVATION_V1_CAPABILITY)
@@ -756,11 +791,11 @@ fn stamp_activation_dispatch_metadata(
     service_version: &str,
     worker_metadata: &HashMap<String, String>,
     definition_configs: &HashMap<String, String>,
-) {
+) -> Result<()> {
     let Some(crate::pb::runtime_message::MessageData::DispatchComponent(request)) =
         runtime_message.message_data.as_mut()
     else {
-        return;
+        return Ok(());
     };
 
     request.metadata.insert(
@@ -806,11 +841,42 @@ fn stamp_activation_dispatch_metadata(
             .entry("project_id".to_string())
             .or_insert_with(|| value.clone());
     }
-    if let Some(value) = configured_activation_artifact_sha256(worker_metadata) {
+    let worker_artifact =
+        configured_activation_artifact_sha256(worker_metadata).ok_or_else(|| {
+            SdkError::Activation {
+                message: "negotiated durable activation is missing the worker artifact identity"
+                    .to_string(),
+                code: crate::error::ErrorCode::DurabilityUnavailable,
+                activation_id: None,
+                attempt: None,
+            }
+        })?;
+    let worker_digest = decode_activation_artifact_sha256(&worker_artifact).ok_or_else(|| {
+        SdkError::Activation {
+            message: "negotiated durable activation has an invalid worker artifact identity"
+                .to_string(),
+            code: crate::error::ErrorCode::DurabilityUnavailable,
+            activation_id: None,
+            attempt: None,
+        }
+    })?;
+    if let Some(run_artifact) = request.metadata.get("activation_artifact_sha256") {
+        if decode_activation_artifact_sha256(run_artifact) != Some(worker_digest) {
+            return Err(SdkError::Activation {
+                message:
+                    "worker artifact identity does not match the run's pinned deployment artifact"
+                        .to_string(),
+                code: crate::error::ErrorCode::NondeterministicReplay,
+                activation_id: None,
+                attempt: None,
+            });
+        }
+    } else {
         request
             .metadata
-            .insert("activation_artifact_sha256".to_string(), value);
+            .insert("activation_artifact_sha256".to_string(), worker_artifact);
     }
+    Ok(())
 }
 
 // RAII guard so the in-flight count is decremented even if a handler panics or
@@ -2000,14 +2066,21 @@ where
                 if client
                     .negotiated_protocol_capability(crate::client::DURABLE_ACTIVATION_V1_CAPABILITY)
                 {
-                    stamp_activation_dispatch_metadata(
+                    if let Err(error) = stamp_activation_dispatch_metadata(
                         &mut runtime_message,
                         &ctx.worker_id,
                         &current_session_id,
                         &ctx.service_version,
                         &ctx.worker_metadata,
                         &ctx.activation_definition_configs,
-                    );
+                    ) {
+                        error!(
+                            run_id,
+                            error = %error,
+                            "Parked poll slot refusing assignment with mismatched artifact identity"
+                        );
+                        continue;
+                    }
                 }
                 if client
                     .negotiated_protocol_capability(crate::client::DURABLE_SUSPENSION_V1_CAPABILITY)
@@ -3787,14 +3860,16 @@ impl Worker {
                             if client.negotiated_protocol_capability(
                                 crate::client::DURABLE_ACTIVATION_V1_CAPABILITY,
                             ) {
-                                stamp_activation_dispatch_metadata(
+                                if let Err(error) = stamp_activation_dispatch_metadata(
                                     &mut runtime_message,
                                     &self.config.worker_id,
                                     &self.config.worker_id,
                                     &self.config.service_version,
                                     &dispatch_worker_metadata,
                                     &dispatch_activation_definition_configs,
-                                );
+                                ) {
+                                    break Err(error);
+                                }
                             }
                             if client.negotiated_protocol_capability(
                                 crate::client::DURABLE_SUSPENSION_V1_CAPABILITY,
@@ -5069,11 +5144,12 @@ mod tests {
         active_lease_renew_interval_ms, active_lease_renew_interval_with_jitter_ms,
         await_checkpoint_ack, canonical_activation_component_config,
         complete_job_request_from_polled_completion, complete_job_with_retry,
-        durable_suspension_service_message, execution_is_revoked, is_cancelled_worker_response,
-        is_parked_worker_session_registration_rejection, is_terminal_worker_response,
-        is_worker_session_inactive_error, parked_ramp_spawn_count, parked_runtime_service_response,
-        parked_worker_session_was_refreshed, polled_job_completion_from_service_message,
-        polled_job_suspension_request, record_groups_by_run, runtime_message_from_job_assignment,
+        deployment_artifact_sha256, durable_suspension_service_message, execution_is_revoked,
+        is_cancelled_worker_response, is_parked_worker_session_registration_rejection,
+        is_terminal_worker_response, is_worker_session_inactive_error, parked_ramp_spawn_count,
+        parked_runtime_service_response, parked_worker_session_was_refreshed,
+        polled_job_completion_from_service_message, polled_job_suspension_request,
+        record_groups_by_run, runtime_message_from_job_assignment,
         stamp_activation_dispatch_metadata, stamp_dispatch_mode,
         stamp_execution_authority_metadata, stamp_protocol_capability, take_correlation_ids,
         try_retire_parked_slot, uncommitted_records_in_reverse, valid_activation_artifact_sha256,
@@ -5420,6 +5496,17 @@ mod tests {
     }
 
     #[test]
+    fn deployment_artifact_identity_is_domain_separated_and_canonical() {
+        assert_eq!(
+            hex::encode(
+                deployment_artifact_sha256("01234567-89AB-CDEF-0123-456789ABCDEF").unwrap()
+            ),
+            "c51344c186e74ccb1ce5b5f6122362285d9dd3a4b125d442280de1dcacae8c9f"
+        );
+        assert!(deployment_artifact_sha256("not-a-deployment-id").is_none());
+    }
+
+    #[test]
     fn negotiated_activation_metadata_uses_typed_dispatch_authority() {
         let mut message = crate::pb::RuntimeMessage {
             message_data: Some(runtime_message::MessageData::DispatchComponent(
@@ -5435,6 +5522,11 @@ mod tests {
                         (
                             "lease_authority".to_string(),
                             "runtime-lease-authority".to_string(),
+                        ),
+                        (
+                            "activation_artifact_sha256".to_string(),
+                            "c51344c186e74ccb1ce5b5f6122362285d9dd3a4b125d442280de1dcacae8c9f"
+                                .to_string(),
                         ),
                     ]),
                     ..Default::default()
@@ -5457,11 +5549,12 @@ mod tests {
                 ("project_id".to_string(), "project-1".to_string()),
                 (
                     "activation_artifact_sha256".to_string(),
-                    "artifact-digest".to_string(),
+                    "c51344c186e74ccb1ce5b5f6122362285d9dd3a4b125d442280de1dcacae8c9f".to_string(),
                 ),
             ]),
             &activation_definition_configs(&components),
-        );
+        )
+        .unwrap();
 
         let Some(runtime_message::MessageData::DispatchComponent(request)) = message.message_data
         else {
@@ -5500,6 +5593,48 @@ mod tests {
                 .map(String::as_str),
             Some(r#"["object",[["model",["string","gpt-5"]]]]"#)
         );
+        assert_eq!(
+            request
+                .metadata
+                .get("activation_artifact_sha256")
+                .map(String::as_str),
+            Some("c51344c186e74ccb1ce5b5f6122362285d9dd3a4b125d442280de1dcacae8c9f")
+        );
+    }
+
+    #[test]
+    fn negotiated_activation_rejects_worker_artifact_mismatch() {
+        let mut message = crate::pb::RuntimeMessage {
+            message_data: Some(runtime_message::MessageData::DispatchComponent(
+                crate::pb::DispatchComponentRequest {
+                    invocation_id: "run-1".to_string(),
+                    component_name: "workflow".to_string(),
+                    lease_id: "lease-1".to_string(),
+                    metadata: HashMap::from([(
+                        "activation_artifact_sha256".to_string(),
+                        "00".repeat(32),
+                    )]),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        let error = stamp_activation_dispatch_metadata(
+            &mut message,
+            "worker-1",
+            "session-1",
+            "1.2.3",
+            &HashMap::from([("activation_artifact_sha256".to_string(), "11".repeat(32))]),
+            &HashMap::new(),
+        )
+        .expect_err("mismatched worker code must not execute a pinned run");
+        assert!(matches!(
+            error,
+            SdkError::Activation {
+                code: ErrorCode::NondeterministicReplay,
+                ..
+            }
+        ));
     }
 
     #[test]
