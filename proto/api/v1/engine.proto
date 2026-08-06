@@ -1270,6 +1270,15 @@ enum ActivationRecoveryPolicy {
   ACTIVATION_RECOVERY_POLICY_FAIL = 5;
 }
 
+// ChildJoinPolicy controls whether a child is part of the parent's terminal
+// obligation. Required children must settle before the parent can succeed;
+// detached children own an independent terminal obligation.
+enum ChildJoinPolicy {
+  CHILD_JOIN_POLICY_UNSPECIFIED = 0;
+  CHILD_JOIN_POLICY_REQUIRED = 1;
+  CHILD_JOIN_POLICY_DETACHED = 2;
+}
+
 // ActivationExternalOutcomeCertainty describes whether an external effect is known.
 enum ActivationExternalOutcomeCertainty {
   ACTIVATION_EXTERNAL_OUTCOME_CERTAINTY_UNSPECIFIED = 0;
@@ -1367,6 +1376,17 @@ message ActivationEvidence {
   bytes sha256 = 3;
 }
 
+// ChildActivationLinkage is immutable spawn identity for a delegated child.
+// child_run_id and child_session_id are allocated before the spawn is
+// admitted, so replay and recovery reattach to the same logical child.
+message ChildActivationLinkage {
+  string child_key = 1;
+  string child_run_id = 2;
+  string child_session_id = 3;
+  bytes child_definition_digest = 4;
+  ChildJoinPolicy join_policy = 5;
+}
+
 // BeginActivationRequest identifies one logical activation independently of attempts.
 message BeginActivationRequest {
   string project_id = 1;
@@ -1380,6 +1400,7 @@ message BeginActivationRequest {
   string worker_session_id = 9;
   bytes run_authority = 10;
   bytes lease_authority = 11;
+  ChildActivationLinkage child = 12;
 }
 
 // ActivationConflictReceipt describes deterministic-key reuse with new semantics.
@@ -1512,6 +1533,7 @@ message ActivationStartedRecord {
   bytes run_authority = 13;
   bytes lease_authority = 14;
   uint32 previous_attempt = 15;
+  ChildActivationLinkage child = 16;
 }
 
 // ActivationCompletedRecord is the canonical all-or-nothing completion bundle.

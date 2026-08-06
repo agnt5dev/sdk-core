@@ -446,6 +446,7 @@ fn durable_timer_plan(
         worker_session_id,
         run_authority: run_authority.into_bytes(),
         lease_authority: lease_authority.into_bytes(),
+        child: None,
     };
     Ok(DurableTimerPlan {
         request,
