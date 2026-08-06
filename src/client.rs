@@ -828,7 +828,9 @@ async fn sleep_engine_retry(attempt: usize) {
 }
 
 fn should_retry_activation_status(status: &tonic::Status, attempt: usize) -> bool {
-    attempt + 1 < ENGINE_ACTIVATION_RPC_ATTEMPTS && is_retryable_engine_status(status)
+    attempt + 1 < ENGINE_ACTIVATION_RPC_ATTEMPTS
+        && status.details().is_empty()
+        && is_retryable_engine_status(status)
 }
 
 /// Client for communicating with the AGNT5 Engine.
@@ -1165,6 +1167,13 @@ mod tests {
 
         let conflict = tonic::Status::already_exists("payload conflict");
         assert!(!should_retry_activation_status(&conflict, 0));
+
+        let typed_conflict = tonic::Status::with_details(
+            tonic::Code::Unavailable,
+            "typed activation outcome",
+            bytes::Bytes::from_static(b"activation-error-detail"),
+        );
+        assert!(!should_retry_activation_status(&typed_conflict, 0));
     }
 
     #[tokio::test]
