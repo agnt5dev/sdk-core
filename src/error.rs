@@ -117,6 +117,11 @@ pub enum SdkError {
     #[error("Execution suspended: {message}")]
     SuspendedExecution { message: String, reason: String },
 
+    #[error("Durable timer suspended: {}", suspension.timer_key)]
+    DurableSuspension {
+        suspension: Box<crate::pb::WorkerSuspension>,
+    },
+
     #[error("Replay error: {message}")]
     ReplayError {
         message: String,
@@ -181,6 +186,7 @@ impl SdkError {
             Self::Timeout { .. } => ErrorCode::ExecutionTimeout,
             Self::InvalidMessage { .. } => ErrorCode::InvalidMessage,
             Self::SuspendedExecution { .. } => ErrorCode::ExecutionSuspended,
+            Self::DurableSuspension { .. } => ErrorCode::ExecutionSuspended,
             Self::ReplayError { .. } => ErrorCode::ExecutionFailed,
             Self::Activation { code, .. } => *code,
             Self::ServiceCallError { .. } => ErrorCode::ServiceUnavailable,
@@ -245,6 +251,7 @@ impl SdkError {
 
             // Suspended execution is not an error to retry
             Self::SuspendedExecution { .. } => RetryHint::NotRetryable,
+            Self::DurableSuspension { .. } => RetryHint::NotRetryable,
 
             // Registration errors are not retryable
             Self::Registration { .. } => RetryHint::NotRetryable,

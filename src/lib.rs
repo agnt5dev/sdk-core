@@ -26,7 +26,8 @@ pub use adk::{
 pub use client::{build_engine_record, CheckpointResult, EngineClient, WorkerCoordinatorClient};
 pub use context::{
     ContextConfig, CoreContext, FunctionCall, FunctionHandle, FunctionNamespace, FunctionRegistry,
-    FunctionResult, FunctionStatus, LanguageModelNamespace, SignalNamespace, TimerNamespace,
+    FunctionResult, FunctionStatus, LanguageModelNamespace, SignalNamespace, TimerActivationClient,
+    TimerNamespace,
 };
 pub use error::{Result, SdkError};
 pub use eval::{

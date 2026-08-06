@@ -831,8 +831,32 @@ impl Drop for InFlightGuard {
     }
 }
 
+struct DurableSuspensionEnvelope {
+    invocation_id: String,
+    metadata: HashMap<String, String>,
+    attempt: i32,
+    lease_id: String,
+}
+
+fn durable_suspension_envelope(
+    runtime_message: &RuntimeMessage,
+) -> Option<DurableSuspensionEnvelope> {
+    let crate::pb::runtime_message::MessageData::DispatchComponent(request) =
+        runtime_message.message_data.as_ref()?
+    else {
+        return None;
+    };
+    Some(DurableSuspensionEnvelope {
+        invocation_id: request.invocation_id.clone(),
+        metadata: request.metadata.clone(),
+        attempt: request.attempt,
+        lease_id: request.lease_id.clone(),
+    })
+}
+
 async fn execute_runtime_message_for_response<F, Fut>(
     worker_name: &str,
+    response_worker_id: &str,
     mut runtime_message: RuntimeMessage,
     response_tx: flume::Sender<ServiceMessage>,
     handler: F,
@@ -848,6 +872,7 @@ where
     let _in_flight = InFlightGuard::enter(&in_flight);
     let tx_clone = response_tx.clone();
     stamp_dispatch_mode(&mut runtime_message, dispatch_mode);
+    let suspension_envelope = durable_suspension_envelope(&runtime_message);
 
     let run_key = dispatch_run_key(&runtime_message);
     if run_key
@@ -891,6 +916,11 @@ where
     let response = match result {
         Some(Ok(Some(response))) => Some(response),
         Some(Ok(None)) => None,
+        Some(Err(SdkError::DurableSuspension { suspension })) => {
+            suspension_envelope.as_ref().map(|envelope| {
+                durable_suspension_service_message(response_worker_id, envelope, *suspension)
+            })
+        }
         Some(Err(e)) => {
             error!("Worker {} handler error: {}", worker_name, e);
             None
@@ -906,6 +936,7 @@ where
 
 async fn execute_runtime_message<F, Fut>(
     worker_name: &str,
+    response_worker_id: &str,
     runtime_message: RuntimeMessage,
     response_tx: flume::Sender<ServiceMessage>,
     handler: F,
@@ -918,6 +949,7 @@ async fn execute_runtime_message<F, Fut>(
 {
     if let Some(response) = execute_runtime_message_for_response(
         worker_name,
+        response_worker_id,
         runtime_message,
         response_tx.clone(),
         handler,
@@ -931,6 +963,34 @@ async fn execute_runtime_message<F, Fut>(
         if let Err(e) = response_tx.send_async(response).await {
             error!("Worker {} failed to send response: {}", worker_name, e);
         }
+    }
+}
+
+fn durable_suspension_service_message(
+    worker_id: &str,
+    envelope: &DurableSuspensionEnvelope,
+    suspension: crate::pb::WorkerSuspension,
+) -> ServiceMessage {
+    ServiceMessage {
+        worker_id: worker_id.to_string(),
+        metadata: HashMap::new(),
+        message_type: Some(crate::pb::service_message::MessageType::FunctionResponse(
+            DispatchComponentResponse {
+                invocation_id: envelope.invocation_id.clone(),
+                success: true,
+                result: Some(
+                    crate::pb::dispatch_component_response::Result::WorkerSuspension(suspension),
+                ),
+                error_message: String::new(),
+                metadata: envelope.metadata.clone(),
+                event_type: "workflow.paused".to_string(),
+                content_index: 0,
+                sequence: 0,
+                attempt: envelope.attempt,
+                source_timestamp_ns: 0,
+                lease_id: envelope.lease_id.clone(),
+            },
+        )),
     }
 }
 
@@ -1996,6 +2056,7 @@ where
                 let (slot_response_tx, slot_response_rx) = flume::unbounded::<ServiceMessage>();
                 let handler_future = execute_runtime_message_for_response(
                     &worker_name,
+                    &ctx.worker_id,
                     runtime_message,
                     slot_response_tx.clone(),
                     handler.clone(),
@@ -3636,6 +3697,7 @@ impl Worker {
             let response_tx = response_tx.clone();
             let handler = message_handler.clone();
             let worker_name = format!("{}-{}", self.config.worker_id, worker_id);
+            let response_worker_id = self.config.worker_id.clone();
             let in_flight = in_flight.clone();
             let cancel_tokens = self.cancel_tokens.clone();
             let revoked_executions = self.revoked_executions.clone();
@@ -3644,6 +3706,7 @@ impl Worker {
                 while let Ok(runtime_message) = task_rx.recv_async().await {
                     execute_runtime_message(
                         &worker_name,
+                        &response_worker_id,
                         runtime_message,
                         response_tx.clone(),
                         handler.clone(),
@@ -5005,12 +5068,12 @@ mod tests {
         activation_definition_configs, active_lease_danger_retry_ms,
         active_lease_renew_interval_ms, active_lease_renew_interval_with_jitter_ms,
         await_checkpoint_ack, canonical_activation_component_config,
-        complete_job_request_from_polled_completion, complete_job_with_retry, execution_is_revoked,
-        is_cancelled_worker_response, is_parked_worker_session_registration_rejection,
-        is_terminal_worker_response, is_worker_session_inactive_error, parked_ramp_spawn_count,
-        parked_runtime_service_response, parked_worker_session_was_refreshed,
-        polled_job_completion_from_service_message, polled_job_suspension_request,
-        record_groups_by_run, runtime_message_from_job_assignment,
+        complete_job_request_from_polled_completion, complete_job_with_retry,
+        durable_suspension_service_message, execution_is_revoked, is_cancelled_worker_response,
+        is_parked_worker_session_registration_rejection, is_terminal_worker_response,
+        is_worker_session_inactive_error, parked_ramp_spawn_count, parked_runtime_service_response,
+        parked_worker_session_was_refreshed, polled_job_completion_from_service_message,
+        polled_job_suspension_request, record_groups_by_run, runtime_message_from_job_assignment,
         stamp_activation_dispatch_metadata, stamp_dispatch_mode,
         stamp_execution_authority_metadata, stamp_protocol_capability, take_correlation_ids,
         try_retire_parked_slot, uncommitted_records_in_reverse, valid_activation_artifact_sha256,
@@ -5912,6 +5975,42 @@ mod tests {
         assert_eq!(request.activation_id, suspension.activation_id);
         assert_eq!(request.delay_ms, suspension.delay_ms);
         assert_eq!(request.ready_at_ms, 0);
+    }
+
+    #[test]
+    fn core_timer_error_maps_to_typed_worker_response() {
+        let suspension = crate::pb::WorkerSuspension {
+            activation_id: "activation-1".into(),
+            attempt: 2,
+            fence_token: b"fence-2".to_vec(),
+            timer_key: "sleep:sleep_0".into(),
+            delay_ms: 5_000,
+            ..Default::default()
+        };
+        let envelope = super::DurableSuspensionEnvelope {
+            invocation_id: "run-1".into(),
+            metadata: HashMap::from([("project_id".into(), "project-1".into())]),
+            attempt: 2,
+            lease_id: "lease-2".into(),
+        };
+
+        let message = durable_suspension_service_message("worker-1", &envelope, suspension.clone());
+        assert_eq!(message.worker_id, "worker-1");
+        let Some(service_message::MessageType::FunctionResponse(response)) = message.message_type
+        else {
+            panic!("expected function response");
+        };
+        assert!(response.success);
+        assert_eq!(response.invocation_id, "run-1");
+        assert_eq!(response.event_type, "workflow.paused");
+        assert_eq!(response.attempt, 2);
+        assert_eq!(response.lease_id, "lease-2");
+        assert_eq!(
+            response.result,
+            Some(dispatch_component_response::Result::WorkerSuspension(
+                suspension
+            ))
+        );
     }
 
     #[test]
