@@ -291,6 +291,9 @@ pub(crate) fn activation_status_error(operation: &str, status: tonic::Status) ->
                 Some(ActivationErrorCode::StateVersionConflict) => {
                     Some(ErrorCode::StateVersionConflict)
                 }
+                Some(ActivationErrorCode::RequiredChildUnresolved) => {
+                    Some(ErrorCode::RequiredChildUnresolved)
+                }
                 Some(ActivationErrorCode::InvalidArgument)
                 | Some(ActivationErrorCode::InlinePayloadTooLarge)
                 | Some(ActivationErrorCode::ReferenceRequired) => Some(ErrorCode::InvalidInput),
@@ -602,6 +605,33 @@ mod activation_tests {
                 attempt: Some(3),
                 ..
             } if id == "actv1_conflict"
+        ));
+    }
+
+    #[test]
+    fn required_child_error_detail_is_preserved() {
+        let detail = ActivationErrorDetail {
+            code: ActivationErrorCode::RequiredChildUnresolved as i32,
+            activation_id: "actv1_parent".into(),
+            attempt: 0,
+            message: "child remains active".into(),
+        };
+        let status = tonic::Status::with_details(
+            tonic::Code::FailedPrecondition,
+            "text is not the contract",
+            Bytes::from(detail.encode_to_vec()),
+        );
+
+        let error = activation_status_error("CompleteActivation", status);
+
+        assert_eq!(error.code(), ErrorCode::RequiredChildUnresolved);
+        assert!(matches!(
+            error,
+            SdkError::Activation {
+                activation_id: Some(ref id),
+                attempt: None,
+                ..
+            } if id == "actv1_parent"
         ));
     }
 

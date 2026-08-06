@@ -38,6 +38,7 @@ pub enum ErrorCode {
     PayloadConflict,
     IllegalTransition,
     StateVersionConflict,
+    RequiredChildUnresolved,
 
     // Validation errors (not retryable)
     InvalidInput,
