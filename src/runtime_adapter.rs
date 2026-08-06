@@ -277,9 +277,38 @@ fn activation_error(
     }
 }
 
+#[derive(Clone, PartialEq, Message)]
+struct GoogleRpcStatus {
+    #[prost(int32, tag = "1")]
+    code: i32,
+    #[prost(string, tag = "2")]
+    message: String,
+    #[prost(message, repeated, tag = "3")]
+    details: Vec<prost_types::Any>,
+}
+
+const ACTIVATION_ERROR_DETAIL_TYPE_URL: &str = "type.googleapis.com/api.v1.ActivationErrorDetail";
+
+fn decode_activation_error_detail(bytes: &[u8]) -> Option<ActivationErrorDetail> {
+    if let Ok(envelope) = GoogleRpcStatus::decode(bytes) {
+        if let Some(detail) = envelope
+            .details
+            .into_iter()
+            .find(|detail| detail.type_url == ACTIVATION_ERROR_DETAIL_TYPE_URL)
+        {
+            if let Ok(detail) = ActivationErrorDetail::decode(detail.value.as_slice()) {
+                return Some(detail);
+            }
+        }
+    }
+    // Backward compatibility for runtimes that emitted the detail directly
+    // instead of wrapping it in google.rpc.Status.
+    ActivationErrorDetail::decode(bytes).ok()
+}
+
 pub(crate) fn activation_status_error(operation: &str, status: tonic::Status) -> SdkError {
     if !status.details().is_empty() {
-        if let Ok(detail) = ActivationErrorDetail::decode(status.details()) {
+        if let Some(detail) = decode_activation_error_detail(status.details()) {
             let code = match ActivationErrorCode::try_from(detail.code).ok() {
                 Some(ActivationErrorCode::NondeterministicReplay) => {
                     Some(ErrorCode::NondeterministicReplay)
@@ -605,6 +634,41 @@ mod activation_tests {
                 attempt: Some(3),
                 ..
             } if id == "actv1_conflict"
+        ));
+    }
+
+    #[test]
+    fn rich_runtime_error_detail_maps_without_parsing_message_text() {
+        let detail = ActivationErrorDetail {
+            code: ActivationErrorCode::IllegalTransition as i32,
+            activation_id: "actv1_missing".into(),
+            attempt: 1,
+            message: "aggregate is not visible".into(),
+        };
+        let envelope = GoogleRpcStatus {
+            code: tonic::Code::FailedPrecondition as i32,
+            message: "text is not the contract".into(),
+            details: vec![prost_types::Any {
+                type_url: ACTIVATION_ERROR_DETAIL_TYPE_URL.into(),
+                value: detail.encode_to_vec(),
+            }],
+        };
+        let status = tonic::Status::with_details(
+            tonic::Code::FailedPrecondition,
+            "text is not the contract",
+            Bytes::from(envelope.encode_to_vec()),
+        );
+
+        let error = activation_status_error("CompleteActivation", status);
+
+        assert_eq!(error.code(), ErrorCode::IllegalTransition);
+        assert!(matches!(
+            error,
+            SdkError::Activation {
+                activation_id: Some(ref id),
+                attempt: Some(1),
+                ..
+            } if id == "actv1_missing"
         ));
     }
 
