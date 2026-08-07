@@ -412,13 +412,36 @@ impl JournalEventQueue {
 
     /// Whether this queue still contains an event for `run_id`.
     ///
-    /// Pull completion uses this while holding the worker flush lock: an empty
+    /// Pull completion uses this while holding that run's flush lock: an empty
     /// result then means no flush for that run is queued or in flight.
     pub fn contains_run(&self, run_id: &str) -> bool {
         self.queue
             .lock()
             .map(|queue| queue.iter().any(|event| event.run_id == run_id))
             .unwrap_or(true)
+    }
+
+    /// Distinct run ids with queued events, oldest-event-first.
+    ///
+    /// The flush task uses this to decide which runs to lock before draining:
+    /// it must hold a run's flush lock *before* removing that run's events, or
+    /// a concurrent checkpoint could overtake events already drained for it.
+    /// Ordering follows queue position so the oldest backlog drains first.
+    pub fn queued_run_ids(&self, max_runs: usize) -> Vec<String> {
+        let Ok(queue) = self.queue.lock() else {
+            return Vec::new();
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for event in queue.iter() {
+            if out.len() >= max_runs {
+                break;
+            }
+            if seen.insert(event.run_id.clone()) {
+                out.push(event.run_id.clone());
+            }
+        }
+        out
     }
 
     /// Record a successful event send (for metrics)
