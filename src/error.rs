@@ -29,6 +29,16 @@ pub enum ErrorCode {
     ExecutionFailed,
     ExecutionTimeout,
     ExecutionSuspended,
+    DurabilityUnavailable,
+    NondeterministicReplay,
+    StaleAuthority,
+    ActivationCancelled,
+    ActivationContended,
+    UnknownOutcome,
+    PayloadConflict,
+    IllegalTransition,
+    StateVersionConflict,
+    RequiredChildUnresolved,
 
     // Validation errors (not retryable)
     InvalidInput,
@@ -108,10 +118,23 @@ pub enum SdkError {
     #[error("Execution suspended: {message}")]
     SuspendedExecution { message: String, reason: String },
 
+    #[error("Durable timer suspended: {}", suspension.timer_key)]
+    DurableSuspension {
+        suspension: Box<crate::pb::WorkerSuspension>,
+    },
+
     #[error("Replay error: {message}")]
     ReplayError {
         message: String,
         step_id: Option<String>,
+    },
+
+    #[error("Durable activation error ({code:?}): {message}")]
+    Activation {
+        message: String,
+        code: ErrorCode,
+        activation_id: Option<String>,
+        attempt: Option<u32>,
     },
 
     #[error("Service call error: {message}")]
@@ -164,7 +187,9 @@ impl SdkError {
             Self::Timeout { .. } => ErrorCode::ExecutionTimeout,
             Self::InvalidMessage { .. } => ErrorCode::InvalidMessage,
             Self::SuspendedExecution { .. } => ErrorCode::ExecutionSuspended,
+            Self::DurableSuspension { .. } => ErrorCode::ExecutionSuspended,
             Self::ReplayError { .. } => ErrorCode::ExecutionFailed,
+            Self::Activation { code, .. } => *code,
             Self::ServiceCallError { .. } => ErrorCode::ServiceUnavailable,
             Self::TelemetryError(_) => ErrorCode::InternalError,
             Self::Internal(_) => ErrorCode::InternalError,
@@ -220,8 +245,14 @@ impl SdkError {
             // Execution errors depend on the specific error
             Self::Invocation { .. } | Self::ReplayError { .. } => RetryHint::NotRetryable,
 
+            // Activation decisions are journal-authoritative. Callers must
+            // begin again or inspect the typed receipt instead of retrying a
+            // failed correctness write generically.
+            Self::Activation { .. } => RetryHint::NotRetryable,
+
             // Suspended execution is not an error to retry
             Self::SuspendedExecution { .. } => RetryHint::NotRetryable,
+            Self::DurableSuspension { .. } => RetryHint::NotRetryable,
 
             // Registration errors are not retryable
             Self::Registration { .. } => RetryHint::NotRetryable,

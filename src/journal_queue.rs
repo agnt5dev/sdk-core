@@ -7,7 +7,8 @@
 //!
 //! - **JournalEventQueue**: Thread-safe buffer with configurable max size
 //! - **JournalEventMessage**: Unified event with classification flags
-//! - **Overflow policy**: Drop oldest when buffer full (FIFO)
+//! - **Overflow policy**: Drop telemetry only; reject correctness events when
+//!   no telemetry slot can be reclaimed
 //! - **Metrics**: Track queued, sent, dropped, errors
 //!
 //! ## Event Classification
@@ -44,7 +45,7 @@
 //! let batch = queue.drain_batch(100);
 //! ```
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -218,16 +219,87 @@ pub struct JournalQueueMetrics {
 
 /// Thread-safe unified journal event queue
 ///
-/// Buffers all event types in memory and provides FIFO access with automatic
-/// oldest-event dropping when buffer is full.
+/// Buffers all event types in memory and provides FIFO access. When the buffer
+/// is full, only SSE-only telemetry can be evicted. Correctness events are
+/// rejected if no telemetry slot can be reclaimed.
 #[derive(Clone)]
 pub struct JournalEventQueue {
-    /// Internal queue protected by mutex
-    queue: Arc<Mutex<VecDeque<JournalEventMessage>>>,
+    /// Indexed queue state protected by one short-lived mutex.
+    queue: Arc<Mutex<JournalQueueState>>,
     /// Configuration
     config: JournalQueueConfig,
     /// Metrics for monitoring queue health
     metrics: Arc<Mutex<JournalQueueMetrics>>,
+}
+
+#[derive(Default)]
+struct JournalQueueState {
+    /// Global FIFO order. IDs drained through the per-run index remain as
+    /// tombstones until an ordinary drain encounters them or compaction runs.
+    order: VecDeque<u64>,
+    events: HashMap<u64, JournalEventMessage>,
+    by_run: HashMap<String, VecDeque<u64>>,
+    next_id: u64,
+}
+
+impl JournalQueueState {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            order: VecDeque::with_capacity(capacity),
+            events: HashMap::with_capacity(capacity),
+            by_run: HashMap::new(),
+            next_id: 0,
+        }
+    }
+
+    fn insert(&mut self, event: JournalEventMessage, front: bool) {
+        let id = self.next_id;
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .expect("journal queue event id exhausted");
+        let run_id = event.run_id.clone();
+
+        self.events.insert(id, event);
+        if front {
+            self.order.push_front(id);
+            self.by_run.entry(run_id).or_default().push_front(id);
+        } else {
+            self.order.push_back(id);
+            self.by_run.entry(run_id).or_default().push_back(id);
+        }
+    }
+
+    fn remove_run_reference(&mut self, run_id: &str, id: u64) {
+        let mut remove_run = false;
+        if let Some(ids) = self.by_run.get_mut(run_id) {
+            if ids.front() == Some(&id) {
+                ids.pop_front();
+            } else if let Some(position) = ids.iter().position(|queued_id| *queued_id == id) {
+                ids.remove(position);
+            }
+            remove_run = ids.is_empty();
+        }
+        if remove_run {
+            self.by_run.remove(run_id);
+        }
+    }
+
+    fn remove_event(&mut self, id: u64) -> Option<JournalEventMessage> {
+        let event = self.events.remove(&id)?;
+        self.remove_run_reference(&event.run_id, id);
+        Some(event)
+    }
+
+    fn maybe_compact_order(&mut self) {
+        const MIN_TOMBSTONES_BEFORE_COMPACTION: usize = 1024;
+        let tombstones = self.order.len().saturating_sub(self.events.len());
+        if tombstones >= MIN_TOMBSTONES_BEFORE_COMPACTION
+            && self.order.len() > self.events.len().saturating_mul(2)
+        {
+            self.order.retain(|id| self.events.contains_key(id));
+        }
+    }
 }
 
 impl JournalEventQueue {
@@ -241,7 +313,9 @@ impl JournalEventQueue {
         );
 
         JournalEventQueue {
-            queue: Arc::new(Mutex::new(VecDeque::with_capacity(config.max_size))),
+            queue: Arc::new(Mutex::new(JournalQueueState::with_capacity(
+                config.max_size,
+            ))),
             config,
             metrics: Arc::new(Mutex::new(JournalQueueMetrics::default())),
         }
@@ -249,28 +323,58 @@ impl JournalEventQueue {
 
     /// Push an event to the queue
     ///
-    /// If the queue is at capacity, the oldest event is dropped (FIFO).
+    /// If the queue is at capacity, the oldest SSE-only event is dropped. A
+    /// correctness event is never evicted: if the queue contains only
+    /// correctness events, a new correctness event is rejected and new
+    /// telemetry is dropped.
     pub fn push(&self, event: JournalEventMessage) -> Result<(), String> {
         let mut queue = self
             .queue
             .lock()
             .map_err(|e| format!("Failed to lock journal queue for push: {}", e))?;
 
-        // Check if buffer is full
-        if queue.len() >= self.config.max_size {
-            // Drop oldest event to make room
-            if let Some(dropped) = queue.pop_front() {
+        // Reclaim telemetry until the buffer has room. push_front() may have
+        // temporarily taken the queue over capacity while preserving a failed
+        // correctness batch, so this can require more than one eviction.
+        while queue.events.len() >= self.config.max_size {
+            let oldest_telemetry = queue.order.iter().enumerate().find_map(|(index, id)| {
+                queue.events.get(id).and_then(|queued| {
+                    JournalEventMessage::is_sse_only_event_type(&queued.event_type)
+                        .then_some((index, *id))
+                })
+            });
+
+            if let Some((index, id)) = oldest_telemetry {
+                queue.order.remove(index);
+                let dropped = queue
+                    .remove_event(id)
+                    .expect("telemetry id came from the same queue");
                 log::warn!(
-                    "Journal queue full ({}), dropped oldest event: type={} run_id={}",
+                    "Journal queue full ({}), dropped oldest telemetry event: type={} run_id={}",
                     self.config.max_size,
                     dropped.event_type,
                     dropped.run_id
                 );
 
-                // Update metrics
                 if let Ok(mut metrics) = self.metrics.lock() {
                     metrics.events_dropped += 1;
                 }
+            } else if JournalEventMessage::is_sse_only_event_type(&event.event_type) {
+                log::warn!(
+                    "Journal queue full ({}), dropped incoming telemetry event: type={} run_id={}",
+                    self.config.max_size,
+                    event.event_type,
+                    event.run_id
+                );
+                if let Ok(mut metrics) = self.metrics.lock() {
+                    metrics.events_dropped += 1;
+                }
+                return Ok(());
+            } else {
+                return Err(format!(
+                    "Journal queue full ({}) with correctness events; rejected event: type={} run_id={}",
+                    self.config.max_size, event.event_type, event.run_id
+                ));
             }
         }
 
@@ -279,10 +383,10 @@ impl JournalEventQueue {
             event.event_type,
             event.run_id,
             event.is_sse_only,
-            queue.len() + 1
+            queue.events.len() + 1
         );
 
-        queue.push_back(event);
+        queue.insert(event, false);
 
         // Update metrics
         if let Ok(mut metrics) = self.metrics.lock() {
@@ -295,7 +399,12 @@ impl JournalEventQueue {
     /// Pop the next event from the queue (FIFO)
     pub fn pop(&self) -> Option<JournalEventMessage> {
         let mut queue = self.queue.lock().ok()?;
-        queue.pop_front()
+        while let Some(id) = queue.order.pop_front() {
+            if let Some(event) = queue.remove_event(id) {
+                return Some(event);
+            }
+        }
+        None
     }
 
     /// Re-queue an event at the front (used when send fails)
@@ -311,7 +420,7 @@ impl JournalEventQueue {
             event.run_id
         );
 
-        queue.push_front(event);
+        queue.insert(event, true);
         Ok(())
     }
 
@@ -325,11 +434,13 @@ impl JournalEventQueue {
             }
         };
 
-        let count = std::cmp::min(max, queue.len());
-        let mut batch = Vec::with_capacity(count);
+        let mut batch = Vec::with_capacity(std::cmp::min(max, queue.events.len()));
 
-        for _ in 0..count {
-            if let Some(event) = queue.pop_front() {
+        while batch.len() < max {
+            let Some(id) = queue.order.pop_front() else {
+                break;
+            };
+            if let Some(event) = queue.remove_event(id) {
                 batch.push(event);
             }
         }
@@ -338,10 +449,86 @@ impl JournalEventQueue {
             log::debug!(
                 "Drained {} events from journal queue (remaining={})",
                 batch.len(),
-                queue.len()
+                queue.events.len()
             );
         }
 
+        batch
+    }
+
+    /// Return the distinct run IDs represented by the next `max` live events.
+    /// The background sender uses this to acquire ordering barriers before it
+    /// removes those events from the queue.
+    pub fn peek_batch_run_ids(&self, max: usize) -> Vec<String> {
+        let queue = match self.queue.lock() {
+            Ok(queue) => queue,
+            Err(error) => {
+                log::error!("Failed to lock journal queue for peek_batch_run_ids: {error}");
+                return Vec::new();
+            }
+        };
+
+        let mut run_ids = Vec::new();
+        let mut seen = HashSet::new();
+        for event in queue
+            .order
+            .iter()
+            .filter_map(|id| queue.events.get(id))
+            .take(max)
+        {
+            if seen.insert(event.run_id.clone()) {
+                run_ids.push(event.run_id.clone());
+            }
+        }
+        run_ids
+    }
+
+    /// Drain up to `max` events belonging to runs whose ordering barriers are
+    /// already held. Events from other runs retain their relative FIFO order.
+    pub fn drain_batch_for_runs(
+        &self,
+        max: usize,
+        allowed_run_ids: &HashSet<String>,
+    ) -> Vec<JournalEventMessage> {
+        let mut queue = match self.queue.lock() {
+            Ok(queue) => queue,
+            Err(error) => {
+                log::error!("Failed to lock journal queue for drain_batch_for_runs: {error}");
+                return Vec::new();
+            }
+        };
+        let mut batch = Vec::with_capacity(std::cmp::min(max, queue.events.len()));
+        let mut skipped = VecDeque::new();
+        let mut examined = 0;
+
+        while examined < max {
+            let Some(id) = queue.order.pop_front() else {
+                break;
+            };
+            let Some(event) = queue.events.get(&id) else {
+                continue;
+            };
+            examined += 1;
+            if allowed_run_ids.contains(&event.run_id) {
+                if let Some(event) = queue.remove_event(id) {
+                    batch.push(event);
+                }
+            } else {
+                skipped.push_back(id);
+            }
+        }
+
+        while let Some(id) = skipped.pop_back() {
+            queue.order.push_front(id);
+        }
+
+        if !batch.is_empty() {
+            log::debug!(
+                "Drained {} barrier-protected events from journal queue (remaining={})",
+                batch.len(),
+                queue.events.len()
+            );
+        }
         batch
     }
 
@@ -355,10 +542,14 @@ impl JournalEventQueue {
             }
         };
 
-        let mut events = Vec::with_capacity(queue.len());
-        while let Some(event) = queue.pop_front() {
-            events.push(event);
+        let mut events = Vec::with_capacity(queue.events.len());
+        while let Some(id) = queue.order.pop_front() {
+            if let Some(event) = queue.remove_event(id) {
+                events.push(event);
+            }
         }
+        queue.by_run.clear();
+        queue.events.clear();
 
         log::debug!("Drained {} events from journal queue", events.len());
         events
@@ -375,25 +566,21 @@ impl JournalEventQueue {
             }
         };
 
-        let mut matched = Vec::new();
-        let mut remaining = std::collections::VecDeque::with_capacity(queue.len());
-
-        while let Some(event) = queue.pop_front() {
-            if event.run_id == run_id {
+        let ids = queue.by_run.remove(run_id).unwrap_or_default();
+        let mut matched = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(event) = queue.events.remove(&id) {
                 matched.push(event);
-            } else {
-                remaining.push_back(event);
             }
         }
-
-        *queue = remaining;
+        queue.maybe_compact_order();
 
         if !matched.is_empty() {
             log::debug!(
                 "Drained {} events for run_id={} (remaining={})",
                 matched.len(),
                 run_id,
-                queue.len()
+                queue.events.len()
             );
         }
 
@@ -402,7 +589,7 @@ impl JournalEventQueue {
 
     /// Get current queue length
     pub fn len(&self) -> usize {
-        self.queue.lock().map(|q| q.len()).unwrap_or(0)
+        self.queue.lock().map(|q| q.events.len()).unwrap_or(0)
     }
 
     /// Check if queue is empty
@@ -412,12 +599,12 @@ impl JournalEventQueue {
 
     /// Whether this queue still contains an event for `run_id`.
     ///
-    /// Pull completion uses this while holding the worker flush lock: an empty
-    /// result then means no flush for that run is queued or in flight.
+    /// Pull completion uses this while holding the run's flush barrier: an
+    /// empty result then means no flush for that run is queued or in flight.
     pub fn contains_run(&self, run_id: &str) -> bool {
         self.queue
             .lock()
-            .map(|queue| queue.iter().any(|event| event.run_id == run_id))
+            .map(|queue| queue.by_run.contains_key(run_id))
             .unwrap_or(true)
     }
 
@@ -471,7 +658,11 @@ impl JournalEventQueue {
     /// Get age of oldest event in queue
     pub fn oldest_age(&self) -> Option<std::time::Duration> {
         let queue = self.queue.lock().ok()?;
-        queue.front().map(|event| event.queued_at.elapsed())
+        queue
+            .order
+            .iter()
+            .find_map(|id| queue.events.get(id))
+            .map(|event| event.queued_at.elapsed())
     }
 
     /// Get the configured batch size
@@ -502,6 +693,13 @@ mod tests {
         }
     }
 
+    fn create_run_event(run_id: &str, event_type: &str, seq: i64) -> JournalEventMessage {
+        JournalEventMessage {
+            run_id: run_id.to_string(),
+            ..create_test_event(event_type, seq)
+        }
+    }
+
     #[test]
     fn test_journal_queue_basic() {
         let queue = JournalEventQueue::new(JournalQueueConfig {
@@ -522,33 +720,107 @@ mod tests {
     }
 
     #[test]
-    fn test_journal_queue_overflow() {
+    fn test_journal_queue_overflow_drops_oldest_telemetry() {
         let queue = JournalEventQueue::new(JournalQueueConfig {
             max_size: 3,
             ..Default::default()
         });
 
         // Fill queue
+        queue.push(create_test_event("output.delta", 1)).unwrap();
+        queue.push(create_test_event("log.info", 2)).unwrap();
+        queue.push(create_test_event("progress.update", 3)).unwrap();
+        assert_eq!(queue.len(), 3);
+
+        // Overflow - should drop oldest telemetry (seq=1)
+        queue.push(create_test_event("output.delta", 4)).unwrap();
+        assert_eq!(queue.len(), 3);
+
+        // Verify oldest was dropped
+        let event = queue.pop().unwrap();
+        assert_eq!(event.sequence, 2);
+        assert_eq!(queue.metrics().events_dropped, 1);
+    }
+
+    #[test]
+    fn test_journal_queue_overflow_never_evicts_correctness_event() {
+        let queue = JournalEventQueue::new(JournalQueueConfig {
+            max_size: 3,
+            ..Default::default()
+        });
+
+        queue
+            .push(create_test_event("workflow.started", 1))
+            .unwrap();
+        queue.push(create_test_event("output.delta", 2)).unwrap();
+        queue
+            .push(create_test_event("workflow.step.started", 3))
+            .unwrap();
+
+        queue
+            .push(create_test_event("workflow.step.completed", 4))
+            .unwrap();
+
+        let sequences: Vec<_> = queue
+            .drain_all()
+            .into_iter()
+            .map(|event| event.sequence)
+            .collect();
+        assert_eq!(sequences, vec![1, 3, 4]);
+        assert_eq!(queue.metrics().events_dropped, 1);
+    }
+
+    #[test]
+    fn test_journal_queue_rejects_correctness_when_only_correctness_is_buffered() {
+        let queue = JournalEventQueue::new(JournalQueueConfig {
+            max_size: 2,
+            ..Default::default()
+        });
+
         queue
             .push(create_test_event("workflow.started", 1))
             .unwrap();
         queue
             .push(create_test_event("workflow.step.started", 2))
             .unwrap();
-        queue
+
+        let error = queue
             .push(create_test_event("workflow.step.completed", 3))
-            .unwrap();
-        assert_eq!(queue.len(), 3);
+            .unwrap_err();
 
-        // Overflow - should drop oldest (seq=1)
+        assert!(error.contains("rejected event: type=workflow.step.completed"));
+        let sequences: Vec<_> = queue
+            .drain_all()
+            .into_iter()
+            .map(|event| event.sequence)
+            .collect();
+        assert_eq!(sequences, vec![1, 2]);
+        assert_eq!(queue.metrics().events_dropped, 0);
+    }
+
+    #[test]
+    fn test_journal_queue_drops_incoming_telemetry_before_correctness() {
+        let queue = JournalEventQueue::new(JournalQueueConfig {
+            max_size: 2,
+            ..Default::default()
+        });
+
         queue
-            .push(create_test_event("workflow.completed", 4))
+            .push(create_test_event("workflow.started", 1))
             .unwrap();
-        assert_eq!(queue.len(), 3);
+        queue
+            .push(create_test_event("workflow.step.started", 2))
+            .unwrap();
 
-        // Verify oldest was dropped
-        let event = queue.pop().unwrap();
-        assert_eq!(event.sequence, 2); // seq=1 was dropped
+        queue.push(create_test_event("output.delta", 3)).unwrap();
+
+        let sequences: Vec<_> = queue
+            .drain_all()
+            .into_iter()
+            .map(|event| event.sequence)
+            .collect();
+        assert_eq!(sequences, vec![1, 2]);
+        assert_eq!(queue.metrics().events_dropped, 1);
     }
 
     #[test]
@@ -711,6 +983,79 @@ mod tests {
         let batch = queue.drain_batch(10);
         assert_eq!(batch.len(), 2);
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn test_drain_run_events_uses_index_and_preserves_global_fifo() {
+        let queue = JournalEventQueue::new(JournalQueueConfig {
+            max_size: 10,
+            ..Default::default()
+        });
+
+        queue
+            .push(create_run_event("run-a", "output.delta", 1))
+            .unwrap();
+        queue
+            .push(create_run_event("run-b", "output.delta", 2))
+            .unwrap();
+        queue
+            .push(create_run_event("run-a", "workflow.step.completed", 3))
+            .unwrap();
+        queue
+            .push(create_run_event("run-c", "output.delta", 4))
+            .unwrap();
+
+        let run_a: Vec<_> = queue
+            .drain_run_events("run-a")
+            .into_iter()
+            .map(|event| event.sequence)
+            .collect();
+        assert_eq!(run_a, vec![1, 3]);
+        assert!(!queue.contains_run("run-a"));
+        assert!(queue.contains_run("run-b"));
+        assert_eq!(queue.len(), 2);
+
+        let remaining: Vec<_> = queue
+            .drain_batch(10)
+            .into_iter()
+            .map(|event| event.sequence)
+            .collect();
+        assert_eq!(remaining, vec![2, 4]);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn test_drain_batch_for_runs_does_not_take_unlocked_front_event() {
+        let queue = JournalEventQueue::new(JournalQueueConfig {
+            max_size: 10,
+            ..Default::default()
+        });
+        queue
+            .push(create_run_event("run-a", "output.delta", 1))
+            .unwrap();
+        queue
+            .push(create_run_event("run-b", "output.delta", 2))
+            .unwrap();
+        queue
+            .push(create_run_event("run-a", "output.delta", 3))
+            .unwrap();
+
+        assert_eq!(queue.peek_batch_run_ids(2), vec!["run-a", "run-b"]);
+
+        let allowed = HashSet::from(["run-a".to_string()]);
+        let drained: Vec<_> = queue
+            .drain_batch_for_runs(2, &allowed)
+            .into_iter()
+            .map(|event| event.sequence)
+            .collect();
+        assert_eq!(drained, vec![1]);
+
+        let remaining: Vec<_> = queue
+            .drain_all()
+            .into_iter()
+            .map(|event| event.sequence)
+            .collect();
+        assert_eq!(remaining, vec![2, 3]);
     }
 
     #[test]

@@ -4,15 +4,17 @@ use crate::journal_queue::{JournalEventMessage, JournalEventQueue, JournalQueueC
 use crate::pb::{
     execution_engine_service_client::ExecutionEngineServiceClient, runtime_message,
     runtime_service_request, runtime_service_response, service_message, CompleteJobRequest,
-    CompleteJobResponse, ComponentInfo, DispatchComponentResponse, EntityStateLoadResult,
-    EntityStateSaveResult, EventStreamMessage, GetEntityStateRequest, GetEntityStateResponse,
-    HealthCheck, JobAssignment, PollJobRequest, PutEntityStateRequest, PutEntityStateResponse,
-    RegisterService, RegisterWorkerSessionRequest, RenewJobLeaseRequest,
-    ReportWorkerCapacityRequest, RuntimeMessage, RuntimeMessageType, RuntimeServiceResponse,
-    ServiceMessage, UnregisterService, WorkerCapability, WorkerHealthStatus, WorkerSlotPolicy,
-    WriteCheckpointRequest,
+    CompleteJobResponse, ComponentInfo, DispatchComponentRequest, DispatchComponentResponse,
+    EntityStateLoadResult, EntityStateSaveResult, EventStreamMessage, GetEntityStateRequest,
+    GetEntityStateResponse, HealthCheck, JobAssignment, LeaseRenewalOutcome, PollJobRequest,
+    PutEntityStateRequest, PutEntityStateResponse, RegisterService, RegisterWorkerSessionRequest,
+    RenewJobLeaseRequest, ReportWorkerCapacityRequest, RuntimeMessage, RuntimeMessageType,
+    RuntimeServiceResponse, ServiceMessage, UnregisterService, WorkerCapability,
+    WorkerHealthStatus, WorkerMode, WorkerSlotPolicy, WriteCheckpointRequest,
 };
+use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as TokioMutex;
@@ -27,6 +29,7 @@ const PARKED_COMPLETION_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 const PARKED_COMPLETE_JOB_ATTEMPTS: usize = 3;
 const PARKED_COMPLETE_JOB_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 const PARKED_COMPLETE_JOB_RETRY_DELAY: Duration = Duration::from_millis(100);
+const DEPLOYMENT_ARTIFACT_DOMAIN: &[u8] = b"agnt5.deployment-artifact.v1\0";
 const ASSIGNMENT_AUTHORED_RETRY_METADATA_KEYS: &[&str] = &[
     "attempt",
     "max_attempts",
@@ -35,6 +38,263 @@ const ASSIGNMENT_AUTHORED_RETRY_METADATA_KEYS: &[&str] = &[
     "backoff_type",
     "backoff_multiplier",
 ];
+
+/// Slot lifecycle events sent from parked poll slots to the ramp supervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParkedSlotEvent {
+    /// A claimed job has reached the language runtime and begun execution.
+    Started { active_started: usize },
+    /// A surplus idle slot retired itself (`total_slots` already decremented).
+    Retired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerSlotPhase {
+    ClaimedNotStarted,
+    Executing,
+    Terminalizing,
+}
+
+#[derive(Debug)]
+struct WorkerSlotEntry {
+    generation: u64,
+    phase: WorkerSlotPhase,
+    claimed_at: Instant,
+}
+
+#[derive(Default)]
+struct WorkerSlotPhaseState {
+    entries: HashMap<String, WorkerSlotEntry>,
+    next_generation: u64,
+    started_notifier: Option<tokio::sync::mpsc::UnboundedSender<ParkedSlotEvent>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct WorkerSlotPhaseSnapshot {
+    claimed_not_started: usize,
+    executing: usize,
+    terminalizing: usize,
+}
+
+impl WorkerSlotPhaseState {
+    fn snapshot(&self) -> WorkerSlotPhaseSnapshot {
+        let mut snapshot = WorkerSlotPhaseSnapshot::default();
+        for entry in self.entries.values() {
+            match entry.phase {
+                WorkerSlotPhase::ClaimedNotStarted => snapshot.claimed_not_started += 1,
+                WorkerSlotPhase::Executing => snapshot.executing += 1,
+                WorkerSlotPhase::Terminalizing => snapshot.terminalizing += 1,
+            }
+        }
+        snapshot
+    }
+}
+
+/// Tracks pull jobs from claim through language start and terminal acknowledgement.
+/// The state mutex is never held across I/O and contains at most one entry per
+/// active pull slot.
+#[derive(Clone, Default)]
+struct WorkerSlotPhases {
+    state: Arc<std::sync::Mutex<WorkerSlotPhaseState>>,
+}
+
+impl WorkerSlotPhases {
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, WorkerSlotPhaseState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn publish(snapshot: WorkerSlotPhaseSnapshot) {
+        crate::telemetry::record_worker_slot_phases(
+            "pull",
+            snapshot.claimed_not_started as u64,
+            snapshot.executing as u64,
+            snapshot.terminalizing as u64,
+        );
+    }
+
+    fn set_started_notifier(&self, notifier: tokio::sync::mpsc::UnboundedSender<ParkedSlotEvent>) {
+        self.lock_state().started_notifier = Some(notifier);
+    }
+
+    fn claim(&self, run_id: String) -> WorkerSlotPhaseGuard {
+        let (generation, replaced, snapshot) = {
+            let mut state = self.lock_state();
+            let generation = state.next_generation;
+            state.next_generation = state.next_generation.wrapping_add(1);
+            let replaced = state
+                .entries
+                .insert(
+                    run_id.clone(),
+                    WorkerSlotEntry {
+                        generation,
+                        phase: WorkerSlotPhase::ClaimedNotStarted,
+                        claimed_at: Instant::now(),
+                    },
+                )
+                .is_some();
+            (generation, replaced, state.snapshot())
+        };
+        if replaced {
+            warn!(run_id, "Replacing duplicate active pull-slot phase entry");
+        }
+        Self::publish(snapshot);
+        WorkerSlotPhaseGuard {
+            phases: self.clone(),
+            run_id,
+            generation,
+        }
+    }
+
+    fn mark_started(&self, run_id: &str) {
+        let transition = {
+            let mut state = self.lock_state();
+            let Some(entry) = state.entries.get_mut(run_id) else {
+                return;
+            };
+            if entry.phase != WorkerSlotPhase::ClaimedNotStarted {
+                return;
+            }
+            entry.phase = WorkerSlotPhase::Executing;
+            let claim_to_start = entry.claimed_at.elapsed();
+            let notifier = state.started_notifier.clone();
+            (claim_to_start, notifier, state.snapshot())
+        };
+        crate::telemetry::record_worker_claim_to_start("pull", transition.0.as_secs_f64());
+        Self::publish(transition.2);
+        if let Some(notifier) = transition.1 {
+            let active_started = transition.2.executing + transition.2.terminalizing;
+            let _ = notifier.send(ParkedSlotEvent::Started { active_started });
+        }
+    }
+
+    fn mark_terminalizing(&self, run_id: &str) {
+        let snapshot = {
+            let mut state = self.lock_state();
+            let Some(entry) = state.entries.get_mut(run_id) else {
+                return;
+            };
+            if entry.phase == WorkerSlotPhase::Terminalizing {
+                return;
+            }
+            entry.phase = WorkerSlotPhase::Terminalizing;
+            state.snapshot()
+        };
+        Self::publish(snapshot);
+    }
+
+    fn finish(&self, run_id: &str, generation: u64) {
+        let result = {
+            let mut state = self.lock_state();
+            let Some(entry) = state.entries.get(run_id) else {
+                return;
+            };
+            if entry.generation != generation {
+                return;
+            }
+            let residency = entry.claimed_at.elapsed();
+            state.entries.remove(run_id);
+            (residency, state.snapshot())
+        };
+        crate::telemetry::record_worker_slot_residency("pull", result.0.as_secs_f64());
+        Self::publish(result.1);
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> WorkerSlotPhaseSnapshot {
+        self.lock_state().snapshot()
+    }
+}
+
+struct WorkerSlotPhaseGuard {
+    phases: WorkerSlotPhases,
+    run_id: String,
+    generation: u64,
+}
+
+impl Drop for WorkerSlotPhaseGuard {
+    fn drop(&mut self) {
+        self.phases.finish(&self.run_id, self.generation);
+    }
+}
+
+/// Per-run ordering barriers for journal flushes and acknowledged checkpoints.
+/// Cross-run ordering is not part of the journal contract, so unrelated runs
+/// must not share a network-duration critical section.
+#[derive(Clone, Default)]
+struct RunFlushLocks {
+    locks: Arc<std::sync::Mutex<HashMap<String, std::sync::Weak<TokioMutex<()>>>>>,
+}
+
+impl RunFlushLocks {
+    fn lock_for_run(&self, run_id: &str) -> Arc<TokioMutex<()>> {
+        let mut locks = match self.locks.lock() {
+            Ok(locks) => locks,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        if let Some(lock) = locks.get(run_id).and_then(std::sync::Weak::upgrade) {
+            return lock;
+        }
+
+        // Weak entries let completed runs disappear without coordinating a
+        // cleanup with the final guard. Compact stale keys opportunistically.
+        if locks.len() >= 4096 {
+            locks.retain(|_, lock| lock.strong_count() > 0);
+        }
+
+        let lock = Arc::new(TokioMutex::new(()));
+        locks.insert(run_id.to_string(), Arc::downgrade(&lock));
+        lock
+    }
+
+    async fn lock_run(&self, run_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        self.lock_for_run(run_id).lock_owned().await
+    }
+
+    async fn lock_runs<I>(&self, run_ids: I) -> Vec<tokio::sync::OwnedMutexGuard<()>>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut run_ids: Vec<_> = run_ids.into_iter().collect();
+        run_ids.sort_unstable();
+        run_ids.dedup();
+        let locks: Vec<_> = run_ids
+            .iter()
+            .map(|run_id| self.lock_for_run(run_id))
+            .collect();
+        let mut guards = Vec::with_capacity(locks.len());
+        for lock in locks {
+            guards.push(lock.lock_owned().await);
+        }
+        guards
+    }
+}
+
+async fn await_checkpoint_ack<F, T>(
+    future: F,
+    timeout_ms: u64,
+    operation: &str,
+    run_id: &str,
+    event_type: &str,
+    sequence_number: i64,
+) -> Result<T>
+where
+    F: Future<Output = T>,
+{
+    tokio::time::timeout(Duration::from_millis(timeout_ms), future)
+        .await
+        .map_err(|_| SdkError::Timeout {
+            message: format!(
+                "{operation} acknowledgement timed out after {timeout_ms}ms for \
+                 run_id={run_id} event_type={event_type} seq={sequence_number}; \
+                 persistence outcome is unknown"
+            ),
+            operation: operation.to_string(),
+            duration_ms: Some(timeout_ms),
+        })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ParkedWorkerSessionRegistrationResult {
@@ -54,6 +314,8 @@ struct ParkedWorkerSessionRegistration {
     service_name: String,
     service_version: String,
     service_type: String,
+    supported_protocol_capabilities: Vec<String>,
+    required_protocol_capabilities: Vec<String>,
 }
 
 impl ParkedWorkerSessionRegistration {
@@ -75,6 +337,8 @@ impl ParkedWorkerSessionRegistration {
             service_name: self.service_name.clone(),
             service_version: self.service_version.clone(),
             service_type: self.service_type.clone(),
+            supported_protocol_capabilities: self.supported_protocol_capabilities.clone(),
+            required_protocol_capabilities: self.required_protocol_capabilities.clone(),
         }
     }
 }
@@ -177,6 +441,7 @@ fn runtime_message_from_job_assignment(
     String,
     String,
     u32,
+    i64,
     i64,
     HashMap<String, String>,
 )> {
@@ -288,6 +553,7 @@ fn runtime_message_from_job_assignment(
         lease_id,
         attempt,
         configured_claim_timeout_ms,
+        job.lease_expires_at_ms,
         completion_metadata,
     ))
 }
@@ -514,6 +780,13 @@ pub struct Worker {
     /// DispatchComponentResponse.lease_id without requiring language bindings
     /// to thread the value through their handler code.
     pending_lease_ids: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    /// Executions whose last known durable lease authority was revoked. The
+    /// entry survives handler cancellation so a late language response cannot
+    /// be forwarded after a cooperative cancellation race.
+    revoked_executions: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Per-execution stop handles for push lease renewal tasks. Pull slots own
+    /// their stop handles directly because each slot awaits one job at a time.
+    lease_renewal_stops: Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
     /// Per-invocation soft-cancel channels keyed by run_id. A oneshot sender
     /// is registered while a dispatched invocation runs; a CancelExecution
     /// message from the coordinator fires it, the pool task's `select!` drops
@@ -536,10 +809,13 @@ pub struct Worker {
     /// Lazily-connected Engine gRPC client. When AGNT5_ENGINE_URL is set, all event paths
     /// route through this client instead of the Go EE.
     engine_client: Arc<TokioMutex<Option<EngineClient>>>,
-    /// Serializes background queue flushes with terminal checkpoint flushes.
-    /// A terminal event must not overtake transient output already drained by
-    /// the periodic flush task.
-    journal_flush_lock: Arc<TokioMutex<()>>,
+    /// Serializes queue flushes and checkpoints within each run. Unrelated
+    /// runs can persist checkpoints concurrently.
+    journal_flush_locks: RunFlushLocks,
+    /// Pull-slot phase state shared with language event emitters. Ramping is
+    /// triggered only after `run.started`, preventing a blocked language event
+    /// loop from claiming the worker's full concurrency budget.
+    slot_phases: WorkerSlotPhases,
 }
 
 // Implement Debug manually to avoid requiring Debug on JournalEventQueue's internals
@@ -582,6 +858,263 @@ fn stamp_dispatch_mode(runtime_message: &mut RuntimeMessage, dispatch_mode: &str
     }
 }
 
+/// Stamp the durable execution authority carried by one dispatch onto the
+/// metadata visible to language handlers. Lifecycle records emitted by those
+/// handlers reuse these fields so the runtime can reject writes after the
+/// lease expires or moves to another worker.
+fn stamp_execution_authority_metadata(
+    runtime_message: &mut RuntimeMessage,
+    worker_id: &str,
+    worker_session_id: &str,
+    dispatch_mode: &str,
+) {
+    let Some(crate::pb::runtime_message::MessageData::DispatchComponent(request)) =
+        runtime_message.message_data.as_mut()
+    else {
+        return;
+    };
+
+    request
+        .metadata
+        .insert("dispatch_mode".to_string(), dispatch_mode.to_string());
+    request
+        .metadata
+        .insert("worker_id".to_string(), worker_id.to_string());
+    request.metadata.insert(
+        "worker_session_id".to_string(),
+        worker_session_id.to_string(),
+    );
+    request
+        .metadata
+        .insert("lease_id".to_string(), request.lease_id.clone());
+    request
+        .metadata
+        .insert("lease_attempt".to_string(), request.attempt.to_string());
+}
+
+fn stamp_protocol_capability(runtime_message: &mut RuntimeMessage, capability: &str) {
+    let Some(crate::pb::runtime_message::MessageData::DispatchComponent(request)) =
+        runtime_message.message_data.as_mut()
+    else {
+        return;
+    };
+    request
+        .metadata
+        .insert(capability.to_string(), "true".to_string());
+}
+
+fn canonical_activation_component_config(config: &HashMap<String, String>) -> String {
+    let mut entries = config.iter().collect::<Vec<_>>();
+    entries.sort_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
+    serde_json::to_string(&serde_json::json!([
+        "object",
+        entries
+            .into_iter()
+            .map(|(key, value)| serde_json::json!([key, ["string", value]]))
+            .collect::<Vec<_>>()
+    ]))
+    .expect("canonical activation component config must serialize")
+}
+
+fn configured_activation_artifact_sha256(metadata: &HashMap<String, String>) -> Option<String> {
+    metadata
+        .get("activation_artifact_sha256")
+        .cloned()
+        .or_else(|| std::env::var("AGNT5_ACTIVATION_ARTIFACT_SHA256").ok())
+        .filter(|value| !value.is_empty())
+}
+
+fn decode_activation_artifact_sha256(value: &str) -> Option<[u8; 32]> {
+    use base64::Engine as _;
+
+    if let Ok(decoded) = hex::decode(value) {
+        if let Ok(digest) = decoded.try_into() {
+            return Some(digest);
+        }
+    }
+    [
+        base64::engine::general_purpose::STANDARD.decode(value),
+        base64::engine::general_purpose::STANDARD_NO_PAD.decode(value),
+        base64::engine::general_purpose::URL_SAFE.decode(value),
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(value),
+    ]
+    .into_iter()
+    .filter_map(|decoded| decoded.ok())
+    .find_map(|decoded| decoded.try_into().ok())
+}
+
+fn valid_activation_artifact_sha256(value: &str) -> bool {
+    decode_activation_artifact_sha256(value).is_some()
+}
+
+fn deployment_artifact_sha256(deployment_id: &str) -> Option<[u8; 32]> {
+    let deployment_id = Uuid::parse_str(deployment_id).ok()?.to_string();
+    let mut digest = Sha256::new();
+    digest.update(DEPLOYMENT_ARTIFACT_DOMAIN);
+    digest.update(deployment_id.as_bytes());
+    Some(digest.finalize().into())
+}
+
+fn configured_deployment_artifact_sha256(metadata: &HashMap<String, String>) -> Option<[u8; 32]> {
+    ["AGNT5_DEPLOYMENT_ID", "deployment_id"]
+        .into_iter()
+        .filter_map(|key| metadata.get(key))
+        .map(String::as_str)
+        .find_map(deployment_artifact_sha256)
+        .or_else(|| {
+            std::env::var("AGNT5_DEPLOYMENT_ID")
+                .ok()
+                .and_then(|value| deployment_artifact_sha256(&value))
+        })
+}
+
+fn worker_protocol_capabilities_for_metadata(
+    metadata: &HashMap<String, String>,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let (supported, required) = crate::client::worker_protocol_capabilities();
+    if !supported
+        .iter()
+        .any(|capability| capability == crate::client::DURABLE_ACTIVATION_V1_CAPABILITY)
+    {
+        return Ok((supported, required));
+    }
+    if let Some(configured) = configured_activation_artifact_sha256(metadata) {
+        if valid_activation_artifact_sha256(&configured) {
+            let configured = decode_activation_artifact_sha256(&configured)
+                .expect("validated activation artifact digest");
+            if configured_deployment_artifact_sha256(metadata)
+                .is_none_or(|expected| expected == configured)
+            {
+                return Ok((supported, required));
+            }
+        }
+    }
+
+    let message = "durable_activation_v1 requires the control-plane deployment artifact identity";
+    if required
+        .iter()
+        .any(|capability| capability == crate::client::DURABLE_ACTIVATION_V1_CAPABILITY)
+    {
+        return Err(SdkError::Activation {
+            message: message.to_string(),
+            code: crate::error::ErrorCode::DurabilityUnavailable,
+            activation_id: None,
+            attempt: None,
+        });
+    }
+    eprintln!(
+        "[WARN] agnt5 durable activation degraded: {message}; legacy checkpoints remain enabled"
+    );
+    Ok((Vec::new(), Vec::new()))
+}
+
+fn activation_definition_configs(components: &[ComponentInfo]) -> HashMap<String, String> {
+    components
+        .iter()
+        .map(|component| {
+            (
+                component.name.clone(),
+                canonical_activation_component_config(&component.config),
+            )
+        })
+        .collect()
+}
+
+fn stamp_activation_dispatch_metadata(
+    runtime_message: &mut RuntimeMessage,
+    worker_id: &str,
+    worker_session_id: &str,
+    service_version: &str,
+    worker_metadata: &HashMap<String, String>,
+    definition_configs: &HashMap<String, String>,
+) -> Result<()> {
+    let Some(crate::pb::runtime_message::MessageData::DispatchComponent(request)) =
+        runtime_message.message_data.as_mut()
+    else {
+        return Ok(());
+    };
+
+    request.metadata.insert(
+        crate::client::DURABLE_ACTIVATION_V1_CAPABILITY.to_string(),
+        "true".to_string(),
+    );
+    request
+        .metadata
+        .insert("worker_id".to_string(), worker_id.to_string());
+    request.metadata.insert(
+        "worker_session_id".to_string(),
+        worker_session_id.to_string(),
+    );
+    request
+        .metadata
+        .insert("lease_id".to_string(), request.lease_id.clone());
+    request
+        .metadata
+        .entry("run_authority".to_string())
+        .or_insert_with(|| request.invocation_id.clone());
+    request
+        .metadata
+        .entry("lease_authority".to_string())
+        .or_insert_with(|| request.lease_id.clone());
+    request
+        .metadata
+        .insert("component_name".to_string(), request.component_name.clone());
+    request.metadata.insert(
+        "activation_definition_version".to_string(),
+        service_version.to_string(),
+    );
+    request.metadata.insert(
+        "activation_definition_config".to_string(),
+        definition_configs
+            .get(&request.component_name)
+            .cloned()
+            .unwrap_or_else(|| "[\"object\",[]]".to_string()),
+    );
+
+    if let Some(value) = worker_metadata.get("project_id") {
+        request
+            .metadata
+            .entry("project_id".to_string())
+            .or_insert_with(|| value.clone());
+    }
+    let worker_artifact =
+        configured_activation_artifact_sha256(worker_metadata).ok_or_else(|| {
+            SdkError::Activation {
+                message: "negotiated durable activation is missing the worker artifact identity"
+                    .to_string(),
+                code: crate::error::ErrorCode::DurabilityUnavailable,
+                activation_id: None,
+                attempt: None,
+            }
+        })?;
+    let worker_digest = decode_activation_artifact_sha256(&worker_artifact).ok_or_else(|| {
+        SdkError::Activation {
+            message: "negotiated durable activation has an invalid worker artifact identity"
+                .to_string(),
+            code: crate::error::ErrorCode::DurabilityUnavailable,
+            activation_id: None,
+            attempt: None,
+        }
+    })?;
+    if let Some(run_artifact) = request.metadata.get("activation_artifact_sha256") {
+        if decode_activation_artifact_sha256(run_artifact) != Some(worker_digest) {
+            return Err(SdkError::Activation {
+                message:
+                    "worker artifact identity does not match the run's pinned deployment artifact"
+                        .to_string(),
+                code: crate::error::ErrorCode::NondeterministicReplay,
+                activation_id: None,
+                attempt: None,
+            });
+        }
+    } else {
+        request
+            .metadata
+            .insert("activation_artifact_sha256".to_string(), worker_artifact);
+    }
+    Ok(())
+}
+
 // RAII guard so the in-flight count is decremented even if a handler panics or
 // is cancelled. Parked polling uses this same guard so each parked slot maps to
 // one active handler invocation, not one queued local message.
@@ -600,13 +1133,38 @@ impl Drop for InFlightGuard {
     }
 }
 
+struct DurableSuspensionEnvelope {
+    invocation_id: String,
+    metadata: HashMap<String, String>,
+    attempt: i32,
+    lease_id: String,
+}
+
+fn durable_suspension_envelope(
+    runtime_message: &RuntimeMessage,
+) -> Option<DurableSuspensionEnvelope> {
+    let crate::pb::runtime_message::MessageData::DispatchComponent(request) =
+        runtime_message.message_data.as_ref()?
+    else {
+        return None;
+    };
+    Some(DurableSuspensionEnvelope {
+        invocation_id: request.invocation_id.clone(),
+        metadata: request.metadata.clone(),
+        attempt: request.attempt,
+        lease_id: request.lease_id.clone(),
+    })
+}
+
 async fn execute_runtime_message_for_response<F, Fut>(
     worker_name: &str,
+    response_worker_id: &str,
     mut runtime_message: RuntimeMessage,
     response_tx: flume::Sender<ServiceMessage>,
     handler: F,
     in_flight: Arc<std::sync::atomic::AtomicUsize>,
     cancel_tokens: Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
+    revoked_executions: Arc<std::sync::Mutex<HashSet<String>>>,
     dispatch_mode: &'static str,
 ) -> Option<ServiceMessage>
 where
@@ -616,8 +1174,19 @@ where
     let _in_flight = InFlightGuard::enter(&in_flight);
     let tx_clone = response_tx.clone();
     stamp_dispatch_mode(&mut runtime_message, dispatch_mode);
+    let suspension_envelope = durable_suspension_envelope(&runtime_message);
 
     let run_key = dispatch_run_key(&runtime_message);
+    if run_key
+        .as_deref()
+        .is_some_and(|run_id| execution_is_revoked(&revoked_executions, run_id))
+    {
+        warn!(
+            "Worker {} refusing dispatch after local execution authority was revoked",
+            worker_name
+        );
+        return None;
+    }
     let result = if let Some(key) = run_key.clone() {
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
         if let Ok(mut m) = cancel_tokens.lock() {
@@ -635,9 +1204,25 @@ where
         Some(handler(runtime_message, tx_clone).await)
     };
 
+    if run_key
+        .as_deref()
+        .is_some_and(|run_id| execution_is_revoked(&revoked_executions, run_id))
+    {
+        warn!(
+            "Worker {} suppressing response after execution authority loss",
+            worker_name
+        );
+        return None;
+    }
+
     let response = match result {
         Some(Ok(Some(response))) => Some(response),
         Some(Ok(None)) => None,
+        Some(Err(SdkError::DurableSuspension { suspension })) => {
+            suspension_envelope.as_ref().map(|envelope| {
+                durable_suspension_service_message(response_worker_id, envelope, *suspension)
+            })
+        }
         Some(Err(e)) => {
             error!("Worker {} handler error: {}", worker_name, e);
             None
@@ -653,22 +1238,26 @@ where
 
 async fn execute_runtime_message<F, Fut>(
     worker_name: &str,
+    response_worker_id: &str,
     runtime_message: RuntimeMessage,
     response_tx: flume::Sender<ServiceMessage>,
     handler: F,
     in_flight: Arc<std::sync::atomic::AtomicUsize>,
     cancel_tokens: Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
+    revoked_executions: Arc<std::sync::Mutex<HashSet<String>>>,
 ) where
     F: Fn(RuntimeMessage, flume::Sender<ServiceMessage>) -> Fut + Send + Clone + 'static,
     Fut: std::future::Future<Output = Result<Option<ServiceMessage>>> + Send + 'static,
 {
     if let Some(response) = execute_runtime_message_for_response(
         worker_name,
+        response_worker_id,
         runtime_message,
         response_tx.clone(),
         handler,
         in_flight,
         cancel_tokens,
+        revoked_executions,
         "push",
     )
     .await
@@ -676,6 +1265,34 @@ async fn execute_runtime_message<F, Fut>(
         if let Err(e) = response_tx.send_async(response).await {
             error!("Worker {} failed to send response: {}", worker_name, e);
         }
+    }
+}
+
+fn durable_suspension_service_message(
+    worker_id: &str,
+    envelope: &DurableSuspensionEnvelope,
+    suspension: crate::pb::WorkerSuspension,
+) -> ServiceMessage {
+    ServiceMessage {
+        worker_id: worker_id.to_string(),
+        metadata: HashMap::new(),
+        message_type: Some(crate::pb::service_message::MessageType::FunctionResponse(
+            DispatchComponentResponse {
+                invocation_id: envelope.invocation_id.clone(),
+                success: true,
+                result: Some(
+                    crate::pb::dispatch_component_response::Result::WorkerSuspension(suspension),
+                ),
+                error_message: String::new(),
+                metadata: envelope.metadata.clone(),
+                event_type: "workflow.paused".to_string(),
+                content_index: 0,
+                sequence: 0,
+                attempt: envelope.attempt,
+                source_timestamp_ns: 0,
+                lease_id: envelope.lease_id.clone(),
+            },
+        )),
     }
 }
 
@@ -934,18 +1551,48 @@ fn polled_job_completion_from_service_message(
     }
 }
 
+fn polled_job_suspension_request(
+    service_message: &ServiceMessage,
+    project_id: &str,
+    run_id: &str,
+) -> Option<crate::pb::SuspendActivationRequest> {
+    let Some(crate::pb::service_message::MessageType::FunctionResponse(response)) =
+        &service_message.message_type
+    else {
+        return None;
+    };
+    let Some(crate::pb::dispatch_component_response::Result::WorkerSuspension(suspension)) =
+        &response.result
+    else {
+        return None;
+    };
+    Some(crate::pb::SuspendActivationRequest {
+        project_id: project_id.to_string(),
+        run_id: run_id.to_string(),
+        activation_id: suspension.activation_id.clone(),
+        attempt: suspension.attempt,
+        fence_token: suspension.fence_token.clone(),
+        timer_key: suspension.timer_key.clone(),
+        ready_at_ms: suspension.ready_at_ms,
+        input_digest: suspension.input_digest.clone(),
+        definition_digest: suspension.definition_digest.clone(),
+        continuation: suspension.continuation.clone(),
+        delay_ms: suspension.delay_ms,
+    })
+}
+
 async fn wait_for_parked_run_events_flush(
     journal_queue: &JournalEventQueue,
-    journal_flush_lock: &Arc<TokioMutex<()>>,
+    journal_flush_locks: &RunFlushLocks,
     run_id: &str,
 ) -> bool {
     let deadline = tokio::time::Instant::now() + PARKED_COMPLETION_FLUSH_TIMEOUT;
     loop {
         {
-            // The periodic sender holds this lock until its drained batch has
-            // been acknowledged or requeued. If this run is absent while we
-            // hold it, CompleteJob cannot overtake an in-flight child event.
-            let _flush_guard = journal_flush_lock.lock().await;
+            // The periodic sender holds this run's barrier until its drained
+            // events have been acknowledged or requeued. If this run is absent
+            // while we hold it, CompleteJob cannot overtake a child event.
+            let _flush_guard = journal_flush_locks.lock_run(run_id).await;
             if !journal_queue.contains_run(run_id) {
                 return true;
             }
@@ -1030,7 +1677,7 @@ async fn complete_or_forward_parked_response(
     slot_idx: usize,
     response_tx: &flume::Sender<ServiceMessage>,
     journal_queue: &JournalEventQueue,
-    journal_flush_lock: &Arc<TokioMutex<()>>,
+    journal_flush_locks: &RunFlushLocks,
 ) -> bool {
     if is_cancelled_worker_response(&service_message) {
         debug!(
@@ -1038,6 +1685,34 @@ async fn complete_or_forward_parked_response(
             slot_idx, assigned_job_id
         );
         return true;
+    }
+
+    if let Some(request) =
+        polled_job_suspension_request(&service_message, tenant_id, assigned_job_id)
+    {
+        match client.suspend_activation(request).await {
+            Ok(receipt) if receipt.accepted => {
+                debug!(
+                    "Parked poll slot {} suspended job_id={} timer_id={}",
+                    slot_idx, assigned_job_id, receipt.timer_id
+                );
+                return true;
+            }
+            Ok(_) => {
+                warn!(
+                    "Parked poll slot {} received an unaccepted suspension receipt for job_id={}",
+                    slot_idx, assigned_job_id
+                );
+                return false;
+            }
+            Err(error) => {
+                warn!(
+                    "Parked poll slot {} failed to suspend job_id={}: {}",
+                    slot_idx, assigned_job_id, error
+                );
+                return false;
+            }
+        }
     }
 
     let Some(completion) = polled_job_completion_from_service_message(
@@ -1057,7 +1732,7 @@ async fn complete_or_forward_parked_response(
     };
 
     let job_id = completion.job_id.clone();
-    if !wait_for_parked_run_events_flush(journal_queue, journal_flush_lock, &job_id).await {
+    if !wait_for_parked_run_events_flush(journal_queue, journal_flush_locks, &job_id).await {
         warn!(
             "Parked poll slot {} refusing to overtake unflushed events for job_id={}",
             slot_idx, job_id
@@ -1099,21 +1774,103 @@ async fn complete_or_forward_parked_response(
     true
 }
 
-fn parked_lease_renew_interval_ms(lease_timeout_ms: i64) -> u64 {
-    let timeout_ms = lease_timeout_ms.max(10_000) as u64;
-    let renewal_ms = (timeout_ms / 2).clamp(5_000, 60_000);
-    renewal_ms.min(timeout_ms.saturating_sub(1_000).max(1_000))
+fn active_lease_renew_interval_ms(lease_timeout_ms: i64) -> u64 {
+    let timeout_ms = lease_timeout_ms.max(2) as u64;
+    (timeout_ms / 2).clamp(1, 60_000)
 }
 
-fn parked_lease_renew_interval_with_jitter_ms(lease_timeout_ms: i64) -> u64 {
-    let base = parked_lease_renew_interval_ms(lease_timeout_ms);
+fn active_lease_renew_interval_with_jitter_ms(lease_timeout_ms: i64) -> u64 {
+    let base = active_lease_renew_interval_ms(lease_timeout_ms);
     let jitter = rand::random::<f64>() * 0.20 - 0.10;
-    ((base as f64) * (1.0 + jitter)).round().max(1_000.0) as u64
+    ((base as f64) * (1.0 + jitter)).round().max(1.0) as u64
 }
 
-fn parked_lease_danger_retry_ms(lease_timeout_ms: i64) -> u64 {
-    let timeout_ms = lease_timeout_ms.max(10_000) as u64;
-    (timeout_ms / 10).clamp(500, 5_000)
+fn active_lease_danger_retry_ms(lease_timeout_ms: i64) -> u64 {
+    let timeout_ms = lease_timeout_ms.max(2) as u64;
+    (timeout_ms / 10).clamp(1, 5_000)
+}
+
+#[derive(Clone)]
+enum ActiveLeaseSession {
+    Push,
+    Pull(Arc<TokioMutex<String>>),
+}
+
+#[derive(Clone)]
+struct ActiveLeaseAuthority {
+    worker_id: String,
+    project_id: String,
+    deployment_id: String,
+    run_id: String,
+    lease_id: String,
+    attempt: u32,
+    lease_timeout_ms: i64,
+    lease_expires_at_ms: i64,
+    session: ActiveLeaseSession,
+}
+
+impl ActiveLeaseAuthority {
+    fn mode_label(&self) -> &'static str {
+        match &self.session {
+            ActiveLeaseSession::Push => "push",
+            ActiveLeaseSession::Pull(_) => "pull",
+        }
+    }
+
+    async fn renewal_request(&self) -> RenewJobLeaseRequest {
+        let (worker_session_id, mode) = match &self.session {
+            ActiveLeaseSession::Push => (String::new(), WorkerMode::Push),
+            ActiveLeaseSession::Pull(session_id) => {
+                (session_id.lock().await.clone(), WorkerMode::Pull)
+            }
+        };
+        RenewJobLeaseRequest {
+            worker_id: self.worker_id.clone(),
+            worker_session_id,
+            run_id: self.run_id.clone(),
+            lease_id: self.lease_id.clone(),
+            lease_timeout_ms: self.lease_timeout_ms,
+            attempt: Some(self.attempt),
+            mode: mode as i32,
+            project_id: self.project_id.clone(),
+            deployment_id: self.deployment_id.clone(),
+        }
+    }
+}
+
+fn execution_is_revoked(
+    revoked_executions: &Arc<std::sync::Mutex<HashSet<String>>>,
+    run_id: &str,
+) -> bool {
+    revoked_executions
+        .lock()
+        .map(|runs| runs.contains(run_id))
+        .unwrap_or(true)
+}
+
+fn revoke_execution_authority(
+    run_id: &str,
+    revoked_executions: &Arc<std::sync::Mutex<HashSet<String>>>,
+    cancel_tokens: &Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
+    cancel_hook: &Arc<std::sync::Mutex<Option<Box<dyn Fn(String) + Send + Sync>>>>,
+) {
+    if let Ok(mut runs) = revoked_executions.lock() {
+        runs.insert(run_id.to_string());
+    }
+    let hooked = cancel_hook
+        .lock()
+        .ok()
+        .and_then(|hook| hook.as_ref().map(|hook| hook(run_id.to_string())))
+        .is_some();
+    if !hooked {
+        if let Some(cancel) = cancel_tokens
+            .lock()
+            .ok()
+            .and_then(|mut tokens| tokens.remove(run_id))
+        {
+            let _ = cancel.send(());
+        }
+    }
 }
 
 async fn report_worker_capacity_with_client(
@@ -1241,6 +1998,19 @@ async fn register_parked_worker_session_with_retries(
     loop {
         match client.register_worker_session(registration.request()).await {
             Ok(session) => {
+                if let Err(error) = crate::client::validate_protocol_capabilities(
+                    &registration.supported_protocol_capabilities,
+                    &registration.required_protocol_capabilities,
+                    &session.supported_protocol_capabilities,
+                    &session.required_protocol_capabilities,
+                ) {
+                    warn!("{} protocol negotiation failed: {}", reason, error);
+                    return ParkedWorkerSessionRegistrationResult::Rejected;
+                }
+                client.retain_negotiated_protocol_capabilities(
+                    &registration.supported_protocol_capabilities,
+                    &session.supported_protocol_capabilities,
+                );
                 return ParkedWorkerSessionRegistrationResult::Registered(
                     session.worker_session_id,
                 );
@@ -1348,15 +2118,6 @@ async fn refresh_parked_worker_session(
     .await
 }
 
-/// Slot lifecycle events sent from parked poll slots to the ramp supervisor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ParkedSlotEvent {
-    /// A parked slot received a job and is about to execute it.
-    GotJob,
-    /// A surplus idle slot retired itself (`total_slots` already decremented).
-    Retired,
-}
-
 /// Shared state for one parked polling session. Bundled behind an `Arc` so the
 /// supervisor can spawn additional slots with a single clone while ramping.
 /// The message handler stays outside: each slot owns its own clone so the
@@ -1366,14 +2127,20 @@ struct ParkedPollContext {
     worker_id: String,
     worker_session_id: Arc<TokioMutex<String>>,
     registration: ParkedWorkerSessionRegistration,
+    service_version: String,
+    worker_metadata: HashMap<String, String>,
+    activation_definition_configs: HashMap<String, String>,
     project_id: String,
     response_tx: flume::Sender<ServiceMessage>,
     in_flight: Arc<std::sync::atomic::AtomicUsize>,
     cancel_tokens: Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
+    cancel_hook: Arc<std::sync::Mutex<Option<Box<dyn Fn(String) + Send + Sync>>>>,
+    revoked_executions: Arc<std::sync::Mutex<HashSet<String>>>,
     streaming_runs: Arc<std::sync::Mutex<HashMap<String, bool>>>,
     pending_lease_ids: Arc<std::sync::Mutex<HashMap<String, String>>>,
     journal_queue: JournalEventQueue,
-    journal_flush_lock: Arc<TokioMutex<()>>,
+    journal_flush_locks: RunFlushLocks,
+    slot_phases: WorkerSlotPhases,
     open_poll_slots: Arc<std::sync::atomic::AtomicUsize>,
     /// Live slot count (parked + busy), shared with the supervisor.
     total_slots: Arc<std::sync::atomic::AtomicUsize>,
@@ -1449,9 +2216,10 @@ fn spawn_parked_slot<F, Fut>(
 }
 
 /// One parked poll slot: owns exactly one outstanding PollJob request or one
-/// active handler invocation. Emits `GotJob` before executing so the supervisor
-/// can ramp capacity, and retires itself after enough consecutive empty polls
-/// once the fleet is above `min_slots`.
+/// active handler invocation. The language runtime emits `Started` through the
+/// shared phase tracker before the supervisor ramps capacity, so a job stuck
+/// waiting to enter the Python/Node event loop cannot cause additional claims.
+/// Surplus idle slots retire after enough consecutive empty polls.
 async fn run_parked_poll_slot<F, Fut>(ctx: Arc<ParkedPollContext>, handler: F, slot_id: usize)
 where
     F: Fn(RuntimeMessage, flume::Sender<ServiceMessage>) -> Fut + Send + Clone + 'static,
@@ -1498,14 +2266,14 @@ where
                 // ramp decisions must see accurate demand even if the handler
                 // panics or is cancelled.
                 let _busy = InFlightGuard::enter(&ctx.busy_slots);
-                let _ = ctx.events_tx.send(ParkedSlotEvent::GotJob);
                 let (
-                    runtime_message,
+                    mut runtime_message,
                     is_streaming,
                     run_id,
                     lease_id,
                     completion_attempt,
                     lease_timeout_ms,
+                    lease_expires_at_ms,
                     completion_metadata,
                 ) = match runtime_message_from_job_assignment(job, ctx.claim_timeout_ms) {
                     Ok(assignment) => assignment,
@@ -1517,6 +2285,40 @@ where
                         continue;
                     }
                 };
+                let _slot_phase = ctx.slot_phases.claim(run_id.clone());
+                stamp_execution_authority_metadata(
+                    &mut runtime_message,
+                    &ctx.worker_id,
+                    &current_session_id,
+                    "pull",
+                );
+                if client
+                    .negotiated_protocol_capability(crate::client::DURABLE_ACTIVATION_V1_CAPABILITY)
+                {
+                    if let Err(error) = stamp_activation_dispatch_metadata(
+                        &mut runtime_message,
+                        &ctx.worker_id,
+                        &current_session_id,
+                        &ctx.service_version,
+                        &ctx.worker_metadata,
+                        &ctx.activation_definition_configs,
+                    ) {
+                        error!(
+                            run_id,
+                            error = %error,
+                            "Parked poll slot refusing assignment with mismatched artifact identity"
+                        );
+                        continue;
+                    }
+                }
+                if client
+                    .negotiated_protocol_capability(crate::client::DURABLE_SUSPENSION_V1_CAPABILITY)
+                {
+                    stamp_protocol_capability(
+                        &mut runtime_message,
+                        crate::client::DURABLE_SUSPENSION_V1_CAPABILITY,
+                    );
+                }
                 let completion_run_id = run_id.clone();
                 let completion_lease_id = lease_id.clone();
                 if !lease_id.is_empty() {
@@ -1529,26 +2331,40 @@ where
                         map.insert(run_id.clone(), true);
                     }
                 }
+                if let Ok(mut revoked) = ctx.revoked_executions.lock() {
+                    revoked.remove(&run_id);
+                }
 
                 let (renew_stop_tx, renew_handle) = tokio::sync::oneshot::channel::<()>();
-                let renewal = spawn_parked_lease_renewal(
+                let renewal = spawn_active_lease_renewal(
                     client.clone(),
-                    ctx.worker_id.clone(),
-                    ctx.worker_session_id.clone(),
-                    run_id.clone(),
-                    lease_id.clone(),
-                    lease_timeout_ms,
+                    ActiveLeaseAuthority {
+                        worker_id: ctx.worker_id.clone(),
+                        project_id: ctx.project_id.clone(),
+                        deployment_id: ctx.registration.deployment_id.clone(),
+                        run_id: run_id.clone(),
+                        lease_id: lease_id.clone(),
+                        attempt: completion_attempt,
+                        lease_timeout_ms,
+                        lease_expires_at_ms,
+                        session: ActiveLeaseSession::Pull(ctx.worker_session_id.clone()),
+                    },
+                    ctx.revoked_executions.clone(),
+                    ctx.cancel_tokens.clone(),
+                    ctx.cancel_hook.clone(),
                     renew_handle,
                 );
 
                 let (slot_response_tx, slot_response_rx) = flume::unbounded::<ServiceMessage>();
                 let handler_future = execute_runtime_message_for_response(
                     &worker_name,
+                    &ctx.worker_id,
                     runtime_message,
                     slot_response_tx.clone(),
                     handler.clone(),
                     ctx.in_flight.clone(),
                     ctx.cancel_tokens.clone(),
+                    ctx.revoked_executions.clone(),
                     "pull",
                 );
                 tokio::pin!(handler_future);
@@ -1600,8 +2416,15 @@ where
                     buffered_responses.push(service_message);
                 }
 
+                // The language handler has returned. Any remaining slot time is
+                // terminal event flushing, CompleteJob acknowledgement, or lease
+                // cleanup rather than user-code execution.
+                ctx.slot_phases.mark_terminalizing(&run_id);
+
                 let mut completed = false;
-                if let Some(service_message) = returned_response {
+                if let Some(service_message) = returned_response
+                    .filter(|_| !execution_is_revoked(&ctx.revoked_executions, &run_id))
+                {
                     completed = complete_or_forward_parked_response(
                         &mut client,
                         service_message,
@@ -1615,11 +2438,18 @@ where
                         slot_id,
                         &ctx.response_tx,
                         &ctx.journal_queue,
-                        &ctx.journal_flush_lock,
+                        &ctx.journal_flush_locks,
                     )
                     .await;
                 }
                 for service_message in buffered_responses {
+                    if execution_is_revoked(&ctx.revoked_executions, &run_id) {
+                        warn!(
+                            "Parked poll slot {} suppressing response after lease authority loss for run_id={}",
+                            slot_id, completion_run_id
+                        );
+                        continue;
+                    }
                     if completed
                         && polled_job_completion_from_service_message(
                             &service_message,
@@ -1649,13 +2479,13 @@ where
                         slot_id,
                         &ctx.response_tx,
                         &ctx.journal_queue,
-                        &ctx.journal_flush_lock,
+                        &ctx.journal_flush_locks,
                     )
                     .await
                         || completed;
                 }
 
-                if completed {
+                if completed || execution_is_revoked(&ctx.revoked_executions, &run_id) {
                     if let Ok(mut map) = ctx.pending_lease_ids.lock() {
                         map.remove(&completion_run_id);
                     }
@@ -1696,63 +2526,114 @@ where
     }
 }
 
-fn spawn_parked_lease_renewal(
+fn spawn_active_lease_renewal(
     mut client: WorkerCoordinatorClient,
-    worker_id: String,
-    worker_session_id: Arc<TokioMutex<String>>,
-    run_id: String,
-    lease_id: String,
-    lease_timeout_ms: i64,
+    authority: ActiveLeaseAuthority,
+    revoked_executions: Arc<std::sync::Mutex<HashSet<String>>>,
+    cancel_tokens: Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
+    cancel_hook: Arc<std::sync::Mutex<Option<Box<dyn Fn(String) + Send + Sync>>>>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    if lease_id.is_empty() {
+    if authority.lease_id.is_empty() {
         return None;
     }
 
     Some(tokio::spawn(async move {
-        let mut interval =
-            Duration::from_millis(parked_lease_renew_interval_with_jitter_ms(lease_timeout_ms));
+        let mut lease_expires_at_ms = if authority.lease_expires_at_ms > 0 {
+            authority.lease_expires_at_ms
+        } else {
+            current_time_ms().saturating_add(authority.lease_timeout_ms)
+        };
+        let mut delay_ms = active_lease_renew_interval_with_jitter_ms(authority.lease_timeout_ms);
         loop {
+            let now_ms = current_time_ms();
+            if now_ms >= lease_expires_at_ms {
+                crate::telemetry::record_lease_renewal(authority.mode_label(), "expired");
+                warn!(
+                    "Execution lease expired before renewal was confirmed: run_id={} lease_id={}",
+                    authority.run_id, authority.lease_id
+                );
+                revoke_execution_authority(
+                    &authority.run_id,
+                    &revoked_executions,
+                    &cancel_tokens,
+                    &cancel_hook,
+                );
+                return;
+            }
+            let remaining_ms = lease_expires_at_ms.saturating_sub(now_ms) as u64;
+            let sleep_ms = delay_ms.min(remaining_ms.max(1));
             tokio::select! {
                 _ = &mut stop_rx => {
                     return;
                 }
-                _ = tokio::time::sleep(interval) => {}
+                _ = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {}
+            }
+
+            if current_time_ms() >= lease_expires_at_ms {
+                crate::telemetry::record_lease_renewal(authority.mode_label(), "danger_expired");
+                warn!(
+                    "Execution entered the lease danger boundary without a confirmed renewal: run_id={} lease_id={}",
+                    authority.run_id, authority.lease_id
+                );
+                revoke_execution_authority(
+                    &authority.run_id,
+                    &revoked_executions,
+                    &cancel_tokens,
+                    &cancel_hook,
+                );
+                return;
             }
 
             match client
-                .renew_job_lease(RenewJobLeaseRequest {
-                    worker_id: worker_id.clone(),
-                    worker_session_id: worker_session_id.lock().await.clone(),
-                    run_id: run_id.clone(),
-                    lease_id: lease_id.clone(),
-                    lease_timeout_ms,
-                })
+                .renew_job_lease(authority.renewal_request().await)
                 .await
             {
                 Ok(resp) if resp.renewed => {
+                    crate::telemetry::record_lease_renewal(authority.mode_label(), "renewed");
                     debug!(
-                        "Renewed parked poll lease run_id={} lease_id={} expires_at_ms={}",
-                        run_id, lease_id, resp.lease_expires_at_ms
+                        "Renewed execution lease run_id={} lease_id={} expires_at_ms={}",
+                        authority.run_id, authority.lease_id, resp.lease_expires_at_ms
                     );
-                    interval = Duration::from_millis(parked_lease_renew_interval_with_jitter_ms(
-                        lease_timeout_ms,
-                    ));
+                    lease_expires_at_ms = resp.lease_expires_at_ms;
+                    delay_ms =
+                        active_lease_renew_interval_with_jitter_ms(authority.lease_timeout_ms);
                 }
-                Ok(_) => {
+                Ok(resp) => {
+                    let outcome = LeaseRenewalOutcome::try_from(resp.outcome)
+                        .unwrap_or(LeaseRenewalOutcome::Unspecified);
                     warn!(
-                        "Parked poll lease renewal returned renewed=false: run_id={} lease_id={}",
-                        run_id, lease_id
+                        "Execution lease authority was revoked: run_id={} lease_id={} outcome={}",
+                        authority.run_id,
+                        authority.lease_id,
+                        outcome.as_str_name(),
+                    );
+                    crate::telemetry::record_lease_renewal(
+                        authority.mode_label(),
+                        match outcome {
+                            LeaseRenewalOutcome::AuthorityLost => "authority_lost",
+                            LeaseRenewalOutcome::Terminal => "terminal",
+                            LeaseRenewalOutcome::SessionInactive => "session_inactive",
+                            LeaseRenewalOutcome::Unspecified | LeaseRenewalOutcome::Renewed => {
+                                "rejected"
+                            }
+                        },
+                    );
+                    revoke_execution_authority(
+                        &authority.run_id,
+                        &revoked_executions,
+                        &cancel_tokens,
+                        &cancel_hook,
                     );
                     return;
                 }
                 Err(e) => {
+                    crate::telemetry::record_lease_renewal(authority.mode_label(), "indeterminate");
                     warn!(
-                        "Parked poll lease renewal failed: run_id={} lease_id={} error={}",
-                        run_id, lease_id, e
+                        "Execution lease renewal is indeterminate; retrying inside the known lease window: run_id={} lease_id={} error={}",
+                        authority.run_id, authority.lease_id, e
                     );
-                    interval =
-                        Duration::from_millis(parked_lease_danger_retry_ms(lease_timeout_ms));
+                    delay_ms = active_lease_danger_retry_ms(authority.lease_timeout_ms);
                 }
             }
         }
@@ -1784,12 +2665,15 @@ impl Worker {
             tokio_handle: Arc::new(std::sync::Mutex::new(None)),
             streaming_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pending_lease_ids: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            revoked_executions: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            lease_renewal_stops: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cancel_hook: Arc::new(std::sync::Mutex::new(None)),
             event_stream_tx: Arc::new(std::sync::Mutex::new(None)),
             dispatch_tx: Arc::new(std::sync::Mutex::new(None)),
             engine_client: Arc::new(TokioMutex::new(None)),
-            journal_flush_lock: Arc::new(TokioMutex::new(())),
+            journal_flush_locks: RunFlushLocks::default(),
+            slot_phases: WorkerSlotPhases::default(),
         }
     }
 
@@ -1841,10 +2725,20 @@ impl Worker {
     ///
     /// * `event` - The journal event message to queue
     pub fn queue_event(&self, event: JournalEventMessage) -> Result<()> {
+        if event.event_type == "run.started" {
+            self.mark_execution_started(&event.run_id);
+        }
         self.journal_queue.push(event).map_err(|e| {
             crate::error::SdkError::Internal(format!("Failed to queue journal event: {}", e))
         })?;
         Ok(())
+    }
+
+    /// Signal that a claimed pull job has reached the language runtime.
+    /// Language bindings call this at `run.started` before checkpoint I/O.
+    pub fn mark_execution_started(&self, run_id: &str) {
+        let run_id = run_id.split(':').next().unwrap_or(run_id);
+        self.slot_phases.mark_started(run_id);
     }
 
     /// Queue a workflow checkpoint for progressive durability (legacy API)
@@ -1954,6 +2848,115 @@ impl Worker {
         Ok(Some(client))
     }
 
+    fn start_push_lease_renewal(
+        &self,
+        client: WorkerCoordinatorClient,
+        request: &DispatchComponentRequest,
+    ) {
+        if request.lease_id.is_empty() {
+            return;
+        }
+        let run_id = request
+            .invocation_id
+            .split(':')
+            .next()
+            .unwrap_or(&request.invocation_id)
+            .to_string();
+        let Ok(attempt) = u32::try_from(request.attempt) else {
+            warn!(
+                "Refusing push lease renewal with negative attempt: run_id={} attempt={}",
+                run_id, request.attempt
+            );
+            revoke_execution_authority(
+                &run_id,
+                &self.revoked_executions,
+                &self.cancel_tokens,
+                &self.cancel_hook,
+            );
+            return;
+        };
+        let project_id = request
+            .metadata
+            .get("project_id")
+            .cloned()
+            .or_else(|| canonical_project_id_from_metadata(&self.metadata))
+            .unwrap_or_default();
+        let deployment_id = if request.deployment_id.is_empty() {
+            request
+                .metadata
+                .get("deployment_id")
+                .cloned()
+                .or_else(|| self.metadata.get("deployment_id").cloned())
+                .unwrap_or_default()
+        } else {
+            request.deployment_id.clone()
+        };
+        if project_id.is_empty() || deployment_id.is_empty() {
+            warn!(
+                "Push lease has incomplete routing authority; cancelling execution: run_id={}",
+                run_id
+            );
+            revoke_execution_authority(
+                &run_id,
+                &self.revoked_executions,
+                &self.cancel_tokens,
+                &self.cancel_hook,
+            );
+            return;
+        }
+        let lease_timeout_ms = request
+            .metadata
+            .get("lease_timeout_ms")
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(120_000);
+        let lease_expires_at_ms = request
+            .metadata
+            .get("lease_expires_at_ms")
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or_else(|| current_time_ms().saturating_add(lease_timeout_ms));
+
+        if let Ok(mut revoked) = self.revoked_executions.lock() {
+            revoked.remove(&run_id);
+        }
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        if let Ok(mut stops) = self.lease_renewal_stops.lock() {
+            if let Some(previous) = stops.insert(run_id.clone(), stop_tx) {
+                let _ = previous.send(());
+            }
+        }
+        let _ = spawn_active_lease_renewal(
+            client,
+            ActiveLeaseAuthority {
+                worker_id: self.config.worker_id.clone(),
+                project_id,
+                deployment_id,
+                run_id,
+                lease_id: request.lease_id.clone(),
+                attempt,
+                lease_timeout_ms,
+                lease_expires_at_ms,
+                session: ActiveLeaseSession::Push,
+            },
+            self.revoked_executions.clone(),
+            self.cancel_tokens.clone(),
+            self.cancel_hook.clone(),
+            stop_rx,
+        );
+    }
+
+    fn stop_execution_lease_renewal(&self, run_id: &str) {
+        if let Some(stop) = self
+            .lease_renewal_stops
+            .lock()
+            .ok()
+            .and_then(|mut stops| stops.remove(run_id))
+        {
+            let _ = stop.send(());
+        }
+    }
+
     /// Remove per-run tracking entries (lease stash, streaming flag) for a
     /// finished invocation.
     ///
@@ -1968,6 +2971,7 @@ impl Worker {
             map.remove(invocation_id);
         }
         let run_id = invocation_id.split(':').next().unwrap_or(invocation_id);
+        self.stop_execution_lease_renewal(run_id);
         if let Ok(mut map) = self.streaming_runs.lock() {
             map.remove(run_id);
         }
@@ -2001,14 +3005,23 @@ impl Worker {
         source_timestamp_ns: i64,
         timeout_ms: u64,
     ) -> Result<()> {
+        let authority_run_id = run_id.split(':').next().unwrap_or(&run_id);
+        if execution_is_revoked(&self.revoked_executions, authority_run_id) {
+            return Err(SdkError::Internal(format!(
+                "execution authority was revoked for run_id={authority_run_id}"
+            )));
+        }
+        if event_type == "run.started" {
+            self.mark_execution_started(&run_id);
+        }
         let is_terminal = event_type == "run.completed" || event_type == "run.failed";
         let is_durable_checkpoint = JournalEventMessage::is_checkpoint_event_type(&event_type);
         // A durable checkpoint is an ordering boundary for every transient
         // event queued before it, not just for run.completed/run.failed.
-        // Holding the same lock as the periodic flush task prevents a drained,
-        // in-flight batch from being overtaken by the checkpoint.
+        // Holding the same per-run barrier as the periodic flush task prevents
+        // a drained, in-flight batch from being overtaken by the checkpoint.
         let _journal_flush_guard = if is_durable_checkpoint {
-            Some(self.journal_flush_lock.lock().await)
+            Some(self.journal_flush_locks.lock_run(&run_id).await)
         } else {
             None
         };
@@ -2017,7 +3030,7 @@ impl Worker {
         if let Some(mut engine) = self.ensure_engine_client().await? {
             // Publish pending transient events through EventStream and persist
             // queued durable boundaries before appending this checkpoint.
-            // Both calls are acknowledged while journal_flush_lock is held.
+            // Both calls are acknowledged while this run's flush barrier is held.
             if is_durable_checkpoint {
                 let pending = self.journal_queue.drain_run_events(&run_id);
                 if !pending.is_empty() {
@@ -2115,9 +3128,17 @@ impl Worker {
                 merged_metadata,
             );
 
-            let timeout = Duration::from_millis(timeout_ms);
             let start = Instant::now();
-            let result = match tokio::time::timeout(timeout, engine.append(record)).await {
+            let result = match await_checkpoint_ack(
+                engine.append(record),
+                timeout_ms,
+                "Engine.Append",
+                &run_id,
+                &event_type,
+                sequence_number,
+            )
+            .await
+            {
                 Ok(Ok((_offset, _ts))) => {
                     debug!(
                         "Engine checkpoint persisted: run_id={} event_type={} seq={}",
@@ -2137,12 +3158,9 @@ impl Worker {
                     }
                     Err(e)
                 }
-                Err(_) => {
-                    warn!(
-                        "Engine Append timeout after {}ms: run_id={} event_type={} seq={}",
-                        timeout_ms, run_id, event_type, sequence_number
-                    );
-                    Ok(()) // Graceful degradation
+                Err(error) => {
+                    warn!("{error}");
+                    Err(error)
                 }
             };
 
@@ -2154,7 +3172,7 @@ impl Worker {
                 experiment_id.as_deref(),
             );
 
-            if is_terminal {
+            if is_terminal && result.is_ok() {
                 self.cleanup_run_tracking(&run_id);
             }
 
@@ -2287,9 +3305,16 @@ impl Worker {
         // Get EE client and call WriteCheckpoint with timeout
         let mut ee_client = self.ensure_ee_client().await?;
 
-        let timeout = Duration::from_millis(timeout_ms);
         let start = Instant::now();
-        let result = match tokio::time::timeout(timeout, ee_client.write_checkpoint(request)).await
+        let result = match await_checkpoint_ack(
+            ee_client.write_checkpoint(request),
+            timeout_ms,
+            "ExecutionEngine.WriteCheckpoint",
+            &run_id,
+            &event_type,
+            sequence_number,
+        )
+        .await
         {
             Ok(Ok(response)) => {
                 let resp = response.into_inner();
@@ -2326,13 +3351,9 @@ impl Worker {
                     source: None,
                 })
             }
-            Err(_) => {
-                warn!(
-                    "WriteCheckpoint timeout after {}ms: run_id={} event_type={} seq={}",
-                    timeout_ms, run_id, event_type, sequence_number
-                );
-                // Return Ok for graceful degradation — event may have been persisted
-                Ok(())
+            Err(error) => {
+                warn!("{error}");
+                Err(error)
             }
         };
 
@@ -2345,7 +3366,7 @@ impl Worker {
             experiment_id.as_deref(),
         );
 
-        if is_terminal {
+        if is_terminal && result.is_ok() {
             self.cleanup_run_tracking(&run_id);
         }
 
@@ -2447,7 +3468,90 @@ impl Worker {
             return Ok(());
         }
 
+        for (run_id, event_type, ..) in &events {
+            if event_type == "run.started" {
+                self.mark_execution_started(run_id);
+            }
+        }
+
+        let mut run_ids: Vec<_> = events.iter().map(|event| event.0.clone()).collect();
+        run_ids.sort_unstable();
+        run_ids.dedup();
+        let _journal_flush_guards = self
+            .journal_flush_locks
+            .lock_runs(run_ids.iter().cloned())
+            .await;
+
         if let Some(mut engine) = self.ensure_engine_client().await? {
+            // The batch is an ordering boundary just like a single acknowledged
+            // checkpoint. Flush anything already queued for these runs before
+            // appending the batch so an earlier stream frame cannot be overtaken.
+            for run_id in &run_ids {
+                let pending = self.journal_queue.drain_run_events(run_id);
+                if pending.is_empty() {
+                    continue;
+                }
+
+                let tenant_id = pending
+                    .iter()
+                    .find_map(|event| canonical_project_id_from_metadata(&event.metadata))
+                    .or_else(|| canonical_project_id_from_metadata(&self.metadata))
+                    .unwrap_or_default();
+                let transient: Vec<_> = pending
+                    .iter()
+                    .filter(|event| event.is_sse_only)
+                    .map(|event| EventStreamMessage {
+                        run_id: event.run_id.clone(),
+                        event_type: event.event_type.clone(),
+                        data: event.data.clone(),
+                        trace_id: event.correlation_id.clone(),
+                        span_id: event.parent_correlation_id.clone(),
+                        project_id: canonical_project_id_from_metadata(&event.metadata)
+                            .unwrap_or_else(|| tenant_id.clone()),
+                        source_timestamp_ns: event.source_timestamp_ns,
+                        worker_id: self.config.worker_id.clone(),
+                    })
+                    .collect();
+                let durable_records: Vec<_> = pending
+                    .iter()
+                    .filter(|event| !event.is_sse_only)
+                    .map(|event| {
+                        client::build_engine_record(
+                            tenant_id.clone(),
+                            event.run_id.clone(),
+                            event.event_type.clone(),
+                            event.data.clone(),
+                            event.source_timestamp_ns,
+                            String::new(),
+                            event.correlation_id.clone(),
+                            event.parent_correlation_id.clone(),
+                            event.metadata.clone(),
+                        )
+                    })
+                    .collect();
+
+                if let Err(error) = engine.stream_events(transient).await {
+                    for event in pending.into_iter().rev() {
+                        self.journal_queue.push_front(event).ok();
+                    }
+                    self.journal_queue.record_error();
+                    let mut guard = self.engine_client.lock().await;
+                    *guard = None;
+                    return Err(error);
+                }
+                if !durable_records.is_empty() {
+                    if let Err(error) = engine.append_batch(durable_records).await {
+                        for event in pending.into_iter().rev().filter(|event| !event.is_sse_only) {
+                            self.journal_queue.push_front(event).ok();
+                        }
+                        self.journal_queue.record_error();
+                        let mut guard = self.engine_client.lock().await;
+                        *guard = None;
+                        return Err(error);
+                    }
+                }
+            }
+
             let originals: Vec<_> = events
                 .into_iter()
                 .map(|(run_id, event_type, data, sequence, metadata, ts)| {
@@ -2520,6 +3624,7 @@ impl Worker {
                         self.journal_queue.push_front(event).ok();
                     }
                     self.journal_queue.record_error();
+                    return Err(e);
                 }
             }
             return Ok(());
@@ -2806,6 +3911,9 @@ impl Worker {
         // Merge user-provided metadata with auto-collected AGNT5_* env vars
         let mut metadata = self.metadata.clone();
         metadata.extend(collect_agnt5_env_vars());
+        if let Some(artifact) = configured_activation_artifact_sha256(&metadata) {
+            metadata.insert("activation_artifact_sha256".to_string(), artifact);
+        }
 
         // declare data-path mode. Default PUSH;
         // `AGNT5_WORKER_MODE=pull` now means parked long-poll assignment
@@ -2833,6 +3941,11 @@ impl Worker {
         let max_concurrency: u32 = self.config.max_concurrency.unwrap_or(100);
 
         let capabilities = worker_capabilities(&self.components);
+        let (supported_protocol_capabilities, required_protocol_capabilities) =
+            worker_protocol_capabilities_for_metadata(&metadata)?;
+        let dispatch_worker_metadata = metadata.clone();
+        let dispatch_activation_definition_configs =
+            activation_definition_configs(&self.components);
         let registration = RegisterService {
             service_name: self.config.service_name.clone(),
             service_version: self.config.service_version.clone(),
@@ -2843,6 +3956,8 @@ impl Worker {
             deployment_id,
             max_concurrency,
             capabilities,
+            supported_protocol_capabilities: supported_protocol_capabilities.clone(),
+            required_protocol_capabilities: required_protocol_capabilities.clone(),
         };
 
         // Pull workers do not need the stateful dispatch stream for work
@@ -2987,18 +4102,22 @@ impl Worker {
             let response_tx = response_tx.clone();
             let handler = message_handler.clone();
             let worker_name = format!("{}-{}", self.config.worker_id, worker_id);
+            let response_worker_id = self.config.worker_id.clone();
             let in_flight = in_flight.clone();
             let cancel_tokens = self.cancel_tokens.clone();
+            let revoked_executions = self.revoked_executions.clone();
 
             let handle = tokio::spawn(async move {
                 while let Ok(runtime_message) = task_rx.recv_async().await {
                     execute_runtime_message(
                         &worker_name,
+                        &response_worker_id,
                         runtime_message,
                         response_tx.clone(),
                         handler.clone(),
                         in_flight.clone(),
                         cancel_tokens.clone(),
+                        revoked_executions.clone(),
                     )
                     .await;
                 }
@@ -3017,6 +4136,8 @@ impl Worker {
                 poll_shutdown,
                 max_concurrency,
                 in_flight.clone(),
+                supported_protocol_capabilities.clone(),
+                required_protocol_capabilities.clone(),
             ))
         } else {
             None
@@ -3028,7 +4149,7 @@ impl Worker {
                 // Dispatch incoming messages to worker pool
                 result = rx.recv_async() => {
                     match result {
-                        Ok(runtime_message) => {
+                        Ok(mut runtime_message) => {
                             // Legacy CheckpointAck messages from older WC — ignore silently.
                             // Checkpoints now use WriteCheckpoint unary RPC to EE directly.
                             if runtime_message.message_type == RuntimeMessageType::CheckpointAck as i32 {
@@ -3067,6 +4188,36 @@ impl Worker {
                                     source: None,
                                 });
                             }
+
+                            if client.negotiated_protocol_capability(
+                                crate::client::DURABLE_ACTIVATION_V1_CAPABILITY,
+                            ) {
+                                if let Err(error) = stamp_activation_dispatch_metadata(
+                                    &mut runtime_message,
+                                    &self.config.worker_id,
+                                    &self.config.worker_id,
+                                    &self.config.service_version,
+                                    &dispatch_worker_metadata,
+                                    &dispatch_activation_definition_configs,
+                                ) {
+                                    break Err(error);
+                                }
+                            }
+                            if client.negotiated_protocol_capability(
+                                crate::client::DURABLE_SUSPENSION_V1_CAPABILITY,
+                            ) {
+                                stamp_protocol_capability(
+                                    &mut runtime_message,
+                                    crate::client::DURABLE_SUSPENSION_V1_CAPABILITY,
+                                );
+                            }
+
+                            stamp_execution_authority_metadata(
+                                &mut runtime_message,
+                                &self.config.worker_id,
+                                &self.config.worker_id,
+                                "push",
+                            );
 
                             // CancelExecution: fire the soft-cancel channel for
                             // the invocation if it's running locally. Handled
@@ -3133,6 +4284,7 @@ impl Worker {
                             // Track is_streaming per run for ephemeral event gating
                             if let Some(ref msg_data) = runtime_message.message_data {
                                 if let crate::pb::runtime_message::MessageData::DispatchComponent(ref req) = msg_data {
+                                    self.start_push_lease_renewal(client.clone(), req);
                                     if req.is_streaming {
                                         let run_id = if let Some(idx) = req.invocation_id.find(':') {
                                             req.invocation_id[..idx].to_string()
@@ -3352,6 +4504,14 @@ impl Worker {
         if let Ok(mut map) = self.pending_lease_ids.lock() {
             map.clear();
         }
+        if let Ok(mut stops) = self.lease_renewal_stops.lock() {
+            for (_, stop) in stops.drain() {
+                let _ = stop.send(());
+            }
+        }
+        if let Ok(mut revoked) = self.revoked_executions.lock() {
+            revoked.clear();
+        }
 
         dispatch_result
     }
@@ -3370,6 +4530,20 @@ impl Worker {
         if let Some(crate::pb::service_message::MessageType::FunctionResponse(ref mut resp)) =
             service_message.message_type
         {
+            let run_id = resp
+                .invocation_id
+                .split(':')
+                .next()
+                .unwrap_or(&resp.invocation_id)
+                .to_string();
+            if execution_is_revoked(&self.revoked_executions, &run_id) {
+                warn!(
+                    "Suppressing worker response after lease authority loss: run_id={}",
+                    run_id
+                );
+                self.cleanup_run_tracking(&resp.invocation_id);
+                return Ok(());
+            }
             let is_terminal = is_terminal_worker_response(&resp.event_type);
             if resp.lease_id.is_empty() {
                 if let Ok(mut map) = self.pending_lease_ids.lock() {
@@ -3383,14 +4557,7 @@ impl Worker {
                 }
             }
             if is_terminal {
-                let run_id = if let Some(idx) = resp.invocation_id.find(':') {
-                    resp.invocation_id[..idx].to_string()
-                } else {
-                    resp.invocation_id.clone()
-                };
-                if let Ok(mut map) = self.streaming_runs.lock() {
-                    map.remove(&run_id);
-                }
+                self.cleanup_run_tracking(&resp.invocation_id);
             }
         }
 
@@ -3474,7 +4641,8 @@ impl Worker {
         let journal_queue_outer = self.journal_queue.clone();
         let streaming_runs_outer = self.streaming_runs.clone();
         let pending_lease_ids_outer = self.pending_lease_ids.clone();
-        let journal_flush_lock_outer = self.journal_flush_lock.clone();
+        let revoked_executions_outer = self.revoked_executions.clone();
+        let journal_flush_locks_outer = self.journal_flush_locks.clone();
         let ee_endpoint_outer = self.config.ee_endpoint.clone();
         let engine_endpoint_outer = self.config.engine_endpoint.clone();
 
@@ -3501,7 +4669,8 @@ impl Worker {
                     .max(1);
                 let streaming_runs = streaming_runs_outer.clone();
                 let pending_lease_ids = pending_lease_ids_outer.clone();
-                let journal_flush_lock = journal_flush_lock_outer.clone();
+                let revoked_executions = revoked_executions_outer.clone();
+                let journal_flush_locks = journal_flush_locks_outer.clone();
                 let ee_endpoint = ee_endpoint_outer.clone();
                 let engine_endpoint = engine_endpoint_outer.clone();
                 let dispatch_tx = dispatch_tx.clone();
@@ -3526,8 +4695,6 @@ impl Worker {
                     loop {
                         interval.tick().await;
 
-                        let _flush_guard = journal_flush_lock.lock().await;
-
                         // Drain more than one nominal batch when backlog is already present.
                         // This preserves the normal small-batch latency path while allowing
                         // the flush task to catch up instead of hard-capping at one batch
@@ -3538,7 +4705,18 @@ impl Worker {
                         } else {
                             batch_size
                         };
-                        let batch = journal_queue.drain_batch(drain_limit);
+                        let run_ids = journal_queue.peek_batch_run_ids(drain_limit);
+                        let _flush_guards = journal_flush_locks.lock_runs(run_ids.clone()).await;
+                        let protected_runs: HashSet<_> = run_ids.into_iter().collect();
+                        let batch: Vec<_> = journal_queue
+                            .drain_batch_for_runs(drain_limit, &protected_runs)
+                            .into_iter()
+                            .filter(|event| {
+                                let run_id =
+                                    event.run_id.split(':').next().unwrap_or(&event.run_id);
+                                !execution_is_revoked(&revoked_executions, run_id)
+                            })
+                            .collect();
                         if batch.is_empty() {
                             continue;
                         }
@@ -3978,6 +5156,8 @@ impl Worker {
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
         max_concurrency: usize,
         in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        supported_protocol_capabilities: Vec<String>,
+        required_protocol_capabilities: Vec<String>,
     ) -> tokio::task::JoinHandle<()>
     where
         F: Fn(RuntimeMessage, flume::Sender<ServiceMessage>) -> Fut + Send + Clone + 'static,
@@ -3989,14 +5169,22 @@ impl Worker {
         let deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").unwrap_or_default();
         let capabilities = worker_capabilities(&self.components);
         let components = self.components.clone();
+        let activation_definition_configs = activation_definition_configs(&components);
+        let mut worker_metadata = self.metadata.clone();
+        if let Some(artifact) = configured_activation_artifact_sha256(&worker_metadata) {
+            worker_metadata.insert("activation_artifact_sha256".to_string(), artifact);
+        }
         let service_name = self.config.service_name.clone();
         let service_version = self.config.service_version.clone();
         let service_type = self.config.service_type.clone();
         let streaming_runs = self.streaming_runs.clone();
         let pending_lease_ids = self.pending_lease_ids.clone();
         let journal_queue = self.journal_queue.clone();
-        let journal_flush_lock = self.journal_flush_lock.clone();
+        let journal_flush_locks = self.journal_flush_locks.clone();
+        let slot_phases = self.slot_phases.clone();
         let cancel_tokens = self.cancel_tokens.clone();
+        let cancel_hook = self.cancel_hook.clone();
+        let revoked_executions = self.revoked_executions.clone();
         let configured_max_slots = env_usize("AGNT5_MAX_SLOTS").unwrap_or(max_concurrency);
         let max_slots = configured_max_slots
             .clamp(1, max_concurrency.max(1))
@@ -4038,8 +5226,10 @@ impl Worker {
                 capabilities,
                 components,
                 service_name,
-                service_version,
+                service_version: service_version.clone(),
                 service_type,
+                supported_protocol_capabilities,
+                required_protocol_capabilities,
             };
             let initial_session_id = match register_parked_worker_session_with_retries(
                 &mut client,
@@ -4076,19 +5266,26 @@ impl Worker {
 
             let (events_tx, mut events_rx) =
                 tokio::sync::mpsc::unbounded_channel::<ParkedSlotEvent>();
+            slot_phases.set_started_notifier(events_tx.clone());
             let ctx = Arc::new(ParkedPollContext {
                 client,
                 worker_id,
                 worker_session_id,
                 registration,
+                service_version,
+                worker_metadata,
+                activation_definition_configs,
                 project_id,
                 response_tx,
                 in_flight,
                 cancel_tokens,
+                cancel_hook,
+                revoked_executions,
                 streaming_runs,
                 pending_lease_ids,
                 journal_queue,
-                journal_flush_lock,
+                journal_flush_locks,
+                slot_phases,
                 open_poll_slots,
                 total_slots: total_slots.clone(),
                 busy_slots: busy_slots.clone(),
@@ -4116,10 +5313,10 @@ impl Worker {
                     }
                     // `ctx` holds an `events_tx` clone, so recv() never yields None here.
                     event = events_rx.recv() => {
-                        if let Some(ParkedSlotEvent::GotJob) = event {
+                        if let Some(ParkedSlotEvent::Started { active_started }) = event {
                             let spawn = parked_ramp_spawn_count(
                                 total_slots.load(std::sync::atomic::Ordering::Relaxed),
-                                busy_slots.load(std::sync::atomic::Ordering::Relaxed),
+                                active_started,
                                 max_slots,
                             );
                             for _ in 0..spawn {
@@ -4279,17 +5476,23 @@ fn is_cancelled_worker_response(service_message: &ServiceMessage) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
+        activation_definition_configs, active_lease_danger_retry_ms,
+        active_lease_renew_interval_ms, active_lease_renew_interval_with_jitter_ms,
+        await_checkpoint_ack, canonical_activation_component_config,
         complete_job_request_from_polled_completion, complete_job_with_retry,
+        deployment_artifact_sha256, durable_suspension_service_message, execution_is_revoked,
         is_cancelled_worker_response, is_parked_worker_session_registration_rejection,
-        is_terminal_worker_response, is_worker_session_inactive_error,
-        parked_lease_danger_retry_ms, parked_lease_renew_interval_ms,
-        parked_lease_renew_interval_with_jitter_ms, parked_ramp_spawn_count,
+        is_terminal_worker_response, is_worker_session_inactive_error, parked_ramp_spawn_count,
         parked_runtime_service_response, parked_worker_session_was_refreshed,
-        polled_job_completion_from_service_message, record_groups_by_run,
-        runtime_message_from_job_assignment, stamp_dispatch_mode, take_correlation_ids,
-        try_retire_parked_slot, uncommitted_records_in_reverse, wait_for_parked_run_events_flush,
-        worker_capabilities, AppendGroupProgress, CompleteJobSender, EntityStateSender,
-        ParkedWorkerSessionRegistration, Worker, WorkerConfig,
+        polled_job_completion_from_service_message, polled_job_suspension_request,
+        record_groups_by_run, runtime_message_from_job_assignment,
+        stamp_activation_dispatch_metadata, stamp_dispatch_mode,
+        stamp_execution_authority_metadata, stamp_protocol_capability, take_correlation_ids,
+        try_retire_parked_slot, uncommitted_records_in_reverse, valid_activation_artifact_sha256,
+        wait_for_parked_run_events_flush, worker_capabilities, ActiveLeaseAuthority,
+        ActiveLeaseSession, AppendGroupProgress, CompleteJobSender, EntityStateSender,
+        ParkedSlotEvent, ParkedWorkerSessionRegistration, RunFlushLocks, Worker, WorkerConfig,
+        WorkerSlotPhaseSnapshot, WorkerSlotPhases,
     };
     use crate::error::{ErrorCode, SdkError};
     use crate::journal_queue::{JournalEventMessage, JournalEventQueue, JournalQueueConfig};
@@ -4298,9 +5501,10 @@ mod tests {
         runtime_service_response, service_message, CompleteJobRequest, CompleteJobResponse,
         DispatchComponentResponse, EntityStateSaveRequest, GetEntityStateRequest,
         GetEntityStateResponse, JobAssignment, PutEntityStateRequest, PutEntityStateResponse,
-        RuntimeServiceRequest, ServiceMessage,
+        RuntimeServiceRequest, ServiceMessage, WorkerMode,
     };
     use std::collections::{HashMap, VecDeque};
+    use std::time::Duration;
 
     struct ScriptedCompleteJobSender {
         outcomes: VecDeque<crate::error::Result<CompleteJobResponse>>,
@@ -4347,6 +5551,157 @@ mod tests {
                 .pop_front()
                 .unwrap_or_else(|| Err(SdkError::Internal("missing scripted outcome".to_string())))
         }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_ack_timeout_fails_closed_with_unknown_outcome() {
+        let error = await_checkpoint_ack(
+            std::future::pending::<()>(),
+            0,
+            "Engine.Append",
+            "run-1",
+            "workflow.step.completed",
+            7,
+        )
+        .await
+        .expect_err("checkpoint acknowledgement timeout must fail closed");
+
+        match error {
+            SdkError::Timeout {
+                message,
+                operation,
+                duration_ms,
+            } => {
+                assert_eq!(operation, "Engine.Append");
+                assert_eq!(duration_ms, Some(0));
+                assert!(message.contains("run_id=run-1"));
+                assert!(message.contains("event_type=workflow.step.completed"));
+                assert!(message.contains("seq=7"));
+                assert!(message.contains("persistence outcome is unknown"));
+            }
+            other => panic!("expected typed timeout error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_ack_timeout_wrapper_preserves_completed_and_inner_error_outcomes() {
+        let result = await_checkpoint_ack(
+            async { Ok::<_, SdkError>(42) },
+            100,
+            "ExecutionEngine.WriteCheckpoint",
+            "run-1",
+            "run.completed",
+            8,
+        )
+        .await
+        .expect("completed future should not time out");
+
+        assert_eq!(result.expect("inner result should be unchanged"), 42);
+
+        let result = await_checkpoint_ack(
+            async { Err::<(), _>(SdkError::Internal("append rejected".to_string())) },
+            100,
+            "Engine.Append",
+            "run-1",
+            "run.completed",
+            9,
+        )
+        .await
+        .expect("completed future should not time out");
+
+        assert!(matches!(
+            result,
+            Err(SdkError::Internal(message)) if message == "append rejected"
+        ));
+    }
+
+    #[tokio::test]
+    async fn active_push_lease_request_carries_complete_authority_tuple() {
+        let authority = ActiveLeaseAuthority {
+            worker_id: "worker-1".to_string(),
+            project_id: "project-1".to_string(),
+            deployment_id: "deployment-1".to_string(),
+            run_id: "run-1".to_string(),
+            lease_id: "lease-1".to_string(),
+            attempt: 3,
+            lease_timeout_ms: 120_000,
+            lease_expires_at_ms: 200_000,
+            session: ActiveLeaseSession::Push,
+        };
+
+        let request = authority.renewal_request().await;
+
+        assert_eq!(request.worker_id, "worker-1");
+        assert!(request.worker_session_id.is_empty());
+        assert_eq!(request.project_id, "project-1");
+        assert_eq!(request.deployment_id, "deployment-1");
+        assert_eq!(request.run_id, "run-1");
+        assert_eq!(request.lease_id, "lease-1");
+        assert_eq!(request.attempt, Some(3));
+        assert_eq!(request.mode, WorkerMode::Push as i32);
+    }
+
+    #[tokio::test]
+    async fn revoked_execution_suppresses_late_push_response() {
+        let config = WorkerConfig::new(
+            "svc".to_string(),
+            "1.0.0".to_string(),
+            "standalone".to_string(),
+        );
+        let worker = Worker::new(config, Vec::new(), HashMap::new());
+        worker
+            .revoked_executions
+            .lock()
+            .unwrap()
+            .insert("run-1".to_string());
+        let (tx, rx) = flume::bounded(1);
+        let message = ServiceMessage {
+            worker_id: "worker-1".to_string(),
+            metadata: HashMap::new(),
+            message_type: Some(service_message::MessageType::FunctionResponse(
+                DispatchComponentResponse {
+                    invocation_id: "run-1".to_string(),
+                    success: true,
+                    event_type: "run.completed".to_string(),
+                    lease_id: "lease-stale".to_string(),
+                    ..Default::default()
+                },
+            )),
+        };
+
+        worker
+            .forward_worker_response(message, false, &tx)
+            .await
+            .unwrap();
+
+        assert!(rx.try_recv().is_err());
+        assert!(execution_is_revoked(&worker.revoked_executions, "run-1"));
+    }
+
+    #[test]
+    fn authority_revocation_invokes_language_cancel_hook() {
+        let config = WorkerConfig::new(
+            "svc".to_string(),
+            "1.0.0".to_string(),
+            "standalone".to_string(),
+        );
+        let worker = Worker::new(config, Vec::new(), HashMap::new());
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled_by_hook = cancelled.clone();
+        worker.set_cancel_hook(move |run_id| {
+            assert_eq!(run_id, "run-1");
+            cancelled_by_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        super::revoke_execution_authority(
+            "run-1",
+            &worker.revoked_executions,
+            &worker.cancel_tokens,
+            &worker.cancel_hook,
+        );
+
+        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(execution_is_revoked(&worker.revoked_executions, "run-1"));
     }
 
     #[test]
@@ -4402,6 +5757,246 @@ mod tests {
         assert_eq!(
             request.metadata.get("dispatch_mode").map(String::as_str),
             Some("push")
+        );
+    }
+
+    #[test]
+    fn execution_authority_metadata_overrides_caller_values() {
+        let mut message = crate::pb::RuntimeMessage {
+            message_data: Some(runtime_message::MessageData::DispatchComponent(
+                crate::pb::DispatchComponentRequest {
+                    lease_id: "lease-7".to_string(),
+                    attempt: 7,
+                    metadata: HashMap::from([
+                        ("dispatch_mode".to_string(), "push".to_string()),
+                        ("worker_id".to_string(), "forged-worker".to_string()),
+                        ("lease_id".to_string(), "forged-lease".to_string()),
+                        ("lease_attempt".to_string(), "99".to_string()),
+                    ]),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+
+        stamp_execution_authority_metadata(&mut message, "worker-1", "session-1", "pull");
+
+        let Some(runtime_message::MessageData::DispatchComponent(request)) = message.message_data
+        else {
+            panic!("dispatch request");
+        };
+        assert_eq!(
+            request.metadata.get("dispatch_mode").map(String::as_str),
+            Some("pull")
+        );
+        assert_eq!(
+            request.metadata.get("worker_id").map(String::as_str),
+            Some("worker-1")
+        );
+        assert_eq!(
+            request
+                .metadata
+                .get("worker_session_id")
+                .map(String::as_str),
+            Some("session-1")
+        );
+        assert_eq!(
+            request.metadata.get("lease_id").map(String::as_str),
+            Some("lease-7")
+        );
+        assert_eq!(
+            request.metadata.get("lease_attempt").map(String::as_str),
+            Some("7")
+        );
+    }
+
+    #[test]
+    fn activation_component_config_is_canonical_and_sorted() {
+        assert_eq!(
+            canonical_activation_component_config(&HashMap::from([
+                ("z".to_string(), "last".to_string()),
+                ("a".to_string(), "first\nline".to_string()),
+            ])),
+            r#"["object",[["a",["string","first\nline"]],["z",["string","last"]]]]"#
+        );
+    }
+
+    #[test]
+    fn activation_artifact_identity_accepts_exactly_32_encoded_bytes() {
+        assert!(valid_activation_artifact_sha256(
+            "6161616161616161616161616161616161616161616161616161616161616161"
+        ));
+        assert!(valid_activation_artifact_sha256(
+            "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE="
+        ));
+        assert!(!valid_activation_artifact_sha256("6161"));
+        assert!(!valid_activation_artifact_sha256("not-a-digest"));
+    }
+
+    #[test]
+    fn deployment_artifact_identity_is_domain_separated_and_canonical() {
+        assert_eq!(
+            hex::encode(
+                deployment_artifact_sha256("01234567-89AB-CDEF-0123-456789ABCDEF").unwrap()
+            ),
+            "c51344c186e74ccb1ce5b5f6122362285d9dd3a4b125d442280de1dcacae8c9f"
+        );
+        assert!(deployment_artifact_sha256("not-a-deployment-id").is_none());
+    }
+
+    #[test]
+    fn negotiated_activation_metadata_uses_typed_dispatch_authority() {
+        let mut message = crate::pb::RuntimeMessage {
+            message_data: Some(runtime_message::MessageData::DispatchComponent(
+                crate::pb::DispatchComponentRequest {
+                    invocation_id: "run-1".to_string(),
+                    component_name: "workflow".to_string(),
+                    lease_id: "lease-1".to_string(),
+                    metadata: HashMap::from([
+                        (
+                            "run_authority".to_string(),
+                            "runtime-run-authority".to_string(),
+                        ),
+                        (
+                            "lease_authority".to_string(),
+                            "runtime-lease-authority".to_string(),
+                        ),
+                        (
+                            "activation_artifact_sha256".to_string(),
+                            "c51344c186e74ccb1ce5b5f6122362285d9dd3a4b125d442280de1dcacae8c9f"
+                                .to_string(),
+                        ),
+                    ]),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        let components = vec![crate::pb::ComponentInfo {
+            name: "workflow".to_string(),
+            config: HashMap::from([("model".to_string(), "gpt-5".to_string())]),
+            ..Default::default()
+        }];
+
+        stamp_activation_dispatch_metadata(
+            &mut message,
+            "worker-1",
+            "session-1",
+            "1.2.3",
+            &HashMap::from([
+                ("project_id".to_string(), "project-1".to_string()),
+                (
+                    "activation_artifact_sha256".to_string(),
+                    "c51344c186e74ccb1ce5b5f6122362285d9dd3a4b125d442280de1dcacae8c9f".to_string(),
+                ),
+            ]),
+            &activation_definition_configs(&components),
+        )
+        .unwrap();
+
+        let Some(runtime_message::MessageData::DispatchComponent(request)) = message.message_data
+        else {
+            panic!("dispatch request");
+        };
+        assert_eq!(
+            request
+                .metadata
+                .get(crate::client::DURABLE_ACTIVATION_V1_CAPABILITY)
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            request
+                .metadata
+                .get("worker_session_id")
+                .map(String::as_str),
+            Some("session-1")
+        );
+        assert_eq!(
+            request.metadata.get("lease_id").map(String::as_str),
+            Some("lease-1")
+        );
+        assert_eq!(
+            request.metadata.get("run_authority").map(String::as_str),
+            Some("runtime-run-authority")
+        );
+        assert_eq!(
+            request.metadata.get("lease_authority").map(String::as_str),
+            Some("runtime-lease-authority")
+        );
+        assert_eq!(
+            request
+                .metadata
+                .get("activation_definition_config")
+                .map(String::as_str),
+            Some(r#"["object",[["model",["string","gpt-5"]]]]"#)
+        );
+        assert_eq!(
+            request
+                .metadata
+                .get("activation_artifact_sha256")
+                .map(String::as_str),
+            Some("c51344c186e74ccb1ce5b5f6122362285d9dd3a4b125d442280de1dcacae8c9f")
+        );
+    }
+
+    #[test]
+    fn negotiated_activation_rejects_worker_artifact_mismatch() {
+        let mut message = crate::pb::RuntimeMessage {
+            message_data: Some(runtime_message::MessageData::DispatchComponent(
+                crate::pb::DispatchComponentRequest {
+                    invocation_id: "run-1".to_string(),
+                    component_name: "workflow".to_string(),
+                    lease_id: "lease-1".to_string(),
+                    metadata: HashMap::from([(
+                        "activation_artifact_sha256".to_string(),
+                        "00".repeat(32),
+                    )]),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        let error = stamp_activation_dispatch_metadata(
+            &mut message,
+            "worker-1",
+            "session-1",
+            "1.2.3",
+            &HashMap::from([("activation_artifact_sha256".to_string(), "11".repeat(32))]),
+            &HashMap::new(),
+        )
+        .expect_err("mismatched worker code must not execute a pinned run");
+        assert!(matches!(
+            error,
+            SdkError::Activation {
+                code: ErrorCode::NondeterministicReplay,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn negotiated_suspension_capability_is_visible_to_language_handlers() {
+        let mut message = crate::pb::RuntimeMessage {
+            message_data: Some(runtime_message::MessageData::DispatchComponent(
+                crate::pb::DispatchComponentRequest::default(),
+            )),
+            ..Default::default()
+        };
+        stamp_protocol_capability(
+            &mut message,
+            crate::client::DURABLE_SUSPENSION_V1_CAPABILITY,
+        );
+        let Some(runtime_message::MessageData::DispatchComponent(request)) = message.message_data
+        else {
+            panic!("dispatch request");
+        };
+        assert_eq!(
+            request
+                .metadata
+                .get(crate::client::DURABLE_SUSPENSION_V1_CAPABILITY)
+                .map(String::as_str),
+            Some("true")
         );
     }
 
@@ -4543,6 +6138,7 @@ mod tests {
             lease_id,
             attempt,
             renewal_timeout_ms,
+            lease_expires_at_ms,
             completion_metadata,
         ) = runtime_message_from_job_assignment(job, 60_000).expect("valid typed assignment");
 
@@ -4551,6 +6147,7 @@ mod tests {
         assert_eq!(lease_id, "lease-1");
         assert_eq!(attempt, 2);
         assert_eq!(renewal_timeout_ms, 60_000);
+        assert_eq!(lease_expires_at_ms, 123_456);
         assert_eq!(
             completion_metadata.get("attempt").map(String::as_str),
             Some("2")
@@ -4817,6 +6414,79 @@ mod tests {
     }
 
     #[test]
+    fn parked_suspension_uses_assignment_owned_project_and_run_scope() {
+        let suspension = crate::pb::WorkerSuspension {
+            activation_id: "activation-1".into(),
+            attempt: 2,
+            fence_token: b"fence-2".to_vec(),
+            timer_key: "sleep:backoff".into(),
+            ready_at_ms: 0,
+            input_digest: vec![1; 32],
+            definition_digest: vec![2; 32],
+            continuation: br#"{"step":2}"#.to_vec(),
+            delay_ms: 5_000,
+        };
+        let response = ServiceMessage {
+            worker_id: "worker-1".into(),
+            metadata: HashMap::new(),
+            message_type: Some(service_message::MessageType::FunctionResponse(
+                DispatchComponentResponse {
+                    invocation_id: "worker-supplied-run".into(),
+                    success: true,
+                    result: Some(dispatch_component_response::Result::WorkerSuspension(
+                        suspension.clone(),
+                    )),
+                    ..Default::default()
+                },
+            )),
+        };
+
+        let request = polled_job_suspension_request(&response, "project-1", "run-1")
+            .expect("typed suspension");
+        assert_eq!(request.project_id, "project-1");
+        assert_eq!(request.run_id, "run-1");
+        assert_eq!(request.activation_id, suspension.activation_id);
+        assert_eq!(request.delay_ms, suspension.delay_ms);
+        assert_eq!(request.ready_at_ms, 0);
+    }
+
+    #[test]
+    fn core_timer_error_maps_to_typed_worker_response() {
+        let suspension = crate::pb::WorkerSuspension {
+            activation_id: "activation-1".into(),
+            attempt: 2,
+            fence_token: b"fence-2".to_vec(),
+            timer_key: "sleep:sleep_0".into(),
+            delay_ms: 5_000,
+            ..Default::default()
+        };
+        let envelope = super::DurableSuspensionEnvelope {
+            invocation_id: "run-1".into(),
+            metadata: HashMap::from([("project_id".into(), "project-1".into())]),
+            attempt: 2,
+            lease_id: "lease-2".into(),
+        };
+
+        let message = durable_suspension_service_message("worker-1", &envelope, suspension.clone());
+        assert_eq!(message.worker_id, "worker-1");
+        let Some(service_message::MessageType::FunctionResponse(response)) = message.message_type
+        else {
+            panic!("expected function response");
+        };
+        assert!(response.success);
+        assert_eq!(response.invocation_id, "run-1");
+        assert_eq!(response.event_type, "workflow.paused");
+        assert_eq!(response.attempt, 2);
+        assert_eq!(response.lease_id, "lease-2");
+        assert_eq!(
+            response.result,
+            Some(dispatch_component_response::Result::WorkerSuspension(
+                suspension
+            ))
+        );
+    }
+
+    #[test]
     fn parked_nonterminal_response_does_not_complete_assignment() {
         let service_message = ServiceMessage {
             message_type: Some(crate::pb::service_message::MessageType::FunctionResponse(
@@ -4955,12 +6625,12 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        let flush_lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        let flush_locks = RunFlushLocks::default();
         let queue_for_sender = queue.clone();
-        let lock_for_sender = flush_lock.clone();
+        let locks_for_sender = flush_locks.clone();
         let sender = tokio::spawn(async move {
             tokio::task::yield_now().await;
-            let _guard = lock_for_sender.lock().await;
+            let _guard = locks_for_sender.lock_run("run-1").await;
             let drained = queue_for_sender.drain_run_events("run-1");
             assert_eq!(drained.len(), 1);
             // Model an acknowledged send while the periodic flush lock remains
@@ -4968,20 +6638,56 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         });
 
-        assert!(wait_for_parked_run_events_flush(&queue, &flush_lock, "run-1").await);
+        assert!(wait_for_parked_run_events_flush(&queue, &flush_locks, "run-1").await);
         sender.await.unwrap();
         assert!(!queue.contains_run("run-1"));
     }
 
+    #[tokio::test]
+    async fn run_flush_locks_serialize_same_run_without_blocking_other_runs() {
+        let locks = RunFlushLocks::default();
+        let run_a_guard = locks.lock_run("run-a").await;
+
+        let same_run = tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            locks.lock_run("run-a"),
+        )
+        .await;
+        assert!(
+            same_run.is_err(),
+            "same run must wait for its ordering barrier"
+        );
+
+        let other_run = tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            locks.lock_run("run-b"),
+        )
+        .await;
+        assert!(
+            other_run.is_ok(),
+            "unrelated run must not share the barrier"
+        );
+
+        drop(run_a_guard);
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            locks.lock_run("run-a"),
+        )
+        .await
+        .is_ok());
+    }
+
     #[test]
-    fn parked_lease_renew_intervals_are_bounded() {
-        assert_eq!(parked_lease_renew_interval_ms(120_000), 60_000);
-        assert_eq!(parked_lease_danger_retry_ms(120_000), 5_000);
-        assert_eq!(parked_lease_renew_interval_ms(2_000), 5_000);
-        assert_eq!(parked_lease_danger_retry_ms(2_000), 1_000);
+    fn active_lease_renew_intervals_are_bounded() {
+        assert_eq!(active_lease_renew_interval_ms(120_000), 60_000);
+        assert_eq!(active_lease_danger_retry_ms(120_000), 5_000);
+        assert_eq!(active_lease_renew_interval_ms(2_000), 1_000);
+        assert_eq!(active_lease_danger_retry_ms(2_000), 200);
+        assert_eq!(active_lease_renew_interval_ms(6), 3);
+        assert_eq!(active_lease_danger_retry_ms(6), 1);
 
         for _ in 0..100 {
-            let jittered = parked_lease_renew_interval_with_jitter_ms(120_000);
+            let jittered = active_lease_renew_interval_with_jitter_ms(120_000);
             assert!(
                 (54_000..=66_000).contains(&jittered),
                 "jittered interval out of ±10% range: {jittered}"
@@ -5052,6 +6758,66 @@ mod tests {
         assert_eq!(parked_ramp_spawn_count(4, 0, 10), 0);
     }
 
+    #[tokio::test]
+    async fn stalled_claim_does_not_signal_slot_ramp_before_language_start() {
+        let phases = WorkerSlotPhases::default();
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        phases.set_started_notifier(events_tx);
+
+        // Model a deliberately stalled language scheduler: four pull jobs are
+        // claimed, but none has emitted run.started. The supervisor must
+        // receive no ramp signal in this state.
+        let guards: Vec<_> = (0..4)
+            .map(|index| phases.claim(format!("slow-run-{index}")))
+            .collect();
+        assert_eq!(
+            phases.snapshot(),
+            WorkerSlotPhaseSnapshot {
+                claimed_not_started: 4,
+                executing: 0,
+                terminalizing: 0,
+            }
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), events_rx.recv())
+                .await
+                .is_err()
+        );
+
+        phases.mark_started("slow-run-0");
+        let event = events_rx.recv().await;
+        assert_eq!(event, Some(ParkedSlotEvent::Started { active_started: 1 }));
+        let Some(ParkedSlotEvent::Started { active_started }) = event else {
+            unreachable!();
+        };
+        assert_eq!(parked_ramp_spawn_count(4, active_started, 16), 0);
+        assert_eq!(
+            phases.snapshot(),
+            WorkerSlotPhaseSnapshot {
+                claimed_not_started: 3,
+                executing: 1,
+                terminalizing: 0,
+            }
+        );
+
+        // Duplicate run.started events are idempotent and cannot cause extra
+        // ramp waves.
+        phases.mark_started("slow-run-0");
+        assert!(events_rx.try_recv().is_err());
+
+        phases.mark_terminalizing("slow-run-0");
+        assert_eq!(
+            phases.snapshot(),
+            WorkerSlotPhaseSnapshot {
+                claimed_not_started: 3,
+                executing: 0,
+                terminalizing: 1,
+            }
+        );
+        drop(guards);
+        assert_eq!(phases.snapshot(), WorkerSlotPhaseSnapshot::default());
+    }
+
     #[test]
     fn try_retire_parked_slot_never_drops_below_min_slots() {
         let total = std::sync::atomic::AtomicUsize::new(3);
@@ -5118,6 +6884,10 @@ mod tests {
             service_name: "svc".into(),
             service_version: "1.2.3".into(),
             service_type: "worker".into(),
+            supported_protocol_capabilities: vec![
+                crate::client::DURABLE_ACTIVATION_V1_CAPABILITY.into()
+            ],
+            required_protocol_capabilities: Vec::new(),
         };
 
         let first = registration.request();

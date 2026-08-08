@@ -26,7 +26,8 @@ pub use adk::{
 pub use client::{build_engine_record, CheckpointResult, EngineClient, WorkerCoordinatorClient};
 pub use context::{
     ContextConfig, CoreContext, FunctionCall, FunctionHandle, FunctionNamespace, FunctionRegistry,
-    FunctionResult, FunctionStatus, LanguageModelNamespace, SignalNamespace, TimerNamespace,
+    FunctionResult, FunctionStatus, LanguageModelNamespace, SignalNamespace, TimerActivationClient,
+    TimerNamespace,
 };
 pub use error::{Result, SdkError};
 pub use eval::{
@@ -49,9 +50,11 @@ pub use lm::{
 };
 pub use logging::{clear_error_buffer, get_error_buffer, init_logging};
 pub use runtime_adapter::{
-    DummyStateManager, EntityStateLoadResult, EntityStateManager, EntityStateSaveResult,
-    InvocationRequest, InvocationResponse, RuntimeAdapter, RuntimeCapabilities, RuntimeContext,
-    StateManager,
+    activation_decision, ActivationAdapter, ActivationCompletionReceipt, ActivationDecision,
+    ActivationExecutionReceipt, ActivationFailureReceipt, ActivationReplayReceipt,
+    ActivationSuspensionReceipt, DummyStateManager, EntityStateLoadResult, EntityStateManager,
+    EntityStateSaveResult, InvocationRequest, InvocationResponse, RuntimeAdapter,
+    RuntimeCapabilities, RuntimeContext, StateManager,
 };
 pub use sandbox::{
     CreateSandboxOptions, ExecuteCodeRequest, ExecuteCodeResult, FileInfo, Language,

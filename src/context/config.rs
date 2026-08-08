@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::runtime_adapter::ActivationAdapter;
+
 use super::registry::FunctionRegistry;
+use super::timer::TimerActivationClient;
 
 /// Identifiers and options required to bootstrap a durable Context instance.
 #[derive(Clone)]
@@ -14,6 +17,7 @@ pub struct ContextConfig {
     pub invocation_id: Option<String>,
     pub metadata: HashMap<String, String>,
     pub function_registry: Arc<FunctionRegistry>,
+    pub(crate) timer_activation_client: Option<Arc<dyn TimerActivationClient>>,
 }
 
 impl ContextConfig {
@@ -33,6 +37,7 @@ impl ContextConfig {
             invocation_id: None,
             metadata: HashMap::new(),
             function_registry: Arc::new(FunctionRegistry::new()),
+            timer_activation_client: None,
         }
     }
 
@@ -54,6 +59,19 @@ impl ContextConfig {
         self.function_registry = registry;
         self
     }
+
+    /// Use an Engine-backed activation adapter for durable timer suspension.
+    pub fn with_activation_adapter(mut self, adapter: ActivationAdapter) -> Self {
+        self.timer_activation_client = Some(Arc::new(tokio::sync::Mutex::new(adapter)));
+        self
+    }
+
+    /// Inject the minimal timer activation client, primarily for embedders and
+    /// deterministic conformance tests.
+    pub fn with_timer_activation_client(mut self, client: Arc<dyn TimerActivationClient>) -> Self {
+        self.timer_activation_client = Some(client);
+        self
+    }
 }
 
 impl std::fmt::Debug for ContextConfig {
@@ -66,6 +84,10 @@ impl std::fmt::Debug for ContextConfig {
             .field("attempt", &self.attempt)
             .field("invocation_id", &self.invocation_id)
             .field("metadata", &self.metadata)
+            .field(
+                "timer_activation_client",
+                &self.timer_activation_client.is_some(),
+            )
             .finish()
     }
 }
@@ -81,6 +103,7 @@ impl Default for ContextConfig {
             invocation_id: None,
             metadata: HashMap::new(),
             function_registry: Arc::new(FunctionRegistry::new()),
+            timer_activation_client: None,
         }
     }
 }

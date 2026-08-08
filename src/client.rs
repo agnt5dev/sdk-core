@@ -3,19 +3,113 @@ use crate::pb::{
     engine_service_client::EngineServiceClient,
     execution_engine_service_client::ExecutionEngineServiceClient,
     worker_coordinator_service_client::WorkerCoordinatorServiceClient, AppendBatchRequest,
-    AppendBatchResponse, AppendRequest, CheckpointRequest, CheckpointType, CompleteJobRequest,
-    CompleteJobResponse, DurableStepCheckpoint, EventStreamMessage, FindByStepKeyRequest,
-    GetEntityStateRequest, GetEntityStateResponse, PollJobRequest, PollJobResponse,
-    PutEntityStateRequest, PutEntityStateResponse, Record, RegisterService,
-    RegisterWorkerSessionRequest, RegisterWorkerSessionResponse, RenewJobLeaseRequest,
-    RenewJobLeaseResponse, ReportWorkerCapacityRequest, ReportWorkerCapacityResponse,
-    RuntimeMessage, ServiceMessage,
+    AppendBatchResponse, AppendRequest, BeginActivationRequest, BeginActivationResponse,
+    CheckpointRequest, CheckpointType, CompleteActivationRequest, CompleteActivationResponse,
+    CompleteJobRequest, CompleteJobResponse, DurableStepCheckpoint, EventStreamMessage,
+    FailActivationRequest, FailActivationResponse, FindByStepKeyRequest, GetEntityStateRequest,
+    GetEntityStateResponse, PollJobRequest, PollJobResponse, PutEntityStateRequest,
+    PutEntityStateResponse, Record, RegisterService, RegisterWorkerSessionRequest,
+    RegisterWorkerSessionResponse, RenewJobLeaseRequest, RenewJobLeaseResponse,
+    ReportWorkerCapacityRequest, ReportWorkerCapacityResponse, RuntimeMessage, ServiceMessage,
+    SuspendActivationRequest, SuspendActivationResponse,
 };
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tonic::transport::Channel;
 use tonic::Code;
 use tracing::{debug, error};
+
+pub const DURABLE_ACTIVATION_V1_CAPABILITY: &str = "durable_activation_v1";
+pub const DURABLE_SUSPENSION_V1_CAPABILITY: &str = "durable_suspension_v1";
+
+pub fn worker_protocol_capabilities() -> (Vec<String>, Vec<String>) {
+    match std::env::var("AGNT5_DURABLE_ACTIVATION_MODE")
+        .unwrap_or_else(|_| "preferred".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "disabled" => (Vec::new(), Vec::new()),
+        "required" => (
+            vec![
+                DURABLE_ACTIVATION_V1_CAPABILITY.to_string(),
+                DURABLE_SUSPENSION_V1_CAPABILITY.to_string(),
+            ],
+            vec![DURABLE_ACTIVATION_V1_CAPABILITY.to_string()],
+        ),
+        _ => (
+            vec![
+                DURABLE_ACTIVATION_V1_CAPABILITY.to_string(),
+                DURABLE_SUSPENSION_V1_CAPABILITY.to_string(),
+            ],
+            Vec::new(),
+        ),
+    }
+}
+
+pub(crate) fn validate_protocol_capabilities(
+    worker_supported: &[String],
+    worker_required: &[String],
+    runtime_supported: &[String],
+    runtime_required: &[String],
+) -> Result<()> {
+    if let Some(required) = worker_required
+        .iter()
+        .find(|required| !runtime_supported.contains(required))
+    {
+        return Err(SdkError::Activation {
+            message: format!("runtime did not negotiate required protocol capability: {required}"),
+            code: crate::error::ErrorCode::DurabilityUnavailable,
+            activation_id: None,
+            attempt: None,
+        });
+    }
+    if let Some(required) = runtime_required
+        .iter()
+        .find(|required| !worker_supported.contains(required))
+    {
+        return Err(SdkError::Activation {
+            message: format!("runtime requires unsupported worker protocol capability: {required}"),
+            code: crate::error::ErrorCode::DurabilityUnavailable,
+            activation_id: None,
+            attempt: None,
+        });
+    }
+    if worker_supported
+        .iter()
+        .any(|capability| capability == DURABLE_ACTIVATION_V1_CAPABILITY)
+        && !worker_required
+            .iter()
+            .any(|capability| capability == DURABLE_ACTIVATION_V1_CAPABILITY)
+        && !runtime_supported
+            .iter()
+            .any(|capability| capability == DURABLE_ACTIVATION_V1_CAPABILITY)
+    {
+        eprintln!(
+            "[WARN] agnt5 durable activation degraded: runtime did not advertise durable_activation_v1; legacy checkpoints remain enabled"
+        );
+    }
+    Ok(())
+}
+
+fn negotiated_protocol_capabilities(
+    worker_supported: &[String],
+    runtime_supported: &[String],
+) -> Vec<String> {
+    worker_supported
+        .iter()
+        .filter(|capability| runtime_supported.contains(capability))
+        .fold(Vec::new(), |mut negotiated, capability| {
+            if !negotiated.contains(capability) {
+                negotiated.push(capability.clone());
+            }
+            negotiated
+        })
+}
+
+fn activation_status(operation: &str, status: tonic::Status) -> SdkError {
+    crate::runtime_adapter::activation_status_error(operation, status)
+}
 
 /// Simple client for communicating with the Worker Coordinator service.
 ///
@@ -32,6 +126,7 @@ use tracing::{debug, error};
 pub struct WorkerCoordinatorClient {
     client: WorkerCoordinatorServiceClient<Channel>,
     engine_client: EngineServiceClient<Channel>,
+    negotiated_protocol_capabilities: Arc<RwLock<Vec<String>>>,
 }
 
 const WORKER_COORDINATOR_RPC_TIMEOUT: Duration = Duration::from_secs(45);
@@ -76,7 +171,31 @@ impl WorkerCoordinatorClient {
         Ok(Self {
             client,
             engine_client,
+            negotiated_protocol_capabilities: Arc::new(RwLock::new(Vec::new())),
         })
+    }
+
+    pub(crate) fn retain_negotiated_protocol_capabilities(
+        &self,
+        worker_supported: &[String],
+        runtime_supported: &[String],
+    ) {
+        let negotiated = negotiated_protocol_capabilities(worker_supported, runtime_supported);
+        let mut capabilities = self
+            .negotiated_protocol_capabilities
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *capabilities = negotiated;
+    }
+
+    /// Return whether this worker session actually negotiated a protocol
+    /// capability with the runtime. Clones share the same session state.
+    pub fn negotiated_protocol_capability(&self, capability: &str) -> bool {
+        self.negotiated_protocol_capabilities
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|negotiated| negotiated == capability)
     }
 
     /// Create a worker stream with immediate registration (based on working pattern)
@@ -88,6 +207,8 @@ impl WorkerCoordinatorClient {
         flume::Sender<ServiceMessage>,
         flume::Receiver<RuntimeMessage>,
     )> {
+        let worker_supported_protocols = registration.supported_protocol_capabilities.clone();
+        let worker_required_protocols = registration.required_protocol_capabilities.clone();
         // Create the registration message first
         let registration_message = ServiceMessage {
             worker_id: worker_id.clone(),
@@ -182,6 +303,16 @@ impl WorkerCoordinatorClient {
                             source: None,
                         });
                     }
+                    validate_protocol_capabilities(
+                        &worker_supported_protocols,
+                        &worker_required_protocols,
+                        &resp.supported_protocol_capabilities,
+                        &resp.required_protocol_capabilities,
+                    )?;
+                    self.retain_negotiated_protocol_capabilities(
+                        &worker_supported_protocols,
+                        &resp.supported_protocol_capabilities,
+                    );
                 }
                 _ => {
                     error!("Unexpected response type to registration");
@@ -494,7 +625,7 @@ impl WorkerCoordinatorClient {
             })
     }
 
-    /// Renew an active job lease for a parked-poll assignment.
+    /// Renew an active push or pull execution lease.
     pub async fn renew_job_lease(
         &mut self,
         req: RenewJobLeaseRequest,
@@ -559,6 +690,20 @@ impl WorkerCoordinatorClient {
 
         Ok(response)
     }
+
+    /// Suspend a polled job through the Engine RPC. Pull workers do not keep a
+    /// bidirectional dispatch stream, so they cannot return this typed result
+    /// through WorkerStream like push workers do.
+    pub async fn suspend_activation(
+        &mut self,
+        req: SuspendActivationRequest,
+    ) -> Result<SuspendActivationResponse> {
+        self.engine_client
+            .suspend_activation(req)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|status| activation_status("SuspendActivation", status))
+    }
 }
 
 /// Open an EventStream on the Execution Engine for sending ephemeral events (SSE-only).
@@ -609,6 +754,7 @@ pub async fn create_ee_event_stream(
 /// the h2 PoisonError that occurs when 100+ concurrent requests share one connection.
 const ENGINE_POOL_SIZE: usize = 8;
 const ENGINE_RPC_RETRY_ATTEMPTS: usize = 20;
+const ENGINE_ACTIVATION_RPC_ATTEMPTS: usize = 6;
 const ENGINE_RPC_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 fn is_retryable_engine_status(status: &tonic::Status) -> bool {
@@ -681,6 +827,12 @@ async fn sleep_engine_retry(attempt: usize) {
     tokio::time::sleep(ENGINE_RPC_RETRY_DELAY * multiplier).await;
 }
 
+fn should_retry_activation_status(status: &tonic::Status, attempt: usize) -> bool {
+    attempt + 1 < ENGINE_ACTIVATION_RPC_ATTEMPTS
+        && status.details().is_empty()
+        && is_retryable_engine_status(status)
+}
+
 /// Client for communicating with the AGNT5 Engine.
 ///
 /// Uses a pool of N independent gRPC connections with round-robin selection.
@@ -744,6 +896,99 @@ impl EngineClient {
     fn next_client(&mut self) -> &mut EngineServiceClient<Channel> {
         let idx = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.clients.len();
         &mut self.clients[idx]
+    }
+
+    /// Admit one logical activation and return the journal-authoritative decision.
+    pub async fn begin_activation(
+        &mut self,
+        request: BeginActivationRequest,
+    ) -> Result<BeginActivationResponse> {
+        for attempt in 0..ENGINE_ACTIVATION_RPC_ATTEMPTS {
+            match self.next_client().begin_activation(request.clone()).await {
+                Ok(response) => return Ok(response.into_inner()),
+                Err(status) if should_retry_activation_status(&status, attempt) => {
+                    debug!(
+                        attempt = attempt + 1,
+                        status = %status,
+                        "BeginActivation hit a transient gRPC status; retrying the exact command"
+                    );
+                    sleep_engine_retry(attempt).await;
+                }
+                Err(status) => return Err(activation_status("BeginActivation", status)),
+            }
+        }
+        unreachable!("activation retry loop always returns")
+    }
+
+    /// Commit one fenced activation completion and wait for its durability acknowledgement.
+    pub async fn complete_activation(
+        &mut self,
+        request: CompleteActivationRequest,
+    ) -> Result<CompleteActivationResponse> {
+        for attempt in 0..ENGINE_ACTIVATION_RPC_ATTEMPTS {
+            match self
+                .next_client()
+                .complete_activation(request.clone())
+                .await
+            {
+                Ok(response) => return Ok(response.into_inner()),
+                Err(status) if should_retry_activation_status(&status, attempt) => {
+                    debug!(
+                        attempt = attempt + 1,
+                        status = %status,
+                        "CompleteActivation hit a transient gRPC status; retrying the exact command"
+                    );
+                    sleep_engine_retry(attempt).await;
+                }
+                Err(status) => return Err(activation_status("CompleteActivation", status)),
+            }
+        }
+        unreachable!("activation retry loop always returns")
+    }
+
+    /// Commit one fenced activation failure and wait for its durability acknowledgement.
+    pub async fn fail_activation(
+        &mut self,
+        request: FailActivationRequest,
+    ) -> Result<FailActivationResponse> {
+        for attempt in 0..ENGINE_ACTIVATION_RPC_ATTEMPTS {
+            match self.next_client().fail_activation(request.clone()).await {
+                Ok(response) => return Ok(response.into_inner()),
+                Err(status) if should_retry_activation_status(&status, attempt) => {
+                    debug!(
+                        attempt = attempt + 1,
+                        status = %status,
+                        "FailActivation hit a transient gRPC status; retrying the exact command"
+                    );
+                    sleep_engine_retry(attempt).await;
+                }
+                Err(status) => return Err(activation_status("FailActivation", status)),
+            }
+        }
+        unreachable!("activation retry loop always returns")
+    }
+
+    /// Atomically park one fenced activation and its parent run until a
+    /// durable timer generation is ready.
+    pub async fn suspend_activation(
+        &mut self,
+        request: SuspendActivationRequest,
+    ) -> Result<SuspendActivationResponse> {
+        for attempt in 0..ENGINE_ACTIVATION_RPC_ATTEMPTS {
+            match self.next_client().suspend_activation(request.clone()).await {
+                Ok(response) => return Ok(response.into_inner()),
+                Err(status) if should_retry_activation_status(&status, attempt) => {
+                    debug!(
+                        attempt = attempt + 1,
+                        status = %status,
+                        "SuspendActivation hit a transient gRPC status; retrying the exact command"
+                    );
+                    sleep_engine_retry(attempt).await;
+                }
+                Err(status) => return Err(activation_status("SuspendActivation", status)),
+            }
+        }
+        unreachable!("activation retry loop always returns")
     }
 
     /// Append a single record to the engine.
@@ -910,6 +1155,27 @@ mod tests {
         assert!(!is_retryable_engine_status(&status));
     }
 
+    #[test]
+    fn activation_rpc_retry_is_bounded_to_transient_statuses() {
+        let lagging_replica =
+            tonic::Status::unavailable("activation actv1_test is not yet visible on this replica");
+        assert!(should_retry_activation_status(&lagging_replica, 0));
+        assert!(!should_retry_activation_status(
+            &lagging_replica,
+            ENGINE_ACTIVATION_RPC_ATTEMPTS - 1
+        ));
+
+        let conflict = tonic::Status::already_exists("payload conflict");
+        assert!(!should_retry_activation_status(&conflict, 0));
+
+        let typed_conflict = tonic::Status::with_details(
+            tonic::Code::Unavailable,
+            "typed activation outcome",
+            bytes::Bytes::from_static(b"activation-error-detail"),
+        );
+        assert!(!should_retry_activation_status(&typed_conflict, 0));
+    }
+
     #[tokio::test]
     async fn append_batch_rejects_multi_run_before_retry_or_rpc() {
         let mut client = EngineClient {
@@ -958,6 +1224,49 @@ mod tests {
             let error = validate_append_batch_response(&response, 2).unwrap_err();
             assert!(matches!(error, SdkError::Internal(_)));
         }
+    }
+
+    #[test]
+    fn protocol_capability_negotiation_fails_closed_when_required() {
+        let durable = DURABLE_ACTIVATION_V1_CAPABILITY.to_string();
+        let error = validate_protocol_capabilities(
+            std::slice::from_ref(&durable),
+            std::slice::from_ref(&durable),
+            &[],
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), crate::error::ErrorCode::DurabilityUnavailable);
+
+        let error =
+            validate_protocol_capabilities(&[], &[], &[], &["runtime_v2".into()]).unwrap_err();
+        assert_eq!(error.code(), crate::error::ErrorCode::DurabilityUnavailable);
+
+        validate_protocol_capabilities(
+            std::slice::from_ref(&durable),
+            std::slice::from_ref(&durable),
+            std::slice::from_ref(&durable),
+            &[],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn protocol_capability_negotiation_retains_only_the_intersection() {
+        assert_eq!(
+            negotiated_protocol_capabilities(
+                &[
+                    DURABLE_ACTIVATION_V1_CAPABILITY.into(),
+                    "worker_only".into(),
+                    DURABLE_ACTIVATION_V1_CAPABILITY.into(),
+                ],
+                &[
+                    DURABLE_ACTIVATION_V1_CAPABILITY.into(),
+                    "runtime_only".into(),
+                ],
+            ),
+            vec![DURABLE_ACTIVATION_V1_CAPABILITY.to_string()]
+        );
     }
 }
 

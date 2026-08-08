@@ -532,11 +532,18 @@ message RegisterService {
   // plus AGNT5-owned built-in capabilities that are routable but should not be
   // registered as user components.
   repeated WorkerCapability capabilities = 9;
+
+  // Typed runtime protocol capabilities. Keep these separate from routable
+  // component capabilities so protocol negotiation cannot affect routing.
+  repeated string supported_protocol_capabilities = 10;
+  repeated string required_protocol_capabilities = 11;
 }
 
 message RegisterServiceResponse {
   bool ack = 1;
   string error = 2;
+  repeated string supported_protocol_capabilities = 3;
+  repeated string required_protocol_capabilities = 4;
 }
 
 message GetServiceComponents {
@@ -668,6 +675,21 @@ message StepCheckpoint {
   bytes result = 6;
 }
 
+// WorkerSuspension is a nonterminal durable execution result. The runtime
+// validates the activation authority and atomically records the activation
+// suspension, run pause, and timer generation before acknowledging the worker.
+message WorkerSuspension {
+  string activation_id = 1;
+  uint32 attempt = 2;
+  bytes fence_token = 3;
+  string timer_key = 4;
+  int64 ready_at_ms = 5;
+  bytes input_digest = 6;
+  bytes definition_digest = 7;
+  bytes continuation = 8;
+  int64 delay_ms = 9; // Requested duration; runtime derives ready_at_ms
+}
+
 // Response from component dispatch (extensible for all types)
 // Used for Worker → WC → EE communication
 message DispatchComponentResponse {
@@ -678,6 +700,7 @@ message DispatchComponentResponse {
     bytes output_data = 3;       // Simple output (functions)
     StateUpdate state_update = 4; // State changes (virtual objects)
     FlowContinuation flow_continuation = 5; // Flow next step
+    WorkerSuspension worker_suspension = 14; // Durable nonterminal wait
   }
 
   string error_message = 6;      // Error message if failed
