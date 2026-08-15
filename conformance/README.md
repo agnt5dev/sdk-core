@@ -35,3 +35,8 @@ Harnesses that provision runtimes, invoke deployed workers, or aggregate CI
 results belong with the environment that operates them. They should consume
 these contracts without making this repository depend on a particular SDK
 language.
+
+Transport and bootstrap contracts that are not component invocations are
+specified alongside this README. See
+[`external-worker-bootstrap-v1.md`](external-worker-bootstrap-v1.md) for the
+customer-hosted worker discovery, token, and reconnect contract.

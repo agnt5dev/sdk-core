@@ -1,4 +1,5 @@
 use crate::error::{Result, SdkError};
+use crate::external_worker::ExternalWorkerSession;
 use crate::pb::{
     engine_service_client::EngineServiceClient,
     execution_engine_service_client::ExecutionEngineServiceClient,
@@ -127,6 +128,7 @@ pub struct WorkerCoordinatorClient {
     client: WorkerCoordinatorServiceClient<Channel>,
     engine_client: EngineServiceClient<Channel>,
     negotiated_protocol_capabilities: Arc<RwLock<Vec<String>>>,
+    external_session: Option<Arc<ExternalWorkerSession>>,
 }
 
 const WORKER_COORDINATOR_RPC_TIMEOUT: Duration = Duration::from_secs(45);
@@ -143,9 +145,39 @@ fn is_idle_poll_timeout(status: &tonic::Status) -> bool {
         && status.message().to_ascii_lowercase().contains("timeout")
 }
 
+async fn authenticated_request<T>(
+    external_session: &Option<Arc<ExternalWorkerSession>>,
+    message: T,
+) -> Result<tonic::Request<T>> {
+    let mut request = tonic::Request::new(message);
+    if let Some(session) = external_session {
+        let token = session.workload_token().await?;
+        let authorization =
+            format!("Bearer {token}")
+                .parse()
+                .map_err(|error| SdkError::Configuration {
+                    message: format!("workload token cannot be encoded as gRPC metadata: {error}"),
+                    field: None,
+                })?;
+        request
+            .metadata_mut()
+            .insert("authorization", authorization);
+    }
+    Ok(request)
+}
+
 impl WorkerCoordinatorClient {
     /// Create a new client connected to the Worker Coordinator
     pub async fn connect(endpoint: String) -> Result<Self> {
+        Self::connect_with_external_session(endpoint, None).await
+    }
+
+    /// Connect with refreshable external-worker authentication. Managed and
+    /// local callers continue to use `connect`, which sends no bearer metadata.
+    pub async fn connect_with_external_session(
+        endpoint: String,
+        external_session: Option<Arc<ExternalWorkerSession>>,
+    ) -> Result<Self> {
         debug!("Connecting to Worker Coordinator at {}", endpoint);
 
         let channel = Channel::from_shared(endpoint.clone())
@@ -172,6 +204,7 @@ impl WorkerCoordinatorClient {
             client,
             engine_client,
             negotiated_protocol_capabilities: Arc::new(RwLock::new(Vec::new())),
+            external_session,
         })
     }
 
@@ -375,9 +408,10 @@ impl WorkerCoordinatorClient {
         };
 
         // EventStream now lives on EngineService (moved from WorkerCoordinatorService).
+        let request = authenticated_request(&self.external_session, stream).await?;
         let mut client = self.engine_client.clone();
         tokio::spawn(async move {
-            match client.event_stream(stream).await {
+            match client.event_stream(request).await {
                 Ok(response) => {
                     let ack = response.into_inner();
                     debug!(
@@ -457,6 +491,7 @@ impl WorkerCoordinatorClient {
         };
 
         // Checkpoint moved from WorkerCoordinatorService → EngineService.
+        let request = authenticated_request(&self.external_session, request).await?;
         let response = self
             .engine_client
             .checkpoint(request)
@@ -521,6 +556,7 @@ impl WorkerCoordinatorClient {
             step_key,
         };
 
+        let request = authenticated_request(&self.external_session, request).await?;
         let response = self
             .engine_client
             .find_by_step_key(request)
@@ -550,9 +586,10 @@ impl WorkerCoordinatorClient {
         &mut self,
         req: RegisterWorkerSessionRequest,
     ) -> Result<RegisterWorkerSessionResponse> {
+        let request = authenticated_request(&self.external_session, req).await?;
         let response = self
             .engine_client
-            .register_worker_session(req)
+            .register_worker_session(request)
             .await
             .map_err(|e| {
                 debug!("RegisterWorkerSession RPC failed: {}", e);
@@ -570,7 +607,7 @@ impl WorkerCoordinatorClient {
     /// Park one worker slot until a job is available or the Engine times out.
     pub async fn poll_job(&mut self, req: PollJobRequest) -> Result<PollJobResponse> {
         let timeout = poll_job_deadline(&req);
-        let mut request = tonic::Request::new(req);
+        let mut request = authenticated_request(&self.external_session, req).await?;
         request.set_timeout(timeout);
         let response = match self.engine_client.poll_job(request).await {
             Ok(response) => response,
@@ -598,8 +635,9 @@ impl WorkerCoordinatorClient {
         &mut self,
         req: GetEntityStateRequest,
     ) -> Result<GetEntityStateResponse> {
+        let request = authenticated_request(&self.external_session, req).await?;
         self.engine_client
-            .get_entity_state(req)
+            .get_entity_state(request)
             .await
             .map(|response| response.into_inner())
             .map_err(|error| SdkError::Connection {
@@ -614,8 +652,9 @@ impl WorkerCoordinatorClient {
         &mut self,
         req: PutEntityStateRequest,
     ) -> Result<PutEntityStateResponse> {
+        let request = authenticated_request(&self.external_session, req).await?;
         self.engine_client
-            .put_entity_state(req)
+            .put_entity_state(request)
             .await
             .map(|response| response.into_inner())
             .map_err(|error| SdkError::Connection {
@@ -630,9 +669,10 @@ impl WorkerCoordinatorClient {
         &mut self,
         req: RenewJobLeaseRequest,
     ) -> Result<RenewJobLeaseResponse> {
+        let request = authenticated_request(&self.external_session, req).await?;
         let response = self
             .engine_client
-            .renew_job_lease(req)
+            .renew_job_lease(request)
             .await
             .map_err(|e| {
                 debug!("RenewJobLease RPC failed: {}", e);
@@ -652,9 +692,10 @@ impl WorkerCoordinatorClient {
         &mut self,
         req: ReportWorkerCapacityRequest,
     ) -> Result<ReportWorkerCapacityResponse> {
+        let request = authenticated_request(&self.external_session, req).await?;
         let response = self
             .engine_client
-            .report_worker_capacity(req)
+            .report_worker_capacity(request)
             .await
             .map_err(|e| {
                 debug!("ReportWorkerCapacity RPC failed: {}", e);
@@ -674,9 +715,10 @@ impl WorkerCoordinatorClient {
     ///
     /// CompleteJob now lives on EngineService (moved from WorkerCoordinatorService).
     pub async fn complete_job(&mut self, req: CompleteJobRequest) -> Result<CompleteJobResponse> {
+        let request = authenticated_request(&self.external_session, req).await?;
         let response = self
             .engine_client
-            .complete_job(req)
+            .complete_job(request)
             .await
             .map_err(|e| {
                 error!("CompleteJob RPC failed: {}", e);
@@ -698,8 +740,9 @@ impl WorkerCoordinatorClient {
         &mut self,
         req: SuspendActivationRequest,
     ) -> Result<SuspendActivationResponse> {
+        let request = authenticated_request(&self.external_session, req).await?;
         self.engine_client
-            .suspend_activation(req)
+            .suspend_activation(request)
             .await
             .map(|response| response.into_inner())
             .map_err(|status| activation_status("SuspendActivation", status))
@@ -842,11 +885,19 @@ fn should_retry_activation_status(status: &tonic::Status, attempt: usize) -> boo
 pub struct EngineClient {
     clients: Vec<EngineServiceClient<Channel>>,
     next: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    external_session: Option<Arc<ExternalWorkerSession>>,
 }
 
 impl EngineClient {
     /// Connect to the engine at the given endpoint with a pool of connections.
     pub async fn connect(endpoint: &str) -> Result<Self> {
+        Self::connect_with_external_session(endpoint, None).await
+    }
+
+    pub async fn connect_with_external_session(
+        endpoint: &str,
+        external_session: Option<Arc<ExternalWorkerSession>>,
+    ) -> Result<Self> {
         debug!(
             "Connecting to Engine at {} (pool_size={})",
             endpoint, ENGINE_POOL_SIZE
@@ -889,6 +940,7 @@ impl EngineClient {
         Ok(Self {
             clients,
             next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            external_session,
         })
     }
 
@@ -904,7 +956,8 @@ impl EngineClient {
         request: BeginActivationRequest,
     ) -> Result<BeginActivationResponse> {
         for attempt in 0..ENGINE_ACTIVATION_RPC_ATTEMPTS {
-            match self.next_client().begin_activation(request.clone()).await {
+            let request = authenticated_request(&self.external_session, request.clone()).await?;
+            match self.next_client().begin_activation(request).await {
                 Ok(response) => return Ok(response.into_inner()),
                 Err(status) if should_retry_activation_status(&status, attempt) => {
                     debug!(
@@ -926,11 +979,8 @@ impl EngineClient {
         request: CompleteActivationRequest,
     ) -> Result<CompleteActivationResponse> {
         for attempt in 0..ENGINE_ACTIVATION_RPC_ATTEMPTS {
-            match self
-                .next_client()
-                .complete_activation(request.clone())
-                .await
-            {
+            let request = authenticated_request(&self.external_session, request.clone()).await?;
+            match self.next_client().complete_activation(request).await {
                 Ok(response) => return Ok(response.into_inner()),
                 Err(status) if should_retry_activation_status(&status, attempt) => {
                     debug!(
@@ -952,7 +1002,8 @@ impl EngineClient {
         request: FailActivationRequest,
     ) -> Result<FailActivationResponse> {
         for attempt in 0..ENGINE_ACTIVATION_RPC_ATTEMPTS {
-            match self.next_client().fail_activation(request.clone()).await {
+            let request = authenticated_request(&self.external_session, request.clone()).await?;
+            match self.next_client().fail_activation(request).await {
                 Ok(response) => return Ok(response.into_inner()),
                 Err(status) if should_retry_activation_status(&status, attempt) => {
                     debug!(
@@ -975,7 +1026,8 @@ impl EngineClient {
         request: SuspendActivationRequest,
     ) -> Result<SuspendActivationResponse> {
         for attempt in 0..ENGINE_ACTIVATION_RPC_ATTEMPTS {
-            match self.next_client().suspend_activation(request.clone()).await {
+            let request = authenticated_request(&self.external_session, request.clone()).await?;
+            match self.next_client().suspend_activation(request).await {
                 Ok(response) => return Ok(response.into_inner()),
                 Err(status) if should_retry_activation_status(&status, attempt) => {
                     debug!(
@@ -994,13 +1046,14 @@ impl EngineClient {
     /// Append a single record to the engine.
     pub async fn append(&mut self, record: Record) -> Result<(u64, i64)> {
         for attempt in 0..ENGINE_RPC_RETRY_ATTEMPTS {
-            match self
-                .next_client()
-                .append(AppendRequest {
+            let request = authenticated_request(
+                &self.external_session,
+                AppendRequest {
                     record: Some(record.clone()),
-                })
-                .await
-            {
+                },
+            )
+            .await?;
+            match self.next_client().append(request).await {
                 Ok(response) => {
                     let response = response.into_inner();
                     return Ok((response.offset, response.timestamp_ns));
@@ -1036,13 +1089,14 @@ impl EngineClient {
         validate_append_batch_records(&records)?;
         let expected = records.len();
         for attempt in 0..ENGINE_RPC_RETRY_ATTEMPTS {
-            match self
-                .next_client()
-                .append_batch(AppendBatchRequest {
+            let request = authenticated_request(
+                &self.external_session,
+                AppendBatchRequest {
                     records: records.clone(),
-                })
-                .await
-            {
+                },
+            )
+            .await?;
+            match self.next_client().append_batch(request).await {
                 Ok(response) => {
                     let response = response.into_inner();
                     return validate_append_batch_response(&response, expected);
@@ -1081,9 +1135,11 @@ impl EngineClient {
             return Ok(0);
         }
         let expected = events.len() as i64;
+        let request =
+            authenticated_request(&self.external_session, tokio_stream::iter(events)).await?;
         let response = self
             .next_client()
-            .event_stream(tokio_stream::iter(events))
+            .event_stream(request)
             .await
             .map_err(|status| SdkError::Connection {
                 message: format!("Engine EventStream failed: {status}"),
@@ -1181,6 +1237,7 @@ mod tests {
         let mut client = EngineClient {
             clients: Vec::new(),
             next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            external_session: None,
         };
         let records = vec![
             Record {

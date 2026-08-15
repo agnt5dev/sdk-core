@@ -47,6 +47,24 @@ agnt5-sdk-core = { version = "0.1.6", features = ["libsql-memory"] }
 | `libsql-memory` | Embedded libSQL-backed vector memory |
 | `wasm-sandbox` | Embedded Wasmtime sandbox execution |
 
+## Customer-hosted workers
+
+Python and TypeScript workers use this crate to connect from customer Docker
+hosts or Kubernetes clusters without hard-coded runtime IDs and endpoints. Set
+`AGNT5_API_KEY_FILE` to a readable service-key file and
+`AGNT5_EXTERNAL_WORKER=true`; optionally set `AGNT5_ENVIRONMENT` and override
+`AGNT5_CONTROL_PLANE_URL` for staging or self-hosted control planes.
+
+Core discovers the authorized project/deployment placement, exchanges the
+bootstrap key for a short-lived workload token, selects pull mode, and refreshes
+authentication during reconnect. The bootstrap key is used only for HTTPS
+discovery/exchange and is never sent to the runtime. Production control-plane
+and runtime endpoints must use verified TLS; plaintext is accepted only on a
+loopback address for local tests.
+
+The normative cross-SDK behavior is documented in
+[`conformance/external-worker-bootstrap-v1.md`](conformance/external-worker-bootstrap-v1.md).
+
 ## Repository boundaries
 
 This repository owns the language-neutral SDK runtime contracts and their Rust

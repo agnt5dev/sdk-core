@@ -1,5 +1,6 @@
 use crate::client::{self, EngineClient, WorkerCoordinatorClient};
 use crate::error::{Result, SdkError};
+use crate::external_worker::{ExternalWorkerBootstrapConfig, ExternalWorkerSession};
 use crate::journal_queue::{JournalEventMessage, JournalEventQueue, JournalQueueConfig};
 use crate::pb::{
     execution_engine_service_client::ExecutionEngineServiceClient, runtime_message,
@@ -604,6 +605,20 @@ pub enum ConnectionState {
     Error(String),
 }
 
+struct JournalFlushTask {
+    shutdown: tokio::sync::watch::Sender<bool>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl JournalFlushTask {
+    async fn shutdown(self) {
+        let _ = self.shutdown.send(true);
+        if let Err(error) = self.handle.await {
+            warn!(?error, "Journal flush supervisor failed during shutdown");
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkerConfig {
     pub service_name: String,
@@ -737,11 +752,31 @@ pub fn collect_agnt5_env_vars() -> HashMap<String, String> {
 }
 
 fn canonical_project_id_from_metadata(metadata: &HashMap<String, String>) -> Option<String> {
-    metadata.get("project_id").cloned()
+    metadata
+        .get("project_id")
+        .map(|project_id| project_id.trim())
+        .filter(|project_id| !project_id.is_empty())
+        .map(str::to_string)
 }
 
 fn canonical_project_id_from_env() -> String {
     std::env::var("AGNT5_PROJECT_ID").ok().unwrap_or_default()
+}
+
+fn resolved_project_id(
+    event_metadata: &HashMap<String, String>,
+    worker_metadata: &HashMap<String, String>,
+    discovered_project_id: Option<&str>,
+) -> String {
+    canonical_project_id_from_metadata(event_metadata)
+        .or_else(|| canonical_project_id_from_metadata(worker_metadata))
+        .or_else(|| {
+            discovered_project_id
+                .map(str::trim)
+                .filter(|project_id| !project_id.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
 }
 
 fn with_project_metadata(
@@ -749,9 +784,15 @@ fn with_project_metadata(
     project_id: &str,
 ) -> HashMap<String, String> {
     if !project_id.is_empty() {
-        metadata
-            .entry("project_id".to_string())
-            .or_insert_with(|| project_id.to_string());
+        match metadata.get_mut("project_id") {
+            Some(existing) if existing.trim().is_empty() => {
+                *existing = project_id.to_string();
+            }
+            Some(_) => {}
+            None => {
+                metadata.insert("project_id".to_string(), project_id.to_string());
+            }
+        }
     }
     metadata
 }
@@ -809,6 +850,9 @@ pub struct Worker {
     /// Lazily-connected Engine gRPC client. When AGNT5_ENGINE_URL is set, all event paths
     /// route through this client instead of the Go EE.
     engine_client: Arc<TokioMutex<Option<EngineClient>>>,
+    /// Cached external-worker discovery and refreshable workload token. Empty
+    /// for existing managed/local workers.
+    external_session: Arc<TokioMutex<Option<Arc<ExternalWorkerSession>>>>,
     /// Serializes queue flushes and checkpoints within each run. Unrelated
     /// runs can persist checkpoints concurrently.
     journal_flush_locks: RunFlushLocks,
@@ -2672,9 +2716,40 @@ impl Worker {
             event_stream_tx: Arc::new(std::sync::Mutex::new(None)),
             dispatch_tx: Arc::new(std::sync::Mutex::new(None)),
             engine_client: Arc::new(TokioMutex::new(None)),
+            external_session: Arc::new(TokioMutex::new(None)),
             journal_flush_locks: RunFlushLocks::default(),
             slot_phases: WorkerSlotPhases::default(),
         }
+    }
+
+    async fn ensure_external_worker_session(&self) -> Result<Option<Arc<ExternalWorkerSession>>> {
+        let mut session = self.external_session.lock().await;
+        if let Some(existing) = session.as_ref() {
+            return Ok(Some(existing.clone()));
+        }
+        let programmatic_legacy_coordinates = (std::env::var("AGNT5_COORDINATOR_ENDPOINT")
+            .is_err()
+            && self.config.coordinator_endpoint != "http://localhost:34186")
+            || (std::env::var("AGNT5_ENGINE_URL").is_err()
+                && self.config.engine_endpoint.is_some())
+            || (std::env::var("AGNT5_EE_ENDPOINT").is_err()
+                && self.config.ee_endpoint != self.config.coordinator_endpoint)
+            || self.metadata.contains_key("project_id")
+            || self.metadata.contains_key("deployment_id");
+        let Some(config) = ExternalWorkerBootstrapConfig::from_env_with_legacy_coordinates(
+            programmatic_legacy_coordinates,
+        )?
+        else {
+            return Ok(None);
+        };
+        let connected = ExternalWorkerSession::connect(config).await?;
+        eprintln!(
+            "[INFO] AGNT5 external worker authenticated (environment={}, deployment={})",
+            connected.connection().environment_id,
+            connected.connection().deployment_id
+        );
+        *session = Some(connected.clone());
+        Ok(Some(connected))
     }
 
     /// Get a clone of the journal event queue for use by language SDKs
@@ -2829,11 +2904,13 @@ impl Worker {
     }
 
     /// Ensure the Engine gRPC client is connected, lazily creating it on first use.
-    /// Returns None if AGNT5_ENGINE_URL is not configured.
+    /// Returns None if neither external discovery nor AGNT5_ENGINE_URL is configured.
     async fn ensure_engine_client(&self) -> Result<Option<EngineClient>> {
-        let endpoint = match &self.config.engine_endpoint {
-            Some(ep) => ep.clone(),
-            None => return Ok(None),
+        let external_session = self.external_session.lock().await.clone();
+        let endpoint = match (&external_session, &self.config.engine_endpoint) {
+            (Some(session), _) => session.connection().runtime_endpoint.clone(),
+            (None, Some(endpoint)) => endpoint.clone(),
+            (None, None) => return Ok(None),
         };
 
         let mut guard = self.engine_client.lock().await;
@@ -2842,7 +2919,8 @@ impl Worker {
         }
 
         debug!("Connecting Engine client to {}", endpoint);
-        let client = EngineClient::connect(&endpoint).await?;
+        let client =
+            EngineClient::connect_with_external_session(&endpoint, external_session).await?;
         *guard = Some(client.clone());
         debug!("Engine client connected to {}", endpoint);
         Ok(Some(client))
@@ -3028,15 +3106,21 @@ impl Worker {
 
         // ── Engine path: when AGNT5_ENGINE_URL is set, route directly to engine ──
         if let Some(mut engine) = self.ensure_engine_client().await? {
+            let discovered_project_id = self
+                .external_session
+                .lock()
+                .await
+                .as_ref()
+                .map(|session| session.connection().project_id.clone());
+            let checkpoint_project_id =
+                resolved_project_id(&metadata, &self.metadata, discovered_project_id.as_deref());
             // Publish pending transient events through EventStream and persist
             // queued durable boundaries before appending this checkpoint.
             // Both calls are acknowledged while this run's flush barrier is held.
             if is_durable_checkpoint {
                 let pending = self.journal_queue.drain_run_events(&run_id);
                 if !pending.is_empty() {
-                    let tenant_id = canonical_project_id_from_metadata(&metadata)
-                        .or_else(|| canonical_project_id_from_metadata(&self.metadata))
-                        .unwrap_or_default();
+                    let tenant_id = checkpoint_project_id.clone();
                     let transient: Vec<_> = pending
                         .iter()
                         .filter(|event| event.is_sse_only)
@@ -3106,8 +3190,11 @@ impl Worker {
                     merged_metadata.insert(k.clone(), v.clone());
                 }
             }
-            let canonical_project_id =
-                canonical_project_id_from_metadata(&merged_metadata).unwrap_or_default();
+            let canonical_project_id = resolved_project_id(
+                &merged_metadata,
+                &self.metadata,
+                discovered_project_id.as_deref(),
+            );
             merged_metadata = with_project_metadata(merged_metadata, &canonical_project_id);
             let (correlation_id, parent_event_id) = take_correlation_ids(&mut merged_metadata);
             let tenant_id = merged_metadata
@@ -3483,6 +3570,12 @@ impl Worker {
             .await;
 
         if let Some(mut engine) = self.ensure_engine_client().await? {
+            let discovered_project_id = self
+                .external_session
+                .lock()
+                .await
+                .as_ref()
+                .map(|session| session.connection().project_id.clone());
             // The batch is an ordering boundary just like a single acknowledged
             // checkpoint. Flush anything already queued for these runs before
             // appending the batch so an earlier stream frame cannot be overtaken.
@@ -3495,8 +3588,13 @@ impl Worker {
                 let tenant_id = pending
                     .iter()
                     .find_map(|event| canonical_project_id_from_metadata(&event.metadata))
-                    .or_else(|| canonical_project_id_from_metadata(&self.metadata))
-                    .unwrap_or_default();
+                    .unwrap_or_else(|| {
+                        resolved_project_id(
+                            &HashMap::new(),
+                            &self.metadata,
+                            discovered_project_id.as_deref(),
+                        )
+                    });
                 let transient: Vec<_> = pending
                     .iter()
                     .filter(|event| event.is_sse_only)
@@ -3583,8 +3681,11 @@ impl Worker {
             let records: Vec<_> = originals
                 .iter()
                 .map(|event| {
-                    let canonical_project_id =
-                        canonical_project_id_from_metadata(&event.metadata).unwrap_or_default();
+                    let canonical_project_id = resolved_project_id(
+                        &event.metadata,
+                        &self.metadata,
+                        discovered_project_id.as_deref(),
+                    );
                     let mut metadata =
                         with_project_metadata(event.metadata.clone(), &canonical_project_id);
                     let tenant_id = metadata
@@ -3818,6 +3919,19 @@ impl Worker {
                     return Ok(());
                 }
                 Err(e) => {
+                    // A failure can occur after discovery but before the
+                    // connection reaches the normal cleanup path. Drop that
+                    // placement here as well so the next attempt cannot loop
+                    // forever on a superseded deployment or endpoint.
+                    let cleared_external_session = {
+                        let mut session = self.external_session.lock().await;
+                        session.take().is_some()
+                    };
+                    if cleared_external_session {
+                        let mut engine = self.engine_client.lock().await;
+                        *engine = None;
+                    }
+
                     // Check if we had a working session (Connected) that dropped,
                     // vs. failing to connect in the first place.
                     let was_connected =
@@ -3890,7 +4004,19 @@ impl Worker {
         // dial the configured endpoint on both first connect and
         // reconnect. The fenced routing projection inside the cluster
         // handles dispatch authority transparently.
-        let coordinator_endpoint = self.config.resolved_coordinator_endpoint();
+        let external_session = self.ensure_external_worker_session().await?;
+        let coordinator_endpoint = external_session
+            .as_ref()
+            .map(|session| session.connection().runtime_endpoint.clone())
+            .unwrap_or_else(|| self.config.resolved_coordinator_endpoint());
+        let project_id = external_session
+            .as_ref()
+            .map(|session| session.connection().project_id.clone())
+            .unwrap_or_else(canonical_project_id_from_env);
+        let deployment_id = external_session
+            .as_ref()
+            .map(|session| session.connection().deployment_id.clone())
+            .unwrap_or_else(|| std::env::var("AGNT5_DEPLOYMENT_ID").unwrap_or_default());
         // Surface the in-flight handshake so users don't stare at silence
         // during the (up to) 10s connect timeout. Pairs with the
         // "[INFO] Connected/Reconnected to coordinator" line below.
@@ -3905,12 +4031,19 @@ impl Worker {
                 coordinator_endpoint
             );
         }
-        let mut client = WorkerCoordinatorClient::connect(coordinator_endpoint.clone()).await?;
+        let mut client = WorkerCoordinatorClient::connect_with_external_session(
+            coordinator_endpoint.clone(),
+            external_session.clone(),
+        )
+        .await?;
 
         // Create registration message with components
         // Merge user-provided metadata with auto-collected AGNT5_* env vars
         let mut metadata = self.metadata.clone();
         metadata.extend(collect_agnt5_env_vars());
+        if !project_id.is_empty() {
+            metadata.insert("project_id".to_string(), project_id.clone());
+        }
         if let Some(artifact) = configured_activation_artifact_sha256(&metadata) {
             metadata.insert("activation_artifact_sha256".to_string(), artifact);
         }
@@ -3919,10 +4052,11 @@ impl Worker {
         // `AGNT5_WORKER_MODE=pull` now means parked long-poll assignment
         // (`RegisterWorkerSession` + `PollJob`). The legacy batch `PollJobs`
         // loop is intentionally gone.
-        let is_pull_mode = matches!(
-            std::env::var("AGNT5_WORKER_MODE").ok().as_deref(),
-            Some("pull") | Some("PULL")
-        );
+        let is_pull_mode = external_session.is_some()
+            || matches!(
+                std::env::var("AGNT5_WORKER_MODE").ok().as_deref(),
+                Some("pull") | Some("PULL")
+            );
         let mode = if is_pull_mode {
             crate::pb::WorkerMode::Pull as i32
         } else {
@@ -3931,8 +4065,6 @@ impl Worker {
         // stamp deployment_id from env so the coordinator's
         // proto-field path picks it up. Falls back to metadata key on
         // older coordinators that haven't been rebuilt yet.
-        let deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").unwrap_or_default();
-
         // declare concurrency budget so the coordinator can
         // size headroom reservations per priority class. Resolved from
         // config (set by a language binding or seeded from the
@@ -3953,7 +4085,7 @@ impl Worker {
             components: self.components.clone(),
             metadata,
             mode,
-            deployment_id,
+            deployment_id: deployment_id.clone(),
             max_concurrency,
             capabilities,
             supported_protocol_capabilities: supported_protocol_capabilities.clone(),
@@ -4020,33 +4152,39 @@ impl Worker {
 
         // Open EventStream on EE for ephemeral events (SSE-only: tokens, progress, logs).
         // EE is the single SSE publisher — WC no longer publishes to Centrifuge.
-        let event_stream_tx = match self.ensure_ee_client().await {
-            Ok(mut ee_client) => {
-                match crate::client::create_ee_event_stream(
-                    &mut ee_client,
-                    self.config.worker_id.clone(),
-                )
-                .await
-                {
-                    Ok(es_tx) => {
-                        debug!("EE EventStream opened for SSE-only events");
-                        Some(es_tx)
-                    }
-                    Err(e) => {
-                        warn!(
+        let event_stream_tx = if external_session.is_some() {
+            // External workers use authenticated Engine EventStream batches;
+            // the legacy ExecutionEngine client has no workload-token surface.
+            None
+        } else {
+            match self.ensure_ee_client().await {
+                Ok(mut ee_client) => {
+                    match crate::client::create_ee_event_stream(
+                        &mut ee_client,
+                        self.config.worker_id.clone(),
+                    )
+                    .await
+                    {
+                        Ok(es_tx) => {
+                            debug!("EE EventStream opened for SSE-only events");
+                            Some(es_tx)
+                        }
+                        Err(e) => {
+                            warn!(
                             "Failed to open EE EventStream, SSE-only events will use dispatch stream: {}",
                             e
                         );
-                        None
+                            None
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                warn!(
+                Err(e) => {
+                    warn!(
                     "Failed to get EE client for EventStream, SSE-only events will use dispatch stream: {}",
                     e
                 );
-                None
+                    None
+                }
             }
         };
 
@@ -4076,7 +4214,11 @@ impl Worker {
         };
 
         // Start unified journal event flush task (replaces checkpoint, delta, span, log flush tasks)
-        let journal_flush_task = self.spawn_journal_flush_task(tx.clone(), event_stream_tx.clone());
+        let journal_flush_task = self.spawn_journal_flush_task(
+            tx.clone(),
+            event_stream_tx.clone(),
+            external_session.clone(),
+        );
 
         // Reuse the concurrency budget computed for the registration
         // message above so the local pool size and the value reported
@@ -4138,6 +4280,10 @@ impl Worker {
                 in_flight.clone(),
                 supported_protocol_capabilities.clone(),
                 required_protocol_capabilities.clone(),
+                coordinator_endpoint.clone(),
+                project_id.clone(),
+                deployment_id.clone(),
+                external_session.clone(),
             ))
         } else {
             None
@@ -4461,12 +4607,6 @@ impl Worker {
         drop(task_rx); // Close receiver
         drop(response_tx); // Close response sender
 
-        // Clear cached EE client on disconnect so it reconnects on next connection
-        {
-            let mut guard = self.ee_client.lock().await;
-            *guard = None;
-        }
-
         // Wait for all worker tasks to complete. During coordinator drain this
         // lets the old stream finish only work that had already started before
         // reconnecting through the configured endpoint.
@@ -4492,7 +4632,23 @@ impl Worker {
         if let Some(task) = heartbeat_task {
             task.abort();
         }
-        journal_flush_task.abort();
+        journal_flush_task.shutdown().await;
+
+        // No handler or flush task can recreate a client beyond this point.
+        // Clear the Engine client while holding the external-session lock so
+        // the next attempt cannot observe a client bound to old placement.
+        {
+            let mut external = self.external_session.lock().await;
+            let mut engine = self.engine_client.lock().await;
+            *engine = None;
+            if external_session.is_some() {
+                *external = None;
+            }
+        }
+        {
+            let mut ee = self.ee_client.lock().await;
+            *ee = None;
+        }
 
         // Clear per-run tracking AFTER flush task is aborted, so the flush
         // task can drain any remaining SSE events first. In-flight work has
@@ -4636,7 +4792,8 @@ impl Worker {
         &self,
         dispatch_tx: flume::Sender<ServiceMessage>,
         event_stream_tx: Option<flume::Sender<EventStreamMessage>>,
-    ) -> tokio::task::JoinHandle<()> {
+        external_session: Option<Arc<ExternalWorkerSession>>,
+    ) -> JournalFlushTask {
         let worker_id_outer = self.config.worker_id.clone();
         let journal_queue_outer = self.journal_queue.clone();
         let streaming_runs_outer = self.streaming_runs.clone();
@@ -4644,7 +4801,12 @@ impl Worker {
         let revoked_executions_outer = self.revoked_executions.clone();
         let journal_flush_locks_outer = self.journal_flush_locks.clone();
         let ee_endpoint_outer = self.config.ee_endpoint.clone();
-        let engine_endpoint_outer = self.config.engine_endpoint.clone();
+        let engine_endpoint_outer = external_session
+            .as_ref()
+            .map(|session| session.connection().runtime_endpoint.clone())
+            .or_else(|| self.config.engine_endpoint.clone());
+        let external_session_outer = external_session;
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
         // Supervisor — restart the inner flush loop on panic with bounded
         // backoff. h2-0.4.13 panics with PoisonError under concurrent stream
@@ -4653,10 +4815,13 @@ impl Worker {
         // events pile up in the queue indefinitely. The inner loop is
         // panic-resilient at the data-handling layer (see streaming_runs
         // mutex poison handling) — this catches the deeper transport panics.
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut backoff = std::time::Duration::from_millis(100);
             const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
             loop {
+                if *shutdown_rx.borrow() {
+                    return;
+                }
                 // Clone per attempt so each inner task owns its capture.
                 let worker_id = worker_id_outer.clone();
                 let journal_queue = journal_queue_outer.clone();
@@ -4673,15 +4838,22 @@ impl Worker {
                 let journal_flush_locks = journal_flush_locks_outer.clone();
                 let ee_endpoint = ee_endpoint_outer.clone();
                 let engine_endpoint = engine_endpoint_outer.clone();
+                let external_session = external_session_outer.clone();
                 let dispatch_tx = dispatch_tx.clone();
                 let event_stream_tx = event_stream_tx.clone();
 
                 // Cache project_id/deployment_id to avoid repeated env lookups per event.
                 // `tenant_id` remains a legacy alias for compatibility with engine/EE APIs.
-                let cached_project_id = canonical_project_id_from_env();
-                let cached_deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").unwrap_or_default();
+                let cached_project_id = external_session
+                    .as_ref()
+                    .map(|session| session.connection().project_id.clone())
+                    .unwrap_or_else(canonical_project_id_from_env);
+                let cached_deployment_id = external_session
+                    .as_ref()
+                    .map(|session| session.connection().deployment_id.clone())
+                    .unwrap_or_else(|| std::env::var("AGNT5_DEPLOYMENT_ID").unwrap_or_default());
 
-                let inner = tokio::spawn(async move {
+                let mut inner = tokio::spawn(async move {
                     let mut interval =
                         tokio::time::interval(Duration::from_millis(flush_interval_ms));
 
@@ -4725,7 +4897,12 @@ impl Worker {
                         if let Some(ref ep) = engine_endpoint {
                             // Ensure engine client is connected
                             if engine.is_none() {
-                                match EngineClient::connect(ep).await {
+                                match EngineClient::connect_with_external_session(
+                                    ep,
+                                    external_session.clone(),
+                                )
+                                .await
+                                {
                                     Ok(c) => {
                                         debug!("Flush task: Engine client connected to {}", ep);
                                         engine = Some(c);
@@ -4767,7 +4944,14 @@ impl Worker {
                                             project_id: canonical_project_id_from_metadata(
                                                 &event.metadata,
                                             )
-                                            .or_else(|| event.tenant_id.clone())
+                                            .or_else(|| {
+                                                event
+                                                    .tenant_id
+                                                    .as_deref()
+                                                    .map(str::trim)
+                                                    .filter(|project_id| !project_id.is_empty())
+                                                    .map(str::to_string)
+                                            })
                                             .unwrap_or_else(|| cached_project_id.clone()),
                                             source_timestamp_ns: event.source_timestamp_ns,
                                             worker_id: worker_id.clone(),
@@ -4781,11 +4965,13 @@ impl Worker {
                             let records: Vec<_> = durable_originals
                                 .iter()
                                 .map(|e| {
-                                    let tenant = if let Some(ref tid) = e.tenant_id {
-                                        tid.clone()
-                                    } else {
-                                        cached_project_id.clone()
-                                    };
+                                    let tenant = e
+                                        .tenant_id
+                                        .as_deref()
+                                        .map(str::trim)
+                                        .filter(|project_id| !project_id.is_empty())
+                                        .map(str::to_string)
+                                        .unwrap_or_else(|| cached_project_id.clone());
                                     client::build_engine_record(
                                         tenant,
                                         e.run_id.clone(),
@@ -5109,7 +5295,15 @@ impl Worker {
                     }
                 });
 
-                match inner.await {
+                let inner_result = tokio::select! {
+                    result = &mut inner => result,
+                    _ = shutdown_rx.changed() => {
+                        inner.abort();
+                        let _ = inner.await;
+                        return;
+                    }
+                };
+                match inner_result {
                     // Inner task ended without panic — flush loop runs
                     // forever in normal operation, so this branch only
                     // fires on shutdown/abort. Exit the supervisor too.
@@ -5127,7 +5321,14 @@ impl Worker {
                             backoff_ms = backoff.as_millis() as u64,
                             "Journal flush task panicked (likely h2 transport); restarting after backoff"
                         );
-                        tokio::time::sleep(backoff).await;
+                        tokio::select! {
+                            _ = tokio::time::sleep(backoff) => {}
+                            changed = shutdown_rx.changed() => {
+                                if changed.is_err() || *shutdown_rx.borrow() {
+                                    return;
+                                }
+                            }
+                        }
                         backoff = (backoff * 2).min(MAX_BACKOFF);
                         continue;
                     }
@@ -5142,7 +5343,11 @@ impl Worker {
                     }
                 }
             }
-        })
+        });
+        JournalFlushTask {
+            shutdown: shutdown_tx,
+            handle,
+        }
     }
 
     /// Spawn parked one-job pollers. Each slot owns exactly one outstanding
@@ -5158,15 +5363,16 @@ impl Worker {
         in_flight: Arc<std::sync::atomic::AtomicUsize>,
         supported_protocol_capabilities: Vec<String>,
         required_protocol_capabilities: Vec<String>,
+        endpoint: String,
+        project_id: String,
+        deployment_id: String,
+        external_session: Option<Arc<ExternalWorkerSession>>,
     ) -> tokio::task::JoinHandle<()>
     where
         F: Fn(RuntimeMessage, flume::Sender<ServiceMessage>) -> Fut + Send + Clone + 'static,
         Fut: std::future::Future<Output = Result<Option<ServiceMessage>>> + Send + 'static,
     {
         let worker_id = self.config.worker_id.clone();
-        let endpoint = self.config.resolved_coordinator_endpoint();
-        let project_id = canonical_project_id_from_env();
-        let deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").unwrap_or_default();
         let capabilities = worker_capabilities(&self.components);
         let components = self.components.clone();
         let activation_definition_configs = activation_definition_configs(&components);
@@ -5210,7 +5416,12 @@ impl Worker {
                 return;
             }
 
-            let mut client = match WorkerCoordinatorClient::connect(endpoint.clone()).await {
+            let mut client = match WorkerCoordinatorClient::connect_with_external_session(
+                endpoint.clone(),
+                external_session,
+            )
+            .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("[WARN] Parked poll task failed to connect: {}", e);
@@ -5246,7 +5457,11 @@ impl Worker {
             let worker_session_id = Arc::new(TokioMutex::new(initial_session_id));
 
             eprintln!(
-                "[INFO] Parked polling started (deployment={}, min_slots={}, max_slots={})",
+                "[INFO] AGNT5 external worker registered (deployment={})",
+                deployment_id
+            );
+            eprintln!(
+                "[INFO] AGNT5 external worker ready (deployment={}, min_slots={}, max_slots={})",
                 deployment_id, min_slots, max_slots
             );
 
@@ -5479,20 +5694,20 @@ mod tests {
         activation_definition_configs, active_lease_danger_retry_ms,
         active_lease_renew_interval_ms, active_lease_renew_interval_with_jitter_ms,
         await_checkpoint_ack, canonical_activation_component_config,
-        complete_job_request_from_polled_completion, complete_job_with_retry,
-        deployment_artifact_sha256, durable_suspension_service_message, execution_is_revoked,
-        is_cancelled_worker_response, is_parked_worker_session_registration_rejection,
-        is_terminal_worker_response, is_worker_session_inactive_error, parked_ramp_spawn_count,
-        parked_runtime_service_response, parked_worker_session_was_refreshed,
-        polled_job_completion_from_service_message, polled_job_suspension_request,
-        record_groups_by_run, runtime_message_from_job_assignment,
-        stamp_activation_dispatch_metadata, stamp_dispatch_mode,
-        stamp_execution_authority_metadata, stamp_protocol_capability, take_correlation_ids,
-        try_retire_parked_slot, uncommitted_records_in_reverse, valid_activation_artifact_sha256,
-        wait_for_parked_run_events_flush, worker_capabilities, ActiveLeaseAuthority,
-        ActiveLeaseSession, AppendGroupProgress, CompleteJobSender, EntityStateSender,
-        ParkedSlotEvent, ParkedWorkerSessionRegistration, RunFlushLocks, Worker, WorkerConfig,
-        WorkerSlotPhaseSnapshot, WorkerSlotPhases,
+        canonical_project_id_from_metadata, complete_job_request_from_polled_completion,
+        complete_job_with_retry, deployment_artifact_sha256, durable_suspension_service_message,
+        execution_is_revoked, is_cancelled_worker_response,
+        is_parked_worker_session_registration_rejection, is_terminal_worker_response,
+        is_worker_session_inactive_error, parked_ramp_spawn_count, parked_runtime_service_response,
+        parked_worker_session_was_refreshed, polled_job_completion_from_service_message,
+        polled_job_suspension_request, record_groups_by_run, resolved_project_id,
+        runtime_message_from_job_assignment, stamp_activation_dispatch_metadata,
+        stamp_dispatch_mode, stamp_execution_authority_metadata, stamp_protocol_capability,
+        take_correlation_ids, try_retire_parked_slot, uncommitted_records_in_reverse,
+        valid_activation_artifact_sha256, wait_for_parked_run_events_flush, with_project_metadata,
+        worker_capabilities, ActiveLeaseAuthority, ActiveLeaseSession, AppendGroupProgress,
+        CompleteJobSender, EntityStateSender, ParkedSlotEvent, ParkedWorkerSessionRegistration,
+        RunFlushLocks, Worker, WorkerConfig, WorkerSlotPhaseSnapshot, WorkerSlotPhases,
     };
     use crate::error::{ErrorCode, SdkError};
     use crate::journal_queue::{JournalEventMessage, JournalEventQueue, JournalQueueConfig};
@@ -5807,6 +6022,23 @@ mod tests {
         assert_eq!(
             request.metadata.get("lease_attempt").map(String::as_str),
             Some("7")
+        );
+    }
+
+    #[test]
+    fn discovered_project_replaces_empty_language_metadata() {
+        let metadata = HashMap::from([("project_id".to_string(), "  ".to_string())]);
+
+        assert_eq!(canonical_project_id_from_metadata(&metadata), None);
+        assert_eq!(
+            resolved_project_id(&metadata, &HashMap::new(), Some("project-from-discovery")),
+            "project-from-discovery"
+        );
+        assert_eq!(
+            with_project_metadata(metadata, "project-from-discovery")
+                .get("project_id")
+                .map(String::as_str),
+            Some("project-from-discovery")
         );
     }
 
