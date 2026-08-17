@@ -43,7 +43,7 @@ impl tonic::service::Interceptor for BearerInterceptor {
 
 type AuthenticatedChannel = InterceptedService<Channel, BearerInterceptor>;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct ExternalWorkerAuthority {
     project_id: String,
     environment_id: String,
@@ -53,6 +53,25 @@ struct ExternalWorkerAuthority {
     runtime_endpoint: String,
     #[serde(default)]
     protocol: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ExternalWorkerTokenRequest<'a> {
+    project_id: &'a str,
+    environment_id: &'a str,
+    deployment_id: &'a str,
+    worker_pool_id: &'a str,
+}
+
+impl<'a> From<&'a ExternalWorkerAuthority> for ExternalWorkerTokenRequest<'a> {
+    fn from(authority: &'a ExternalWorkerAuthority) -> Self {
+        Self {
+            project_id: &authority.project_id,
+            environment_id: &authority.environment_id,
+            deployment_id: &authority.deployment_id,
+            worker_pool_id: &authority.worker_pool_id,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -181,7 +200,7 @@ async fn exchange_external_worker_token(
             bootstrap.control_plane_url, EXTERNAL_TOKEN_PATH
         ))
         .header("X-API-KEY", &bootstrap.credential)
-        .json(&bootstrap.authority)
+        .json(&ExternalWorkerTokenRequest::from(&bootstrap.authority))
         .send()
         .await
         .map_err(|error| SdkError::Connection {
@@ -1386,6 +1405,30 @@ pub fn build_engine_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_worker_token_request_contains_only_immutable_authority() {
+        let authority = ExternalWorkerAuthority {
+            project_id: "project-1".into(),
+            environment_id: "environment-1".into(),
+            deployment_id: "deployment-1".into(),
+            worker_pool_id: "pool-1".into(),
+            runtime_endpoint: "https://runtime.example".into(),
+            protocol: "pull.v1".into(),
+        };
+
+        let value = serde_json::to_value(ExternalWorkerTokenRequest::from(&authority)).unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "project_id": "project-1",
+                "environment_id": "environment-1",
+                "deployment_id": "deployment-1",
+                "worker_pool_id": "pool-1"
+            })
+        );
+    }
 
     #[test]
     fn retryable_engine_status_includes_partition_handoff_errors() {
