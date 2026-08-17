@@ -13,12 +13,237 @@ use crate::pb::{
     ReportWorkerCapacityRequest, ReportWorkerCapacityResponse, RuntimeMessage, ServiceMessage,
     SuspendActivationRequest, SuspendActivationResponse,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use tonic::metadata::MetadataValue;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 use tonic::Code;
+use tonic::{Request, Status};
 use tracing::{debug, error};
+
+const EXTERNAL_DISCOVERY_PATH: &str = "/api/v1/worker-discovery";
+const EXTERNAL_TOKEN_PATH: &str = "/api/v1/worker-token";
+
+#[derive(Clone, Debug)]
+struct BearerInterceptor {
+    token: Arc<RwLock<Option<MetadataValue<tonic::metadata::Ascii>>>>,
+}
+
+impl tonic::service::Interceptor for BearerInterceptor {
+    fn call(&mut self, mut request: Request<()>) -> std::result::Result<Request<()>, Status> {
+        if let Some(token) = self.token.read().unwrap_or_else(|p| p.into_inner()).clone() {
+            request.metadata_mut().insert("authorization", token);
+        }
+        Ok(request)
+    }
+}
+
+type AuthenticatedChannel = InterceptedService<Channel, BearerInterceptor>;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ExternalWorkerAuthority {
+    project_id: String,
+    environment_id: String,
+    deployment_id: String,
+    worker_pool_id: String,
+    #[serde(default)]
+    runtime_endpoint: String,
+    #[serde(default)]
+    protocol: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ExternalWorkerTokenResponse {
+    workload_token: String,
+    expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Clone, Debug)]
+struct ExternalWorkerBootstrap {
+    control_plane_url: String,
+    credential: String,
+    authority: ExternalWorkerAuthority,
+}
+
+pub(crate) fn external_worker_enabled() -> bool {
+    matches!(
+        std::env::var("AGNT5_EXTERNAL_WORKER").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    )
+}
+
+async fn external_worker_bootstrap() -> Result<(String, BearerInterceptor)> {
+    let control_plane_url = std::env::var("AGNT5_CONTROL_PLANE_URL")
+        .unwrap_or_else(|_| "https://api.agnt5.com".to_string())
+        .trim_end_matches('/')
+        .to_string();
+    let key_path = std::env::var("AGNT5_API_KEY_FILE").map_err(|_| SdkError::Connection {
+        message: "AGNT5_API_KEY_FILE is required for external workers".to_string(),
+        code: crate::error::ErrorCode::ConnectionFailed,
+        source: None,
+    })?;
+    let credential = std::fs::read_to_string(&key_path)
+        .map_err(|error| SdkError::Connection {
+            message: format!("read external worker credential {}: {}", key_path, error),
+            code: crate::error::ErrorCode::ConnectionFailed,
+            source: None,
+        })?
+        .trim()
+        .to_string();
+    if credential.is_empty() {
+        return Err(SdkError::Connection {
+            message: "external worker credential file is empty".to_string(),
+            code: crate::error::ErrorCode::ConnectionFailed,
+            source: None,
+        });
+    }
+    let environment = std::env::var("AGNT5_ENVIRONMENT").unwrap_or_default();
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|error| SdkError::Connection {
+            message: format!("create external worker bootstrap client: {}", error),
+            code: crate::error::ErrorCode::ConnectionFailed,
+            source: None,
+        })?;
+    let response = http
+        .post(format!("{}{}", control_plane_url, EXTERNAL_DISCOVERY_PATH))
+        .header("X-API-KEY", &credential)
+        .json(&serde_json::json!({"environment": environment}))
+        .send()
+        .await
+        .map_err(|error| SdkError::Connection {
+            message: format!("external worker discovery failed: {}", error),
+            code: crate::error::ErrorCode::ConnectionFailed,
+            source: None,
+        })?;
+    if !response.status().is_success() {
+        return Err(SdkError::Connection {
+            message: format!("external worker discovery returned {}", response.status()),
+            code: crate::error::ErrorCode::ConnectionFailed,
+            source: None,
+        });
+    }
+    let authority: ExternalWorkerAuthority =
+        response
+            .json()
+            .await
+            .map_err(|error| SdkError::Connection {
+                message: format!("decode external worker discovery response: {}", error),
+                code: crate::error::ErrorCode::ConnectionFailed,
+                source: None,
+            })?;
+    if authority.protocol != "pull.v1" || authority.runtime_endpoint.trim().is_empty() {
+        return Err(SdkError::Connection {
+            message: "external worker discovery returned an unsupported target".to_string(),
+            code: crate::error::ErrorCode::ConnectionFailed,
+            source: None,
+        });
+    }
+    let bootstrap = ExternalWorkerBootstrap {
+        control_plane_url,
+        credential,
+        authority,
+    };
+    let initial = exchange_external_worker_token(&http, &bootstrap).await?;
+    let token = bearer_metadata(&initial.workload_token)?;
+    let shared = Arc::new(RwLock::new(Some(token)));
+    spawn_external_worker_token_refresh(
+        http,
+        bootstrap.clone(),
+        shared.clone(),
+        initial.expires_at,
+    );
+
+    // Discovery is authoritative. These values are consumed immediately after
+    // connect when the pull session registration is constructed.
+    std::env::set_var("AGNT5_PROJECT_ID", &bootstrap.authority.project_id);
+    std::env::set_var("AGNT5_DEPLOYMENT_ID", &bootstrap.authority.deployment_id);
+    std::env::set_var("AGNT5_WORKERPOOL_ID", &bootstrap.authority.worker_pool_id);
+    std::env::set_var("AGNT5_WORKER_MODE", "pull");
+    eprintln!("[INFO] external worker authenticated");
+    Ok((
+        bootstrap.authority.runtime_endpoint.clone(),
+        BearerInterceptor { token: shared },
+    ))
+}
+
+async fn exchange_external_worker_token(
+    http: &reqwest::Client,
+    bootstrap: &ExternalWorkerBootstrap,
+) -> Result<ExternalWorkerTokenResponse> {
+    let response = http
+        .post(format!(
+            "{}{}",
+            bootstrap.control_plane_url, EXTERNAL_TOKEN_PATH
+        ))
+        .header("X-API-KEY", &bootstrap.credential)
+        .json(&bootstrap.authority)
+        .send()
+        .await
+        .map_err(|error| SdkError::Connection {
+            message: format!("external worker token exchange failed: {}", error),
+            code: crate::error::ErrorCode::ConnectionFailed,
+            source: None,
+        })?;
+    if !response.status().is_success() {
+        return Err(SdkError::Connection {
+            message: format!(
+                "external worker token exchange returned {}",
+                response.status()
+            ),
+            code: crate::error::ErrorCode::ConnectionFailed,
+            source: None,
+        });
+    }
+    response.json().await.map_err(|error| SdkError::Connection {
+        message: format!("decode external worker token response: {}", error),
+        code: crate::error::ErrorCode::ConnectionFailed,
+        source: None,
+    })
+}
+
+fn bearer_metadata(token: &str) -> Result<MetadataValue<tonic::metadata::Ascii>> {
+    format!("Bearer {}", token)
+        .parse()
+        .map_err(|error| SdkError::Connection {
+            message: format!("invalid external worker token metadata: {}", error),
+            code: crate::error::ErrorCode::ConnectionFailed,
+            source: None,
+        })
+}
+
+fn spawn_external_worker_token_refresh(
+    http: reqwest::Client,
+    bootstrap: ExternalWorkerBootstrap,
+    token: Arc<RwLock<Option<MetadataValue<tonic::metadata::Ascii>>>>,
+    mut expires_at: chrono::DateTime<chrono::Utc>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let delay = (expires_at - chrono::Utc::now() - chrono::Duration::seconds(60))
+                .to_std()
+                .unwrap_or(Duration::from_secs(1));
+            tokio::time::sleep(delay).await;
+            match exchange_external_worker_token(&http, &bootstrap).await {
+                Ok(refreshed) => match bearer_metadata(&refreshed.workload_token) {
+                    Ok(value) => {
+                        *token.write().unwrap_or_else(|p| p.into_inner()) = Some(value);
+                        expires_at = refreshed.expires_at;
+                    }
+                    Err(error) => error!("External worker token refresh rejected: {}", error),
+                },
+                Err(error) => {
+                    error!("External worker token refresh failed: {}; retrying", error);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+        }
+    });
+}
 
 pub const DURABLE_ACTIVATION_V1_CAPABILITY: &str = "durable_activation_v1";
 pub const DURABLE_SUSPENSION_V1_CAPABILITY: &str = "durable_suspension_v1";
@@ -124,8 +349,8 @@ fn activation_status(operation: &str, status: tonic::Status) -> SdkError {
 /// multiplexes streams.
 #[derive(Debug, Clone)]
 pub struct WorkerCoordinatorClient {
-    client: WorkerCoordinatorServiceClient<Channel>,
-    engine_client: EngineServiceClient<Channel>,
+    client: WorkerCoordinatorServiceClient<AuthenticatedChannel>,
+    engine_client: EngineServiceClient<AuthenticatedChannel>,
     negotiated_protocol_capabilities: Arc<RwLock<Vec<String>>>,
 }
 
@@ -146,6 +371,16 @@ fn is_idle_poll_timeout(status: &tonic::Status) -> bool {
 impl WorkerCoordinatorClient {
     /// Create a new client connected to the Worker Coordinator
     pub async fn connect(endpoint: String) -> Result<Self> {
+        let (endpoint, interceptor) = if external_worker_enabled() {
+            external_worker_bootstrap().await?
+        } else {
+            (
+                endpoint,
+                BearerInterceptor {
+                    token: Arc::new(RwLock::new(None)),
+                },
+            )
+        };
         debug!("Connecting to Worker Coordinator at {}", endpoint);
 
         let channel = Channel::from_shared(endpoint.clone())
@@ -165,8 +400,9 @@ impl WorkerCoordinatorClient {
                 e
             })?;
 
-        let client = WorkerCoordinatorServiceClient::new(channel.clone());
-        let engine_client = EngineServiceClient::new(channel);
+        let client =
+            WorkerCoordinatorServiceClient::with_interceptor(channel.clone(), interceptor.clone());
+        let engine_client = EngineServiceClient::with_interceptor(channel, interceptor);
 
         Ok(Self {
             client,
@@ -840,20 +1076,30 @@ fn should_retry_activation_status(status: &tonic::Status, attempt: usize) -> boo
 /// events are routed through a single HTTP/2 connection.
 #[derive(Debug, Clone)]
 pub struct EngineClient {
-    clients: Vec<EngineServiceClient<Channel>>,
+    clients: Vec<EngineServiceClient<AuthenticatedChannel>>,
     next: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl EngineClient {
     /// Connect to the engine at the given endpoint with a pool of connections.
     pub async fn connect(endpoint: &str) -> Result<Self> {
+        let (endpoint, interceptor) = if external_worker_enabled() {
+            external_worker_bootstrap().await?
+        } else {
+            (
+                endpoint.to_string(),
+                BearerInterceptor {
+                    token: Arc::new(RwLock::new(None)),
+                },
+            )
+        };
         debug!(
             "Connecting to Engine at {} (pool_size={})",
             endpoint, ENGINE_POOL_SIZE
         );
 
         let uri = if endpoint.contains("://") {
-            endpoint.to_string()
+            endpoint.clone()
         } else {
             format!("http://{}", endpoint)
         };
@@ -879,7 +1125,10 @@ impl EngineClient {
                         source: None,
                     }
                 })?;
-            clients.push(EngineServiceClient::new(channel));
+            clients.push(EngineServiceClient::with_interceptor(
+                channel,
+                interceptor.clone(),
+            ));
         }
 
         debug!(
@@ -893,7 +1142,7 @@ impl EngineClient {
     }
 
     /// Get the next client from the pool (round-robin).
-    fn next_client(&mut self) -> &mut EngineServiceClient<Channel> {
+    fn next_client(&mut self) -> &mut EngineServiceClient<AuthenticatedChannel> {
         let idx = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.clients.len();
         &mut self.clients[idx]
     }

@@ -660,7 +660,18 @@ impl WorkerConfig {
             .unwrap_or(5);
 
         // Engine endpoint — when set, bypasses Go EE for all event writes.
-        let engine_endpoint = std::env::var("AGNT5_ENGINE_URL").ok();
+        let engine_endpoint = std::env::var("AGNT5_ENGINE_URL").ok().or_else(|| {
+            if matches!(
+                std::env::var("AGNT5_EXTERNAL_WORKER").ok().as_deref(),
+                Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+            ) {
+                // EngineClient performs authenticated discovery and replaces
+                // this bootstrap placeholder with the advertised runtime URL.
+                Some(coordinator_endpoint.clone())
+            } else {
+                None
+            }
+        });
 
         // Concurrency budget: seed from the env var so existing deployments
         // keep working; language bindings may overwrite before `run()`.
@@ -4020,33 +4031,37 @@ impl Worker {
 
         // Open EventStream on EE for ephemeral events (SSE-only: tokens, progress, logs).
         // EE is the single SSE publisher — WC no longer publishes to Centrifuge.
-        let event_stream_tx = match self.ensure_ee_client().await {
-            Ok(mut ee_client) => {
-                match crate::client::create_ee_event_stream(
-                    &mut ee_client,
-                    self.config.worker_id.clone(),
-                )
-                .await
-                {
-                    Ok(es_tx) => {
-                        debug!("EE EventStream opened for SSE-only events");
-                        Some(es_tx)
-                    }
-                    Err(e) => {
-                        warn!(
+        let event_stream_tx = if is_pull_mode && crate::client::external_worker_enabled() {
+            None
+        } else {
+            match self.ensure_ee_client().await {
+                Ok(mut ee_client) => {
+                    match crate::client::create_ee_event_stream(
+                        &mut ee_client,
+                        self.config.worker_id.clone(),
+                    )
+                    .await
+                    {
+                        Ok(es_tx) => {
+                            debug!("EE EventStream opened for SSE-only events");
+                            Some(es_tx)
+                        }
+                        Err(e) => {
+                            warn!(
                             "Failed to open EE EventStream, SSE-only events will use dispatch stream: {}",
                             e
                         );
-                        None
+                            None
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                warn!(
+                Err(e) => {
+                    warn!(
                     "Failed to get EE client for EventStream, SSE-only events will use dispatch stream: {}",
                     e
                 );
-                None
+                    None
+                }
             }
         };
 
@@ -5243,6 +5258,10 @@ impl Worker {
                     "RegisterWorkerSession was rejected after 3 attempts; exiting worker process",
                 ),
             };
+            if crate::client::external_worker_enabled() {
+                eprintln!("[INFO] external worker registered");
+                eprintln!("[INFO] external worker ready");
+            }
             let worker_session_id = Arc::new(TokioMutex::new(initial_session_id));
 
             eprintln!(
