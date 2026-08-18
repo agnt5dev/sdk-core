@@ -19,7 +19,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tonic::metadata::MetadataValue;
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::Channel;
+use tonic::transport::{Channel, ClientTlsConfig};
 use tonic::Code;
 use tonic::{Request, Status};
 use tracing::{debug, error};
@@ -94,7 +94,19 @@ pub(crate) fn external_worker_enabled() -> bool {
     )
 }
 
-async fn external_worker_bootstrap() -> Result<(String, BearerInterceptor)> {
+async fn external_worker_bootstrap() -> Result<(String, BearerInterceptor, Option<ClientTlsConfig>)>
+{
+    if crate::external_worker_identity::bootstrap_profile_enabled() {
+        let identity = crate::external_worker_identity::connection_identity().await?;
+        eprintln!("[INFO] external worker authenticated with bootstrap identity");
+        return Ok((
+            identity.endpoint,
+            BearerInterceptor {
+                token: identity.authorization,
+            },
+            Some(identity.tls),
+        ));
+    }
     let control_plane_url = std::env::var("AGNT5_CONTROL_PLANE_URL")
         .unwrap_or_else(|_| "https://api.agnt5.com".to_string())
         .trim_end_matches('/')
@@ -187,6 +199,7 @@ async fn external_worker_bootstrap() -> Result<(String, BearerInterceptor)> {
     Ok((
         bootstrap.authority.runtime_endpoint.clone(),
         BearerInterceptor { token: shared },
+        None,
     ))
 }
 
@@ -390,7 +403,7 @@ fn is_idle_poll_timeout(status: &tonic::Status) -> bool {
 impl WorkerCoordinatorClient {
     /// Create a new client connected to the Worker Coordinator
     pub async fn connect(endpoint: String) -> Result<Self> {
-        let (endpoint, interceptor) = if external_worker_enabled() {
+        let (endpoint, interceptor, tls) = if external_worker_enabled() {
             external_worker_bootstrap().await?
         } else {
             (
@@ -398,16 +411,25 @@ impl WorkerCoordinatorClient {
                 BearerInterceptor {
                     token: Arc::new(RwLock::new(None)),
                 },
+                None,
             )
         };
         debug!("Connecting to Worker Coordinator at {}", endpoint);
 
-        let channel = Channel::from_shared(endpoint.clone())
-            .map_err(|e| SdkError::Connection {
+        let mut channel =
+            Channel::from_shared(endpoint.clone()).map_err(|e| SdkError::Connection {
                 message: format!("Invalid endpoint {}: {}", endpoint, e),
                 code: crate::error::ErrorCode::ConnectionFailed,
                 source: None,
-            })?
+            })?;
+        if let Some(tls) = tls {
+            channel = channel.tls_config(tls).map_err(|e| SdkError::Connection {
+                message: format!("Invalid worker TLS configuration: {}", e),
+                code: crate::error::ErrorCode::ConnectionFailed,
+                source: None,
+            })?;
+        }
+        let channel = channel
             .connect_timeout(Duration::from_secs(10))
             .timeout(WORKER_COORDINATOR_RPC_TIMEOUT)
             .http2_adaptive_window(true)
@@ -1102,7 +1124,7 @@ pub struct EngineClient {
 impl EngineClient {
     /// Connect to the engine at the given endpoint with a pool of connections.
     pub async fn connect(endpoint: &str) -> Result<Self> {
-        let (endpoint, interceptor) = if external_worker_enabled() {
+        let (endpoint, interceptor, tls) = if external_worker_enabled() {
             external_worker_bootstrap().await?
         } else {
             (
@@ -1110,6 +1132,7 @@ impl EngineClient {
                 BearerInterceptor {
                     token: Arc::new(RwLock::new(None)),
                 },
+                None,
             )
         };
         debug!(
@@ -1125,12 +1148,20 @@ impl EngineClient {
 
         let mut clients = Vec::with_capacity(ENGINE_POOL_SIZE);
         for i in 0..ENGINE_POOL_SIZE {
-            let channel = Channel::from_shared(uri.clone())
-                .map_err(|e| SdkError::Connection {
+            let mut channel =
+                Channel::from_shared(uri.clone()).map_err(|e| SdkError::Connection {
                     message: format!("Invalid engine endpoint {}: {}", endpoint, e),
                     code: crate::error::ErrorCode::ConnectionFailed,
                     source: None,
-                })?
+                })?;
+            if let Some(tls) = tls.clone() {
+                channel = channel.tls_config(tls).map_err(|e| SdkError::Connection {
+                    message: format!("Invalid worker TLS configuration: {}", e),
+                    code: crate::error::ErrorCode::ConnectionFailed,
+                    source: None,
+                })?;
+            }
+            let channel = channel
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(30))
                 .http2_adaptive_window(true)

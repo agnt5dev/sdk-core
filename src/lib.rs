@@ -6,6 +6,7 @@ pub mod client;
 pub mod context;
 pub mod error;
 pub mod eval;
+pub mod external_worker_identity;
 pub mod journal_queue;
 pub mod lm;
 pub mod logging;
