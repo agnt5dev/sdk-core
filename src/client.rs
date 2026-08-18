@@ -94,8 +94,12 @@ pub(crate) fn external_worker_enabled() -> bool {
     )
 }
 
-async fn external_worker_bootstrap() -> Result<(String, BearerInterceptor, Option<ClientTlsConfig>)>
-{
+async fn external_worker_bootstrap() -> Result<(
+    String,
+    BearerInterceptor,
+    Option<ClientTlsConfig>,
+    Option<String>,
+)> {
     if crate::external_worker_identity::bootstrap_profile_enabled() {
         let identity = crate::external_worker_identity::connection_identity().await?;
         eprintln!("[INFO] external worker authenticated with bootstrap identity");
@@ -105,6 +109,7 @@ async fn external_worker_bootstrap() -> Result<(String, BearerInterceptor, Optio
                 token: identity.authorization,
             },
             Some(identity.tls),
+            Some(identity.worker_id),
         ));
     }
     let control_plane_url = std::env::var("AGNT5_CONTROL_PLANE_URL")
@@ -199,6 +204,7 @@ async fn external_worker_bootstrap() -> Result<(String, BearerInterceptor, Optio
     Ok((
         bootstrap.authority.runtime_endpoint.clone(),
         BearerInterceptor { token: shared },
+        None,
         None,
     ))
 }
@@ -384,6 +390,7 @@ pub struct WorkerCoordinatorClient {
     client: WorkerCoordinatorServiceClient<AuthenticatedChannel>,
     engine_client: EngineServiceClient<AuthenticatedChannel>,
     negotiated_protocol_capabilities: Arc<RwLock<Vec<String>>>,
+    authoritative_worker_id: Option<String>,
 }
 
 const WORKER_COORDINATOR_RPC_TIMEOUT: Duration = Duration::from_secs(45);
@@ -403,7 +410,7 @@ fn is_idle_poll_timeout(status: &tonic::Status) -> bool {
 impl WorkerCoordinatorClient {
     /// Create a new client connected to the Worker Coordinator
     pub async fn connect(endpoint: String) -> Result<Self> {
-        let (endpoint, interceptor, tls) = if external_worker_enabled() {
+        let (endpoint, interceptor, tls, authoritative_worker_id) = if external_worker_enabled() {
             external_worker_bootstrap().await?
         } else {
             (
@@ -411,6 +418,7 @@ impl WorkerCoordinatorClient {
                 BearerInterceptor {
                     token: Arc::new(RwLock::new(None)),
                 },
+                None,
                 None,
             )
         };
@@ -449,7 +457,15 @@ impl WorkerCoordinatorClient {
             client,
             engine_client,
             negotiated_protocol_capabilities: Arc::new(RwLock::new(Vec::new())),
+            authoritative_worker_id,
         })
+    }
+
+    /// Use the server-assigned ID for certificate-bound customer workers.
+    pub(crate) fn effective_worker_id<'a>(&'a self, configured: &'a str) -> &'a str {
+        self.authoritative_worker_id
+            .as_deref()
+            .unwrap_or(configured)
     }
 
     pub(crate) fn retain_negotiated_protocol_capabilities(
@@ -484,6 +500,7 @@ impl WorkerCoordinatorClient {
         flume::Sender<ServiceMessage>,
         flume::Receiver<RuntimeMessage>,
     )> {
+        let worker_id = self.effective_worker_id(&worker_id).to_string();
         let worker_supported_protocols = registration.supported_protocol_capabilities.clone();
         let worker_required_protocols = registration.required_protocol_capabilities.clone();
         // Create the registration message first
@@ -825,8 +842,9 @@ impl WorkerCoordinatorClient {
     /// Register a parked-poll worker session with the Engine.
     pub async fn register_worker_session(
         &mut self,
-        req: RegisterWorkerSessionRequest,
+        mut req: RegisterWorkerSessionRequest,
     ) -> Result<RegisterWorkerSessionResponse> {
+        req.worker_id = self.effective_worker_id(&req.worker_id).to_string();
         let response = self
             .engine_client
             .register_worker_session(req)
@@ -845,7 +863,8 @@ impl WorkerCoordinatorClient {
     }
 
     /// Park one worker slot until a job is available or the Engine times out.
-    pub async fn poll_job(&mut self, req: PollJobRequest) -> Result<PollJobResponse> {
+    pub async fn poll_job(&mut self, mut req: PollJobRequest) -> Result<PollJobResponse> {
+        req.worker_id = self.effective_worker_id(&req.worker_id).to_string();
         let timeout = poll_job_deadline(&req);
         let mut request = tonic::Request::new(req);
         request.set_timeout(timeout);
@@ -905,8 +924,9 @@ impl WorkerCoordinatorClient {
     /// Renew an active push or pull execution lease.
     pub async fn renew_job_lease(
         &mut self,
-        req: RenewJobLeaseRequest,
+        mut req: RenewJobLeaseRequest,
     ) -> Result<RenewJobLeaseResponse> {
+        req.worker_id = self.effective_worker_id(&req.worker_id).to_string();
         let response = self
             .engine_client
             .renew_job_lease(req)
@@ -927,8 +947,9 @@ impl WorkerCoordinatorClient {
     /// Report current parked-poll capacity and active slot usage.
     pub async fn report_worker_capacity(
         &mut self,
-        req: ReportWorkerCapacityRequest,
+        mut req: ReportWorkerCapacityRequest,
     ) -> Result<ReportWorkerCapacityResponse> {
+        req.worker_id = self.effective_worker_id(&req.worker_id).to_string();
         let response = self
             .engine_client
             .report_worker_capacity(req)
@@ -950,7 +971,11 @@ impl WorkerCoordinatorClient {
     /// Updates job_queue, run status, journal, and batch counters.
     ///
     /// CompleteJob now lives on EngineService (moved from WorkerCoordinatorService).
-    pub async fn complete_job(&mut self, req: CompleteJobRequest) -> Result<CompleteJobResponse> {
+    pub async fn complete_job(
+        &mut self,
+        mut req: CompleteJobRequest,
+    ) -> Result<CompleteJobResponse> {
+        req.worker_id = self.effective_worker_id(&req.worker_id).to_string();
         let response = self
             .engine_client
             .complete_job(req)
@@ -1119,12 +1144,13 @@ fn should_retry_activation_status(status: &tonic::Status, attempt: usize) -> boo
 pub struct EngineClient {
     clients: Vec<EngineServiceClient<AuthenticatedChannel>>,
     next: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    authoritative_worker_id: Option<String>,
 }
 
 impl EngineClient {
     /// Connect to the engine at the given endpoint with a pool of connections.
     pub async fn connect(endpoint: &str) -> Result<Self> {
-        let (endpoint, interceptor, tls) = if external_worker_enabled() {
+        let (endpoint, interceptor, tls, authoritative_worker_id) = if external_worker_enabled() {
             external_worker_bootstrap().await?
         } else {
             (
@@ -1132,6 +1158,7 @@ impl EngineClient {
                 BearerInterceptor {
                     token: Arc::new(RwLock::new(None)),
                 },
+                None,
                 None,
             )
         };
@@ -1188,6 +1215,7 @@ impl EngineClient {
         Ok(Self {
             clients,
             next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            authoritative_worker_id,
         })
     }
 
@@ -1375,9 +1403,14 @@ impl EngineClient {
     /// Publish a bounded batch of ephemeral events and wait until the runtime
     /// acknowledges every frame. Closing each batch supplies the ordering
     /// barrier needed before a durable terminal event is appended.
-    pub async fn stream_events(&mut self, events: Vec<EventStreamMessage>) -> Result<i64> {
+    pub async fn stream_events(&mut self, mut events: Vec<EventStreamMessage>) -> Result<i64> {
         if events.is_empty() {
             return Ok(0);
+        }
+        if let Some(worker_id) = &self.authoritative_worker_id {
+            for event in &mut events {
+                event.worker_id.clone_from(worker_id);
+            }
         }
         let expected = events.len() as i64;
         let response = self
@@ -1504,6 +1537,7 @@ mod tests {
         let mut client = EngineClient {
             clients: Vec::new(),
             next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            authoritative_worker_id: None,
         };
         let records = vec![
             Record {

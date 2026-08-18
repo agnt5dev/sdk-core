@@ -102,6 +102,7 @@ pub enum IdentityReadiness {
 #[derive(Clone)]
 pub struct ConnectionIdentity {
     pub endpoint: String,
+    pub worker_id: String,
     pub tls: ClientTlsConfig,
     pub authorization: Arc<RwLock<Option<MetadataValue<tonic::metadata::Ascii>>>>,
 }
@@ -223,6 +224,7 @@ impl IdentityManager {
         }
         Ok(ConnectionIdentity {
             endpoint: session.runtime_endpoint.clone(),
+            worker_id: session.worker_id.clone(),
             tls: tls_config(&session)?,
             authorization,
         })
@@ -509,6 +511,7 @@ fn validate_session(session: &Session, authority: &Authority) -> Result<()> {
 }
 
 fn load_session(path: &Path, authority: &Authority) -> Result<Session> {
+    ensure_private_session_file(path)?;
     let bytes = std::fs::read(path)
         .map_err(|e| connection_error(format!("load worker session {}: {e}", path.display())))?;
     let session: Session = serde_json::from_slice(&bytes)
@@ -521,18 +524,30 @@ fn write_session(path: &Path, session: &Session) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| connection_error("worker session path has no parent"))?;
-    let temporary = parent.join(format!(".{SESSION_FILE_NAME}.tmp"));
+    let temporary = parent.join(format!(".{SESSION_FILE_NAME}.{}.tmp", uuid::Uuid::new_v4()));
     let bytes = serde_json::to_vec(session)
         .map_err(|e| connection_error(format!("encode worker session: {e}")))?;
     write_private_file(&temporary, &bytes)?;
-    std::fs::rename(&temporary, path)
-        .map_err(|e| connection_error(format!("replace worker session atomically: {e}")))?;
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(connection_error(format!(
+            "replace worker session atomically: {error}"
+        )));
+    }
+    sync_directory(parent)?;
     Ok(())
 }
 
 fn ensure_private_directory(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path)
         .map_err(|e| connection_error(format!("create worker session directory: {e}")))?;
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|e| connection_error(format!("inspect worker session directory: {e}")))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(connection_error(
+            "worker session directory must be a real directory, not a symlink",
+        ));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -545,7 +560,7 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
 fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     let mut options = std::fs::OpenOptions::new();
-    options.create(true).truncate(true).write(true);
+    options.create_new(true).write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -557,6 +572,34 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     file.write_all(bytes)
         .and_then(|_| file.sync_all())
         .map_err(|e| connection_error(format!("flush worker session: {e}")))
+}
+
+fn ensure_private_session_file(path: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|e| connection_error(format!("inspect worker session {}: {e}", path.display())))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(connection_error(
+            "worker session must be a regular file, not a symlink",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(connection_error(
+                "worker session permissions must not allow group or other access",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    std::fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|e| connection_error(format!("flush worker session directory: {e}")))?;
+    Ok(())
 }
 
 fn bearer_metadata(token: &str) -> Result<MetadataValue<tonic::metadata::Ascii>> {
