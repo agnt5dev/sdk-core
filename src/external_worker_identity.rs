@@ -17,7 +17,6 @@ use tonic::metadata::MetadataValue;
 use tonic::transport::{Certificate, ClientTlsConfig, Identity};
 use tracing::{error, warn};
 
-const DISCOVERY_PATH: &str = "/api/v1/worker-discovery";
 const SESSION_OPEN_PATH: &str = "/api/v1/external-worker-sessions";
 const TOKEN_REFRESH_PATH: &str = "/api/v1/external-worker-sessions/token";
 const SESSION_RENEW_PATH: &str = "/api/v1/external-worker-sessions/renew";
@@ -28,20 +27,15 @@ static MANAGER: OnceCell<Arc<IdentityManager>> = OnceCell::const_new();
 static SESSION_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-struct Authority {
-    project_id: String,
-    environment_id: String,
-    deployment_id: String,
-    worker_pool_id: String,
+pub(crate) struct Authority {
+    pub(crate) project_id: String,
+    pub(crate) environment_id: String,
+    pub(crate) deployment_id: String,
+    pub(crate) worker_pool_id: String,
     #[serde(default)]
-    runtime_endpoint: String,
+    pub(crate) runtime_endpoint: String,
     #[serde(default)]
-    protocol: String,
-}
-
-#[derive(Debug, Serialize)]
-struct DiscoveryRequest<'a> {
-    environment: &'a str,
+    pub(crate) protocol: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -121,20 +115,18 @@ struct IdentityManager {
     subscribers: Mutex<Vec<Subscriber>>,
 }
 
-pub fn bootstrap_profile_enabled() -> bool {
-    matches!(
-        std::env::var("AGNT5_WORKER_IDENTITY_MODE")
-            .unwrap_or_else(|_| "disabled".to_string())
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "bootstrap" | "required"
-    )
-}
-
-pub async fn connection_identity() -> Result<ConnectionIdentity> {
+pub(crate) async fn connection_identity(
+    control_plane_url: String,
+    identity_url: String,
+    credential: String,
+    authority: Authority,
+) -> Result<ConnectionIdentity> {
     let manager = MANAGER
-        .get_or_try_init(|| async { IdentityManager::initialize().await.map(Arc::new) })
+        .get_or_try_init(|| async {
+            IdentityManager::initialize(control_plane_url, identity_url, credential, authority)
+                .await
+                .map(Arc::new)
+        })
         .await?
         .clone();
     manager.connection_identity().await
@@ -145,28 +137,15 @@ pub async fn readiness() -> Option<IdentityReadiness> {
 }
 
 impl IdentityManager {
-    async fn initialize() -> Result<Self> {
-        let control_plane_url = normalized_url(
-            "AGNT5_CONTROL_PLANE_URL",
-            "https://api.agnt5.com",
-            "control-plane URL",
-        )?;
-        let identity_url = normalized_url(
-            "AGNT5_IDENTITY_MTLS_URL",
-            &control_plane_url,
-            "identity mTLS URL",
-        )?;
-        let key_path = required_env("AGNT5_API_KEY_FILE")?;
-        let credential = std::fs::read_to_string(&key_path)
-            .map_err(|e| connection_error(format!("read bootstrap credential {key_path}: {e}")))?
-            .trim()
-            .to_string();
-        if credential.is_empty() {
-            return Err(connection_error("bootstrap credential file is empty"));
-        }
+    async fn initialize(
+        control_plane_url: String,
+        identity_url: String,
+        credential: String,
+        authority: Authority,
+    ) -> Result<Self> {
+        validate_identity_endpoint(&identity_url)?;
         let session_dir = PathBuf::from(required_env("AGNT5_WORKER_SESSION_DIR")?);
         ensure_private_directory(&session_dir)?;
-        let authority = discover(&control_plane_url, &credential).await?;
         // Discovery is authoritative for runtime registration. Language
         // bindings consume these through the existing WorkerConfig path.
         std::env::set_var("AGNT5_PROJECT_ID", &authority.project_id);
@@ -361,35 +340,6 @@ impl IdentityManager {
             };
         }
     }
-}
-
-async fn discover(control_plane_url: &str, credential: &str) -> Result<Authority> {
-    let environment = std::env::var("AGNT5_ENVIRONMENT").unwrap_or_default();
-    let response = bootstrap_http_client()?
-        .post(format!("{control_plane_url}{DISCOVERY_PATH}"))
-        .header("X-API-KEY", credential)
-        .json(&DiscoveryRequest {
-            environment: &environment,
-        })
-        .send()
-        .await
-        .map_err(|e| connection_error(format!("external worker discovery failed: {e}")))?;
-    if !response.status().is_success() {
-        return Err(connection_error(format!(
-            "external worker discovery returned {}",
-            response.status()
-        )));
-    }
-    let authority: Authority = response
-        .json()
-        .await
-        .map_err(|e| connection_error(format!("decode external worker discovery: {e}")))?;
-    if authority.protocol != "pull.v1" || authority.runtime_endpoint.trim().is_empty() {
-        return Err(connection_error(
-            "external worker discovery returned an unsupported target",
-        ));
-    }
-    Ok(authority)
 }
 
 async fn open_session(
@@ -626,17 +576,17 @@ fn bearer_metadata(token: &str) -> Result<MetadataValue<tonic::metadata::Ascii>>
         .map_err(|_| connection_error("worker token cannot be encoded as authorization metadata"))
 }
 
-fn normalized_url(name: &str, default: &str, label: &str) -> Result<String> {
-    let value = std::env::var(name).unwrap_or_else(|_| default.to_string());
-    let value = value.trim().trim_end_matches('/').to_string();
-    let parsed = reqwest::Url::parse(&value)
-        .map_err(|e| connection_error(format!("invalid {label}: {e}")))?;
+fn validate_identity_endpoint(value: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(value)
+        .map_err(|e| connection_error(format!("invalid discovered identity endpoint: {e}")))?;
     if parsed.scheme() != "https"
         && !matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "::1"))
     {
-        return Err(connection_error(format!("{label} must use HTTPS")));
+        return Err(connection_error(
+            "discovered identity endpoint must use HTTPS",
+        ));
     }
-    Ok(value)
+    Ok(())
 }
 
 fn required_env(name: &str) -> Result<String> {

@@ -661,10 +661,7 @@ impl WorkerConfig {
 
         // Engine endpoint — when set, bypasses Go EE for all event writes.
         let engine_endpoint = std::env::var("AGNT5_ENGINE_URL").ok().or_else(|| {
-            if matches!(
-                std::env::var("AGNT5_EXTERNAL_WORKER").ok().as_deref(),
-                Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
-            ) {
+            if crate::client::remote_worker_bootstrap_enabled() {
                 // EngineClient performs authenticated discovery and replaces
                 // this bootstrap placeholder with the advertised runtime URL.
                 Some(coordinator_endpoint.clone())
@@ -4031,7 +4028,7 @@ impl Worker {
 
         // Open EventStream on EE for ephemeral events (SSE-only: tokens, progress, logs).
         // EE is the single SSE publisher — WC no longer publishes to Centrifuge.
-        let event_stream_tx = if is_pull_mode && crate::client::external_worker_enabled() {
+        let event_stream_tx = if is_pull_mode && crate::client::remote_worker_bootstrap_enabled() {
             None
         } else {
             match self.ensure_ee_client().await {
@@ -5258,9 +5255,9 @@ impl Worker {
                     "RegisterWorkerSession was rejected after 3 attempts; exiting worker process",
                 ),
             };
-            if crate::client::external_worker_enabled() {
-                eprintln!("[INFO] external worker registered");
-                eprintln!("[INFO] external worker ready");
+            if crate::client::remote_worker_bootstrap_enabled() {
+                eprintln!("[INFO] worker registered through remote bootstrap");
+                eprintln!("[INFO] worker ready");
             }
             let worker_session_id = Arc::new(TokioMutex::new(initial_session_id));
 

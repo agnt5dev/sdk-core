@@ -26,6 +26,8 @@ use tracing::{debug, error};
 
 const EXTERNAL_DISCOVERY_PATH: &str = "/api/v1/worker-discovery";
 const EXTERNAL_TOKEN_PATH: &str = "/api/v1/worker-token";
+const AUTH_PROFILE_BOOTSTRAP_MTLS: &str = "bootstrap-mtls";
+const AUTH_PROFILE_TOKEN_AUTH: &str = "token-auth";
 
 #[derive(Clone, Debug)]
 struct BearerInterceptor {
@@ -53,6 +55,14 @@ struct ExternalWorkerAuthority {
     runtime_endpoint: String,
     #[serde(default)]
     protocol: String,
+    #[serde(default = "default_external_worker_auth_profile")]
+    auth_profile: String,
+    #[serde(default)]
+    identity_endpoint: String,
+}
+
+fn default_external_worker_auth_profile() -> String {
+    AUTH_PROFILE_TOKEN_AUTH.to_string()
 }
 
 #[derive(Debug, Serialize)]
@@ -87,11 +97,8 @@ struct ExternalWorkerBootstrap {
     authority: ExternalWorkerAuthority,
 }
 
-pub(crate) fn external_worker_enabled() -> bool {
-    matches!(
-        std::env::var("AGNT5_EXTERNAL_WORKER").ok().as_deref(),
-        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
-    )
+pub(crate) fn remote_worker_bootstrap_enabled() -> bool {
+    std::env::var("AGNT5_API_KEY_FILE").is_ok_and(|value| !value.trim().is_empty())
 }
 
 async fn external_worker_bootstrap() -> Result<(
@@ -100,18 +107,6 @@ async fn external_worker_bootstrap() -> Result<(
     Option<ClientTlsConfig>,
     Option<String>,
 )> {
-    if crate::external_worker_identity::bootstrap_profile_enabled() {
-        let identity = crate::external_worker_identity::connection_identity().await?;
-        eprintln!("[INFO] external worker authenticated with bootstrap identity");
-        return Ok((
-            identity.endpoint,
-            BearerInterceptor {
-                token: identity.authorization,
-            },
-            Some(identity.tls),
-            Some(identity.worker_id),
-        ));
-    }
     let control_plane_url = std::env::var("AGNT5_CONTROL_PLANE_URL")
         .unwrap_or_else(|_| "https://api.agnt5.com".to_string())
         .trim_end_matches('/')
@@ -148,7 +143,10 @@ async fn external_worker_bootstrap() -> Result<(
     let response = http
         .post(format!("{}{}", control_plane_url, EXTERNAL_DISCOVERY_PATH))
         .header("X-API-KEY", &credential)
-        .json(&serde_json::json!({"environment": environment}))
+        .json(&serde_json::json!({
+            "environment": environment,
+            "supported_auth_profiles": [AUTH_PROFILE_BOOTSTRAP_MTLS, AUTH_PROFILE_TOKEN_AUTH]
+        }))
         .send()
         .await
         .map_err(|error| SdkError::Connection {
@@ -179,6 +177,53 @@ async fn external_worker_bootstrap() -> Result<(
             source: None,
         });
     }
+    match authority.auth_profile.as_str() {
+        AUTH_PROFILE_BOOTSTRAP_MTLS => {
+            if authority.identity_endpoint.trim().is_empty() {
+                return Err(SdkError::Connection {
+                    message:
+                        "worker discovery selected bootstrap-mtls without an identity endpoint"
+                            .to_string(),
+                    code: crate::error::ErrorCode::ConnectionFailed,
+                    source: None,
+                });
+            }
+            let identity_authority = crate::external_worker_identity::Authority {
+                project_id: authority.project_id,
+                environment_id: authority.environment_id,
+                deployment_id: authority.deployment_id,
+                worker_pool_id: authority.worker_pool_id,
+                runtime_endpoint: authority.runtime_endpoint,
+                protocol: authority.protocol,
+            };
+            let identity = crate::external_worker_identity::connection_identity(
+                control_plane_url,
+                authority.identity_endpoint,
+                credential,
+                identity_authority,
+            )
+            .await?;
+            eprintln!("[INFO] worker authenticated with bootstrap mTLS");
+            return Ok((
+                identity.endpoint,
+                BearerInterceptor {
+                    token: identity.authorization,
+                },
+                Some(identity.tls),
+                Some(identity.worker_id),
+            ));
+        }
+        AUTH_PROFILE_TOKEN_AUTH => {}
+        profile => {
+            return Err(SdkError::Connection {
+                message: format!(
+                    "worker discovery selected unsupported authentication profile {profile:?}"
+                ),
+                code: crate::error::ErrorCode::ConnectionFailed,
+                source: None,
+            });
+        }
+    }
     let bootstrap = ExternalWorkerBootstrap {
         control_plane_url,
         credential,
@@ -200,7 +245,7 @@ async fn external_worker_bootstrap() -> Result<(
     std::env::set_var("AGNT5_DEPLOYMENT_ID", &bootstrap.authority.deployment_id);
     std::env::set_var("AGNT5_WORKERPOOL_ID", &bootstrap.authority.worker_pool_id);
     std::env::set_var("AGNT5_WORKER_MODE", "pull");
-    eprintln!("[INFO] external worker authenticated");
+    eprintln!("[INFO] worker authenticated with token auth");
     Ok((
         bootstrap.authority.runtime_endpoint.clone(),
         BearerInterceptor { token: shared },
@@ -410,18 +455,19 @@ fn is_idle_poll_timeout(status: &tonic::Status) -> bool {
 impl WorkerCoordinatorClient {
     /// Create a new client connected to the Worker Coordinator
     pub async fn connect(endpoint: String) -> Result<Self> {
-        let (endpoint, interceptor, tls, authoritative_worker_id) = if external_worker_enabled() {
-            external_worker_bootstrap().await?
-        } else {
-            (
-                endpoint,
-                BearerInterceptor {
-                    token: Arc::new(RwLock::new(None)),
-                },
-                None,
-                None,
-            )
-        };
+        let (endpoint, interceptor, tls, authoritative_worker_id) =
+            if remote_worker_bootstrap_enabled() {
+                external_worker_bootstrap().await?
+            } else {
+                (
+                    endpoint,
+                    BearerInterceptor {
+                        token: Arc::new(RwLock::new(None)),
+                    },
+                    None,
+                    None,
+                )
+            };
         debug!("Connecting to Worker Coordinator at {}", endpoint);
 
         let mut channel =
@@ -1150,18 +1196,19 @@ pub struct EngineClient {
 impl EngineClient {
     /// Connect to the engine at the given endpoint with a pool of connections.
     pub async fn connect(endpoint: &str) -> Result<Self> {
-        let (endpoint, interceptor, tls, authoritative_worker_id) = if external_worker_enabled() {
-            external_worker_bootstrap().await?
-        } else {
-            (
-                endpoint.to_string(),
-                BearerInterceptor {
-                    token: Arc::new(RwLock::new(None)),
-                },
-                None,
-                None,
-            )
-        };
+        let (endpoint, interceptor, tls, authoritative_worker_id) =
+            if remote_worker_bootstrap_enabled() {
+                external_worker_bootstrap().await?
+            } else {
+                (
+                    endpoint.to_string(),
+                    BearerInterceptor {
+                        token: Arc::new(RwLock::new(None)),
+                    },
+                    None,
+                    None,
+                )
+            };
         debug!(
             "Connecting to Engine at {} (pool_size={})",
             endpoint, ENGINE_POOL_SIZE
@@ -1479,6 +1526,8 @@ mod tests {
             worker_pool_id: "pool-1".into(),
             runtime_endpoint: "https://runtime.example".into(),
             protocol: "pull.v1".into(),
+            auth_profile: AUTH_PROFILE_TOKEN_AUTH.into(),
+            identity_endpoint: String::new(),
         };
 
         let value = serde_json::to_value(ExternalWorkerTokenRequest::from(&authority)).unwrap();
