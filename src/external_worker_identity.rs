@@ -330,6 +330,24 @@ impl IdentityManager {
             .session
             .write()
             .map_err(|_| connection_error("worker identity state is unavailable"))? = next.clone();
+        // A token bound to the replacement certificate must never be sent on
+        // the old TLS channel. Removing authorization from current clients
+        // makes the next pull request fail closed and enter the worker's
+        // normal reconnect path, which obtains this replacement identity.
+        let mut subscribers = self.subscribers.lock().await;
+        subscribers.retain(|subscriber| {
+            if let Some(token) = subscriber.token.upgrade() {
+                if subscriber.session_id == current.session_id {
+                    if let Ok(mut stored) = token.write() {
+                        *stored = None;
+                    }
+                }
+                true
+            } else {
+                false
+            }
+        });
+        drop(subscribers);
         self.mark_ready(&next);
         warn!("external worker identity rotated; the runtime will reconnect the worker channel");
         Ok(())
