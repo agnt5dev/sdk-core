@@ -13,12 +13,320 @@ use crate::pb::{
     ReportWorkerCapacityRequest, ReportWorkerCapacityResponse, RuntimeMessage, ServiceMessage,
     SuspendActivationRequest, SuspendActivationResponse,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use tonic::transport::Channel;
+use tonic::metadata::MetadataValue;
+use tonic::service::interceptor::InterceptedService;
+use tonic::transport::{Channel, ClientTlsConfig};
 use tonic::Code;
+use tonic::{Request, Status};
 use tracing::{debug, error};
+
+const EXTERNAL_DISCOVERY_PATH: &str = "/api/v1/worker-discovery";
+const EXTERNAL_TOKEN_PATH: &str = "/api/v1/worker-token";
+const AUTH_PROFILE_BOOTSTRAP_MTLS: &str = "bootstrap-mtls";
+const AUTH_PROFILE_TOKEN_AUTH: &str = "token-auth";
+
+#[derive(Clone, Debug)]
+struct BearerInterceptor {
+    token: Arc<RwLock<Option<MetadataValue<tonic::metadata::Ascii>>>>,
+}
+
+impl tonic::service::Interceptor for BearerInterceptor {
+    fn call(&mut self, mut request: Request<()>) -> std::result::Result<Request<()>, Status> {
+        if let Some(token) = self.token.read().unwrap_or_else(|p| p.into_inner()).clone() {
+            request.metadata_mut().insert("authorization", token);
+        }
+        Ok(request)
+    }
+}
+
+type AuthenticatedChannel = InterceptedService<Channel, BearerInterceptor>;
+
+#[derive(Clone, Debug, Deserialize)]
+struct ExternalWorkerAuthority {
+    project_id: String,
+    environment_id: String,
+    deployment_id: String,
+    worker_pool_id: String,
+    #[serde(default)]
+    runtime_endpoint: String,
+    #[serde(default)]
+    protocol: String,
+    #[serde(default = "default_external_worker_auth_profile")]
+    auth_profile: String,
+    #[serde(default)]
+    identity_endpoint: String,
+}
+
+fn default_external_worker_auth_profile() -> String {
+    AUTH_PROFILE_TOKEN_AUTH.to_string()
+}
+
+#[derive(Debug, Serialize)]
+struct ExternalWorkerTokenRequest<'a> {
+    project_id: &'a str,
+    environment_id: &'a str,
+    deployment_id: &'a str,
+    worker_pool_id: &'a str,
+}
+
+impl<'a> From<&'a ExternalWorkerAuthority> for ExternalWorkerTokenRequest<'a> {
+    fn from(authority: &'a ExternalWorkerAuthority) -> Self {
+        Self {
+            project_id: &authority.project_id,
+            environment_id: &authority.environment_id,
+            deployment_id: &authority.deployment_id,
+            worker_pool_id: &authority.worker_pool_id,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ExternalWorkerTokenResponse {
+    workload_token: String,
+    expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Clone, Debug)]
+struct ExternalWorkerBootstrap {
+    control_plane_url: String,
+    credential: String,
+    authority: ExternalWorkerAuthority,
+}
+
+pub(crate) fn remote_worker_bootstrap_enabled() -> bool {
+    std::env::var("AGNT5_API_KEY_FILE").is_ok_and(|value| !value.trim().is_empty())
+}
+
+async fn external_worker_bootstrap() -> Result<(
+    String,
+    BearerInterceptor,
+    Option<ClientTlsConfig>,
+    Option<String>,
+)> {
+    let control_plane_url = std::env::var("AGNT5_CONTROL_PLANE_URL")
+        .unwrap_or_else(|_| "https://api.agnt5.com".to_string())
+        .trim_end_matches('/')
+        .to_string();
+    let key_path = std::env::var("AGNT5_API_KEY_FILE").map_err(|_| SdkError::Connection {
+        message: "AGNT5_API_KEY_FILE is required for external workers".to_string(),
+        code: crate::error::ErrorCode::ConnectionFailed,
+        source: None,
+    })?;
+    let credential = std::fs::read_to_string(&key_path)
+        .map_err(|error| SdkError::Connection {
+            message: format!("read external worker credential {}: {}", key_path, error),
+            code: crate::error::ErrorCode::ConnectionFailed,
+            source: None,
+        })?
+        .trim()
+        .to_string();
+    if credential.is_empty() {
+        return Err(SdkError::Connection {
+            message: "external worker credential file is empty".to_string(),
+            code: crate::error::ErrorCode::ConnectionFailed,
+            source: None,
+        });
+    }
+    let environment = std::env::var("AGNT5_ENVIRONMENT").unwrap_or_default();
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|error| SdkError::Connection {
+            message: format!("create external worker bootstrap client: {}", error),
+            code: crate::error::ErrorCode::ConnectionFailed,
+            source: None,
+        })?;
+    let response = http
+        .post(format!("{}{}", control_plane_url, EXTERNAL_DISCOVERY_PATH))
+        .header("X-API-KEY", &credential)
+        .json(&serde_json::json!({
+            "environment": environment,
+            "supported_auth_profiles": [AUTH_PROFILE_BOOTSTRAP_MTLS, AUTH_PROFILE_TOKEN_AUTH]
+        }))
+        .send()
+        .await
+        .map_err(|error| SdkError::Connection {
+            message: format!("external worker discovery failed: {}", error),
+            code: crate::error::ErrorCode::ConnectionFailed,
+            source: None,
+        })?;
+    if !response.status().is_success() {
+        return Err(SdkError::Connection {
+            message: format!("external worker discovery returned {}", response.status()),
+            code: crate::error::ErrorCode::ConnectionFailed,
+            source: None,
+        });
+    }
+    let authority: ExternalWorkerAuthority =
+        response
+            .json()
+            .await
+            .map_err(|error| SdkError::Connection {
+                message: format!("decode external worker discovery response: {}", error),
+                code: crate::error::ErrorCode::ConnectionFailed,
+                source: None,
+            })?;
+    if authority.protocol != "pull.v1" || authority.runtime_endpoint.trim().is_empty() {
+        return Err(SdkError::Connection {
+            message: "external worker discovery returned an unsupported target".to_string(),
+            code: crate::error::ErrorCode::ConnectionFailed,
+            source: None,
+        });
+    }
+    match authority.auth_profile.as_str() {
+        AUTH_PROFILE_BOOTSTRAP_MTLS => {
+            if authority.identity_endpoint.trim().is_empty() {
+                return Err(SdkError::Connection {
+                    message:
+                        "worker discovery selected bootstrap-mtls without an identity endpoint"
+                            .to_string(),
+                    code: crate::error::ErrorCode::ConnectionFailed,
+                    source: None,
+                });
+            }
+            let identity_authority = crate::external_worker_identity::Authority {
+                project_id: authority.project_id,
+                environment_id: authority.environment_id,
+                deployment_id: authority.deployment_id,
+                worker_pool_id: authority.worker_pool_id,
+                runtime_endpoint: authority.runtime_endpoint,
+                protocol: authority.protocol,
+            };
+            let identity = crate::external_worker_identity::connection_identity(
+                control_plane_url,
+                authority.identity_endpoint,
+                credential,
+                identity_authority,
+            )
+            .await?;
+            eprintln!("[INFO] worker authenticated with bootstrap mTLS");
+            return Ok((
+                identity.endpoint,
+                BearerInterceptor {
+                    token: identity.authorization,
+                },
+                Some(identity.tls),
+                Some(identity.worker_id),
+            ));
+        }
+        AUTH_PROFILE_TOKEN_AUTH => {}
+        profile => {
+            return Err(SdkError::Connection {
+                message: format!(
+                    "worker discovery selected unsupported authentication profile {profile:?}"
+                ),
+                code: crate::error::ErrorCode::ConnectionFailed,
+                source: None,
+            });
+        }
+    }
+    let bootstrap = ExternalWorkerBootstrap {
+        control_plane_url,
+        credential,
+        authority,
+    };
+    let initial = exchange_external_worker_token(&http, &bootstrap).await?;
+    let token = bearer_metadata(&initial.workload_token)?;
+    let shared = Arc::new(RwLock::new(Some(token)));
+    spawn_external_worker_token_refresh(
+        http,
+        bootstrap.clone(),
+        shared.clone(),
+        initial.expires_at,
+    );
+
+    // Discovery is authoritative. These values are consumed immediately after
+    // connect when the pull session registration is constructed.
+    std::env::set_var("AGNT5_PROJECT_ID", &bootstrap.authority.project_id);
+    std::env::set_var("AGNT5_DEPLOYMENT_ID", &bootstrap.authority.deployment_id);
+    std::env::set_var("AGNT5_WORKERPOOL_ID", &bootstrap.authority.worker_pool_id);
+    std::env::set_var("AGNT5_WORKER_MODE", "pull");
+    eprintln!("[INFO] worker authenticated with token auth");
+    Ok((
+        bootstrap.authority.runtime_endpoint.clone(),
+        BearerInterceptor { token: shared },
+        None,
+        None,
+    ))
+}
+
+async fn exchange_external_worker_token(
+    http: &reqwest::Client,
+    bootstrap: &ExternalWorkerBootstrap,
+) -> Result<ExternalWorkerTokenResponse> {
+    let response = http
+        .post(format!(
+            "{}{}",
+            bootstrap.control_plane_url, EXTERNAL_TOKEN_PATH
+        ))
+        .header("X-API-KEY", &bootstrap.credential)
+        .json(&ExternalWorkerTokenRequest::from(&bootstrap.authority))
+        .send()
+        .await
+        .map_err(|error| SdkError::Connection {
+            message: format!("external worker token exchange failed: {}", error),
+            code: crate::error::ErrorCode::ConnectionFailed,
+            source: None,
+        })?;
+    if !response.status().is_success() {
+        return Err(SdkError::Connection {
+            message: format!(
+                "external worker token exchange returned {}",
+                response.status()
+            ),
+            code: crate::error::ErrorCode::ConnectionFailed,
+            source: None,
+        });
+    }
+    response.json().await.map_err(|error| SdkError::Connection {
+        message: format!("decode external worker token response: {}", error),
+        code: crate::error::ErrorCode::ConnectionFailed,
+        source: None,
+    })
+}
+
+fn bearer_metadata(token: &str) -> Result<MetadataValue<tonic::metadata::Ascii>> {
+    format!("Bearer {}", token)
+        .parse()
+        .map_err(|error| SdkError::Connection {
+            message: format!("invalid external worker token metadata: {}", error),
+            code: crate::error::ErrorCode::ConnectionFailed,
+            source: None,
+        })
+}
+
+fn spawn_external_worker_token_refresh(
+    http: reqwest::Client,
+    bootstrap: ExternalWorkerBootstrap,
+    token: Arc<RwLock<Option<MetadataValue<tonic::metadata::Ascii>>>>,
+    mut expires_at: chrono::DateTime<chrono::Utc>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let delay = (expires_at - chrono::Utc::now() - chrono::Duration::seconds(60))
+                .to_std()
+                .unwrap_or(Duration::from_secs(1));
+            tokio::time::sleep(delay).await;
+            match exchange_external_worker_token(&http, &bootstrap).await {
+                Ok(refreshed) => match bearer_metadata(&refreshed.workload_token) {
+                    Ok(value) => {
+                        *token.write().unwrap_or_else(|p| p.into_inner()) = Some(value);
+                        expires_at = refreshed.expires_at;
+                    }
+                    Err(error) => error!("External worker token refresh rejected: {}", error),
+                },
+                Err(error) => {
+                    error!("External worker token refresh failed: {}; retrying", error);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+        }
+    });
+}
 
 pub const DURABLE_ACTIVATION_V1_CAPABILITY: &str = "durable_activation_v1";
 pub const DURABLE_SUSPENSION_V1_CAPABILITY: &str = "durable_suspension_v1";
@@ -124,9 +432,10 @@ fn activation_status(operation: &str, status: tonic::Status) -> SdkError {
 /// multiplexes streams.
 #[derive(Debug, Clone)]
 pub struct WorkerCoordinatorClient {
-    client: WorkerCoordinatorServiceClient<Channel>,
-    engine_client: EngineServiceClient<Channel>,
+    client: WorkerCoordinatorServiceClient<AuthenticatedChannel>,
+    engine_client: EngineServiceClient<AuthenticatedChannel>,
     negotiated_protocol_capabilities: Arc<RwLock<Vec<String>>>,
+    authoritative_worker_id: Option<String>,
 }
 
 const WORKER_COORDINATOR_RPC_TIMEOUT: Duration = Duration::from_secs(45);
@@ -146,14 +455,35 @@ fn is_idle_poll_timeout(status: &tonic::Status) -> bool {
 impl WorkerCoordinatorClient {
     /// Create a new client connected to the Worker Coordinator
     pub async fn connect(endpoint: String) -> Result<Self> {
+        let (endpoint, interceptor, tls, authoritative_worker_id) =
+            if remote_worker_bootstrap_enabled() {
+                external_worker_bootstrap().await?
+            } else {
+                (
+                    endpoint,
+                    BearerInterceptor {
+                        token: Arc::new(RwLock::new(None)),
+                    },
+                    None,
+                    None,
+                )
+            };
         debug!("Connecting to Worker Coordinator at {}", endpoint);
 
-        let channel = Channel::from_shared(endpoint.clone())
-            .map_err(|e| SdkError::Connection {
+        let mut channel =
+            Channel::from_shared(endpoint.clone()).map_err(|e| SdkError::Connection {
                 message: format!("Invalid endpoint {}: {}", endpoint, e),
                 code: crate::error::ErrorCode::ConnectionFailed,
                 source: None,
-            })?
+            })?;
+        if let Some(tls) = tls {
+            channel = channel.tls_config(tls).map_err(|e| SdkError::Connection {
+                message: format!("Invalid worker TLS configuration: {}", e),
+                code: crate::error::ErrorCode::ConnectionFailed,
+                source: None,
+            })?;
+        }
+        let channel = channel
             .connect_timeout(Duration::from_secs(10))
             .timeout(WORKER_COORDINATOR_RPC_TIMEOUT)
             .http2_adaptive_window(true)
@@ -165,14 +495,23 @@ impl WorkerCoordinatorClient {
                 e
             })?;
 
-        let client = WorkerCoordinatorServiceClient::new(channel.clone());
-        let engine_client = EngineServiceClient::new(channel);
+        let client =
+            WorkerCoordinatorServiceClient::with_interceptor(channel.clone(), interceptor.clone());
+        let engine_client = EngineServiceClient::with_interceptor(channel, interceptor);
 
         Ok(Self {
             client,
             engine_client,
             negotiated_protocol_capabilities: Arc::new(RwLock::new(Vec::new())),
+            authoritative_worker_id,
         })
+    }
+
+    /// Use the server-assigned ID for certificate-bound customer workers.
+    pub(crate) fn effective_worker_id<'a>(&'a self, configured: &'a str) -> &'a str {
+        self.authoritative_worker_id
+            .as_deref()
+            .unwrap_or(configured)
     }
 
     pub(crate) fn retain_negotiated_protocol_capabilities(
@@ -207,6 +546,7 @@ impl WorkerCoordinatorClient {
         flume::Sender<ServiceMessage>,
         flume::Receiver<RuntimeMessage>,
     )> {
+        let worker_id = self.effective_worker_id(&worker_id).to_string();
         let worker_supported_protocols = registration.supported_protocol_capabilities.clone();
         let worker_required_protocols = registration.required_protocol_capabilities.clone();
         // Create the registration message first
@@ -548,8 +888,9 @@ impl WorkerCoordinatorClient {
     /// Register a parked-poll worker session with the Engine.
     pub async fn register_worker_session(
         &mut self,
-        req: RegisterWorkerSessionRequest,
+        mut req: RegisterWorkerSessionRequest,
     ) -> Result<RegisterWorkerSessionResponse> {
+        req.worker_id = self.effective_worker_id(&req.worker_id).to_string();
         let response = self
             .engine_client
             .register_worker_session(req)
@@ -568,7 +909,8 @@ impl WorkerCoordinatorClient {
     }
 
     /// Park one worker slot until a job is available or the Engine times out.
-    pub async fn poll_job(&mut self, req: PollJobRequest) -> Result<PollJobResponse> {
+    pub async fn poll_job(&mut self, mut req: PollJobRequest) -> Result<PollJobResponse> {
+        req.worker_id = self.effective_worker_id(&req.worker_id).to_string();
         let timeout = poll_job_deadline(&req);
         let mut request = tonic::Request::new(req);
         request.set_timeout(timeout);
@@ -628,8 +970,9 @@ impl WorkerCoordinatorClient {
     /// Renew an active push or pull execution lease.
     pub async fn renew_job_lease(
         &mut self,
-        req: RenewJobLeaseRequest,
+        mut req: RenewJobLeaseRequest,
     ) -> Result<RenewJobLeaseResponse> {
+        req.worker_id = self.effective_worker_id(&req.worker_id).to_string();
         let response = self
             .engine_client
             .renew_job_lease(req)
@@ -650,8 +993,9 @@ impl WorkerCoordinatorClient {
     /// Report current parked-poll capacity and active slot usage.
     pub async fn report_worker_capacity(
         &mut self,
-        req: ReportWorkerCapacityRequest,
+        mut req: ReportWorkerCapacityRequest,
     ) -> Result<ReportWorkerCapacityResponse> {
+        req.worker_id = self.effective_worker_id(&req.worker_id).to_string();
         let response = self
             .engine_client
             .report_worker_capacity(req)
@@ -673,7 +1017,11 @@ impl WorkerCoordinatorClient {
     /// Updates job_queue, run status, journal, and batch counters.
     ///
     /// CompleteJob now lives on EngineService (moved from WorkerCoordinatorService).
-    pub async fn complete_job(&mut self, req: CompleteJobRequest) -> Result<CompleteJobResponse> {
+    pub async fn complete_job(
+        &mut self,
+        mut req: CompleteJobRequest,
+    ) -> Result<CompleteJobResponse> {
+        req.worker_id = self.effective_worker_id(&req.worker_id).to_string();
         let response = self
             .engine_client
             .complete_job(req)
@@ -840,32 +1188,54 @@ fn should_retry_activation_status(status: &tonic::Status, attempt: usize) -> boo
 /// events are routed through a single HTTP/2 connection.
 #[derive(Debug, Clone)]
 pub struct EngineClient {
-    clients: Vec<EngineServiceClient<Channel>>,
+    clients: Vec<EngineServiceClient<AuthenticatedChannel>>,
     next: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    authoritative_worker_id: Option<String>,
 }
 
 impl EngineClient {
     /// Connect to the engine at the given endpoint with a pool of connections.
     pub async fn connect(endpoint: &str) -> Result<Self> {
+        let (endpoint, interceptor, tls, authoritative_worker_id) =
+            if remote_worker_bootstrap_enabled() {
+                external_worker_bootstrap().await?
+            } else {
+                (
+                    endpoint.to_string(),
+                    BearerInterceptor {
+                        token: Arc::new(RwLock::new(None)),
+                    },
+                    None,
+                    None,
+                )
+            };
         debug!(
             "Connecting to Engine at {} (pool_size={})",
             endpoint, ENGINE_POOL_SIZE
         );
 
         let uri = if endpoint.contains("://") {
-            endpoint.to_string()
+            endpoint.clone()
         } else {
             format!("http://{}", endpoint)
         };
 
         let mut clients = Vec::with_capacity(ENGINE_POOL_SIZE);
         for i in 0..ENGINE_POOL_SIZE {
-            let channel = Channel::from_shared(uri.clone())
-                .map_err(|e| SdkError::Connection {
+            let mut channel =
+                Channel::from_shared(uri.clone()).map_err(|e| SdkError::Connection {
                     message: format!("Invalid engine endpoint {}: {}", endpoint, e),
                     code: crate::error::ErrorCode::ConnectionFailed,
                     source: None,
-                })?
+                })?;
+            if let Some(tls) = tls.clone() {
+                channel = channel.tls_config(tls).map_err(|e| SdkError::Connection {
+                    message: format!("Invalid worker TLS configuration: {}", e),
+                    code: crate::error::ErrorCode::ConnectionFailed,
+                    source: None,
+                })?;
+            }
+            let channel = channel
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(30))
                 .http2_adaptive_window(true)
@@ -879,7 +1249,10 @@ impl EngineClient {
                         source: None,
                     }
                 })?;
-            clients.push(EngineServiceClient::new(channel));
+            clients.push(EngineServiceClient::with_interceptor(
+                channel,
+                interceptor.clone(),
+            ));
         }
 
         debug!(
@@ -889,11 +1262,12 @@ impl EngineClient {
         Ok(Self {
             clients,
             next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            authoritative_worker_id,
         })
     }
 
     /// Get the next client from the pool (round-robin).
-    fn next_client(&mut self) -> &mut EngineServiceClient<Channel> {
+    fn next_client(&mut self) -> &mut EngineServiceClient<AuthenticatedChannel> {
         let idx = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.clients.len();
         &mut self.clients[idx]
     }
@@ -1076,9 +1450,14 @@ impl EngineClient {
     /// Publish a bounded batch of ephemeral events and wait until the runtime
     /// acknowledges every frame. Closing each batch supplies the ordering
     /// barrier needed before a durable terminal event is appended.
-    pub async fn stream_events(&mut self, events: Vec<EventStreamMessage>) -> Result<i64> {
+    pub async fn stream_events(&mut self, mut events: Vec<EventStreamMessage>) -> Result<i64> {
         if events.is_empty() {
             return Ok(0);
+        }
+        if let Some(worker_id) = &self.authoritative_worker_id {
+            for event in &mut events {
+                event.worker_id.clone_from(worker_id);
+            }
         }
         let expected = events.len() as i64;
         let response = self
@@ -1139,6 +1518,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn external_worker_token_request_contains_only_immutable_authority() {
+        let authority = ExternalWorkerAuthority {
+            project_id: "project-1".into(),
+            environment_id: "environment-1".into(),
+            deployment_id: "deployment-1".into(),
+            worker_pool_id: "pool-1".into(),
+            runtime_endpoint: "https://runtime.example".into(),
+            protocol: "pull.v1".into(),
+            auth_profile: AUTH_PROFILE_TOKEN_AUTH.into(),
+            identity_endpoint: String::new(),
+        };
+
+        let value = serde_json::to_value(ExternalWorkerTokenRequest::from(&authority)).unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "project_id": "project-1",
+                "environment_id": "environment-1",
+                "deployment_id": "deployment-1",
+                "worker_pool_id": "pool-1"
+            })
+        );
+    }
+
+    #[test]
     fn retryable_engine_status_includes_partition_handoff_errors() {
         let status = tonic::Status::internal(
             "Engine AppendBatch failed: no sequencer available after retry",
@@ -1181,6 +1586,7 @@ mod tests {
         let mut client = EngineClient {
             clients: Vec::new(),
             next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            authoritative_worker_id: None,
         };
         let records = vec![
             Record {

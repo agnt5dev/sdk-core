@@ -116,6 +116,8 @@ crc32fast = "1"
 
 # Base64 encoding for sandbox file operations
 base64 = "0.22"
+rcgen = "0.14.9"
+pem = "3"
 
 # Bytes for WASI pipe types
 bytes = "1"
