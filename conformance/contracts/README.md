@@ -44,3 +44,8 @@ assertion inappropriate.
 
 Recommended groups are `functions`, `workflows`, `streaming`, `state`,
 `agents`, `tools`, and `hitl`.
+
+Worker protocol contracts may replace `component` and `input` with an
+`assignment` plus `worker_result`, and assert the metadata on the resulting
+terminal mutation. These contracts cover cross-SDK fencing behavior that is
+not observable in a component's business output.

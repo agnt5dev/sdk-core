@@ -37,6 +37,7 @@ const ASSIGNMENT_AUTHORED_RETRY_METADATA_KEYS: &[&str] = &[
     "max_interval_ms",
     "backoff_type",
     "backoff_multiplier",
+    "assignment_commit_offset",
 ];
 
 /// Slot lifecycle events sent from parked poll slots to the ramp supervisor.
@@ -6139,6 +6140,7 @@ mod tests {
                 ("lease_expires_at_ms".to_string(), "999999999".to_string()),
                 ("lease_timeout_ms".to_string(), "1".to_string()),
                 ("max_attempts".to_string(), "5".to_string()),
+                ("assignment_commit_offset".to_string(), "42".to_string()),
             ]),
             attempt: 2,
             timeout_ms: 0,
@@ -6171,6 +6173,12 @@ mod tests {
         assert_eq!(
             completion_metadata.get("max_attempts").map(String::as_str),
             Some("5")
+        );
+        assert_eq!(
+            completion_metadata
+                .get("assignment_commit_offset")
+                .map(String::as_str),
+            Some("42")
         );
         match message.message_data {
             Some(runtime_message::MessageData::DispatchComponent(req)) => {
@@ -6281,6 +6289,7 @@ mod tests {
                 ("max_interval_ms".to_string(), "1000".to_string()),
                 ("backoff_type".to_string(), "exponential".to_string()),
                 ("backoff_multiplier".to_string(), "2".to_string()),
+                ("assignment_commit_offset".to_string(), "42".to_string()),
             ]),
         )
         .expect("function response should become a fenced completion");
@@ -6384,6 +6393,7 @@ mod tests {
                 ("max_interval_ms".to_string(), "1000".to_string()),
                 ("backoff_type".to_string(), "exponential".to_string()),
                 ("backoff_multiplier".to_string(), "2".to_string()),
+                ("assignment_commit_offset".to_string(), "42".to_string()),
                 (
                     "completion_event_type".to_string(),
                     "forged.event".to_string(),
@@ -6420,6 +6430,7 @@ mod tests {
             ("max_interval_ms", "1000"),
             ("backoff_type", "exponential"),
             ("backoff_multiplier", "2"),
+            ("assignment_commit_offset", "42"),
         ] {
             assert_eq!(
                 request.metadata.get(key).map(String::as_str),
