@@ -1,0 +1,20 @@
+version: 1
+group: worker_assignment_receipt
+coverage: behavior
+cases:
+- id: committed_assignment_offset_reaches_terminal_mutation
+  sdks: [python, typescript, go]
+  assignment:
+    metadata:
+      lease_id: lease-1
+      lease_attempt: "0"
+      assignment_commit_offset: "42"
+  worker_result:
+    event_type: run.completed
+    output: {ok: true}
+  expect:
+    terminal_metadata_subset:
+      lease_id: lease-1
+      lease_attempt: "0"
+      assignment_commit_offset: "42"
+    invariant: terminal mutation carries the exact committed assignment offset
