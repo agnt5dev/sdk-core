@@ -1105,7 +1105,7 @@ const ENGINE_RPC_RETRY_ATTEMPTS: usize = 20;
 const ENGINE_ACTIVATION_RPC_ATTEMPTS: usize = 6;
 const ENGINE_RPC_RETRY_DELAY: Duration = Duration::from_millis(100);
 
-fn is_retryable_engine_status(status: &tonic::Status) -> bool {
+pub(crate) fn is_retryable_engine_status(status: &tonic::Status) -> bool {
     let message = status.message().to_ascii_lowercase();
     matches!(
         status.code(),
@@ -1114,6 +1114,14 @@ fn is_retryable_engine_status(status: &tonic::Status) -> bool {
             | tonic::Code::Cancelled
             | tonic::Code::Unknown
     ) || is_retryable_engine_message(&message)
+}
+
+pub(crate) fn engine_append_status_error(operation: &str, status: tonic::Status) -> SdkError {
+    SdkError::Connection {
+        message: format!("{operation} failed: {status}"),
+        code: crate::error::ErrorCode::ConnectionFailed,
+        source: Some(Box::new(status)),
+    }
 }
 
 fn is_retryable_engine_message(message: &str) -> bool {
@@ -1393,11 +1401,7 @@ impl EngineClient {
                 }
                 Err(status) => {
                     debug!("Engine Append failed: {}", status);
-                    return Err(SdkError::Connection {
-                        message: format!("Engine Append failed: {}", status),
-                        code: crate::error::ErrorCode::ConnectionFailed,
-                        source: None,
-                    });
+                    return Err(engine_append_status_error("Engine Append", status));
                 }
             }
         }
@@ -1435,11 +1439,7 @@ impl EngineClient {
                 }
                 Err(status) => {
                     debug!("Engine AppendBatch failed: {}", status);
-                    return Err(SdkError::Connection {
-                        message: format!("Engine AppendBatch failed: {}", status),
-                        code: crate::error::ErrorCode::ConnectionFailed,
-                        source: None,
-                    });
+                    return Err(engine_append_status_error("Engine AppendBatch", status));
                 }
             }
         }

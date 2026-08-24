@@ -408,6 +408,46 @@ fn uncommitted_records_in_reverse<T>(records: Vec<T>, committed: &[bool]) -> Vec
         .collect()
 }
 
+fn retryable_uncommitted_records_in_reverse<T>(
+    records: Vec<T>,
+    committed: &[bool],
+    error: &SdkError,
+) -> Vec<T> {
+    if journal_append_error_is_retryable(error) {
+        uncommitted_records_in_reverse(records, committed)
+    } else {
+        Vec::new()
+    }
+}
+
+fn journal_append_error_is_retryable(error: &SdkError) -> bool {
+    if let SdkError::Connection {
+        source: Some(source),
+        ..
+    } = error
+    {
+        if let Some(status) = source.downcast_ref::<tonic::Status>() {
+            return crate::client::is_retryable_engine_status(status);
+        }
+    }
+
+    match error {
+        SdkError::Status(status) => crate::client::is_retryable_engine_status(status),
+        SdkError::Transport(_)
+        | SdkError::Connection {
+            code:
+                crate::error::ErrorCode::ConnectionFailed
+                | crate::error::ErrorCode::ConnectionTimeout
+                | crate::error::ErrorCode::ServiceUnavailable,
+            ..
+        }
+        | SdkError::Unavailable { .. }
+        | SdkError::ServiceCallError { .. }
+        | SdkError::Timeout { .. } => true,
+        _ => error.is_retryable(),
+    }
+}
+
 async fn append_records_by_run(
     engine: &mut EngineClient,
     records: &[crate::pb::Record],
@@ -625,10 +665,9 @@ pub struct WorkerConfig {
     /// Default: 5
     pub max_retries: u32,
 
-    /// AGNT5 Engine endpoint for direct event writes.
-    /// When set, all event paths (checkpoints, boundary, SSE-only) route to the engine's
-    /// Append/AppendBatch RPCs instead of the Go Execution Engine.
-    /// Env: AGNT5_ENGINE_URL. None = use Go EE (default).
+    /// AGNT5 Engine endpoint for current checkpoint and event writes.
+    /// Defaults to the coordinator endpoint because supported runtimes expose a
+    /// combined gRPC listener. Env: AGNT5_ENGINE_URL overrides that endpoint.
     pub engine_endpoint: Option<String>,
 
     /// Declared concurrency budget: the max in-flight handler invocations
@@ -660,16 +699,12 @@ impl WorkerConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(5);
 
-        // Engine endpoint — when set, bypasses Go EE for all event writes.
-        let engine_endpoint = std::env::var("AGNT5_ENGINE_URL").ok().or_else(|| {
-            if crate::client::remote_worker_bootstrap_enabled() {
-                // EngineClient performs authenticated discovery and replaces
-                // this bootstrap placeholder with the advertised runtime URL.
-                Some(coordinator_endpoint.clone())
-            } else {
-                None
-            }
-        });
+        // Current Engine endpoint. Supported runtimes expose EngineService on
+        // the combined coordinator listener unless explicitly overridden.
+        let engine_endpoint = resolve_engine_endpoint(
+            std::env::var("AGNT5_ENGINE_URL").ok(),
+            &coordinator_endpoint,
+        );
 
         // Concurrency budget: seed from the env var so existing deployments
         // keep working; language bindings may overwrite before `run()`.
@@ -697,6 +732,38 @@ impl WorkerConfig {
     pub fn resolved_coordinator_endpoint(&self) -> String {
         self.coordinator_endpoint.clone()
     }
+}
+
+fn resolve_engine_endpoint(
+    explicit_endpoint: Option<String>,
+    coordinator_endpoint: &str,
+) -> Option<String> {
+    explicit_endpoint
+        .filter(|endpoint| !endpoint.trim().is_empty())
+        .or_else(|| {
+            (!coordinator_endpoint.trim().is_empty()).then(|| coordinator_endpoint.to_string())
+        })
+}
+
+fn require_engine_endpoint(config: &WorkerConfig) -> Result<&str> {
+    let endpoint = config
+        .engine_endpoint
+        .as_deref()
+        .filter(|endpoint| !endpoint.trim().is_empty())
+        .ok_or_else(|| SdkError::Configuration {
+            message: "Current checkpoint transport requires AGNT5_ENGINE_URL or a non-empty AGNT5_COORDINATOR_ENDPOINT for the combined runtime service".to_string(),
+            field: Some("AGNT5_ENGINE_URL".to_string()),
+        })?;
+    let uri = if endpoint.contains("://") {
+        endpoint.to_string()
+    } else {
+        format!("http://{endpoint}")
+    };
+    Channel::from_shared(uri).map_err(|error| SdkError::Configuration {
+        message: format!("Invalid current Engine endpoint {endpoint}: {error}"),
+        field: Some("AGNT5_ENGINE_URL".to_string()),
+    })?;
+    Ok(endpoint)
 }
 
 /// Blacklist patterns for sensitive environment variables
@@ -2838,12 +2905,10 @@ impl Worker {
     }
 
     /// Ensure the Engine gRPC client is connected, lazily creating it on first use.
-    /// Returns None if AGNT5_ENGINE_URL is not configured.
+    /// Returns an actionable configuration error rather than selecting the
+    /// deprecated ExecutionEngine checkpoint service.
     async fn ensure_engine_client(&self) -> Result<Option<EngineClient>> {
-        let endpoint = match &self.config.engine_endpoint {
-            Some(ep) => ep.clone(),
-            None => return Ok(None),
-        };
+        let endpoint = require_engine_endpoint(&self.config)?.to_string();
 
         let mut guard = self.engine_client.lock().await;
         if let Some(ref client) = *guard {
@@ -3089,10 +3154,19 @@ impl Worker {
                     }
                     if !durable_records.is_empty() {
                         if let Err(error) = engine.append_batch(durable_records).await {
-                            for event in
-                                pending.into_iter().rev().filter(|event| !event.is_sse_only)
-                            {
-                                self.journal_queue.push_front(event).ok();
+                            let durable_count =
+                                pending.iter().filter(|event| !event.is_sse_only).count();
+                            if journal_append_error_is_retryable(&error) {
+                                for event in
+                                    pending.into_iter().rev().filter(|event| !event.is_sse_only)
+                                {
+                                    self.journal_queue.push_front(event).ok();
+                                }
+                            } else {
+                                warn!(
+                                    "Engine permanently rejected {} queued durable events for run_id={}; dropping them: {}",
+                                    durable_count, run_id, error
+                                );
                             }
                             self.journal_queue.record_error();
                             let mut guard = self.engine_client.lock().await;
@@ -3550,8 +3624,19 @@ impl Worker {
                 }
                 if !durable_records.is_empty() {
                     if let Err(error) = engine.append_batch(durable_records).await {
-                        for event in pending.into_iter().rev().filter(|event| !event.is_sse_only) {
-                            self.journal_queue.push_front(event).ok();
+                        let durable_count =
+                            pending.iter().filter(|event| !event.is_sse_only).count();
+                        if journal_append_error_is_retryable(&error) {
+                            for event in
+                                pending.into_iter().rev().filter(|event| !event.is_sse_only)
+                            {
+                                self.journal_queue.push_front(event).ok();
+                            }
+                        } else {
+                            warn!(
+                                "Engine permanently rejected {} queued durable events; dropping them: {}",
+                                durable_count, error
+                            );
                         }
                         self.journal_queue.record_error();
                         let mut guard = self.engine_client.lock().await;
@@ -3621,15 +3706,24 @@ impl Worker {
                     debug!("Engine batch checkpoint: {} events persisted", count);
                 }
                 Err((e, committed, _written)) => {
-                    warn!(
-                        "Engine batch checkpoint failed for {} non-terminal events; queued for retry: {}",
-                        count, e
-                    );
+                    let retryable = journal_append_error_is_retryable(&e);
+                    if retryable {
+                        warn!(
+                            "Engine batch checkpoint transiently failed for {} non-terminal events; queued for retry: {}",
+                            count, e
+                        );
+                    } else {
+                        warn!(
+                            "Engine permanently rejected a checkpoint batch of {} non-terminal events; dropping uncommitted records: {}",
+                            count, e
+                        );
+                    }
                     {
                         let mut guard = self.engine_client.lock().await;
                         *guard = None;
                     }
-                    for event in uncommitted_records_in_reverse(originals, &committed) {
+                    for event in retryable_uncommitted_records_in_reverse(originals, &committed, &e)
+                    {
                         self.journal_queue.push_front(event).ok();
                     }
                     self.journal_queue.record_error();
@@ -3704,6 +3798,7 @@ impl Worker {
         F: Fn(RuntimeMessage, flume::Sender<ServiceMessage>) -> Fut + Send + Clone + 'static,
         Fut: std::future::Future<Output = Result<Option<ServiceMessage>>> + Send + 'static,
     {
+        require_engine_endpoint(&self.config)?;
         info!("Starting worker {}", self.config.worker_id);
 
         // Capture the tokio runtime handle for emit_checkpoint_sync_blocking.
@@ -4841,11 +4936,23 @@ impl Worker {
                                         );
                                     }
                                     Err((e, committed, written)) => {
-                                        warn!("Flush task: Engine AppendBatch failed: {}", e);
-                                        engine = None; // Clear for reconnection
-                                        for event in uncommitted_records_in_reverse(
+                                        let retryable = journal_append_error_is_retryable(&e);
+                                        if retryable {
+                                            warn!(
+                                                "Flush task: Engine AppendBatch transiently failed; queued uncommitted records for retry: {}",
+                                                e
+                                            );
+                                            engine = None; // Clear for reconnection
+                                        } else {
+                                            warn!(
+                                                "Flush task: Engine permanently rejected AppendBatch; dropping uncommitted records: {}",
+                                                e
+                                            );
+                                        }
+                                        for event in retryable_uncommitted_records_in_reverse(
                                             durable_originals,
                                             &committed,
+                                            &e,
                                         ) {
                                             journal_queue.push_front(event).ok();
                                         }
@@ -5502,7 +5609,8 @@ mod tests {
         is_terminal_worker_response, is_worker_session_inactive_error, parked_ramp_spawn_count,
         parked_runtime_service_response, parked_worker_session_was_refreshed,
         polled_job_completion_from_service_message, polled_job_suspension_request,
-        record_groups_by_run, runtime_message_from_job_assignment,
+        record_groups_by_run, require_engine_endpoint, resolve_engine_endpoint,
+        retryable_uncommitted_records_in_reverse, runtime_message_from_job_assignment,
         stamp_activation_dispatch_metadata, stamp_dispatch_mode,
         stamp_execution_authority_metadata, stamp_protocol_capability, take_correlation_ids,
         try_retire_parked_slot, uncommitted_records_in_reverse, valid_activation_artifact_sha256,
@@ -6053,6 +6161,97 @@ mod tests {
             uncommitted_records_in_reverse(vec![0, 1, 2, 3], &committed),
             vec![3, 1]
         );
+    }
+
+    #[test]
+    fn permanent_engine_rejection_does_not_requeue_uncommitted_records() {
+        let error = crate::client::engine_append_status_error(
+            "Engine AppendBatch",
+            tonic::Status::failed_precondition(
+                "worker lifecycle mutation rejected: run_not_active",
+            ),
+        );
+
+        assert!(
+            retryable_uncommitted_records_in_reverse(vec![0, 1], &[false, false], &error,)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn transient_engine_rejection_requeues_uncommitted_records() {
+        let error = crate::client::engine_append_status_error(
+            "Engine AppendBatch",
+            tonic::Status::unavailable("runtime unavailable"),
+        );
+
+        assert_eq!(
+            retryable_uncommitted_records_in_reverse(vec![0, 1], &[false, false], &error),
+            vec![1, 0]
+        );
+    }
+
+    #[test]
+    fn partition_handoff_precondition_requeues_uncommitted_records() {
+        let error = crate::client::engine_append_status_error(
+            "Engine AppendBatch",
+            tonic::Status::failed_precondition("stale epoch on forward: 162 < 163"),
+        );
+
+        assert_eq!(
+            retryable_uncommitted_records_in_reverse(vec![0, 1], &[false, false], &error),
+            vec![1, 0]
+        );
+    }
+
+    #[test]
+    fn missing_engine_endpoint_derives_supported_combined_runtime_endpoint() {
+        assert_eq!(
+            resolve_engine_endpoint(None, "http://runtime.example:34182"),
+            Some("http://runtime.example:34182".to_string())
+        );
+    }
+
+    #[test]
+    fn explicitly_missing_engine_endpoint_fails_with_actionable_configuration_error() {
+        let config = WorkerConfig {
+            engine_endpoint: None,
+            ..WorkerConfig::new(
+                "svc".to_string(),
+                "1.0.0".to_string(),
+                "standalone".to_string(),
+            )
+        };
+
+        let error = require_engine_endpoint(&config).unwrap_err();
+        assert!(matches!(
+            error,
+            SdkError::Configuration {
+                field: Some(field),
+                ..
+            } if field == "AGNT5_ENGINE_URL"
+        ));
+    }
+
+    #[test]
+    fn invalid_engine_endpoint_fails_before_worker_startup() {
+        let config = WorkerConfig {
+            engine_endpoint: Some("http://[invalid".to_string()),
+            ..WorkerConfig::new(
+                "svc".to_string(),
+                "1.0.0".to_string(),
+                "standalone".to_string(),
+            )
+        };
+
+        let error = require_engine_endpoint(&config).unwrap_err();
+        assert!(matches!(
+            error,
+            SdkError::Configuration {
+                field: Some(field),
+                ..
+            } if field == "AGNT5_ENGINE_URL"
+        ));
     }
 
     #[test]
