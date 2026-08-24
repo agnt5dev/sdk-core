@@ -31,7 +31,7 @@ Add the crate to a Rust project:
 
 ```toml
 [dependencies]
-agnt5-sdk-core = "0.1.6"
+agnt5-sdk-core = "0.2.1"
 ```
 
 The default build contains the portable SDK foundation. Optional capabilities
@@ -39,13 +39,25 @@ can be enabled with Cargo features:
 
 ```toml
 [dependencies]
-agnt5-sdk-core = { version = "0.1.6", features = ["libsql-memory"] }
+agnt5-sdk-core = { version = "0.2.1", features = ["libsql-memory"] }
 ```
 
 | Feature | Purpose |
 | --- | --- |
 | `libsql-memory` | Embedded libSQL-backed vector memory |
 | `wasm-sandbox` | Embedded Wasmtime sandbox execution |
+
+## Worker runtime endpoint
+
+Workers persist lifecycle events and durable checkpoints through the current
+`EngineService` contract. Set `AGNT5_ENGINE_URL` when the Engine listener is
+different from the worker coordinator. Otherwise, the SDK uses
+`AGNT5_COORDINATOR_ENDPOINT` as a combined runtime gRPC endpoint.
+
+The SDK does not silently fall back to the deprecated `ExecutionEngineService`
+checkpoint RPC when the Engine endpoint is absent. A configuration that cannot
+produce a non-empty current Engine endpoint fails worker startup with an
+actionable error.
 
 ## Repository boundaries
 
