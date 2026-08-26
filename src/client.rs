@@ -19,7 +19,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tonic::metadata::MetadataValue;
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::{Channel, ClientTlsConfig};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig};
 use tonic::Code;
 use tonic::{Request, Status};
 use tracing::{debug, error};
@@ -63,6 +63,26 @@ struct ExternalWorkerAuthority {
 
 fn default_external_worker_auth_profile() -> String {
     AUTH_PROFILE_TOKEN_AUTH.to_string()
+}
+
+fn external_worker_ca_bundle() -> Result<Option<Vec<u8>>> {
+    let path = match std::env::var("SSL_CERT_FILE") {
+        Ok(path) if !path.trim().is_empty() => path,
+        _ => return Ok(None),
+    };
+    let pem = std::fs::read(&path).map_err(|error| SdkError::Connection {
+        message: format!("read external worker CA bundle {}: {}", path, error),
+        code: crate::error::ErrorCode::ConnectionFailed,
+        source: None,
+    })?;
+    if pem.is_empty() {
+        return Err(SdkError::Connection {
+            message: format!("external worker CA bundle {} is empty", path),
+            code: crate::error::ErrorCode::ConnectionFailed,
+            source: None,
+        });
+    }
+    Ok(Some(pem))
 }
 
 impl ExternalWorkerAuthority {
@@ -142,14 +162,24 @@ async fn external_worker_bootstrap() -> Result<(
         });
     }
     let environment = std::env::var("AGNT5_ENVIRONMENT").unwrap_or_default();
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| SdkError::Connection {
-            message: format!("create external worker bootstrap client: {}", error),
-            code: crate::error::ErrorCode::ConnectionFailed,
-            source: None,
-        })?;
+    let ca_bundle = external_worker_ca_bundle()?;
+    let mut http_builder = reqwest::Client::builder().timeout(Duration::from_secs(15));
+    if let Some(pem) = ca_bundle.as_deref() {
+        let certificates =
+            reqwest::Certificate::from_pem_bundle(pem).map_err(|error| SdkError::Connection {
+                message: format!("parse external worker CA bundle: {}", error),
+                code: crate::error::ErrorCode::ConnectionFailed,
+                source: None,
+            })?;
+        for certificate in certificates {
+            http_builder = http_builder.add_root_certificate(certificate);
+        }
+    }
+    let http = http_builder.build().map_err(|error| SdkError::Connection {
+        message: format!("create external worker bootstrap client: {}", error),
+        code: crate::error::ErrorCode::ConnectionFailed,
+        source: None,
+    })?;
     let response = http
         .post(format!("{}{}", control_plane_url, EXTERNAL_DISCOVERY_PATH))
         .header("X-API-KEY", &credential)
@@ -257,10 +287,12 @@ async fn external_worker_bootstrap() -> Result<(
     std::env::set_var("AGNT5_WORKERPOOL_ID", &bootstrap.authority.worker_pool_id);
     std::env::set_var("AGNT5_WORKER_MODE", "pull");
     eprintln!("[INFO] worker authenticated with token auth");
+    let runtime_tls =
+        ca_bundle.map(|pem| ClientTlsConfig::new().ca_certificate(Certificate::from_pem(pem)));
     Ok((
         bootstrap.authority.runtime_endpoint.clone(),
         BearerInterceptor { token: shared },
-        None,
+        runtime_tls,
         None,
         bootstrap.authority,
     ))
