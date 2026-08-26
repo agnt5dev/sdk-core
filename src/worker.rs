@@ -816,10 +816,6 @@ fn canonical_project_id_from_metadata(metadata: &HashMap<String, String>) -> Opt
     metadata.get("project_id").cloned()
 }
 
-fn canonical_project_id_from_env() -> String {
-    std::env::var("AGNT5_PROJECT_ID").ok().unwrap_or_default()
-}
-
 fn with_project_metadata(
     mut metadata: HashMap<String, String>,
     project_id: &str,
@@ -837,6 +833,10 @@ pub struct Worker {
     config: WorkerConfig,
     components: Vec<ComponentInfo>,
     metadata: HashMap<String, String>,
+    /// Project-bound authority learned during external worker discovery.
+    /// Shared by every clone and background task so reconnects and checkpoint
+    /// flushes do not depend on process-global environment mutation.
+    connection_authority: Arc<std::sync::RwLock<HashMap<String, String>>>,
     connection_state: Arc<std::sync::Mutex<ConnectionState>>,
     /// Unified journal event queue (replaces checkpoint_queue, delta_queue, span_export_queue, log_export_queue)
     journal_queue: JournalEventQueue,
@@ -901,6 +901,13 @@ impl std::fmt::Debug for Worker {
             .field("config", &self.config)
             .field("components", &self.components)
             .field("metadata", &self.metadata)
+            .field(
+                "connection_authority",
+                &self
+                    .connection_authority
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            )
             .field("connection_state", &self.connection_state)
             .field("journal_queue_size", &self.journal_queue.len())
             .field("streaming_runs", &self.streaming_runs)
@@ -2735,6 +2742,7 @@ impl Worker {
             config,
             components,
             metadata,
+            connection_authority: Arc::new(std::sync::RwLock::new(HashMap::new())),
             connection_state: Arc::new(std::sync::Mutex::new(ConnectionState::Disconnected)),
             journal_queue: JournalEventQueue::new(journal_config),
             ee_client: Arc::new(TokioMutex::new(None)),
@@ -2769,6 +2777,81 @@ impl Worker {
     /// Update service metadata
     pub fn set_metadata(&mut self, metadata: HashMap<String, String>) {
         self.metadata = metadata;
+    }
+
+    fn effective_metadata(&self) -> HashMap<String, String> {
+        self.metadata_for_request(HashMap::new())
+    }
+
+    fn metadata_for_request(
+        &self,
+        mut request_metadata: HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        for (key, value) in &self.metadata {
+            request_metadata
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
+        let authority = self
+            .connection_authority
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (key, value) in authority.iter() {
+            request_metadata.insert(key.clone(), value.clone());
+        }
+        request_metadata
+    }
+
+    fn routing_value_for_metadata(
+        &self,
+        key: &str,
+        request_metadata: &HashMap<String, String>,
+    ) -> Option<String> {
+        self.connection_authority
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(key)
+            .cloned()
+            .or_else(|| request_metadata.get(key).cloned())
+            .or_else(|| self.metadata.get(key).cloned())
+    }
+
+    fn deployment_id_for_request(
+        &self,
+        typed_deployment_id: &str,
+        request_metadata: &HashMap<String, String>,
+    ) -> String {
+        if let Some(authority) = self
+            .connection_authority
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get("deployment_id")
+            .cloned()
+        {
+            return authority;
+        }
+        if !typed_deployment_id.is_empty() {
+            return typed_deployment_id.to_string();
+        }
+        self.routing_value_for_metadata("deployment_id", request_metadata)
+            .unwrap_or_default()
+    }
+
+    fn retain_external_worker_authority(&self, client: &WorkerCoordinatorClient) {
+        let mut authority = HashMap::new();
+        client.apply_external_worker_authority(&mut authority);
+        self.retain_connection_authority(authority);
+    }
+
+    fn retain_connection_authority(&self, authority: HashMap<String, String>) {
+        if authority.is_empty() {
+            return;
+        }
+        let mut retained = self
+            .connection_authority
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *retained = authority;
     }
 
     /// Get current connection state
@@ -2949,22 +3032,11 @@ impl Worker {
             );
             return;
         };
-        let project_id = request
-            .metadata
-            .get("project_id")
-            .cloned()
-            .or_else(|| canonical_project_id_from_metadata(&self.metadata))
+        let project_id = self
+            .routing_value_for_metadata("project_id", &request.metadata)
             .unwrap_or_default();
-        let deployment_id = if request.deployment_id.is_empty() {
-            request
-                .metadata
-                .get("deployment_id")
-                .cloned()
-                .or_else(|| self.metadata.get("deployment_id").cloned())
-                .unwrap_or_default()
-        } else {
-            request.deployment_id.clone()
-        };
+        let deployment_id =
+            self.deployment_id_for_request(&request.deployment_id, &request.metadata);
         if project_id.is_empty() || deployment_id.is_empty() {
             warn!(
                 "Push lease has incomplete routing authority; cancelling execution: run_id={}",
@@ -3108,8 +3180,8 @@ impl Worker {
             if is_durable_checkpoint {
                 let pending = self.journal_queue.drain_run_events(&run_id);
                 if !pending.is_empty() {
-                    let tenant_id = canonical_project_id_from_metadata(&metadata)
-                        .or_else(|| canonical_project_id_from_metadata(&self.metadata))
+                    let tenant_id = self
+                        .routing_value_for_metadata("project_id", &metadata)
                         .unwrap_or_default();
                     let transient: Vec<_> = pending
                         .iter()
@@ -3120,7 +3192,8 @@ impl Worker {
                             data: event.data.clone(),
                             trace_id: event.correlation_id.clone(),
                             span_id: event.parent_correlation_id.clone(),
-                            project_id: canonical_project_id_from_metadata(&event.metadata)
+                            project_id: self
+                                .routing_value_for_metadata("project_id", &event.metadata)
                                 .unwrap_or_else(|| tenant_id.clone()),
                             source_timestamp_ns: event.source_timestamp_ns,
                             worker_id: self.config.worker_id.clone(),
@@ -3139,7 +3212,7 @@ impl Worker {
                                 String::new(),
                                 e.correlation_id.clone(),
                                 e.parent_correlation_id.clone(),
-                                e.metadata.clone(),
+                                self.metadata_for_request(e.metadata.clone()),
                             )
                         })
                         .collect();
@@ -3183,12 +3256,7 @@ impl Worker {
                 }
             }
 
-            let mut merged_metadata = metadata;
-            for (k, v) in &self.metadata {
-                if !merged_metadata.contains_key(k) {
-                    merged_metadata.insert(k.clone(), v.clone());
-                }
-            }
+            let mut merged_metadata = self.metadata_for_request(metadata);
             let canonical_project_id =
                 canonical_project_id_from_metadata(&merged_metadata).unwrap_or_default();
             merged_metadata = with_project_metadata(merged_metadata, &canonical_project_id);
@@ -3283,7 +3351,8 @@ impl Worker {
                             data: event.data.clone(),
                             trace_id: String::new(),
                             span_id: String::new(),
-                            project_id: canonical_project_id_from_metadata(&event.metadata)
+                            project_id: self
+                                .routing_value_for_metadata("project_id", &event.metadata)
                                 .unwrap_or_default(),
                             source_timestamp_ns: event.source_timestamp_ns,
                             worker_id: self.config.worker_id.clone(),
@@ -3356,12 +3425,7 @@ impl Worker {
         }
 
         // Merge service metadata (tenant_id, deployment_id) with passed metadata
-        let mut merged_metadata = metadata;
-        for (k, v) in &self.metadata {
-            if !merged_metadata.contains_key(k) {
-                merged_metadata.insert(k.clone(), v.clone());
-            }
-        }
+        let mut merged_metadata = self.metadata_for_request(metadata);
         let canonical_project_id =
             canonical_project_id_from_metadata(&merged_metadata).unwrap_or_default();
         merged_metadata = with_project_metadata(merged_metadata, &canonical_project_id);
@@ -3566,6 +3630,7 @@ impl Worker {
             .await;
 
         if let Some(mut engine) = self.ensure_engine_client().await? {
+            let worker_metadata = self.effective_metadata();
             // The batch is an ordering boundary just like a single acknowledged
             // checkpoint. Flush anything already queued for these runs before
             // appending the batch so an earlier stream frame cannot be overtaken.
@@ -3577,8 +3642,10 @@ impl Worker {
 
                 let tenant_id = pending
                     .iter()
-                    .find_map(|event| canonical_project_id_from_metadata(&event.metadata))
-                    .or_else(|| canonical_project_id_from_metadata(&self.metadata))
+                    .find_map(|event| {
+                        self.routing_value_for_metadata("project_id", &event.metadata)
+                    })
+                    .or_else(|| canonical_project_id_from_metadata(&worker_metadata))
                     .unwrap_or_default();
                 let transient: Vec<_> = pending
                     .iter()
@@ -3589,7 +3656,8 @@ impl Worker {
                         data: event.data.clone(),
                         trace_id: event.correlation_id.clone(),
                         span_id: event.parent_correlation_id.clone(),
-                        project_id: canonical_project_id_from_metadata(&event.metadata)
+                        project_id: self
+                            .routing_value_for_metadata("project_id", &event.metadata)
                             .unwrap_or_else(|| tenant_id.clone()),
                         source_timestamp_ns: event.source_timestamp_ns,
                         worker_id: self.config.worker_id.clone(),
@@ -3608,7 +3676,7 @@ impl Worker {
                             String::new(),
                             event.correlation_id.clone(),
                             event.parent_correlation_id.clone(),
-                            event.metadata.clone(),
+                            self.metadata_for_request(event.metadata.clone()),
                         )
                     })
                     .collect();
@@ -3649,12 +3717,7 @@ impl Worker {
             let originals: Vec<_> = events
                 .into_iter()
                 .map(|(run_id, event_type, data, sequence, metadata, ts)| {
-                    let mut merged = metadata;
-                    for (k, v) in &self.metadata {
-                        if !merged.contains_key(k) {
-                            merged.insert(k.clone(), v.clone());
-                        }
-                    }
+                    let mut merged = self.metadata_for_request(metadata);
                     let (cid, pcid) = take_correlation_ids(&mut merged);
                     JournalEventMessage {
                         run_id,
@@ -4010,10 +4073,11 @@ impl Worker {
             );
         }
         let mut client = WorkerCoordinatorClient::connect(coordinator_endpoint.clone()).await?;
+        self.retain_external_worker_authority(&client);
 
         // Create registration message with components
         // Merge user-provided metadata with auto-collected AGNT5_* env vars
-        let mut metadata = self.metadata.clone();
+        let mut metadata = self.effective_metadata();
         metadata.extend(collect_agnt5_env_vars());
         if let Some(artifact) = configured_activation_artifact_sha256(&metadata) {
             metadata.insert("activation_artifact_sha256".to_string(), artifact);
@@ -4032,10 +4096,10 @@ impl Worker {
         } else {
             crate::pb::WorkerMode::Push as i32
         };
-        // stamp deployment_id from env so the coordinator's
-        // proto-field path picks it up. Falls back to metadata key on
-        // older coordinators that haven't been rebuilt yet.
-        let deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").unwrap_or_default();
+        // Stamp the connection-bound deployment into the coordinator's typed
+        // registration field. Local workers retain their configured metadata;
+        // external workers use the authenticated discovery authority.
+        let deployment_id = metadata.get("deployment_id").cloned().unwrap_or_default();
 
         // declare concurrency budget so the coordinator can
         // size headroom reservations per priority class. Resolved from
@@ -4753,6 +4817,19 @@ impl Worker {
         let journal_flush_locks_outer = self.journal_flush_locks.clone();
         let ee_endpoint_outer = self.config.ee_endpoint.clone();
         let engine_endpoint_outer = self.config.engine_endpoint.clone();
+        let connection_metadata = self.effective_metadata();
+        let authoritative_project_id_outer = self
+            .connection_authority
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get("project_id")
+            .cloned();
+        let cached_project_id_outer =
+            canonical_project_id_from_metadata(&connection_metadata).unwrap_or_default();
+        let cached_deployment_id_outer = connection_metadata
+            .get("deployment_id")
+            .cloned()
+            .unwrap_or_default();
 
         // Supervisor — restart the inner flush loop on panic with bounded
         // backoff. h2-0.4.13 panics with PoisonError under concurrent stream
@@ -4784,10 +4861,11 @@ impl Worker {
                 let dispatch_tx = dispatch_tx.clone();
                 let event_stream_tx = event_stream_tx.clone();
 
-                // Cache project_id/deployment_id to avoid repeated env lookups per event.
+                // Cache the connection-bound authority for this flush attempt.
                 // `tenant_id` remains a legacy alias for compatibility with engine/EE APIs.
-                let cached_project_id = canonical_project_id_from_env();
-                let cached_deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").unwrap_or_default();
+                let cached_project_id = cached_project_id_outer.clone();
+                let cached_deployment_id = cached_deployment_id_outer.clone();
+                let authoritative_project_id = authoritative_project_id_outer.clone();
 
                 let inner = tokio::spawn(async move {
                     let mut interval =
@@ -4872,11 +4950,15 @@ impl Worker {
                                             data: event.data.clone(),
                                             trace_id: event.correlation_id.clone(),
                                             span_id: event.parent_correlation_id.clone(),
-                                            project_id: canonical_project_id_from_metadata(
-                                                &event.metadata,
-                                            )
-                                            .or_else(|| event.tenant_id.clone())
-                                            .unwrap_or_else(|| cached_project_id.clone()),
+                                            project_id: authoritative_project_id
+                                                .clone()
+                                                .or_else(|| {
+                                                    canonical_project_id_from_metadata(
+                                                        &event.metadata,
+                                                    )
+                                                })
+                                                .or_else(|| event.tenant_id.clone())
+                                                .unwrap_or_else(|| cached_project_id.clone()),
                                             source_timestamp_ns: event.source_timestamp_ns,
                                             worker_id: worker_id.clone(),
                                         });
@@ -4889,11 +4971,15 @@ impl Worker {
                             let records: Vec<_> = durable_originals
                                 .iter()
                                 .map(|e| {
-                                    let tenant = if let Some(ref tid) = e.tenant_id {
-                                        tid.clone()
-                                    } else {
-                                        cached_project_id.clone()
-                                    };
+                                    let tenant = authoritative_project_id
+                                        .clone()
+                                        .or_else(|| e.tenant_id.clone())
+                                        .unwrap_or_else(|| cached_project_id.clone());
+                                    let mut metadata = e.metadata.clone();
+                                    if let Some(project_id) = &authoritative_project_id {
+                                        metadata
+                                            .insert("project_id".to_string(), project_id.clone());
+                                    }
                                     client::build_engine_record(
                                         tenant,
                                         e.run_id.clone(),
@@ -4903,7 +4989,7 @@ impl Worker {
                                         String::new(),
                                         e.correlation_id.clone(),
                                         e.parent_correlation_id.clone(),
-                                        e.metadata.clone(),
+                                        metadata,
                                     )
                                 })
                                 .collect();
@@ -5026,7 +5112,11 @@ impl Worker {
                                 }
                                 // No EventStream or EventStream failed — fallback to dispatch stream for SSE-only
                                 let mut metadata = event.metadata.clone();
-                                metadata = with_project_metadata(metadata, &cached_project_id);
+                                if let Some(project_id) = &authoritative_project_id {
+                                    metadata.insert("project_id".to_string(), project_id.clone());
+                                } else {
+                                    metadata = with_project_metadata(metadata, &cached_project_id);
+                                }
                                 if !cached_deployment_id.is_empty() {
                                     metadata.insert(
                                         "deployment_id".to_string(),
@@ -5084,7 +5174,11 @@ impl Worker {
 
                             // Boundary event — collect for batch WriteJournalEventsBatch to EE
                             let mut metadata = event.metadata.clone();
-                            metadata = with_project_metadata(metadata, &cached_project_id);
+                            if let Some(project_id) = &authoritative_project_id {
+                                metadata.insert("project_id".to_string(), project_id.clone());
+                            } else {
+                                metadata = with_project_metadata(metadata, &cached_project_id);
+                            }
                             if !cached_deployment_id.is_empty() {
                                 metadata
                                     .entry("deployment_id".to_string())
@@ -5285,12 +5379,15 @@ impl Worker {
     {
         let worker_id = self.config.worker_id.clone();
         let endpoint = self.config.resolved_coordinator_endpoint();
-        let project_id = canonical_project_id_from_env();
-        let deployment_id = std::env::var("AGNT5_DEPLOYMENT_ID").unwrap_or_default();
         let capabilities = worker_capabilities(&self.components);
         let components = self.components.clone();
         let activation_definition_configs = activation_definition_configs(&components);
-        let mut worker_metadata = self.metadata.clone();
+        let mut worker_metadata = self.effective_metadata();
+        let project_id = canonical_project_id_from_metadata(&worker_metadata).unwrap_or_default();
+        let deployment_id = worker_metadata
+            .get("deployment_id")
+            .cloned()
+            .unwrap_or_default();
         if let Some(artifact) = configured_activation_artifact_sha256(&worker_metadata) {
             worker_metadata.insert("activation_artifact_sha256".to_string(), artifact);
         }
@@ -5322,11 +5419,11 @@ impl Worker {
 
         tokio::spawn(async move {
             if project_id.is_empty() {
-                eprintln!("[INFO] Parked polling disabled (AGNT5_PROJECT_ID not set)");
+                eprintln!("[INFO] Parked polling disabled (project authority not set)");
                 return;
             }
             if deployment_id.is_empty() {
-                eprintln!("[INFO] Parked polling disabled (AGNT5_DEPLOYMENT_ID not set)");
+                eprintln!("[INFO] Parked polling disabled (deployment authority not set)");
                 return;
             }
 
@@ -5706,6 +5803,95 @@ mod tests {
             }
             other => panic!("expected typed timeout error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn discovered_authority_reaches_prebootstrap_worker_clones_and_overrides_request_scope() {
+        let config = WorkerConfig::new(
+            "svc".to_string(),
+            "1.0.0".to_string(),
+            "standalone".to_string(),
+        );
+        let worker = Worker::new(
+            config,
+            Vec::new(),
+            HashMap::from([
+                ("project_id".to_string(), "stale-project".to_string()),
+                ("deployment_id".to_string(), "stale-deployment".to_string()),
+            ]),
+        );
+        // Language bindings clone the Worker before the first coordinator
+        // connection performs external discovery.
+        let checkpoint_worker = worker.clone();
+
+        worker.retain_connection_authority(HashMap::from([
+            ("project_id".to_string(), "discovered-project".to_string()),
+            (
+                "environment_id".to_string(),
+                "discovered-environment".to_string(),
+            ),
+            (
+                "deployment_id".to_string(),
+                "discovered-deployment".to_string(),
+            ),
+            (
+                "worker_pool_id".to_string(),
+                "discovered-worker-pool".to_string(),
+            ),
+        ]));
+
+        let conflicting_event_metadata = HashMap::from([(
+            "project_id".to_string(),
+            "request-supplied-project".to_string(),
+        )]);
+        assert_eq!(
+            checkpoint_worker
+                .routing_value_for_metadata("project_id", &conflicting_event_metadata,),
+            Some("discovered-project".to_string()),
+            "authenticated discovery must bind every checkpoint to its project"
+        );
+
+        let effective = checkpoint_worker.effective_metadata();
+        assert_eq!(effective.get("project_id").unwrap(), "discovered-project");
+        assert_eq!(
+            effective.get("environment_id").unwrap(),
+            "discovered-environment"
+        );
+        assert_eq!(
+            effective.get("deployment_id").unwrap(),
+            "discovered-deployment"
+        );
+        assert_eq!(
+            effective.get("worker_pool_id").unwrap(),
+            "discovered-worker-pool"
+        );
+        assert_eq!(
+            checkpoint_worker
+                .deployment_id_for_request("request-supplied-deployment", &HashMap::new(),),
+            "discovered-deployment"
+        );
+    }
+
+    #[test]
+    fn local_worker_preserves_typed_deployment_authority() {
+        let config = WorkerConfig::new(
+            "svc".to_string(),
+            "1.0.0".to_string(),
+            "standalone".to_string(),
+        );
+        let worker = Worker::new(
+            config,
+            Vec::new(),
+            HashMap::from([(
+                "deployment_id".to_string(),
+                "worker-metadata-deployment".to_string(),
+            )]),
+        );
+
+        assert_eq!(
+            worker.deployment_id_for_request("typed-deployment", &HashMap::new()),
+            "typed-deployment"
+        );
     }
 
     #[tokio::test]

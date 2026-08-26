@@ -65,6 +65,15 @@ fn default_external_worker_auth_profile() -> String {
     AUTH_PROFILE_TOKEN_AUTH.to_string()
 }
 
+impl ExternalWorkerAuthority {
+    fn apply_to_metadata(&self, metadata: &mut HashMap<String, String>) {
+        metadata.insert("project_id".to_string(), self.project_id.clone());
+        metadata.insert("environment_id".to_string(), self.environment_id.clone());
+        metadata.insert("deployment_id".to_string(), self.deployment_id.clone());
+        metadata.insert("worker_pool_id".to_string(), self.worker_pool_id.clone());
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ExternalWorkerTokenRequest<'a> {
     project_id: &'a str,
@@ -106,6 +115,7 @@ async fn external_worker_bootstrap() -> Result<(
     BearerInterceptor,
     Option<ClientTlsConfig>,
     Option<String>,
+    ExternalWorkerAuthority,
 )> {
     let control_plane_url = std::env::var("AGNT5_CONTROL_PLANE_URL")
         .unwrap_or_else(|_| "https://api.agnt5.com".to_string())
@@ -189,16 +199,16 @@ async fn external_worker_bootstrap() -> Result<(
                 });
             }
             let identity_authority = crate::external_worker_identity::Authority {
-                project_id: authority.project_id,
-                environment_id: authority.environment_id,
-                deployment_id: authority.deployment_id,
-                worker_pool_id: authority.worker_pool_id,
-                runtime_endpoint: authority.runtime_endpoint,
-                protocol: authority.protocol,
+                project_id: authority.project_id.clone(),
+                environment_id: authority.environment_id.clone(),
+                deployment_id: authority.deployment_id.clone(),
+                worker_pool_id: authority.worker_pool_id.clone(),
+                runtime_endpoint: authority.runtime_endpoint.clone(),
+                protocol: authority.protocol.clone(),
             };
             let identity = crate::external_worker_identity::connection_identity(
                 control_plane_url,
-                authority.identity_endpoint,
+                authority.identity_endpoint.clone(),
                 credential,
                 identity_authority,
             )
@@ -211,6 +221,7 @@ async fn external_worker_bootstrap() -> Result<(
                 },
                 Some(identity.tls),
                 Some(identity.worker_id),
+                authority,
             ));
         }
         AUTH_PROFILE_TOKEN_AUTH => {}
@@ -251,6 +262,7 @@ async fn external_worker_bootstrap() -> Result<(
         BearerInterceptor { token: shared },
         None,
         None,
+        bootstrap.authority,
     ))
 }
 
@@ -436,6 +448,7 @@ pub struct WorkerCoordinatorClient {
     engine_client: EngineServiceClient<AuthenticatedChannel>,
     negotiated_protocol_capabilities: Arc<RwLock<Vec<String>>>,
     authoritative_worker_id: Option<String>,
+    external_worker_authority: Option<ExternalWorkerAuthority>,
 }
 
 const WORKER_COORDINATOR_RPC_TIMEOUT: Duration = Duration::from_secs(45);
@@ -455,15 +468,18 @@ fn is_idle_poll_timeout(status: &tonic::Status) -> bool {
 impl WorkerCoordinatorClient {
     /// Create a new client connected to the Worker Coordinator
     pub async fn connect(endpoint: String) -> Result<Self> {
-        let (endpoint, interceptor, tls, authoritative_worker_id) =
+        let (endpoint, interceptor, tls, authoritative_worker_id, external_worker_authority) =
             if remote_worker_bootstrap_enabled() {
-                external_worker_bootstrap().await?
+                let (endpoint, interceptor, tls, worker_id, authority) =
+                    external_worker_bootstrap().await?;
+                (endpoint, interceptor, tls, worker_id, Some(authority))
             } else {
                 (
                     endpoint,
                     BearerInterceptor {
                         token: Arc::new(RwLock::new(None)),
                     },
+                    None,
                     None,
                     None,
                 )
@@ -504,7 +520,18 @@ impl WorkerCoordinatorClient {
             engine_client,
             negotiated_protocol_capabilities: Arc::new(RwLock::new(Vec::new())),
             authoritative_worker_id,
+            external_worker_authority,
         })
+    }
+
+    /// Apply the project-bound authority returned by external worker discovery.
+    /// Discovery is authoritative, so these values intentionally replace any
+    /// same-named metadata supplied before the connection was established.
+    pub(crate) fn apply_external_worker_authority(&self, metadata: &mut HashMap<String, String>) {
+        let Some(authority) = &self.external_worker_authority else {
+            return;
+        };
+        authority.apply_to_metadata(metadata);
     }
 
     /// Use the server-assigned ID for certificate-bound customer workers.
@@ -1206,7 +1233,9 @@ impl EngineClient {
     pub async fn connect(endpoint: &str) -> Result<Self> {
         let (endpoint, interceptor, tls, authoritative_worker_id) =
             if remote_worker_bootstrap_enabled() {
-                external_worker_bootstrap().await?
+                let (endpoint, interceptor, tls, worker_id, _authority) =
+                    external_worker_bootstrap().await?;
+                (endpoint, interceptor, tls, worker_id)
             } else {
                 (
                     endpoint.to_string(),
@@ -1541,6 +1570,40 @@ mod tests {
                 "worker_pool_id": "pool-1"
             })
         );
+    }
+
+    #[test]
+    fn external_worker_authority_overrides_preconfigured_routing_metadata() {
+        let authority = ExternalWorkerAuthority {
+            project_id: "discovered-project".into(),
+            environment_id: "discovered-environment".into(),
+            deployment_id: "discovered-deployment".into(),
+            worker_pool_id: "discovered-pool".into(),
+            runtime_endpoint: "https://runtime.example".into(),
+            protocol: "pull.v1".into(),
+            auth_profile: AUTH_PROFILE_TOKEN_AUTH.into(),
+            identity_endpoint: String::new(),
+        };
+        let mut metadata = HashMap::from([
+            ("project_id".to_string(), "configured-project".to_string()),
+            (
+                "deployment_id".to_string(),
+                "configured-deployment".to_string(),
+            ),
+        ]);
+
+        authority.apply_to_metadata(&mut metadata);
+
+        assert_eq!(metadata.get("project_id").unwrap(), "discovered-project");
+        assert_eq!(
+            metadata.get("environment_id").unwrap(),
+            "discovered-environment"
+        );
+        assert_eq!(
+            metadata.get("deployment_id").unwrap(),
+            "discovered-deployment"
+        );
+        assert_eq!(metadata.get("worker_pool_id").unwrap(), "discovered-pool");
     }
 
     #[test]
