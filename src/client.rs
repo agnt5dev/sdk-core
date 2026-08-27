@@ -19,7 +19,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tonic::metadata::MetadataValue;
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::{Certificate, Channel, ClientTlsConfig};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 use tonic::Code;
 use tonic::{Request, Status};
 use tracing::{debug, error};
@@ -83,6 +83,23 @@ fn external_worker_ca_bundle() -> Result<Option<Vec<u8>>> {
         });
     }
     Ok(Some(pem))
+}
+
+fn configure_channel_tls(
+    endpoint: Endpoint,
+    tls: Option<ClientTlsConfig>,
+) -> std::result::Result<Endpoint, tonic::transport::Error> {
+    let tls = match tls {
+        Some(tls) => Some(tls),
+        None if endpoint.uri().scheme_str() == Some("https") => {
+            Some(ClientTlsConfig::new().with_webpki_roots())
+        }
+        None => None,
+    };
+    match tls {
+        Some(tls) => endpoint.tls_config(tls),
+        None => Ok(endpoint),
+    }
 }
 
 impl ExternalWorkerAuthority {
@@ -287,12 +304,18 @@ async fn external_worker_bootstrap() -> Result<(
     std::env::set_var("AGNT5_WORKERPOOL_ID", &bootstrap.authority.worker_pool_id);
     std::env::set_var("AGNT5_WORKER_MODE", "pull");
     eprintln!("[INFO] worker authenticated with token auth");
-    let runtime_tls =
-        ca_bundle.map(|pem| ClientTlsConfig::new().ca_certificate(Certificate::from_pem(pem)));
+    eprintln!(
+        "[INFO] discovered runtime endpoint ({})",
+        bootstrap.authority.runtime_endpoint
+    );
+    let mut runtime_tls = ClientTlsConfig::new().with_webpki_roots();
+    if let Some(pem) = ca_bundle {
+        runtime_tls = runtime_tls.ca_certificate(Certificate::from_pem(pem));
+    }
     Ok((
         bootstrap.authority.runtime_endpoint.clone(),
         BearerInterceptor { token: shared },
-        runtime_tls,
+        Some(runtime_tls),
         None,
         bootstrap.authority,
     ))
@@ -518,19 +541,16 @@ impl WorkerCoordinatorClient {
             };
         debug!("Connecting to Worker Coordinator at {}", endpoint);
 
-        let mut channel =
-            Channel::from_shared(endpoint.clone()).map_err(|e| SdkError::Connection {
-                message: format!("Invalid endpoint {}: {}", endpoint, e),
-                code: crate::error::ErrorCode::ConnectionFailed,
-                source: None,
-            })?;
-        if let Some(tls) = tls {
-            channel = channel.tls_config(tls).map_err(|e| SdkError::Connection {
-                message: format!("Invalid worker TLS configuration: {}", e),
-                code: crate::error::ErrorCode::ConnectionFailed,
-                source: None,
-            })?;
-        }
+        let channel = Channel::from_shared(endpoint.clone()).map_err(|e| SdkError::Connection {
+            message: format!("Invalid endpoint {}: {}", endpoint, e),
+            code: crate::error::ErrorCode::ConnectionFailed,
+            source: None,
+        })?;
+        let channel = configure_channel_tls(channel, tls).map_err(|e| SdkError::Connection {
+            message: format!("Invalid worker TLS configuration: {}", e),
+            code: crate::error::ErrorCode::ConnectionFailed,
+            source: None,
+        })?;
         let channel = channel
             .connect_timeout(Duration::from_secs(10))
             .timeout(WORKER_COORDINATOR_RPC_TIMEOUT)
@@ -1291,19 +1311,17 @@ impl EngineClient {
 
         let mut clients = Vec::with_capacity(ENGINE_POOL_SIZE);
         for i in 0..ENGINE_POOL_SIZE {
-            let mut channel =
-                Channel::from_shared(uri.clone()).map_err(|e| SdkError::Connection {
-                    message: format!("Invalid engine endpoint {}: {}", endpoint, e),
-                    code: crate::error::ErrorCode::ConnectionFailed,
-                    source: None,
-                })?;
-            if let Some(tls) = tls.clone() {
-                channel = channel.tls_config(tls).map_err(|e| SdkError::Connection {
+            let channel = Channel::from_shared(uri.clone()).map_err(|e| SdkError::Connection {
+                message: format!("Invalid engine endpoint {}: {}", endpoint, e),
+                code: crate::error::ErrorCode::ConnectionFailed,
+                source: None,
+            })?;
+            let channel =
+                configure_channel_tls(channel, tls.clone()).map_err(|e| SdkError::Connection {
                     message: format!("Invalid worker TLS configuration: {}", e),
                     code: crate::error::ErrorCode::ConnectionFailed,
                     source: None,
                 })?;
-            }
             let channel = channel
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(30))
@@ -1577,6 +1595,32 @@ pub fn build_engine_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn https_channel_enables_tls_without_an_explicit_client_config() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            drop(socket);
+        });
+
+        let endpoint = Channel::from_shared(format!("https://{address}"))
+            .expect("test endpoint should be valid");
+        let error = configure_channel_tls(endpoint, None)
+            .expect("default HTTPS TLS configuration should be valid")
+            .connect_timeout(Duration::from_secs(1))
+            .connect()
+            .await
+            .expect_err("the test listener intentionally does not speak TLS");
+
+        accept.await.unwrap();
+        let error = format!("{error:?}");
+        assert!(
+            !error.contains("HttpsUriWithoutTlsSupport"),
+            "HTTPS channel attempted to connect without TLS: {error}"
+        );
+    }
 
     #[test]
     fn external_worker_token_request_contains_only_immutable_authority() {

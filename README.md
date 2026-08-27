@@ -39,7 +39,7 @@ can be enabled with Cargo features:
 
 ```toml
 [dependencies]
-agnt5-sdk-core = { version = "0.2.2", features = ["libsql-memory"] }
+agnt5-sdk-core = { version = "0.2.3", features = ["libsql-memory"] }
 ```
 
 | Feature | Purpose |
