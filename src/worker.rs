@@ -7,10 +7,10 @@ use crate::pb::{
     CompleteJobResponse, ComponentInfo, DispatchComponentRequest, DispatchComponentResponse,
     EntityStateLoadResult, EntityStateSaveResult, EventStreamMessage, GetEntityStateRequest,
     GetEntityStateResponse, HealthCheck, JobAssignment, LeaseRenewalOutcome, PollJobRequest,
-    PutEntityStateRequest, PutEntityStateResponse, RegisterService, RegisterWorkerSessionRequest,
-    RenewJobLeaseRequest, ReportWorkerCapacityRequest, RuntimeMessage, RuntimeMessageType,
-    RuntimeServiceResponse, ServiceMessage, UnregisterService, WorkerCapability,
-    WorkerHealthStatus, WorkerMode, WorkerSlotPolicy, WriteCheckpointRequest,
+    PutEntityStateRequest, PutEntityStateResponse, Record, RegisterService,
+    RegisterWorkerSessionRequest, RenewJobLeaseRequest, ReportWorkerCapacityRequest,
+    RuntimeMessage, RuntimeMessageType, RuntimeServiceResponse, ServiceMessage, UnregisterService,
+    WorkerCapability, WorkerHealthStatus, WorkerMode, WorkerSlotPolicy, WriteCheckpointRequest,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -1695,6 +1695,7 @@ fn complete_job_request_from_polled_completion(
     worker_session_id: &str,
     tenant_id: &str,
     completion: PolledJobCompletion,
+    lifecycle_records: Vec<Record>,
 ) -> CompleteJobRequest {
     let mut metadata = completion.metadata;
     metadata.insert("completion_event_type".to_string(), completion.event_type);
@@ -1710,7 +1711,139 @@ fn complete_job_request_from_polled_completion(
         lease_id: completion.lease_id,
         worker_session_id: worker_session_id.to_string(),
         attempt: Some(completion.attempt),
+        lifecycle_records,
     }
+}
+
+/// Caps mirrored from the runtime contract
+/// (`docs/contracts/pull-completion-lifecycle-v1.md`). A bundle over either
+/// bound is appended inline instead.
+const PULL_LIFECYCLE_MAX_RECORDS: usize = 32;
+const PULL_LIFECYCLE_MAX_BYTES: usize = 256 * 1024;
+
+/// Held journal events for one run, split into the durable records that may
+/// ride inside `CompleteJob` and the SSE-only events handed back to the
+/// periodic flusher.
+struct HeldRunEvents {
+    records: Vec<Record>,
+    durable: Vec<JournalEventMessage>,
+    transient: Vec<JournalEventMessage>,
+}
+
+impl HeldRunEvents {
+    fn record_bytes(&self) -> usize {
+        self.records
+            .iter()
+            .map(|record| {
+                record.data.len()
+                    + record
+                        .metadata
+                        .iter()
+                        .map(|(key, value)| key.len() + value.len())
+                        .sum::<usize>()
+            })
+            .sum()
+    }
+
+    fn within_bundle_caps(&self) -> bool {
+        self.records.len() <= PULL_LIFECYCLE_MAX_RECORDS
+            && self.record_bytes() <= PULL_LIFECYCLE_MAX_BYTES
+    }
+}
+
+/// Drain and release a held run under its flush barrier. Pure with respect
+/// to the network: the caller decides whether the records ride in
+/// `CompleteJob`, are appended inline, or go back to the queue.
+async fn take_held_run_events(
+    journal_queue: &JournalEventQueue,
+    journal_flush_locks: &RunFlushLocks,
+    tenant_id: &str,
+    run_id: &str,
+) -> Option<HeldRunEvents> {
+    if !journal_queue.is_held(run_id) {
+        return None;
+    }
+    let _flush_guard = journal_flush_locks.lock_run(run_id).await;
+    let pending = journal_queue.drain_run_events(run_id);
+    journal_queue.release_run(run_id);
+    let (transient, durable): (Vec<_>, Vec<_>) =
+        pending.into_iter().partition(|event| event.is_sse_only);
+    let records = durable
+        .iter()
+        .map(|event| {
+            let tenant = canonical_project_id_from_metadata(&event.metadata)
+                .or_else(|| event.tenant_id.clone())
+                .unwrap_or_else(|| tenant_id.to_string());
+            let mut metadata = event.metadata.clone();
+            metadata.insert("project_id".to_string(), tenant.clone());
+            client::build_engine_record(
+                tenant,
+                event.run_id.clone(),
+                event.event_type.clone(),
+                event.data.clone(),
+                event.source_timestamp_ns,
+                String::new(),
+                event.correlation_id.clone(),
+                event.parent_correlation_id.clone(),
+                metadata,
+            )
+        })
+        .collect();
+    Some(HeldRunEvents {
+        records,
+        durable,
+        transient,
+    })
+}
+
+fn requeue_held_run_events(journal_queue: &JournalEventQueue, events: Vec<JournalEventMessage>) {
+    for event in events.into_iter().rev() {
+        if let Err(error) = journal_queue.push_front(event) {
+            warn!("Failed to requeue a held lifecycle event: {error}");
+        }
+    }
+}
+
+/// Resolve a held run at completion time. Returns the records to carry in
+/// `CompleteJob`; an empty vector means nothing is held or the events were
+/// appended inline / handed back to the periodic flusher instead.
+async fn take_lifecycle_bundle(
+    client: &mut WorkerCoordinatorClient,
+    journal_queue: &JournalEventQueue,
+    journal_flush_locks: &RunFlushLocks,
+    tenant_id: &str,
+    run_id: &str,
+) -> Vec<Record> {
+    let Some(mut held) =
+        take_held_run_events(journal_queue, journal_flush_locks, tenant_id, run_id).await
+    else {
+        return Vec::new();
+    };
+    // SSE-only events never ride in the bundle; the flusher streams them.
+    requeue_held_run_events(journal_queue, std::mem::take(&mut held.transient));
+    if held.records.is_empty() {
+        return Vec::new();
+    }
+    let bundle_negotiated = client
+        .negotiated_protocol_capability(crate::client::PULL_COMPLETION_LIFECYCLE_V1_CAPABILITY);
+    if bundle_negotiated && held.within_bundle_caps() {
+        return held.records;
+    }
+    debug!(
+        "Appending {} held lifecycle records inline for run_id={} (negotiated={}, within_caps={})",
+        held.records.len(),
+        run_id,
+        bundle_negotiated,
+        held.within_bundle_caps()
+    );
+    if let Err(error) = client.append_records(held.records).await {
+        warn!(
+            "Inline append of held lifecycle records failed for run_id={}; returning them to the flusher: {}",
+            run_id, error
+        );
+        requeue_held_run_events(journal_queue, held.durable);
+    }
+    Vec::new()
 }
 
 async fn complete_polled_job_with_client(
@@ -1719,6 +1852,7 @@ async fn complete_polled_job_with_client(
     worker_session_id: &str,
     tenant_id: &str,
     completion: PolledJobCompletion,
+    lifecycle_records: Vec<Record>,
 ) -> Result<()> {
     let job_id = completion.job_id.clone();
     let request = complete_job_request_from_polled_completion(
@@ -1726,6 +1860,7 @@ async fn complete_polled_job_with_client(
         worker_session_id,
         tenant_id,
         completion,
+        lifecycle_records,
     );
     match complete_job_with_retry(
         client,
@@ -1767,12 +1902,34 @@ async fn complete_or_forward_parked_response(
             "Parked poll slot {} observed runtime-authored cancellation for job_id={}",
             slot_idx, assigned_job_id
         );
+        journal_queue.release_run(assigned_job_id);
         return true;
     }
 
     if let Some(request) =
         polled_job_suspension_request(&service_message, tenant_id, assigned_job_id)
     {
+        // A suspension has no CompleteJob to carry held records, so they go
+        // back through the ordinary append path before the run parks.
+        if let Some(held) = take_held_run_events(
+            journal_queue,
+            journal_flush_locks,
+            tenant_id,
+            assigned_job_id,
+        )
+        .await
+        {
+            requeue_held_run_events(journal_queue, held.transient);
+            if !held.records.is_empty() {
+                if let Err(error) = client.append_records(held.records).await {
+                    warn!(
+                        "Parked poll slot {} could not append held lifecycle records before suspending job_id={}; returning them to the flusher: {}",
+                        slot_idx, assigned_job_id, error
+                    );
+                    requeue_held_run_events(journal_queue, held.durable);
+                }
+            }
+        }
         match client.suspend_activation(request).await {
             Ok(receipt) if receipt.accepted => {
                 debug!(
@@ -1815,6 +1972,14 @@ async fn complete_or_forward_parked_response(
     };
 
     let job_id = completion.job_id.clone();
+    let lifecycle_records = take_lifecycle_bundle(
+        client,
+        journal_queue,
+        journal_flush_locks,
+        tenant_id,
+        &job_id,
+    )
+    .await;
     if !wait_for_parked_run_events_flush(journal_queue, journal_flush_locks, &job_id).await {
         warn!(
             "Parked poll slot {} refusing to overtake unflushed events for job_id={}",
@@ -1830,6 +1995,7 @@ async fn complete_or_forward_parked_response(
         &current_session_id,
         tenant_id,
         completion,
+        lifecycle_records,
     )
     .await
     {
@@ -2402,6 +2568,20 @@ where
                         crate::client::DURABLE_SUSPENSION_V1_CAPABILITY,
                     );
                 }
+                // Hold this run's queued lifecycle events so CompleteJob can
+                // carry them. Streaming runs keep per-event delivery so SSE
+                // viewers see boundaries live.
+                if !is_streaming
+                    && client.negotiated_protocol_capability(
+                        crate::client::PULL_COMPLETION_LIFECYCLE_V1_CAPABILITY,
+                    )
+                {
+                    ctx.journal_queue.hold_run(&run_id);
+                    stamp_protocol_capability(
+                        &mut runtime_message,
+                        crate::client::PULL_COMPLETION_LIFECYCLE_V1_CAPABILITY,
+                    );
+                }
                 let completion_run_id = run_id.clone();
                 let completion_lease_id = lease_id.clone();
                 if !lease_id.is_empty() {
@@ -2569,6 +2749,8 @@ where
                 }
 
                 if completed || execution_is_revoked(&ctx.revoked_executions, &run_id) {
+                    // Anything still held now belongs to the periodic flusher.
+                    ctx.journal_queue.release_run(&completion_run_id);
                     if let Ok(mut map) = ctx.pending_lease_ids.lock() {
                         map.remove(&completion_run_id);
                     }
@@ -2766,6 +2948,95 @@ impl Worker {
         self.journal_queue.clone()
     }
 
+    /// Flush every queued event for `run_id` before an independently-authored
+    /// durable write such as BeginActivation or CompleteActivation.
+    ///
+    /// Pull workers keep lifecycle events held so they can normally ride in
+    /// CompleteJob. An activation RPC is a separate journal boundary, so it
+    /// must drain and acknowledge the held prefix first while retaining the
+    /// hold for any later lifecycle records.
+    pub async fn flush_run_events_before_durable_write(&self, run_id: &str) -> Result<()> {
+        let _flush_guard = self.journal_flush_locks.lock_run(run_id).await;
+        let pending = self.journal_queue.drain_run_events(run_id);
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        let Some(mut engine) = self.ensure_engine_client().await? else {
+            return Err(SdkError::Internal(
+                "the engine client is required for durable writes".to_string(),
+            ));
+        };
+        let worker_metadata = self.effective_metadata();
+        let project_id = pending
+            .iter()
+            .find_map(|event| self.routing_value_for_metadata("project_id", &event.metadata))
+            .or_else(|| canonical_project_id_from_metadata(&worker_metadata))
+            .unwrap_or_default();
+        let transient: Vec<EventStreamMessage> = pending
+            .iter()
+            .filter(|event| event.is_sse_only)
+            .map(|event| EventStreamMessage {
+                run_id: event.run_id.clone(),
+                event_type: event.event_type.clone(),
+                data: event.data.clone(),
+                trace_id: event.correlation_id.clone(),
+                span_id: event.parent_correlation_id.clone(),
+                project_id: self
+                    .routing_value_for_metadata("project_id", &event.metadata)
+                    .unwrap_or_else(|| project_id.clone()),
+                source_timestamp_ns: event.source_timestamp_ns,
+                worker_id: self.config.worker_id.clone(),
+            })
+            .collect();
+        let durable_records = pending
+            .iter()
+            .filter(|event| !event.is_sse_only)
+            .map(|event| {
+                client::build_engine_record(
+                    project_id.clone(),
+                    event.run_id.clone(),
+                    event.event_type.clone(),
+                    event.data.clone(),
+                    event.source_timestamp_ns,
+                    String::new(),
+                    event.correlation_id.clone(),
+                    event.parent_correlation_id.clone(),
+                    self.metadata_for_request(event.metadata.clone()),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        if !transient.is_empty() {
+            if let Err(error) = engine.stream_events(transient).await {
+                for event in pending.into_iter().rev() {
+                    self.journal_queue.push_front(event).ok();
+                }
+                self.journal_queue.record_error();
+                *self.engine_client.lock().await = None;
+                return Err(error);
+            }
+        }
+        if !durable_records.is_empty() {
+            if let Err(error) = engine.append_batch(durable_records).await {
+                if journal_append_error_is_retryable(&error) {
+                    for event in pending.into_iter().rev().filter(|event| !event.is_sse_only) {
+                        self.journal_queue.push_front(event).ok();
+                    }
+                }
+                self.journal_queue.record_error();
+                *self.engine_client.lock().await = None;
+                return Err(error);
+            }
+        }
+        debug!(
+            "Flushed {} queued events before durable write for run_id={}",
+            pending.len(),
+            run_id
+        );
+        Ok(())
+    }
+
     /// Set components for the worker.
     /// Note: Built-in scorers are NOT registered as components. The platform
     /// routes scorer requests to any available worker without component lookup,
@@ -2877,7 +3148,7 @@ impl Worker {
     /// Queue a journal event for delivery to the platform
     ///
     /// This is the unified method for queueing all event types. Events are classified as:
-    /// - Boundary events: Persisted to journal_events table (workflow.*, agent.*, lm.call.*, etc.)
+    /// - Boundary events: Persisted to journal_events table (workflow.*, agent.*, lm.*, etc.)
     /// - SSE-only events: Forwarded to SSE stream but NOT persisted (output.delta, log, etc.)
     ///
     /// # Arguments
@@ -3121,6 +3392,7 @@ impl Worker {
         if let Ok(mut map) = self.streaming_runs.lock() {
             map.remove(run_id);
         }
+        self.journal_queue.release_run(run_id);
     }
 
     /// Emit a checkpoint event synchronously and wait for acknowledgement.
@@ -4800,7 +5072,7 @@ impl Worker {
     /// This task periodically flushes all buffered events to EE.
     /// Events are routed based on type:
     /// - SSE-only events (output.delta, log, etc.): Sent via EventStream for real-time SSE delivery
-    /// - Boundary events (workflow.*, agent.*, lm.call.*): Sent via WriteJournalEventsBatch to EE for durable persistence + SSE
+    /// - Boundary events (workflow.*, agent.*, lm.*): Sent via WriteJournalEventsBatch to EE for durable persistence + SSE
     ///
     /// All events go directly to EE — the dispatch stream is only used as a fallback
     /// for SSE-only events when EventStream is unavailable.
@@ -6793,6 +7065,7 @@ mod tests {
             "session-1",
             "project-1",
             completion,
+            Vec::new(),
         );
 
         assert_eq!(request.job_id, "run-1");
@@ -6995,8 +7268,12 @@ mod tests {
                 }),
                 Ok(CompleteJobResponse {
                     acknowledged: false,
+                    lifecycle_written_count: 0,
                 }),
-                Ok(CompleteJobResponse { acknowledged: true }),
+                Ok(CompleteJobResponse {
+                    acknowledged: true,
+                    ..Default::default()
+                }),
             ]),
             requests: Vec::new(),
         };
@@ -7022,6 +7299,78 @@ mod tests {
             .requests
             .iter()
             .all(|request| request.lease_id == "lease-7" && request.attempt == Some(7)));
+    }
+
+    #[tokio::test]
+    async fn held_run_events_become_lifecycle_records_in_order() {
+        use super::{
+            requeue_held_run_events, take_held_run_events, HeldRunEvents, PULL_LIFECYCLE_MAX_BYTES,
+            PULL_LIFECYCLE_MAX_RECORDS,
+        };
+        let queue = JournalEventQueue::new(JournalQueueConfig::default());
+        let locks = RunFlushLocks::default();
+        queue.hold_run("run-1");
+        for (event_type, sse_only) in [
+            ("run.started", false),
+            ("function.started", false),
+            ("llm.token", true),
+            ("function.completed", false),
+        ] {
+            queue
+                .push(JournalEventMessage {
+                    run_id: "run-1".to_string(),
+                    event_type: event_type.to_string(),
+                    is_sse_only: sse_only,
+                    source_timestamp_ns: 42,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+
+        let held = take_held_run_events(&queue, &locks, "project-1", "run-1")
+            .await
+            .expect("run was held");
+        assert_eq!(
+            held.records
+                .iter()
+                .map(|record| record.event_type.as_str())
+                .collect::<Vec<_>>(),
+            ["run.started", "function.started", "function.completed"]
+        );
+        assert!(held
+            .records
+            .iter()
+            .all(|record| record.project_id == "project-1"
+                && record.run_id == "run-1"
+                && record.timestamp_ns == 42
+                && record.metadata.get("project_id").map(String::as_str) == Some("project-1")));
+        assert_eq!(held.transient.len(), 1);
+        assert!(held.within_bundle_caps());
+        assert!(!queue.is_held("run-1"), "draining releases the hold");
+        assert!(
+            take_held_run_events(&queue, &locks, "project-1", "run-1")
+                .await
+                .is_none(),
+            "a released run is not drained again"
+        );
+
+        requeue_held_run_events(&queue, held.transient);
+        assert!(
+            queue.contains_run("run-1"),
+            "SSE-only events return to the queue"
+        );
+
+        let mut oversized = HeldRunEvents {
+            records: (0..PULL_LIFECYCLE_MAX_RECORDS + 1)
+                .map(|_| held.records[0].clone())
+                .collect(),
+            durable: Vec::new(),
+            transient: Vec::new(),
+        };
+        assert!(!oversized.within_bundle_caps());
+        oversized.records.truncate(1);
+        oversized.records[0].data = vec![0; PULL_LIFECYCLE_MAX_BYTES + 1];
+        assert!(!oversized.within_bundle_caps());
     }
 
     #[tokio::test]

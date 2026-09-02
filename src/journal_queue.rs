@@ -230,6 +230,10 @@ pub struct JournalEventQueue {
     config: JournalQueueConfig,
     /// Metrics for monitoring queue health
     metrics: Arc<Mutex<JournalQueueMetrics>>,
+    /// Runs whose queued events are being held for their `CompleteJob` bundle.
+    /// The periodic flusher never selects a held run; an explicit per-run
+    /// drain (an inline checkpoint, the completion itself) still takes them.
+    held_runs: Arc<Mutex<HashSet<String>>>,
 }
 
 #[derive(Default)]
@@ -318,6 +322,7 @@ impl JournalEventQueue {
             ))),
             config,
             metrics: Arc::new(Mutex::new(JournalQueueMetrics::default())),
+            held_runs: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -467,6 +472,7 @@ impl JournalEventQueue {
                 return Vec::new();
             }
         };
+        let held = self.held_runs_snapshot();
 
         let mut run_ids = Vec::new();
         let mut seen = HashSet::new();
@@ -476,11 +482,45 @@ impl JournalEventQueue {
             .filter_map(|id| queue.events.get(id))
             .take(max)
         {
+            if held.contains(&event.run_id) {
+                continue;
+            }
             if seen.insert(event.run_id.clone()) {
                 run_ids.push(event.run_id.clone());
             }
         }
         run_ids
+    }
+
+    /// Keep `run_id`'s queued events out of the periodic flush until
+    /// `release_run` or an explicit per-run drain.
+    pub fn hold_run(&self, run_id: &str) {
+        self.held_runs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(run_id.to_string());
+    }
+
+    /// Return the run to normal periodic flushing. Returns whether it was held.
+    pub fn release_run(&self, run_id: &str) -> bool {
+        self.held_runs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(run_id)
+    }
+
+    pub fn is_held(&self, run_id: &str) -> bool {
+        self.held_runs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(run_id)
+    }
+
+    fn held_runs_snapshot(&self) -> HashSet<String> {
+        self.held_runs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Drain up to `max` events belonging to runs whose ordering barriers are
@@ -1056,6 +1096,44 @@ mod tests {
             .map(|event| event.sequence)
             .collect();
         assert_eq!(remaining, vec![2, 3]);
+    }
+
+    #[test]
+    fn held_runs_are_skipped_by_the_periodic_peek_but_drained_explicitly() {
+        let queue = JournalEventQueue::new(JournalQueueConfig::default());
+        queue.hold_run("held");
+        for (run_id, event_type) in [
+            ("held", "run.started"),
+            ("other", "run.started"),
+            ("held", "function.completed"),
+        ] {
+            queue
+                .push(JournalEventMessage::new(
+                    run_id.to_string(),
+                    event_type.to_string(),
+                    Vec::new(),
+                ))
+                .unwrap();
+        }
+
+        assert!(queue.is_held("held"));
+        assert_eq!(queue.peek_batch_run_ids(10), vec!["other".to_string()]);
+        let allowed: HashSet<String> = queue.peek_batch_run_ids(10).into_iter().collect();
+        let periodic = queue.drain_batch_for_runs(10, &allowed);
+        assert_eq!(periodic.len(), 1);
+        assert_eq!(periodic[0].run_id, "other");
+        assert!(queue.contains_run("held"), "held events stay queued");
+
+        let held = queue.drain_run_events("held");
+        assert_eq!(
+            held.iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            ["run.started", "function.completed"]
+        );
+        assert!(queue.release_run("held"));
+        assert!(!queue.release_run("held"));
+        assert!(!queue.is_held("held"));
     }
 
     #[test]

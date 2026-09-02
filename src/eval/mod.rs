@@ -138,7 +138,7 @@ impl ScorerResult {
 /// Event from execution trace (for glassbox testing)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceEvent {
-    /// Event type (e.g., "run.started", "lm.call.completed")
+    /// Event type (e.g., "run.started", "lm.completed")
     pub event_type: String,
     /// Unique event identifier
     pub event_id: String,
@@ -246,13 +246,13 @@ mod tests {
 
     #[test]
     fn test_trace_event_builder() {
-        let event = TraceEvent::new("lm.call.completed", "event-1")
+        let event = TraceEvent::new("lm.completed", "event-1")
             .correlation_id("corr-1")
             .timestamp_ns(1000000)
             .data(json!({"total_tokens": 500}))
             .name("chat");
 
-        assert_eq!(event.event_type, "lm.call.completed");
+        assert_eq!(event.event_type, "lm.completed");
         assert_eq!(event.event_id, "event-1");
         assert_eq!(event.correlation_id, "corr-1");
         assert_eq!(event.timestamp_ns, 1000000);

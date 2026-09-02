@@ -1368,6 +1368,7 @@ message ActivationUsage {
   int64 latency_ms = 4;
   string provider = 5;
   string model = 6;
+  int64 cached_tokens = 7;
 }
 
 // ActivationEvidence contains bounded diagnostic evidence for an accepted outcome.
@@ -1402,6 +1403,12 @@ message BeginActivationRequest {
   bytes run_authority = 10;
   bytes lease_authority = 11;
   ChildActivationLinkage child = 12;
+  // Human-readable name shown on the journal record (step name, tool name,
+  // model id). Not part of the activation identity.
+  string display_name = 13;
+  // Optional plaintext JSON input rendered on the journal record. Never
+  // feeds input_digest; bounded to 64 KiB.
+  bytes input_data = 14;
 }
 
 // ActivationConflictReceipt describes deterministic-key reuse with new semantics.
@@ -1477,6 +1484,8 @@ message FailActivationRequest {
   bool retryable = 8;
   ActivationExternalOutcomeCertainty external_outcome_certainty = 9;
   repeated ActivationEvidence evidence = 10;
+  // Wall-clock duration of the failed attempt as measured by the worker.
+  int64 latency_ms = 11;
 }
 
 // FailActivationResponse acknowledges the canonical failure decision.
@@ -1515,114 +1524,6 @@ message SuspendActivationResponse {
   uint32 attempt = 4;
   uint64 accepted_journal_offset = 5;
   string timer_id = 6;
-}
-
-// ActivationStartedRecord is the canonical journal event for a new attempt.
-message ActivationStartedRecord {
-  string project_id = 1;
-  string run_id = 2;
-  string parent_activation_id = 3;
-  string activation_id = 4;
-  ActivationKind kind = 5;
-  string stable_key = 6;
-  bytes input_digest = 7;
-  bytes definition_digest = 8;
-  ActivationRecoveryPolicy recovery_policy = 9;
-  uint32 attempt = 10;
-  bytes fence_token = 11;
-  string worker_session_id = 12;
-  bytes run_authority = 13;
-  bytes lease_authority = 14;
-  uint32 previous_attempt = 15;
-  ChildActivationLinkage child = 16;
-}
-
-// ActivationCompletedRecord is the canonical all-or-nothing completion bundle.
-message ActivationCompletedRecord {
-  string project_id = 1;
-  string run_id = 2;
-  string activation_id = 3;
-  uint32 attempt = 4;
-  bytes fence_token = 5;
-  ActivationPayload output = 6;
-  bytes output_digest = 7;
-  repeated ActivationStateMutation state_mutations = 8;
-  repeated ActivationOutboxIntent outbox_intents = 9;
-  ActivationUsage usage = 10;
-  repeated ActivationEvidence evidence = 11;
-}
-
-// ActivationFailedRecord is the canonical failure bundle.
-message ActivationFailedRecord {
-  string project_id = 1;
-  string run_id = 2;
-  string activation_id = 3;
-  uint32 attempt = 4;
-  bytes fence_token = 5;
-  string error_code = 6;
-  ActivationPayload error_data = 7;
-  bool retryable = 8;
-  ActivationExternalOutcomeCertainty external_outcome_certainty = 9;
-  repeated ActivationEvidence evidence = 10;
-}
-
-// ActivationSuspendedRecord records a durable nonterminal suspension.
-message ActivationSuspendedRecord {
-  string project_id = 1;
-  string run_id = 2;
-  string activation_id = 3;
-  uint32 attempt = 4;
-  bytes fence_token = 5;
-  string resume_source = 6;
-  string timer_key = 7;
-  int64 ready_at_ms = 8;
-  bytes input_digest = 9;
-  bytes definition_digest = 10;
-  bytes continuation = 11;
-}
-
-// ActivationCancelledRecord records the canonical cancellation winner.
-message ActivationCancelledRecord {
-  string project_id = 1;
-  string run_id = 2;
-  string activation_id = 3;
-  uint32 attempt = 4;
-  string reason = 5;
-}
-
-// ActivationUnknownOutcomeRecord records an effect whose external result is uncertain.
-message ActivationUnknownOutcomeRecord {
-  ActivationFailedRecord failure = 1;
-}
-
-// ActivationSnapshotRecord is a journal-owned compaction snapshot.
-message ActivationSnapshotRecord {
-  string project_id = 1;
-  string run_id = 2;
-  string activation_id = 3;
-  ActivationStatus status = 4;
-  ActivationStartedRecord current_attempt = 5;
-  ActivationCompletedRecord completion = 6;
-  ActivationFailedRecord failure = 7;
-  uint64 accepted_journal_offset = 8;
-  ActivationSuspendedRecord suspension = 9;
-  ActivationCancelledRecord cancellation = 10;
-}
-
-// ActivationJournalRecord is the canonical Durable Activation V1 encoding.
-// It intentionally contains no map fields so deterministic protobuf encoding
-// is byte-identical across supported languages.
-message ActivationJournalRecord {
-  uint32 version = 1;
-  oneof event {
-    ActivationStartedRecord started = 10;
-    ActivationCompletedRecord completed = 11;
-    ActivationFailedRecord failed = 12;
-    ActivationSuspendedRecord suspended = 13;
-    ActivationCancelledRecord cancelled = 14;
-    ActivationSnapshotRecord snapshot = 15;
-    ActivationUnknownOutcomeRecord unknown_outcome = 16;
-  }
 }
 
 // EventStreamMessage carries a single ephemeral event from worker to engine.
@@ -1801,9 +1702,21 @@ message CompleteJobRequest {
   // lease-fenced completion; optional preserves wire compatibility while
   // allowing the runtime to distinguish attempt 0 from an old client.
   optional uint32 attempt = 11;
+  // Lifecycle records the worker deferred while `pull_completion_lifecycle_v1`
+  // was negotiated: run.started, <component>.started, handler journal events,
+  // and <component>.completed|failed, in emission order. The runtime appends
+  // them in one atomic batch at offsets below the fenced completion request,
+  // then appends the request. Records must belong to this project and run and
+  // must not be terminal, another `run.*` lifecycle event, runtime-internal,
+  // an activation record, or `workflow.state.changed`. Ignored when this
+  // lease's completion is already projected. Max 32 records / 256 KiB.
+  repeated Record lifecycle_records = 12;
 }
 
 // CompleteJobResponse acknowledges the job completion.
 message CompleteJobResponse {
   bool acknowledged = 1;
+  // Lifecycle records newly written by this call. A retried CompleteJob
+  // resolves duplicates to their earlier offsets and does not count them.
+  uint32 lifecycle_written_count = 2;
 }

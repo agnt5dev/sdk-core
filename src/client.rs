@@ -397,9 +397,19 @@ fn spawn_external_worker_token_refresh(
 
 pub const DURABLE_ACTIVATION_V1_CAPABILITY: &str = "durable_activation_v1";
 pub const DURABLE_SUSPENSION_V1_CAPABILITY: &str = "durable_suspension_v1";
+/// Lets a non-streaming pull job carry its lifecycle records inside
+/// `CompleteJob` instead of appending them one RPC at a time. Always optional;
+/// `AGNT5_PULL_COMPLETION_LIFECYCLE=disabled` stops advertising it.
+pub const PULL_COMPLETION_LIFECYCLE_V1_CAPABILITY: &str = "pull_completion_lifecycle_v1";
+
+fn pull_completion_lifecycle_enabled() -> bool {
+    !std::env::var("AGNT5_PULL_COMPLETION_LIFECYCLE")
+        .map(|value| value.trim().eq_ignore_ascii_case("disabled"))
+        .unwrap_or(false)
+}
 
 pub fn worker_protocol_capabilities() -> (Vec<String>, Vec<String>) {
-    match std::env::var("AGNT5_DURABLE_ACTIVATION_MODE")
+    let (mut supported, required) = match std::env::var("AGNT5_DURABLE_ACTIVATION_MODE")
         .unwrap_or_else(|_| "preferred".to_string())
         .to_ascii_lowercase()
         .as_str()
@@ -419,7 +429,11 @@ pub fn worker_protocol_capabilities() -> (Vec<String>, Vec<String>) {
             ],
             Vec::new(),
         ),
+    };
+    if pull_completion_lifecycle_enabled() {
+        supported.push(PULL_COMPLETION_LIFECYCLE_V1_CAPABILITY.to_string());
     }
+    (supported, required)
 }
 
 pub(crate) fn validate_protocol_capabilities(
@@ -1116,6 +1130,23 @@ impl WorkerCoordinatorClient {
             .into_inner();
 
         Ok(response)
+    }
+
+    /// Append journal records through the Engine RPC on the worker's own
+    /// channel. Used when a held lifecycle bundle cannot ride in `CompleteJob`
+    /// (over the cap, the capability was lost, or the job suspended instead).
+    pub async fn append_records(&mut self, records: Vec<Record>) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let expected = records.len();
+        let response = self
+            .engine_client
+            .append_batch(AppendBatchRequest { records })
+            .await
+            .map_err(|status| engine_append_status_error("Engine AppendBatch", status))?
+            .into_inner();
+        validate_append_batch_response(&response, expected).map(|_| ())
     }
 
     /// Suspend a polled job through the Engine RPC. Pull workers do not keep a

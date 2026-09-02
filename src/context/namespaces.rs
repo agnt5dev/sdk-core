@@ -439,7 +439,7 @@ fn durable_timer_plan(
         run_id: config.run_id.clone(),
         parent_activation_id,
         kind: ActivationKind::Timer as i32,
-        stable_key: timer_key,
+        stable_key: timer_key.clone(),
         input_digest: input_digest.clone(),
         definition_digest: definition_digest.clone(),
         recovery_policy: ActivationRecoveryPolicy::DurableSteps as i32,
@@ -447,6 +447,11 @@ fn durable_timer_plan(
         run_authority: run_authority.into_bytes(),
         lease_authority: lease_authority.into_bytes(),
         child: None,
+        display_name: timer_key.clone(),
+        input_data: serde_json::to_vec(&serde_json::json!({
+            "delay_ms": delay_ms,
+            "timer_key": timer_key,
+        }))?,
     };
     Ok(DurableTimerPlan {
         request,
@@ -757,6 +762,13 @@ mod tests {
         assert_eq!(requests[0].stable_key, timer_key);
         assert_eq!(requests[0].run_authority, b"run-1");
         assert_eq!(requests[0].lease_authority, b"lease-1");
+        assert_eq!(requests[0].display_name, timer_key);
+        let input_data: serde_json::Value =
+            serde_json::from_slice(&requests[0].input_data).expect("input_data is JSON");
+        assert_eq!(
+            input_data,
+            json!({"delay_ms": 2_500, "timer_key": timer_key})
+        );
     }
 
     #[tokio::test]
