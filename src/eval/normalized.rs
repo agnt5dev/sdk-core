@@ -301,7 +301,7 @@ mod tests {
             spans: vec![NormalizedSpan {
                 schema_version: NORMALIZED_SPAN_SCHEMA.to_string(),
                 span_id: "span_1".to_string(),
-                event_type: "lm.call.completed".to_string(),
+                event_type: "lm.completed".to_string(),
                 input_ref: Some("s3://managed/input.json".to_string()),
                 output_hash: Some("hmac:output".to_string()),
                 ..Default::default()

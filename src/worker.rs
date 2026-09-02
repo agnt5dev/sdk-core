@@ -3059,7 +3059,7 @@ impl Worker {
     /// Queue a journal event for delivery to the platform
     ///
     /// This is the unified method for queueing all event types. Events are classified as:
-    /// - Boundary events: Persisted to journal_events table (workflow.*, agent.*, lm.call.*, etc.)
+    /// - Boundary events: Persisted to journal_events table (workflow.*, agent.*, lm.*, etc.)
     /// - SSE-only events: Forwarded to SSE stream but NOT persisted (output.delta, log, etc.)
     ///
     /// # Arguments
@@ -4983,7 +4983,7 @@ impl Worker {
     /// This task periodically flushes all buffered events to EE.
     /// Events are routed based on type:
     /// - SSE-only events (output.delta, log, etc.): Sent via EventStream for real-time SSE delivery
-    /// - Boundary events (workflow.*, agent.*, lm.call.*): Sent via WriteJournalEventsBatch to EE for durable persistence + SSE
+    /// - Boundary events (workflow.*, agent.*, lm.*): Sent via WriteJournalEventsBatch to EE for durable persistence + SSE
     ///
     /// All events go directly to EE — the dispatch stream is only used as a fallback
     /// for SSE-only events when EventStream is unavailable.
