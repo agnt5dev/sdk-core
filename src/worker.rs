@@ -2948,6 +2948,95 @@ impl Worker {
         self.journal_queue.clone()
     }
 
+    /// Flush every queued event for `run_id` before an independently-authored
+    /// durable write such as BeginActivation or CompleteActivation.
+    ///
+    /// Pull workers keep lifecycle events held so they can normally ride in
+    /// CompleteJob. An activation RPC is a separate journal boundary, so it
+    /// must drain and acknowledge the held prefix first while retaining the
+    /// hold for any later lifecycle records.
+    pub async fn flush_run_events_before_durable_write(&self, run_id: &str) -> Result<()> {
+        let _flush_guard = self.journal_flush_locks.lock_run(run_id).await;
+        let pending = self.journal_queue.drain_run_events(run_id);
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        let Some(mut engine) = self.ensure_engine_client().await? else {
+            return Err(SdkError::Internal(
+                "the engine client is required for durable writes".to_string(),
+            ));
+        };
+        let worker_metadata = self.effective_metadata();
+        let project_id = pending
+            .iter()
+            .find_map(|event| self.routing_value_for_metadata("project_id", &event.metadata))
+            .or_else(|| canonical_project_id_from_metadata(&worker_metadata))
+            .unwrap_or_default();
+        let transient: Vec<EventStreamMessage> = pending
+            .iter()
+            .filter(|event| event.is_sse_only)
+            .map(|event| EventStreamMessage {
+                run_id: event.run_id.clone(),
+                event_type: event.event_type.clone(),
+                data: event.data.clone(),
+                trace_id: event.correlation_id.clone(),
+                span_id: event.parent_correlation_id.clone(),
+                project_id: self
+                    .routing_value_for_metadata("project_id", &event.metadata)
+                    .unwrap_or_else(|| project_id.clone()),
+                source_timestamp_ns: event.source_timestamp_ns,
+                worker_id: self.config.worker_id.clone(),
+            })
+            .collect();
+        let durable_records = pending
+            .iter()
+            .filter(|event| !event.is_sse_only)
+            .map(|event| {
+                client::build_engine_record(
+                    project_id.clone(),
+                    event.run_id.clone(),
+                    event.event_type.clone(),
+                    event.data.clone(),
+                    event.source_timestamp_ns,
+                    String::new(),
+                    event.correlation_id.clone(),
+                    event.parent_correlation_id.clone(),
+                    self.metadata_for_request(event.metadata.clone()),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        if !transient.is_empty() {
+            if let Err(error) = engine.stream_events(transient).await {
+                for event in pending.into_iter().rev() {
+                    self.journal_queue.push_front(event).ok();
+                }
+                self.journal_queue.record_error();
+                *self.engine_client.lock().await = None;
+                return Err(error);
+            }
+        }
+        if !durable_records.is_empty() {
+            if let Err(error) = engine.append_batch(durable_records).await {
+                if journal_append_error_is_retryable(&error) {
+                    for event in pending.into_iter().rev().filter(|event| !event.is_sse_only) {
+                        self.journal_queue.push_front(event).ok();
+                    }
+                }
+                self.journal_queue.record_error();
+                *self.engine_client.lock().await = None;
+                return Err(error);
+            }
+        }
+        debug!(
+            "Flushed {} queued events before durable write for run_id={}",
+            pending.len(),
+            run_id
+        );
+        Ok(())
+    }
+
     /// Set components for the worker.
     /// Note: Built-in scorers are NOT registered as components. The platform
     /// routes scorer requests to any available worker without component lookup,

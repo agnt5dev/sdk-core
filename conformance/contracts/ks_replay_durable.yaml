@@ -1,4 +1,6 @@
 version: 1
+group: durability
+coverage: resilience
 component: ks_replay_durable
 component_type: workflow
 cases:
@@ -9,6 +11,29 @@ cases:
   timeout_seconds: 60
   expect:
     status: paused
+    events:
+      required:
+      - run.started
+      - workflow.step.started
+      - workflow.step.suspended
+      ordered:
+      - run.started
+      - workflow.step.started
+      - workflow.step.suspended
+    durability:
+      contract: durable_activation_v1
+      runtime_artifact_required: true
+      sdk_artifact_required: true
+      artifact_identity_required: true
+      terminal_outcome_count: 1
+      min_activations: 3
+      decisions_include:
+      - replay
+      unique_terminal_per_activation: true
+      journal_min_counts:
+        workflow.step.started: 3
+        workflow.step.completed: 3
+        run.completed: 1
   resume_steps:
   - user_response: continue
     expect:
