@@ -108,11 +108,26 @@ pub struct AssertionResult {
     pub explanation: String,
 }
 
+/// Total tokens for an `lm.completed` record: `usage.tokens_in + usage.tokens_out`,
+/// falling back to a top-level `total_tokens` field.
+fn event_total_tokens(data: &serde_json::Value) -> Option<u64> {
+    let usage = data.get("usage")?;
+    let tokens_in = usage.get("tokens_in").and_then(|v| v.as_u64());
+    let tokens_out = usage.get("tokens_out").and_then(|v| v.as_u64());
+    match (tokens_in, tokens_out) {
+        (None, None) => None,
+        (tokens_in, tokens_out) => Some(tokens_in.unwrap_or(0) + tokens_out.unwrap_or(0)),
+    }
+}
+
 fn check_max_tokens(trace: &[TraceEvent], max: u64) -> AssertionResult {
     let total: u64 = trace
         .iter()
-        .filter(|e| e.event_type == "lm.call.completed")
-        .filter_map(|e| e.data.get("total_tokens").and_then(|v| v.as_u64()))
+        .filter(|e| e.event_type == "lm.completed")
+        .filter_map(|e| {
+            event_total_tokens(&e.data)
+                .or_else(|| e.data.get("total_tokens").and_then(|v| v.as_u64()))
+        })
         .sum();
 
     AssertionResult {
@@ -125,7 +140,7 @@ fn check_max_tokens(trace: &[TraceEvent], max: u64) -> AssertionResult {
 fn check_max_lm_calls(trace: &[TraceEvent], max: u32) -> AssertionResult {
     let count = trace
         .iter()
-        .filter(|e| e.event_type == "lm.call.completed")
+        .filter(|e| e.event_type == "lm.completed")
         .count() as u32;
 
     AssertionResult {
@@ -160,16 +175,23 @@ fn check_event_sequence(trace: &[TraceEvent], events: &[String]) -> AssertionRes
     }
 }
 
+/// A step counts as memoized when its `workflow.step.completed` record carries
+/// `is_memoized: true` or `decision: "replay"`. A replayed activation appends no
+/// record of its own, so memoization is inferred from the completed record whose
+/// identity (`name`/`attempt`) matches a prior execution.
 fn check_step_memoized(trace: &[TraceEvent], step_name: &str) -> AssertionResult {
     let memoized = trace
         .iter()
         .filter(|e| e.event_type == "workflow.step.completed")
         .filter(|e| e.name.as_deref() == Some(step_name))
         .any(|e| {
-            e.data
+            let is_memoized = e
+                .data
                 .get("is_memoized")
                 .and_then(|v| v.as_bool())
-                .unwrap_or(false)
+                .unwrap_or(false);
+            let replayed = e.data.get("decision").and_then(|v| v.as_str()) == Some("replay");
+            is_memoized || replayed
         });
 
     AssertionResult {
@@ -188,7 +210,7 @@ fn check_no_errors(trace: &[TraceEvent]) -> AssertionResult {
         "run.failed",
         "workflow.step.failed",
         "agent.failed",
-        "lm.call.failed",
+        "lm.failed",
         "function.failed",
     ];
     let errors: Vec<_> = trace
@@ -320,12 +342,12 @@ mod tests {
                 name: None,
             },
             TraceEvent {
-                event_type: "lm.call.completed".into(),
+                event_type: "lm.completed".into(),
                 event_id: "2".into(),
                 correlation_id: "a".into(),
                 parent_correlation_id: None,
                 timestamp_ns: 2_000_000,
-                data: json!({"total_tokens": 500}),
+                data: json!({"usage": {"tokens_in": 300, "tokens_out": 200}}),
                 name: Some("chat".into()),
             },
             TraceEvent {
@@ -382,7 +404,7 @@ mod tests {
         // Should pass - subsequence present
         let result = TraceAssertion::event_sequence(vec![
             "run.started".into(),
-            "lm.call.completed".into(),
+            "lm.completed".into(),
             "run.completed".into(),
         ])
         .check(&trace);
@@ -412,6 +434,34 @@ mod tests {
         // Should fail - step not found
         let result = TraceAssertion::step_memoized("unknown_step").check(&trace);
         assert!(!result.passed);
+
+        // Should pass - replay decision on the completed record counts as memoized
+        let replayed = vec![TraceEvent {
+            event_type: "workflow.step.completed".into(),
+            event_id: "5".into(),
+            correlation_id: "a".into(),
+            parent_correlation_id: None,
+            timestamp_ns: 5_000_000,
+            data: json!({"decision": "replay", "attempt": 1}),
+            name: Some("replayed_step".into()),
+        }];
+        let result = TraceAssertion::step_memoized("replayed_step").check(&replayed);
+        assert!(result.passed);
+    }
+
+    #[test]
+    fn test_max_tokens_falls_back_to_total_tokens() {
+        let trace = vec![TraceEvent {
+            event_type: "lm.completed".into(),
+            event_id: "1".into(),
+            correlation_id: "a".into(),
+            parent_correlation_id: None,
+            timestamp_ns: 1_000_000,
+            data: json!({"total_tokens": 500}),
+            name: Some("chat".into()),
+        }];
+        assert!(TraceAssertion::max_tokens(500).check(&trace).passed);
+        assert!(!TraceAssertion::max_tokens(499).check(&trace).passed);
     }
 
     #[test]
