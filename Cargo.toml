@@ -134,11 +134,16 @@ tar = "0.4"
 tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 
 [features]
-default = []
+# `vendored-protoc` builds protoc from source through `protobuf-src` so a
+# plain `cargo build` works anywhere. It adds several minutes to a cold build,
+# so CI and downstream SDK builds disable it and set PROTOC to a prebuilt
+# binary instead. See build.rs.
+default = ["vendored-protoc"]
+vendored-protoc = ["dep:protobuf-src"]
 libsql-memory = ["dep:libsql"]
 wasm-sandbox = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:tempfile"]
 
 # Build dependencies
 [build-dependencies]
 tonic-prost-build = "0.14"
-protobuf-src = "2.0"
+protobuf-src = { version = "2.0", optional = true }
