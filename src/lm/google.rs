@@ -831,14 +831,14 @@ struct GeminiFunctionCall {
 }
 
 impl GeminiPart {
-    fn to_tool_call(&self, index: usize) -> Option<ToolCall> {
+    fn to_tool_call(&self, response_id: &str, index: usize) -> Option<ToolCall> {
         self.function_call.as_ref().map(|function_call| ToolCall {
-            // Gemini functionCall parts do not include IDs. Match the fallback
-            // convention used by the OpenAI-compatible streaming parser.
+            // Gemini functionCall parts may omit IDs. Scope fallback IDs to the
+            // response so indexes restarting at zero cannot collide across turns.
             id: function_call
                 .id
                 .clone()
-                .unwrap_or_else(|| format!("call_{index}")),
+                .unwrap_or_else(|| format!("call_{response_id}_{index}")),
             name: function_call.name.clone(),
             arguments: function_call.args.to_string(),
             provider_data: self
@@ -1003,6 +1003,7 @@ impl GeminiResponse {
         model: &str,
         response_format: ResponseFormat,
     ) -> SdkResult<GenerateResponse> {
+        let response_id = uuid::Uuid::new_v4().to_string();
         let raw = serde_json::to_value(&self).ok();
 
         let mut text = String::new();
@@ -1017,7 +1018,7 @@ impl GeminiResponse {
                         if let Some(t) = &part.text {
                             text.push_str(t);
                         }
-                        if let Some(tool_call) = part.to_tool_call(tool_calls.len()) {
+                        if let Some(tool_call) = part.to_tool_call(&response_id, tool_calls.len()) {
                             tool_calls.push(tool_call);
                         }
                     }
@@ -1039,7 +1040,7 @@ impl GeminiResponse {
         });
 
         Ok(GenerateResponse {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: response_id,
             model: model.to_string(),
             created: None,
             text,
@@ -1104,6 +1105,7 @@ fn parse_json_value(text: &str) -> SdkResult<JsonValue> {
 
 #[derive(Clone)]
 struct PartialResponse {
+    id: String,
     model: String,
     usage: Option<GeminiUsageMetadata>,
     finish_reason: Option<String>,
@@ -1113,6 +1115,7 @@ struct PartialResponse {
 impl PartialResponse {
     fn new(model: String) -> Self {
         Self {
+            id: uuid::Uuid::new_v4().to_string(),
             model,
             usage: None,
             finish_reason: None,
@@ -1134,7 +1137,8 @@ impl PartialResponse {
 
                 if let Some(content) = candidate.content {
                     for part in content.parts {
-                        if let Some(tool_call) = part.to_tool_call(self.tool_calls.len()) {
+                        if let Some(tool_call) = part.to_tool_call(&self.id, self.tool_calls.len())
+                        {
                             self.tool_calls.push(tool_call);
                         }
                         if let Some(text) = part.text {
@@ -1173,7 +1177,7 @@ impl PartialResponse {
         });
 
         Ok(GenerateResponse {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: self.id,
             model: self.model,
             created: None,
             text,
@@ -1366,6 +1370,47 @@ mod tests {
     }
 
     #[test]
+    fn non_streaming_synthetic_tool_call_ids_are_scoped_to_response() {
+        let fixture = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {
+                            "functionCall": {
+                                "name": "lookup_weather",
+                                "args": {"city": "San Francisco"}
+                            }
+                        },
+                        {
+                            "functionCall": {
+                                "name": "lookup_weather",
+                                "args": {"city": "Oakland"}
+                            }
+                        }
+                    ]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let parse_response = || {
+            serde_json::from_value::<GeminiResponse>(fixture.clone())
+                .unwrap()
+                .into_generate_response("gemini-2.5-flash", ResponseFormat::Text)
+                .unwrap()
+        };
+
+        let first = parse_response();
+        let second = parse_response();
+        let first_tool_calls = first.tool_calls.as_ref().unwrap();
+        let second_tool_calls = second.tool_calls.as_ref().unwrap();
+
+        assert_eq!(first_tool_calls[0].id, format!("call_{}_0", first.id));
+        assert_eq!(first_tool_calls[1].id, format!("call_{}_1", first.id));
+        assert_eq!(second_tool_calls[0].id, format!("call_{}_0", second.id));
+        assert_ne!(first_tool_calls[0].id, second_tool_calls[0].id);
+    }
+
+    #[test]
     fn google_thought_signature_survives_tool_call_replay() {
         let tool_call = ToolCall {
             id: "call_0".to_string(),
@@ -1423,6 +1468,33 @@ mod tests {
         assert_eq!(tool_calls[0].name, "calculate");
         assert_eq!(tool_calls[0].arguments, r#"{"expression":"15 * 7"}"#);
         assert_eq!(response.finish_reason.as_deref(), Some("STOP"));
+    }
+
+    #[test]
+    fn streaming_synthetic_tool_call_id_uses_completed_response_id() {
+        let fixture = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "functionCall": {
+                            "name": "calculate",
+                            "args": {"expression": "15 * 7"}
+                        }
+                    }]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let event: GeminiStreamResponse = serde_json::from_value(fixture).unwrap();
+        let mut partial = PartialResponse::new("gemini-2.5-flash".to_string());
+
+        let text = partial.absorb(event).join("");
+        let response = partial
+            .into_generate_response(text, ResponseFormat::Text)
+            .unwrap();
+        let tool_calls = response.tool_calls.as_ref().unwrap();
+
+        assert_eq!(tool_calls[0].id, format!("call_{}_0", response.id));
     }
 
     #[test]
