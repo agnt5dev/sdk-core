@@ -12,7 +12,7 @@ use super::deterministic::{
 use super::{ScorerInput, ScorerResult};
 use serde_json::Value;
 
-/// Names of all built-in scorers that can be handled in Rust.
+/// Names reserved by the cross-SDK built-in scorer contract.
 pub const BUILTIN_SCORER_NAMES: &[&str] = &[
     "exact_match",
     "contains",
@@ -22,6 +22,9 @@ pub const BUILTIN_SCORER_NAMES: &[&str] = &[
     "numeric_range",
     "levenshtein",
     "llm_judge",
+    "correctness",
+    "faithfulness",
+    "goal_success",
     "agent_judge",
     "tool_called",
     "tool_not_called",
@@ -325,17 +328,19 @@ mod tests {
     }
 
     #[test]
-    fn test_llm_judge_returns_none() {
-        // llm_judge is built-in but not in the fast path
+    fn test_worker_executed_judges_are_known_but_not_in_the_fast_path() {
         let input = json!({"output": "test"});
-        assert!(execute("llm_judge", input.to_string().as_bytes()).is_none());
-    }
-
-    #[test]
-    fn test_agent_judge_returns_none() {
-        // agent_judge is built-in but worker-executed, not in the Rust fast path
-        let input = json!({"output": "test"});
-        assert!(execute("agent_judge", input.to_string().as_bytes()).is_none());
+        for scorer_name in [
+            "llm_judge",
+            "correctness",
+            "faithfulness",
+            "goal_success",
+            "agent_judge",
+        ] {
+            assert!(is_builtin_scorer(scorer_name));
+            assert!(!can_execute_locally(scorer_name));
+            assert!(execute(scorer_name, input.to_string().as_bytes()).is_none());
+        }
     }
 
     #[test]
