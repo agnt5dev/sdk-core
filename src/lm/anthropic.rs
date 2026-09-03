@@ -398,6 +398,7 @@ fn build_stream(
                                     id: id.clone(),
                                     name: name.clone(),
                                     arguments: input.to_string(),
+                                    provider_data: None,
                                 });
                             }
                         }
@@ -757,6 +758,7 @@ impl MessagesResponse {
                             id: id.clone(),
                             name: name.clone(),
                             arguments: input.to_string(),
+                            provider_data: None,
                         });
                     }
                 }
@@ -875,8 +877,23 @@ fn parse_json_value(text: &str) -> SdkResult<JsonValue> {
         )));
     }
 
-    serde_json::from_str(trimmed)
+    let json = markdown_fenced_json_body(trimmed).unwrap_or(trimmed);
+    serde_json::from_str(json)
         .map_err(|err| SdkError::Other(anyhow!("failed to parse JSON response: {err}")))
+}
+
+/// Anthropic JSON mode is prompt-mediated, so otherwise valid responses can
+/// arrive inside a single Markdown code fence. Accept only a fence that wraps
+/// the entire response; extracting JSON from arbitrary prose would hide model
+/// contract violations.
+fn markdown_fenced_json_body(text: &str) -> Option<&str> {
+    let fenced = text.strip_prefix("```")?;
+    let (language, body) = fenced.split_once('\n')?;
+    if !language.trim().is_empty() && !language.trim().eq_ignore_ascii_case("json") {
+        return None;
+    }
+
+    body.trim_end().strip_suffix("```").map(str::trim)
 }
 
 fn augment_system_prompt(existing: Option<String>, format: &ResponseFormat) -> Option<String> {
@@ -1202,6 +1219,20 @@ fn delimiter_length(remaining: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_response_accepts_markdown_fenced_object() {
+        let parsed = parse_json_value("```json\n{\"city\":\"Paris\"}\n```").unwrap();
+
+        assert_eq!(parsed, json!({"city": "Paris"}));
+    }
+
+    #[test]
+    fn json_response_rejects_prose_wrapped_object() {
+        let error = parse_json_value("Here is the result: {\"city\":\"Paris\"}").unwrap_err();
+
+        assert!(error.to_string().contains("failed to parse JSON response"));
+    }
 
     #[test]
     fn response_server_tool_use_surfaces_as_tool_call() {

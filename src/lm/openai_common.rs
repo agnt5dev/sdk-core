@@ -319,6 +319,7 @@ impl ChatCompletionResponse {
                         id: api_tc.id.clone(),
                         name: api_tc.function.name.clone(),
                         arguments: api_tc.function.arguments.clone(),
+                        provider_data: None,
                     })
                     .collect()
             });
@@ -552,6 +553,7 @@ impl PartialResponse {
                         .unwrap_or_else(|| format!("call_{index}")),
                     name: name.clone(),
                     arguments: partial.arguments.clone(),
+                    provider_data: None,
                 })
             })
             .collect::<Vec<_>>();

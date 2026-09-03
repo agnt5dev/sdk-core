@@ -764,6 +764,7 @@ fn tool_calls_from_output(output: &[OutputItem]) -> Vec<ToolCall> {
                     id: call_id.clone(),
                     name: name.clone(),
                     arguments: arguments.clone(),
+                    provider_data: None,
                 });
             }
             OutputItem::ToolCall {
@@ -774,6 +775,7 @@ fn tool_calls_from_output(output: &[OutputItem]) -> Vec<ToolCall> {
                     id: format!("call_{}", tool_name),
                     name: tool_name.clone(),
                     arguments: arguments.to_string(),
+                    provider_data: None,
                 });
             }
             OutputItem::WebSearchCall {
@@ -785,6 +787,7 @@ fn tool_calls_from_output(output: &[OutputItem]) -> Vec<ToolCall> {
                     id: id.clone(),
                     name: "web_search_preview".to_string(),
                     arguments: built_in_tool_arguments(provider_fields),
+                    provider_data: None,
                 });
             }
             OutputItem::CodeInterpreterCall {
@@ -796,6 +799,7 @@ fn tool_calls_from_output(output: &[OutputItem]) -> Vec<ToolCall> {
                     id: id.clone(),
                     name: "code_interpreter".to_string(),
                     arguments: built_in_tool_arguments(provider_fields),
+                    provider_data: None,
                 });
             }
             OutputItem::FileSearchCall {
@@ -807,6 +811,7 @@ fn tool_calls_from_output(output: &[OutputItem]) -> Vec<ToolCall> {
                     id: id.clone(),
                     name: "file_search".to_string(),
                     arguments: built_in_tool_arguments(provider_fields),
+                    provider_data: None,
                 });
             }
             _ => {}
@@ -1795,6 +1800,7 @@ mod tests {
             id: "call_123".to_string(),
             name: "lookup_weather".to_string(),
             arguments: "{\"city\":\"SF\"}".to_string(),
+            provider_data: None,
         }];
 
         let response = state.into_generate_response(ResponseFormat::Text).unwrap();

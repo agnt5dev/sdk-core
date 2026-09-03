@@ -840,6 +840,7 @@ impl BedrockAnthropicResponse {
                             id,
                             name,
                             arguments: input.to_string(),
+                            provider_data: None,
                         });
                     }
                 }
@@ -1573,6 +1574,7 @@ impl BedrockPartialResponse {
                     id,
                     name,
                     arguments,
+                    provider_data: None,
                 })
             })
             .collect::<Vec<_>>();
@@ -1847,6 +1849,7 @@ mod tests {
             id: "toolu_123".to_string(),
             name: "lookup_weather".to_string(),
             arguments: r#"{"city":"Seattle"}"#.to_string(),
+            provider_data: None,
         };
         let request = request()
             .add_tool(
