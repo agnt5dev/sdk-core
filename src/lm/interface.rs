@@ -241,8 +241,8 @@ pub struct GenerationConfig {
     pub max_output_tokens: Option<u32>,
     pub response_format: ResponseFormat,
     pub prompt_cache: Option<PromptCacheConfig>,
-    /// Reasoning effort for o-series models (o1, o3-mini, o3)
-    /// Only supported by OpenAI Responses API
+    /// Provider-neutral reasoning effort.
+    /// Maps to OpenAI reasoning effort and Gemini 3 thinking level.
     pub reasoning_effort: Option<ReasoningEffort>,
     /// Output modalities (text, audio, image)
     /// Only supported by OpenAI Responses API
@@ -347,8 +347,7 @@ impl JsonSchemaFormat {
     }
 }
 
-/// Reasoning effort for o-series models (o1, o3-mini, o3).
-/// Controls how much compute the model uses for reasoning.
+/// Provider-neutral control for how much compute a model uses for reasoning.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ReasoningEffort {
     /// Minimal reasoning effort (fastest)
@@ -600,6 +599,9 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: String,
+    /// Opaque provider state that must be replayed with this call.
+    /// Callers should preserve it unchanged in subsequent assistant messages.
+    pub provider_data: Option<Value>,
 }
 
 #[derive(Clone, Debug, Default)]

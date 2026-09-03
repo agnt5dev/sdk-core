@@ -31,7 +31,7 @@ Add the crate to a Rust project:
 
 ```toml
 [dependencies]
-agnt5-sdk-core = "0.2.2"
+agnt5-sdk-core = "0.2.5"
 ```
 
 The default build contains the portable SDK foundation. Optional capabilities
@@ -39,7 +39,7 @@ can be enabled with Cargo features:
 
 ```toml
 [dependencies]
-agnt5-sdk-core = { version = "0.2.3", features = ["libsql-memory"] }
+agnt5-sdk-core = { version = "0.2.5", features = ["libsql-memory"] }
 ```
 
 | Feature | Purpose |

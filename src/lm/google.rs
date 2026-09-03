@@ -19,8 +19,8 @@ use super::http;
 use super::interface::{
     generate as generate_via_model, stream as stream_via_model, BuiltInTool, ContentBlockType,
     GenerateRequest, GenerateResponse, GenerationConfig, LanguageModel, Message, MessageRole,
-    ResponseFormat, StreamChunk, StreamHandle, StreamRequest, TokenUsage, ToolCall, ToolChoice,
-    ToolDefinition,
+    ReasoningEffort, ResponseFormat, StreamChunk, StreamHandle, StreamRequest, TokenUsage,
+    ToolCall, ToolChoice, ToolDefinition,
 };
 use super::telemetry;
 
@@ -105,8 +105,8 @@ impl GoogleConfig {
 ///
 /// Supports the full Gemini model family including:
 /// - Gemini 2.0 Flash (fast, cost-effective)
-/// - Gemini 1.5 Pro (high capability, long context)
-/// - Gemini 1.5 Flash (balanced performance)
+/// - Gemini 3.6 Flash (stable, tool-capable)
+/// - Gemini 3.5 Flash Lite (cost-effective)
 ///
 /// # Example
 ///
@@ -116,7 +116,7 @@ impl GoogleConfig {
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let provider = GoogleProvider::from_env()?;
 /// let response = provider.generate(
-///     GenerateRequest::new("google/gemini-2.0-flash")
+///     GenerateRequest::new("google/gemini-3.6-flash")
 ///         .user_message("Explain neural networks")
 /// ).await?;
 /// println!("{}", response.text);
@@ -565,6 +565,7 @@ impl GeminiPayload {
                 text: Some(prompt.clone()),
                 function_call: None,
                 function_response: None,
+                thought_signature: None,
             }],
         });
 
@@ -574,7 +575,7 @@ impl GeminiPayload {
             max_output_tokens,
             response_format,
             prompt_cache,
-            reasoning_effort: _,
+            reasoning_effort,
             modalities: _,
             built_in_tools,
             timeout: _,
@@ -585,7 +586,8 @@ impl GeminiPayload {
             top_p,
             max_output_tokens: Some(max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS)),
             response_mime_type: response_mime_type(&response_format),
-            response_schema: response_schema(&response_format),
+            response_json_schema: response_json_schema(&response_format),
+            thinking_config: thinking_config(reasoning_effort.as_ref()),
         });
 
         // Build a mixed tools array: function-declaration tools + Gemini
@@ -715,6 +717,7 @@ impl GeminiContent {
                 text: Some(text),
                 function_call: None,
                 function_response: None,
+                thought_signature: None,
             }],
         }
     }
@@ -725,8 +728,7 @@ impl GeminiContent {
         // Tool result message (functionResponse)
         if let Some(tool_call_id) = &message.tool_call_id {
             // Parse the result content as JSON if possible, otherwise use as text
-            let response_value: JsonValue = serde_json::from_str(&message.content)
-                .unwrap_or_else(|_| json!({"result": message.content.clone()}));
+            let response_value = google_function_response(&message.content);
 
             parts.push(GeminiPart {
                 text: None,
@@ -734,7 +736,9 @@ impl GeminiContent {
                 function_response: Some(GeminiFunctionResponse {
                     name: function_name.unwrap_or(tool_call_id).to_string(),
                     response: response_value,
+                    id: Some(tool_call_id.clone()),
                 }),
+                thought_signature: None,
             });
 
             return Self {
@@ -751,6 +755,7 @@ impl GeminiContent {
                     text: Some(message.content.clone()),
                     function_call: None,
                     function_response: None,
+                    thought_signature: None,
                 });
             }
 
@@ -761,10 +766,12 @@ impl GeminiContent {
                 parts.push(GeminiPart {
                     text: None,
                     function_call: Some(GeminiFunctionCall {
+                        id: Some(tc.id.clone()),
                         name: tc.name.clone(),
                         args,
                     }),
                     function_response: None,
+                    thought_signature: google_thought_signature(tc).map(str::to_owned),
                 });
             }
 
@@ -785,12 +792,21 @@ impl GeminiContent {
             text: Some(message.content.clone()),
             function_call: None,
             function_response: None,
+            thought_signature: None,
         });
 
         Self {
             role: Some(role.to_string()),
             parts,
         }
+    }
+}
+
+fn google_function_response(content: &str) -> JsonValue {
+    match serde_json::from_str(content) {
+        Ok(value @ JsonValue::Object(_)) => value,
+        Ok(value) => json!({"result": value}),
+        Err(_) => json!({"result": content}),
     }
 }
 
@@ -802,30 +818,52 @@ struct GeminiPart {
     function_call: Option<GeminiFunctionCall>,
     #[serde(rename = "functionResponse", skip_serializing_if = "Option::is_none")]
     function_response: Option<GeminiFunctionResponse>,
+    #[serde(rename = "thoughtSignature", skip_serializing_if = "Option::is_none")]
+    thought_signature: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct GeminiFunctionCall {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
     name: String,
     args: JsonValue,
 }
 
-impl GeminiFunctionCall {
-    fn to_tool_call(&self, index: usize) -> ToolCall {
-        ToolCall {
+impl GeminiPart {
+    fn to_tool_call(&self, index: usize) -> Option<ToolCall> {
+        self.function_call.as_ref().map(|function_call| ToolCall {
             // Gemini functionCall parts do not include IDs. Match the fallback
             // convention used by the OpenAI-compatible streaming parser.
-            id: format!("call_{index}"),
-            name: self.name.clone(),
-            arguments: self.args.to_string(),
-        }
+            id: function_call
+                .id
+                .clone()
+                .unwrap_or_else(|| format!("call_{index}")),
+            name: function_call.name.clone(),
+            arguments: function_call.args.to_string(),
+            provider_data: self
+                .thought_signature
+                .as_ref()
+                .map(|signature| json!({"google": {"thought_signature": signature}})),
+        })
     }
+}
+
+fn google_thought_signature(tool_call: &ToolCall) -> Option<&str> {
+    tool_call
+        .provider_data
+        .as_ref()?
+        .get("google")?
+        .get("thought_signature")?
+        .as_str()
 }
 
 #[derive(Serialize, Deserialize)]
 struct GeminiFunctionResponse {
     name: String,
     response: JsonValue,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -838,8 +876,16 @@ struct GeminiGenerationConfig {
     max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_mime_type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    response_schema: Option<JsonValue>,
+    #[serde(rename = "responseJsonSchema", skip_serializing_if = "Option::is_none")]
+    response_json_schema: Option<JsonValue>,
+    #[serde(rename = "thinkingConfig", skip_serializing_if = "Option::is_none")]
+    thinking_config: Option<GeminiThinkingConfig>,
+}
+
+#[derive(Serialize)]
+struct GeminiThinkingConfig {
+    #[serde(rename = "thinkingLevel")]
+    thinking_level: &'static str,
 }
 
 #[derive(Serialize)]
@@ -877,11 +923,21 @@ fn response_mime_type(format: &ResponseFormat) -> Option<String> {
     }
 }
 
-fn response_schema(format: &ResponseFormat) -> Option<JsonValue> {
+fn response_json_schema(format: &ResponseFormat) -> Option<JsonValue> {
     match format {
         ResponseFormat::JsonSchema(schema) => Some(schema.schema.clone()),
         _ => None,
     }
+}
+
+fn thinking_config(effort: Option<&ReasoningEffort>) -> Option<GeminiThinkingConfig> {
+    effort.map(|effort| GeminiThinkingConfig {
+        thinking_level: match effort {
+            ReasoningEffort::Minimal => "minimal",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+        },
+    })
 }
 
 fn convert_tools(tools: &[ToolDefinition]) -> SdkResult<Vec<GeminiTool>> {
@@ -961,8 +1017,8 @@ impl GeminiResponse {
                         if let Some(t) = &part.text {
                             text.push_str(t);
                         }
-                        if let Some(function_call) = &part.function_call {
-                            tool_calls.push(function_call.to_tool_call(tool_calls.len()));
+                        if let Some(tool_call) = part.to_tool_call(tool_calls.len()) {
+                            tool_calls.push(tool_call);
                         }
                     }
                 }
@@ -1078,9 +1134,8 @@ impl PartialResponse {
 
                 if let Some(content) = candidate.content {
                     for part in content.parts {
-                        if let Some(function_call) = part.function_call {
-                            self.tool_calls
-                                .push(function_call.to_tool_call(self.tool_calls.len()));
+                        if let Some(tool_call) = part.to_tool_call(self.tool_calls.len()) {
+                            self.tool_calls.push(tool_call);
                         }
                         if let Some(text) = part.text {
                             text_parts.push(text);
@@ -1210,6 +1265,40 @@ mod tests {
     }
 
     #[test]
+    fn generate_payload_uses_json_schema_and_gemini_thinking_level() {
+        let request = GenerateRequest::new("google/gemini-3.6-flash")
+            .user_message("Return city facts.")
+            .response_format(ResponseFormat::JsonSchema(
+                crate::lm::JsonSchemaFormat::new(
+                    "city_facts",
+                    json!({
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                        "additionalProperties": false
+                    }),
+                ),
+            ))
+            .configure(|config| {
+                config.reasoning_effort = Some(crate::lm::ReasoningEffort::Minimal);
+            });
+
+        let payload = GeminiPayload::from_request(&request).unwrap();
+        let value = serde_json::to_value(payload).unwrap();
+        let generation_config = &value["generation_config"];
+
+        assert!(generation_config.get("response_schema").is_none());
+        assert_eq!(
+            generation_config["responseJsonSchema"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            generation_config["thinkingConfig"]["thinkingLevel"],
+            "minimal"
+        );
+    }
+
+    #[test]
     fn cached_content_create_payload_uses_models_prefix_and_ttl() {
         let payload = GeminiCachedContentPayload::new(
             "gemini-2.5-flash".to_string(),
@@ -1242,9 +1331,11 @@ mod tests {
                         {"text": "I'll check."},
                         {
                             "functionCall": {
+                                "id": "google-call-123",
                                 "name": "lookup_weather",
                                 "args": {"city": "San Francisco"}
-                            }
+                            },
+                            "thoughtSignature": "opaque-google-signature"
                         }
                     ]
                 },
@@ -1265,9 +1356,36 @@ mod tests {
 
         assert_eq!(response.text, "I'll check.");
         assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0].id, "call_0");
+        assert_eq!(tool_calls[0].id, "google-call-123");
         assert_eq!(tool_calls[0].name, "lookup_weather");
         assert_eq!(tool_calls[0].arguments, r#"{"city":"San Francisco"}"#);
+        assert_eq!(
+            tool_calls[0].provider_data,
+            Some(json!({"google": {"thought_signature": "opaque-google-signature"}}))
+        );
+    }
+
+    #[test]
+    fn google_thought_signature_survives_tool_call_replay() {
+        let tool_call = ToolCall {
+            id: "call_0".to_string(),
+            name: "calculate".to_string(),
+            arguments: r#"{"expression":"15 * 23"}"#.to_string(),
+            provider_data: Some(
+                json!({"google": {"thought_signature": "opaque-google-signature"}}),
+            ),
+        };
+        let request = GenerateRequest::new("google/gemini-3.5-flash-lite")
+            .message(Message::assistant_with_tool_calls("", vec![tool_call]))
+            .message(Message::tool_result("call_0", "345"));
+
+        let payload = GeminiPayload::from_request(&request).unwrap();
+        let value = serde_json::to_value(payload).unwrap();
+
+        assert_eq!(
+            value["contents"][0]["parts"][0]["thoughtSignature"],
+            "opaque-google-signature"
+        );
     }
 
     #[test]
@@ -1277,6 +1395,7 @@ mod tests {
                 "content": {
                     "parts": [{
                         "functionCall": {
+                            "id": "google-call-456",
                             "name": "calculate",
                             "args": {"expression": "15 * 7"}
                         }
@@ -1300,7 +1419,7 @@ mod tests {
         let tool_calls = response.tool_calls.unwrap();
 
         assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0].id, "call_0");
+        assert_eq!(tool_calls[0].id, "google-call-456");
         assert_eq!(tool_calls[0].name, "calculate");
         assert_eq!(tool_calls[0].arguments, r#"{"expression":"15 * 7"}"#);
         assert_eq!(response.finish_reason.as_deref(), Some("STOP"));
@@ -1333,6 +1452,7 @@ mod tests {
                     id: "call_0".to_string(),
                     name: "calculate".to_string(),
                     arguments: r#"{"expression":"15 * 7"}"#.to_string(),
+                    provider_data: None,
                 }],
             ))
             .message(Message::tool_result("call_0", r#"{"value":105}"#));
@@ -1345,8 +1465,35 @@ mod tests {
             "calculate"
         );
         assert_eq!(
+            value["contents"][1]["parts"][0]["functionResponse"]["id"],
+            "call_0"
+        );
+        assert_eq!(
             value["contents"][1]["parts"][0]["functionResponse"]["response"]["value"],
             105
+        );
+    }
+
+    #[test]
+    fn scalar_tool_result_is_wrapped_as_a_google_struct() {
+        let request = GenerateRequest::new("google/gemini-3.5-flash-lite")
+            .message(Message::assistant_with_tool_calls(
+                "",
+                vec![ToolCall {
+                    id: "call_0".to_string(),
+                    name: "calculate".to_string(),
+                    arguments: r#"{"expression":"15 * 23"}"#.to_string(),
+                    provider_data: None,
+                }],
+            ))
+            .message(Message::tool_result("call_0", "345"));
+
+        let payload = GeminiPayload::from_request(&request).unwrap();
+        let value = serde_json::to_value(payload).unwrap();
+
+        assert_eq!(
+            value["contents"][1]["parts"][0]["functionResponse"]["response"],
+            json!({"result": 345})
         );
     }
 }

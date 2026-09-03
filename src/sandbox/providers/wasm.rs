@@ -608,6 +608,17 @@ async fn collect_files(
 mod tests {
     use super::*;
 
+    fn sandbox_without_quickjs() -> WasmSandbox {
+        let missing_root = tempfile::tempdir().unwrap();
+        WasmSandbox::new(WasmSandboxConfig {
+            // An explicit missing path takes precedence over the ambient
+            // integration-test environment and deterministically disables JS.
+            quickjs_wasm_path: Some(missing_root.path().join("missing-qjs-wasi.wasm")),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
     #[test]
     fn test_wasm_sandbox_config_default() {
         let config = WasmSandboxConfig::default();
@@ -629,7 +640,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_wasm_sandbox_capabilities_without_quickjs() {
-        let sandbox = WasmSandbox::new(WasmSandboxConfig::default()).unwrap();
+        let sandbox = sandbox_without_quickjs();
         let caps = sandbox.capabilities();
         // Without QuickJS binary, no languages available
         assert!(caps.languages.is_empty());
@@ -659,7 +670,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_wasm_sandbox_js_without_module() {
-        let sandbox = WasmSandbox::new(WasmSandboxConfig::default()).unwrap();
+        let sandbox = sandbox_without_quickjs();
         let result = sandbox
             .execute_code(ExecuteCodeRequest {
                 code: "console.log('hello')".to_string(),
