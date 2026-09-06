@@ -2606,11 +2606,13 @@ where
                         // A negotiated server decision is authoritative for
                         // this response. HOLD prevents a ready-but-unfilled
                         // poll from being mistaken for an empty queue. A
-                        // shared gate collapses duplicate HA edge hints into
-                        // at most one local change per throttle window.
+                        // SCALE_UP uses the shared throttle in the supervisor.
+                        // Every slot receiving SCALE_DOWN may retire: the
+                        // atomic active-plus-idle floor is the authoritative
+                        // bound and lets an idle fleet converge in one poll
+                        // cycle instead of one slot every 30 seconds.
                         consecutive_empty = 0;
                         if matches!(hint, ServerSlotScalingHint::ScaleDown(delta) if delta > 0)
-                            && ctx.server_slot_scaling.try_change()
                             && try_retire_parked_slot(
                                 &ctx.total_slots,
                                 &ctx.busy_slots,
@@ -5868,8 +5870,13 @@ impl Worker {
             let worker_session_id = Arc::new(TokioMutex::new(initial_session_id));
 
             eprintln!(
-                "[INFO] Parked polling started (deployment={}, min_slots={}, max_slots={})",
-                deployment_id, min_slots, max_slots
+                "[INFO] Parked polling started (deployment={}, min_slots={}, max_slots={}, server_slot_scaling={})",
+                deployment_id,
+                min_slots,
+                max_slots,
+                client.negotiated_protocol_capability(
+                    crate::client::SERVER_SLOT_SCALING_V1_CAPABILITY
+                )
             );
 
             let open_poll_slots = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -5967,9 +5974,10 @@ impl Worker {
                             }
                             if spawn > 0 {
                                 debug!(
-                                    "Parked poll ramp: spawned {} slot(s) (total={})",
+                                    "Parked poll ramp: spawned {} slot(s) (total={}, server_hint={:?})",
                                     spawn,
-                                    total_slots.load(std::sync::atomic::Ordering::Relaxed)
+                                    total_slots.load(std::sync::atomic::Ordering::Relaxed),
+                                    slot_scaling
                                 );
                             }
                         }
