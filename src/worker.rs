@@ -2200,12 +2200,23 @@ fn spawn_parked_capacity_reporter(
     })
 }
 
-fn is_worker_session_inactive_error(error: &SdkError) -> bool {
-    // Keep in sync with runtime's `Status::permission_denied("worker session is not active")`.
-    error
-        .to_string()
-        .to_ascii_lowercase()
-        .contains("worker session is not active")
+fn is_worker_session_refresh_required_error(error: &SdkError) -> bool {
+    // Keep these exact fragments in sync with runtime worker-session validation.
+    // Every case means the current token can no longer make progress, while a
+    // fresh RegisterWorkerSession request can establish current authority.
+    let error = error.to_string().to_ascii_lowercase();
+    [
+        "worker session is not active",
+        "worker session is superseded or inactive",
+        "worker session route is not available at this edge",
+        "worker session token is malformed",
+        "worker session token signature is invalid",
+        "worker session token identity does not match",
+        "worker session token scope is invalid",
+        "worker session token is expired",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
 }
 
 fn is_parked_worker_session_registration_rejection(error: &SdkError) -> bool {
@@ -2764,7 +2775,7 @@ where
                     let _ = handle.await;
                 }
             }
-            Err(e) if is_worker_session_inactive_error(&e) => {
+            Err(e) if is_worker_session_refresh_required_error(&e) => {
                 consecutive_empty = 0;
                 warn!("Parked poll slot {} error: {}", slot_id, e);
                 if !refresh_parked_worker_session(
@@ -5975,18 +5986,18 @@ mod tests {
         complete_job_request_from_polled_completion, complete_job_with_retry,
         deployment_artifact_sha256, durable_suspension_service_message, execution_is_revoked,
         is_cancelled_worker_response, is_parked_worker_session_registration_rejection,
-        is_terminal_worker_response, is_worker_session_inactive_error, parked_ramp_spawn_count,
-        parked_runtime_service_response, parked_worker_session_was_refreshed,
-        polled_job_completion_from_service_message, polled_job_suspension_request,
-        record_groups_by_run, require_engine_endpoint, resolve_engine_endpoint,
-        retryable_uncommitted_records_in_reverse, runtime_message_from_job_assignment,
-        stamp_activation_dispatch_metadata, stamp_dispatch_mode,
-        stamp_execution_authority_metadata, stamp_protocol_capability, take_correlation_ids,
-        try_retire_parked_slot, uncommitted_records_in_reverse, valid_activation_artifact_sha256,
-        wait_for_parked_run_events_flush, worker_capabilities, ActiveLeaseAuthority,
-        ActiveLeaseSession, AppendGroupProgress, CompleteJobSender, EntityStateSender,
-        ParkedSlotEvent, ParkedWorkerSessionRegistration, RunFlushLocks, Worker, WorkerConfig,
-        WorkerSlotPhaseSnapshot, WorkerSlotPhases,
+        is_terminal_worker_response, is_worker_session_refresh_required_error,
+        parked_ramp_spawn_count, parked_runtime_service_response,
+        parked_worker_session_was_refreshed, polled_job_completion_from_service_message,
+        polled_job_suspension_request, record_groups_by_run, require_engine_endpoint,
+        resolve_engine_endpoint, retryable_uncommitted_records_in_reverse,
+        runtime_message_from_job_assignment, stamp_activation_dispatch_metadata,
+        stamp_dispatch_mode, stamp_execution_authority_metadata, stamp_protocol_capability,
+        take_correlation_ids, try_retire_parked_slot, uncommitted_records_in_reverse,
+        valid_activation_artifact_sha256, wait_for_parked_run_events_flush, worker_capabilities,
+        ActiveLeaseAuthority, ActiveLeaseSession, AppendGroupProgress, CompleteJobSender,
+        EntityStateSender, ParkedSlotEvent, ParkedWorkerSessionRegistration, RunFlushLocks, Worker,
+        WorkerConfig, WorkerSlotPhaseSnapshot, WorkerSlotPhases,
     };
     use crate::error::{ErrorCode, SdkError};
     use crate::journal_queue::{JournalEventMessage, JournalEventQueue, JournalQueueConfig};
@@ -7457,14 +7468,34 @@ mod tests {
     }
 
     #[test]
-    fn worker_session_inactive_errors_are_detected() {
-        let error = SdkError::Connection {
-            message: "PollJob failed: code: 'The caller does not have permission to execute the specified operation', message: \"worker session is not active\"".to_string(),
+    fn worker_session_refresh_required_errors_are_detected() {
+        for message in [
+            "worker session is not active",
+            "worker session is superseded or inactive",
+            "worker session route is not available at this edge",
+            "worker session token is malformed",
+            "worker session token signature is invalid",
+            "worker session token identity does not match",
+            "worker session token scope is invalid",
+            "worker session token is expired",
+        ] {
+            let error = SdkError::Connection {
+                message: format!(
+                    "PollJob failed: code: 'The caller does not have permission to execute the specified operation', message: \"{message}\""
+                ),
+                code: ErrorCode::ConnectionFailed,
+                source: None,
+            };
+
+            assert!(is_worker_session_refresh_required_error(&error));
+        }
+
+        let unrelated = SdkError::Connection {
+            message: "PollJob failed: code: 'The service is currently unavailable'".to_string(),
             code: ErrorCode::ConnectionFailed,
             source: None,
         };
-
-        assert!(is_worker_session_inactive_error(&error));
+        assert!(!is_worker_session_refresh_required_error(&unrelated));
     }
 
     #[test]
