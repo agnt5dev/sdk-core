@@ -9,8 +9,9 @@ use crate::pb::{
     GetEntityStateResponse, HealthCheck, JobAssignment, LeaseRenewalOutcome, PollJobRequest,
     PutEntityStateRequest, PutEntityStateResponse, Record, RegisterService,
     RegisterWorkerSessionRequest, RenewJobLeaseRequest, ReportWorkerCapacityRequest,
-    RuntimeMessage, RuntimeMessageType, RuntimeServiceResponse, ServiceMessage, UnregisterService,
-    WorkerCapability, WorkerHealthStatus, WorkerMode, WorkerSlotPolicy, WriteCheckpointRequest,
+    RuntimeMessage, RuntimeMessageType, RuntimeServiceResponse, ServiceMessage,
+    SlotScalingDecision, SlotScalingHint, UnregisterService, WorkerCapability, WorkerHealthStatus,
+    WorkerMode, WorkerSlotPolicy, WriteCheckpointRequest,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -25,6 +26,7 @@ use uuid::Uuid;
 const PARKED_WORKER_SESSION_REGISTER_ATTEMPTS: usize = 3;
 const PARKED_WORKER_SESSION_REGISTER_RETRY_MS: u64 = 1_000;
 const PARKED_WORKER_SESSION_TRANSIENT_RETRY_MAX_MS: u64 = 32_000;
+const PARKED_SLOT_RAMP_THROTTLE_MS: u64 = 1_000;
 const PARKED_COMPLETION_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 const PARKED_COMPLETE_JOB_ATTEMPTS: usize = 3;
 const PARKED_COMPLETE_JOB_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -44,9 +46,19 @@ const ASSIGNMENT_AUTHORED_RETRY_METADATA_KEYS: &[&str] = &[
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParkedSlotEvent {
     /// A claimed job has reached the language runtime and begun execution.
-    Started { active_started: usize },
+    Started {
+        active_started: usize,
+        slot_scaling: Option<ServerSlotScalingHint>,
+    },
     /// A surplus idle slot retired itself (`total_slots` already decremented).
     Retired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerSlotScalingHint {
+    Hold,
+    ScaleUp(usize),
+    ScaleDown(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +73,7 @@ struct WorkerSlotEntry {
     generation: u64,
     phase: WorkerSlotPhase,
     claimed_at: Instant,
+    slot_scaling: Option<ServerSlotScalingHint>,
 }
 
 #[derive(Default)]
@@ -119,7 +132,11 @@ impl WorkerSlotPhases {
         self.lock_state().started_notifier = Some(notifier);
     }
 
-    fn claim(&self, run_id: String) -> WorkerSlotPhaseGuard {
+    fn claim(
+        &self,
+        run_id: String,
+        slot_scaling: Option<ServerSlotScalingHint>,
+    ) -> WorkerSlotPhaseGuard {
         let (generation, replaced, snapshot) = {
             let mut state = self.lock_state();
             let generation = state.next_generation;
@@ -132,6 +149,7 @@ impl WorkerSlotPhases {
                         generation,
                         phase: WorkerSlotPhase::ClaimedNotStarted,
                         claimed_at: Instant::now(),
+                        slot_scaling,
                     },
                 )
                 .is_some();
@@ -159,14 +177,18 @@ impl WorkerSlotPhases {
             }
             entry.phase = WorkerSlotPhase::Executing;
             let claim_to_start = entry.claimed_at.elapsed();
+            let slot_scaling = entry.slot_scaling;
             let notifier = state.started_notifier.clone();
-            (claim_to_start, notifier, state.snapshot())
+            (claim_to_start, slot_scaling, notifier, state.snapshot())
         };
         crate::telemetry::record_worker_claim_to_start("pull", transition.0.as_secs_f64());
-        Self::publish(transition.2);
-        if let Some(notifier) = transition.1 {
-            let active_started = transition.2.executing + transition.2.terminalizing;
-            let _ = notifier.send(ParkedSlotEvent::Started { active_started });
+        Self::publish(transition.3);
+        if let Some(notifier) = transition.2 {
+            let active_started = transition.3.executing + transition.3.terminalizing;
+            let _ = notifier.send(ParkedSlotEvent::Started {
+                active_started,
+                slot_scaling: transition.1,
+            });
         }
     }
 
@@ -331,7 +353,7 @@ impl ParkedWorkerSessionRegistration {
                 max_slots: self.max_slots as u32,
                 target_cpu_usage: 0.75,
                 target_memory_usage: 0.80,
-                ramp_throttle_ms: 1_000,
+                ramp_throttle_ms: PARKED_SLOT_RAMP_THROTTLE_MS as i64,
             }),
             capabilities: self.capabilities.clone(),
             components: self.components.clone(),
@@ -2418,6 +2440,57 @@ struct ParkedPollContext {
     claim_timeout_ms: i64,
     min_slots: usize,
     retire_empty_polls: usize,
+    server_slot_scaling: Arc<ServerSlotScalingGate>,
+}
+
+struct ServerSlotScalingGate {
+    last_change: std::sync::Mutex<Option<Instant>>,
+    throttle: Duration,
+}
+
+impl ServerSlotScalingGate {
+    fn new(throttle: Duration) -> Self {
+        Self {
+            last_change: std::sync::Mutex::new(None),
+            throttle,
+        }
+    }
+
+    fn try_change(&self) -> bool {
+        let now = Instant::now();
+        let mut last = self
+            .last_change
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if last.is_some_and(|last| now.duration_since(last) < self.throttle) {
+            return false;
+        }
+        *last = Some(now);
+        true
+    }
+}
+
+fn negotiated_slot_scaling_hint(
+    server_slot_scaling_negotiated: bool,
+    hint: Option<&SlotScalingHint>,
+) -> Option<ServerSlotScalingHint> {
+    if !server_slot_scaling_negotiated {
+        return None;
+    }
+    let hint = hint?;
+    match hint.decision() {
+        SlotScalingDecision::Hold => Some(ServerSlotScalingHint::Hold),
+        SlotScalingDecision::ScaleUp if hint.suggested_delta > 0 => Some(
+            ServerSlotScalingHint::ScaleUp(hint.suggested_delta as usize),
+        ),
+        SlotScalingDecision::ScaleDown if hint.suggested_delta > 0 => Some(
+            ServerSlotScalingHint::ScaleDown(hint.suggested_delta as usize),
+        ),
+        SlotScalingDecision::ScaleUp | SlotScalingDecision::ScaleDown => {
+            Some(ServerSlotScalingHint::Hold)
+        }
+        SlotScalingDecision::Unspecified => None,
+    }
 }
 
 /// How many new slots to spawn when a parked slot goes busy: grow the fleet
@@ -2430,6 +2503,21 @@ fn parked_ramp_spawn_count(total_slots: usize, busy_slots: usize, max_slots: usi
         .saturating_mul(2)
         .min(max_slots)
         .saturating_sub(total_slots)
+}
+
+fn parked_hint_spawn_count(
+    total_slots: usize,
+    active_started: usize,
+    max_slots: usize,
+    slot_scaling: Option<ServerSlotScalingHint>,
+) -> usize {
+    match slot_scaling {
+        Some(ServerSlotScalingHint::ScaleUp(delta)) => {
+            delta.min(max_slots.saturating_sub(total_slots))
+        }
+        Some(_) => 0,
+        None => parked_ramp_spawn_count(total_slots, active_started, max_slots),
+    }
 }
 
 /// Retire one surplus slot, but only while at least `min_slots` *idle* pollers
@@ -2507,7 +2595,37 @@ where
 
         match poll_result {
             Ok(resp) => {
+                let slot_scaling = negotiated_slot_scaling_hint(
+                    client.negotiated_protocol_capability(
+                        crate::client::SERVER_SLOT_SCALING_V1_CAPABILITY,
+                    ),
+                    resp.slot_scaling.as_ref(),
+                );
                 let Some(job) = resp.job else {
+                    if let Some(hint) = slot_scaling {
+                        // A negotiated server decision is authoritative for
+                        // this response. HOLD prevents a ready-but-unfilled
+                        // poll from being mistaken for an empty queue. A
+                        // shared gate collapses duplicate HA edge hints into
+                        // at most one local change per throttle window.
+                        consecutive_empty = 0;
+                        if matches!(hint, ServerSlotScalingHint::ScaleDown(delta) if delta > 0)
+                            && ctx.server_slot_scaling.try_change()
+                            && try_retire_parked_slot(
+                                &ctx.total_slots,
+                                &ctx.busy_slots,
+                                ctx.min_slots,
+                            )
+                        {
+                            debug!(
+                                "Parked poll slot {} retiring from server scaling hint",
+                                slot_id
+                            );
+                            let _ = ctx.events_tx.send(ParkedSlotEvent::Retired);
+                            return;
+                        }
+                        continue;
+                    }
                     consecutive_empty += 1;
                     if consecutive_empty >= retire_threshold
                         && try_retire_parked_slot(&ctx.total_slots, &ctx.busy_slots, ctx.min_slots)
@@ -2545,7 +2663,7 @@ where
                         continue;
                     }
                 };
-                let _slot_phase = ctx.slot_phases.claim(run_id.clone());
+                let _slot_phase = ctx.slot_phases.claim(run_id.clone(), slot_scaling);
                 stamp_execution_authority_metadata(
                     &mut runtime_message,
                     &ctx.worker_id,
@@ -5798,6 +5916,9 @@ impl Worker {
                 claim_timeout_ms,
                 min_slots,
                 retire_empty_polls,
+                server_slot_scaling: Arc::new(ServerSlotScalingGate::new(Duration::from_millis(
+                    PARKED_SLOT_RAMP_THROTTLE_MS,
+                ))),
             });
 
             let mut slots = tokio::task::JoinSet::new();
@@ -5817,12 +5938,25 @@ impl Worker {
                     }
                     // `ctx` holds an `events_tx` clone, so recv() never yields None here.
                     event = events_rx.recv() => {
-                        if let Some(ParkedSlotEvent::Started { active_started }) = event {
-                            let spawn = parked_ramp_spawn_count(
-                                total_slots.load(std::sync::atomic::Ordering::Relaxed),
-                                active_started,
-                                max_slots,
-                            );
+                        if let Some(ParkedSlotEvent::Started {
+                            active_started,
+                            slot_scaling,
+                        }) = event {
+                            let total = total_slots.load(std::sync::atomic::Ordering::Relaxed);
+                            let spawn = if matches!(
+                                slot_scaling,
+                                Some(ServerSlotScalingHint::ScaleUp(_))
+                            ) && (total >= max_slots || !ctx.server_slot_scaling.try_change())
+                            {
+                                0
+                            } else {
+                                parked_hint_spawn_count(
+                                    total,
+                                    active_started,
+                                    max_slots,
+                                    slot_scaling,
+                                )
+                            };
                             for _ in 0..spawn {
                                 spawn_parked_slot(
                                     &mut slots,
@@ -5987,17 +6121,18 @@ mod tests {
         deployment_artifact_sha256, durable_suspension_service_message, execution_is_revoked,
         is_cancelled_worker_response, is_parked_worker_session_registration_rejection,
         is_terminal_worker_response, is_worker_session_refresh_required_error,
-        parked_ramp_spawn_count, parked_runtime_service_response,
-        parked_worker_session_was_refreshed, polled_job_completion_from_service_message,
-        polled_job_suspension_request, record_groups_by_run, require_engine_endpoint,
-        resolve_engine_endpoint, retryable_uncommitted_records_in_reverse,
-        runtime_message_from_job_assignment, stamp_activation_dispatch_metadata,
-        stamp_dispatch_mode, stamp_execution_authority_metadata, stamp_protocol_capability,
-        take_correlation_ids, try_retire_parked_slot, uncommitted_records_in_reverse,
-        valid_activation_artifact_sha256, wait_for_parked_run_events_flush, worker_capabilities,
-        ActiveLeaseAuthority, ActiveLeaseSession, AppendGroupProgress, CompleteJobSender,
-        EntityStateSender, ParkedSlotEvent, ParkedWorkerSessionRegistration, RunFlushLocks, Worker,
-        WorkerConfig, WorkerSlotPhaseSnapshot, WorkerSlotPhases,
+        negotiated_slot_scaling_hint, parked_hint_spawn_count, parked_ramp_spawn_count,
+        parked_runtime_service_response, parked_worker_session_was_refreshed,
+        polled_job_completion_from_service_message, polled_job_suspension_request,
+        record_groups_by_run, require_engine_endpoint, resolve_engine_endpoint,
+        retryable_uncommitted_records_in_reverse, runtime_message_from_job_assignment,
+        stamp_activation_dispatch_metadata, stamp_dispatch_mode,
+        stamp_execution_authority_metadata, stamp_protocol_capability, take_correlation_ids,
+        try_retire_parked_slot, uncommitted_records_in_reverse, valid_activation_artifact_sha256,
+        wait_for_parked_run_events_flush, worker_capabilities, ActiveLeaseAuthority,
+        ActiveLeaseSession, AppendGroupProgress, CompleteJobSender, EntityStateSender,
+        ParkedSlotEvent, ParkedWorkerSessionRegistration, RunFlushLocks, ServerSlotScalingGate,
+        ServerSlotScalingHint, Worker, WorkerConfig, WorkerSlotPhaseSnapshot, WorkerSlotPhases,
     };
     use crate::error::{ErrorCode, SdkError};
     use crate::journal_queue::{JournalEventMessage, JournalEventQueue, JournalQueueConfig};
@@ -6006,7 +6141,7 @@ mod tests {
         runtime_service_response, service_message, CompleteJobRequest, CompleteJobResponse,
         DispatchComponentResponse, EntityStateSaveRequest, GetEntityStateRequest,
         GetEntityStateResponse, JobAssignment, PutEntityStateRequest, PutEntityStateResponse,
-        RuntimeServiceRequest, ServiceMessage, WorkerMode,
+        RuntimeServiceRequest, ServiceMessage, SlotScalingDecision, SlotScalingHint, WorkerMode,
     };
     use std::collections::{HashMap, VecDeque};
     use std::time::Duration;
@@ -7550,6 +7685,53 @@ mod tests {
         assert_eq!(parked_ramp_spawn_count(4, 0, 10), 0);
     }
 
+    #[test]
+    fn server_slot_hints_require_negotiation_and_absence_preserves_fallback() {
+        let up = SlotScalingHint {
+            decision: SlotScalingDecision::ScaleUp as i32,
+            suggested_delta: 3,
+        };
+        assert_eq!(negotiated_slot_scaling_hint(false, Some(&up)), None);
+        assert_eq!(negotiated_slot_scaling_hint(true, None), None);
+        assert_eq!(
+            negotiated_slot_scaling_hint(true, Some(&up)),
+            Some(ServerSlotScalingHint::ScaleUp(3))
+        );
+
+        let malformed = SlotScalingHint {
+            decision: SlotScalingDecision::ScaleDown as i32,
+            suggested_delta: 0,
+        };
+        assert_eq!(
+            negotiated_slot_scaling_hint(true, Some(&malformed)),
+            Some(ServerSlotScalingHint::Hold)
+        );
+    }
+
+    #[test]
+    fn server_slot_hint_spawn_is_bounded_and_absence_keeps_local_ramp() {
+        assert_eq!(parked_hint_spawn_count(2, 2, 8, None), 2);
+        assert_eq!(
+            parked_hint_spawn_count(2, 2, 8, Some(ServerSlotScalingHint::Hold)),
+            0
+        );
+        assert_eq!(
+            parked_hint_spawn_count(7, 7, 8, Some(ServerSlotScalingHint::ScaleUp(4))),
+            1
+        );
+        assert_eq!(
+            parked_hint_spawn_count(8, 8, 8, Some(ServerSlotScalingHint::ScaleUp(1))),
+            0
+        );
+    }
+
+    #[test]
+    fn worker_local_gate_collapses_duplicate_ha_scale_hints() {
+        let gate = ServerSlotScalingGate::new(Duration::from_secs(60));
+        assert!(gate.try_change());
+        assert!(!gate.try_change());
+    }
+
     #[tokio::test]
     async fn stalled_claim_does_not_signal_slot_ramp_before_language_start() {
         let phases = WorkerSlotPhases::default();
@@ -7560,7 +7742,7 @@ mod tests {
         // claimed, but none has emitted run.started. The supervisor must
         // receive no ramp signal in this state.
         let guards: Vec<_> = (0..4)
-            .map(|index| phases.claim(format!("slow-run-{index}")))
+            .map(|index| phases.claim(format!("slow-run-{index}"), None))
             .collect();
         assert_eq!(
             phases.snapshot(),
@@ -7578,8 +7760,18 @@ mod tests {
 
         phases.mark_started("slow-run-0");
         let event = events_rx.recv().await;
-        assert_eq!(event, Some(ParkedSlotEvent::Started { active_started: 1 }));
-        let Some(ParkedSlotEvent::Started { active_started }) = event else {
+        assert_eq!(
+            event,
+            Some(ParkedSlotEvent::Started {
+                active_started: 1,
+                slot_scaling: None,
+            })
+        );
+        let Some(ParkedSlotEvent::Started {
+            active_started,
+            slot_scaling: None,
+        }) = event
+        else {
             unreachable!();
         };
         assert_eq!(parked_ramp_spawn_count(4, active_started, 16), 0);
