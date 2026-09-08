@@ -1402,9 +1402,21 @@ impl EngineClient {
         &mut self,
         request: BeginActivationRequest,
     ) -> Result<BeginActivationResponse> {
+        let mut timer = crate::core_metrics::RpcTimer::new(&request.run_id, "begin");
         for attempt in 0..ENGINE_ACTIVATION_RPC_ATTEMPTS {
             match self.next_client().begin_activation(request.clone()).await {
-                Ok(response) => return Ok(response.into_inner()),
+                Ok(response) => {
+                    let response = response.into_inner();
+                    timer.outcome(match response.outcome {
+                        1 => "execute",
+                        2 => "replay",
+                        3 => "wait",
+                        4 => "conflict",
+                        5 => "cancelled",
+                        _ => "unknown",
+                    });
+                    return Ok(response);
+                }
                 Err(status) if should_retry_activation_status(&status, attempt) => {
                     debug!(
                         attempt = attempt + 1,
@@ -1413,7 +1425,10 @@ impl EngineClient {
                     );
                     sleep_engine_retry(attempt).await;
                 }
-                Err(status) => return Err(activation_status("BeginActivation", status)),
+                Err(status) => {
+                    timer.outcome("error");
+                    return Err(activation_status("BeginActivation", status));
+                }
             }
         }
         unreachable!("activation retry loop always returns")
@@ -1424,13 +1439,26 @@ impl EngineClient {
         &mut self,
         request: CompleteActivationRequest,
     ) -> Result<CompleteActivationResponse> {
+        let mut timer = crate::core_metrics::RpcTimer::new(&request.run_id, "complete");
         for attempt in 0..ENGINE_ACTIVATION_RPC_ATTEMPTS {
             match self
                 .next_client()
                 .complete_activation(request.clone())
                 .await
             {
-                Ok(response) => return Ok(response.into_inner()),
+                Ok(response) => {
+                    let response = response.into_inner();
+                    timer.outcome(if response.accepted {
+                        if response.replayed {
+                            "replay"
+                        } else {
+                            "success"
+                        }
+                    } else {
+                        "unknown"
+                    });
+                    return Ok(response);
+                }
                 Err(status) if should_retry_activation_status(&status, attempt) => {
                     debug!(
                         attempt = attempt + 1,
@@ -1439,7 +1467,10 @@ impl EngineClient {
                     );
                     sleep_engine_retry(attempt).await;
                 }
-                Err(status) => return Err(activation_status("CompleteActivation", status)),
+                Err(status) => {
+                    timer.outcome("error");
+                    return Err(activation_status("CompleteActivation", status));
+                }
             }
         }
         unreachable!("activation retry loop always returns")
@@ -1450,9 +1481,18 @@ impl EngineClient {
         &mut self,
         request: FailActivationRequest,
     ) -> Result<FailActivationResponse> {
+        let mut timer = crate::core_metrics::RpcTimer::new(&request.run_id, "fail");
         for attempt in 0..ENGINE_ACTIVATION_RPC_ATTEMPTS {
             match self.next_client().fail_activation(request.clone()).await {
-                Ok(response) => return Ok(response.into_inner()),
+                Ok(response) => {
+                    let response = response.into_inner();
+                    timer.outcome(if response.accepted {
+                        "success"
+                    } else {
+                        "unknown"
+                    });
+                    return Ok(response);
+                }
                 Err(status) if should_retry_activation_status(&status, attempt) => {
                     debug!(
                         attempt = attempt + 1,
@@ -1461,7 +1501,10 @@ impl EngineClient {
                     );
                     sleep_engine_retry(attempt).await;
                 }
-                Err(status) => return Err(activation_status("FailActivation", status)),
+                Err(status) => {
+                    timer.outcome("error");
+                    return Err(activation_status("FailActivation", status));
+                }
             }
         }
         unreachable!("activation retry loop always returns")

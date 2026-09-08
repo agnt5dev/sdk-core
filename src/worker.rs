@@ -71,6 +71,7 @@ enum WorkerSlotPhase {
 #[derive(Debug)]
 struct WorkerSlotEntry {
     generation: u64,
+    slot_id: usize,
     phase: WorkerSlotPhase,
     claimed_at: Instant,
     slot_scaling: Option<ServerSlotScalingHint>,
@@ -79,6 +80,7 @@ struct WorkerSlotEntry {
 #[derive(Default)]
 struct WorkerSlotPhaseState {
     entries: HashMap<String, WorkerSlotEntry>,
+    worker_id: String,
     next_generation: u64,
     started_notifier: Option<tokio::sync::mpsc::UnboundedSender<ParkedSlotEvent>>,
 }
@@ -132,12 +134,18 @@ impl WorkerSlotPhases {
         self.lock_state().started_notifier = Some(notifier);
     }
 
+    fn configure(&self, worker_id: &str, max_slots: usize) {
+        self.lock_state().worker_id = worker_id.to_owned();
+        crate::core_metrics::configured(worker_id, max_slots);
+    }
+
     fn claim(
         &self,
         run_id: String,
         slot_scaling: Option<ServerSlotScalingHint>,
+        slot_id: usize,
     ) -> WorkerSlotPhaseGuard {
-        let (generation, replaced, snapshot) = {
+        let (generation, replaced, snapshot, worker_id, at_ms) = {
             let mut state = self.lock_state();
             let generation = state.next_generation;
             state.next_generation = state.next_generation.wrapping_add(1);
@@ -147,18 +155,28 @@ impl WorkerSlotPhases {
                     run_id.clone(),
                     WorkerSlotEntry {
                         generation,
+                        slot_id,
                         phase: WorkerSlotPhase::ClaimedNotStarted,
                         claimed_at: Instant::now(),
                         slot_scaling,
                     },
                 )
                 .is_some();
-            (generation, replaced, state.snapshot())
+            (
+                generation,
+                replaced,
+                state.snapshot(),
+                state.worker_id.clone(),
+                crate::core_metrics::now_ms(),
+            )
         };
         if replaced {
             warn!(run_id, "Replacing duplicate active pull-slot phase entry");
         }
         Self::publish(snapshot);
+        crate::core_metrics::worker_event(
+            "claimed", &worker_id, &run_id, slot_id, generation, at_ms,
+        );
         WorkerSlotPhaseGuard {
             phases: self.clone(),
             run_id,
@@ -178,11 +196,30 @@ impl WorkerSlotPhases {
             entry.phase = WorkerSlotPhase::Executing;
             let claim_to_start = entry.claimed_at.elapsed();
             let slot_scaling = entry.slot_scaling;
+            let slot_id = entry.slot_id;
+            let generation = entry.generation;
             let notifier = state.started_notifier.clone();
-            (claim_to_start, slot_scaling, notifier, state.snapshot())
+            (
+                claim_to_start,
+                slot_scaling,
+                notifier,
+                state.snapshot(),
+                state.worker_id.clone(),
+                slot_id,
+                crate::core_metrics::now_ms(),
+                generation,
+            )
         };
         crate::telemetry::record_worker_claim_to_start("pull", transition.0.as_secs_f64());
         Self::publish(transition.3);
+        crate::core_metrics::worker_event(
+            "started",
+            &transition.4,
+            run_id,
+            transition.5,
+            transition.7,
+            transition.6,
+        );
         if let Some(notifier) = transition.2 {
             let active_started = transition.3.executing + transition.3.terminalizing;
             let _ = notifier.send(ParkedSlotEvent::Started {
@@ -193,7 +230,7 @@ impl WorkerSlotPhases {
     }
 
     fn mark_terminalizing(&self, run_id: &str) {
-        let snapshot = {
+        let (snapshot, worker_id, slot_id, at_ms, generation) = {
             let mut state = self.lock_state();
             let Some(entry) = state.entries.get_mut(run_id) else {
                 return;
@@ -202,9 +239,25 @@ impl WorkerSlotPhases {
                 return;
             }
             entry.phase = WorkerSlotPhase::Terminalizing;
-            state.snapshot()
+            let slot_id = entry.slot_id;
+            let generation = entry.generation;
+            (
+                state.snapshot(),
+                state.worker_id.clone(),
+                slot_id,
+                crate::core_metrics::now_ms(),
+                generation,
+            )
         };
         Self::publish(snapshot);
+        crate::core_metrics::worker_event(
+            "handler_finished",
+            &worker_id,
+            run_id,
+            slot_id,
+            generation,
+            at_ms,
+        );
     }
 
     fn finish(&self, run_id: &str, generation: u64) {
@@ -217,11 +270,21 @@ impl WorkerSlotPhases {
                 return;
             }
             let residency = entry.claimed_at.elapsed();
+            let slot_id = entry.slot_id;
             state.entries.remove(run_id);
-            (residency, state.snapshot())
+            (
+                residency,
+                state.snapshot(),
+                state.worker_id.clone(),
+                slot_id,
+                crate::core_metrics::now_ms(),
+            )
         };
         crate::telemetry::record_worker_slot_residency("pull", result.0.as_secs_f64());
         Self::publish(result.1);
+        crate::core_metrics::worker_event(
+            "released", &result.2, run_id, result.3, generation, result.4,
+        );
     }
 
     #[cfg(test)]
@@ -2025,6 +2088,7 @@ async fn complete_or_forward_parked_response(
         return false;
     } else {
         let elapsed = started.elapsed();
+        crate::core_metrics::acknowledged(&job_id);
         if elapsed > Duration::from_millis(500) {
             warn!(
                 "Parked poll slot {} CompleteJob was slow: job_id={} elapsed_ms={}",
@@ -2205,6 +2269,7 @@ fn spawn_parked_capacity_reporter(
             tokio::select! {
                 _ = shutdown_rx.recv() => return,
                 _ = interval.tick() => {
+                    crate::core_metrics::configured(&worker_id, effective_max_slots);
                     let current_session_id = worker_session_id.lock().await.clone();
                     report_worker_capacity_with_client(
                         &mut client,
@@ -2665,7 +2730,7 @@ where
                         continue;
                     }
                 };
-                let _slot_phase = ctx.slot_phases.claim(run_id.clone(), slot_scaling);
+                let _slot_phase = ctx.slot_phases.claim(run_id.clone(), slot_scaling, slot_id);
                 stamp_execution_authority_metadata(
                     &mut runtime_message,
                     &ctx.worker_id,
@@ -5880,6 +5945,7 @@ impl Worker {
             );
 
             let open_poll_slots = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            slot_phases.configure(&worker_id, max_slots);
             let total_slots = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let busy_slots = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let capacity_reporter = spawn_parked_capacity_reporter(
@@ -7750,7 +7816,7 @@ mod tests {
         // claimed, but none has emitted run.started. The supervisor must
         // receive no ramp signal in this state.
         let guards: Vec<_> = (0..4)
-            .map(|index| phases.claim(format!("slow-run-{index}"), None))
+            .map(|index| phases.claim(format!("slow-run-{index}"), None, index))
             .collect();
         assert_eq!(
             phases.snapshot(),

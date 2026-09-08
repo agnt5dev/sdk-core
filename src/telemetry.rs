@@ -324,7 +324,14 @@ fn init_telemetry_inner(service_name: &str, service_version: &str) -> Result<(),
             "agnt5=warn,agnt5_sdk_python=warn,h2=error,hyper=error,tonic=error,tower=error,opentelemetry=warn,opentelemetry_sdk=warn,opentelemetry_otlp=warn".to_string()
         }
     });
-    let console_filter = EnvFilter::new(&console_directive);
+    let mut console_filter = EnvFilter::new(&console_directive);
+    if std::env::var("AGNT5_CORE_METRICS_LOGS").is_ok_and(|value| value == "1") {
+        // Keep correlation logs opt-in without changing the application's or
+        // launcher's RUST_LOG filters (uv also interprets that variable).
+        console_filter = console_filter.add_directive(
+            "agnt5.core_metrics=info".parse().expect("static core metric log directive"),
+        );
+    }
 
     // OTLP filter: user application logs (agnt5_sdk_python, agnt5_sdk_typescript) always
     // exported at all levels, so the control plane can query them by log_source="application" + run_id.
