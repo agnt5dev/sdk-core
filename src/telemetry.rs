@@ -329,7 +329,9 @@ fn init_telemetry_inner(service_name: &str, service_version: &str) -> Result<(),
         // Keep correlation logs opt-in without changing the application's or
         // launcher's RUST_LOG filters (uv also interprets that variable).
         console_filter = console_filter.add_directive(
-            "agnt5.core_metrics=info".parse().expect("static core metric log directive"),
+            "agnt5.core_metrics=info"
+                .parse()
+                .expect("static core metric log directive"),
         );
     }
 
