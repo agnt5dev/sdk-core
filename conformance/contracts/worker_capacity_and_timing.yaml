@@ -1,0 +1,38 @@
+version: 1
+group: worker_capacity_and_timing
+coverage: behavior
+cases:
+- id: server_capacity_requires_negotiation
+  sdks: [python, typescript, go]
+  worker_session:
+    negotiated_slot_scaling: false
+    max_slots: 8
+  runtime_hint:
+    desired_slots: 32
+  expect:
+    invariant: unnegotiated hints preserve local ramp and idle-retirement behavior
+- id: negotiated_capacity_is_bounded
+  sdks: [python, typescript, go]
+  worker_session:
+    negotiated_slot_scaling: true
+    min_slots: 1
+    max_slots: 8
+  runtime_hint:
+    desired_slots: 32
+  expect:
+    invariant: scale-up never exceeds configured maximum and retirement preserves the minimum
+- id: claimed_work_does_not_signal_execution
+  sdks: [python, typescript, go]
+  worker_observations: [claimed]
+  expect:
+    invariant: a claim without language execution starting does not trigger execution-driven ramp
+- id: business_and_acknowledgment_are_separate
+  sdks: [python, typescript, go]
+  worker_observations: [claimed, started, business, handler_finished, acknowledged, released]
+  expect:
+    invariant: business timing excludes activation RPC and terminal acknowledgment latency
+- id: telemetry_preserves_execution_outcomes
+  sdks: [python, typescript, go]
+  telemetry: unavailable
+  expect:
+    invariant: user results, failures, and cancellation propagate independently of telemetry

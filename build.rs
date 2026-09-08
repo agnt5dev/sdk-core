@@ -1,6 +1,18 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     configure_protoc();
 
+    // Once a build script emits any `rerun-if-*` directive Cargo stops using
+    // its default package-wide change detection. Keep the generated bindings
+    // tied to their source schemas as well as to the protoc configuration.
+    for proto in [
+        "proto/api/v1/worker_coordinator.proto",
+        "proto/api/v1/execution_engine.proto",
+        "proto/api/v1/engine.proto",
+        "proto/api/v1/common.proto",
+    ] {
+        println!("cargo:rerun-if-changed={proto}");
+    }
+
     tonic_prost_build::configure()
         .build_server(false)
         .compile_protos(

@@ -9,8 +9,9 @@ use crate::pb::{
     GetEntityStateResponse, HealthCheck, JobAssignment, LeaseRenewalOutcome, PollJobRequest,
     PutEntityStateRequest, PutEntityStateResponse, Record, RegisterService,
     RegisterWorkerSessionRequest, RenewJobLeaseRequest, ReportWorkerCapacityRequest,
-    RuntimeMessage, RuntimeMessageType, RuntimeServiceResponse, ServiceMessage, UnregisterService,
-    WorkerCapability, WorkerHealthStatus, WorkerMode, WorkerSlotPolicy, WriteCheckpointRequest,
+    RuntimeMessage, RuntimeMessageType, RuntimeServiceResponse, ServiceMessage,
+    SlotScalingDecision, SlotScalingHint, UnregisterService, WorkerCapability, WorkerHealthStatus,
+    WorkerMode, WorkerSlotPolicy, WriteCheckpointRequest,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -25,6 +26,7 @@ use uuid::Uuid;
 const PARKED_WORKER_SESSION_REGISTER_ATTEMPTS: usize = 3;
 const PARKED_WORKER_SESSION_REGISTER_RETRY_MS: u64 = 1_000;
 const PARKED_WORKER_SESSION_TRANSIENT_RETRY_MAX_MS: u64 = 32_000;
+const PARKED_SLOT_RAMP_THROTTLE_MS: u64 = 1_000;
 const PARKED_COMPLETION_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 const PARKED_COMPLETE_JOB_ATTEMPTS: usize = 3;
 const PARKED_COMPLETE_JOB_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -44,9 +46,19 @@ const ASSIGNMENT_AUTHORED_RETRY_METADATA_KEYS: &[&str] = &[
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParkedSlotEvent {
     /// A claimed job has reached the language runtime and begun execution.
-    Started { active_started: usize },
+    Started {
+        active_started: usize,
+        slot_scaling: Option<ServerSlotScalingHint>,
+    },
     /// A surplus idle slot retired itself (`total_slots` already decremented).
     Retired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerSlotScalingHint {
+    Hold,
+    ScaleUp(usize),
+    ScaleDown(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,13 +71,16 @@ enum WorkerSlotPhase {
 #[derive(Debug)]
 struct WorkerSlotEntry {
     generation: u64,
+    slot_id: usize,
     phase: WorkerSlotPhase,
     claimed_at: Instant,
+    slot_scaling: Option<ServerSlotScalingHint>,
 }
 
 #[derive(Default)]
 struct WorkerSlotPhaseState {
     entries: HashMap<String, WorkerSlotEntry>,
+    worker_id: String,
     next_generation: u64,
     started_notifier: Option<tokio::sync::mpsc::UnboundedSender<ParkedSlotEvent>>,
 }
@@ -119,8 +134,18 @@ impl WorkerSlotPhases {
         self.lock_state().started_notifier = Some(notifier);
     }
 
-    fn claim(&self, run_id: String) -> WorkerSlotPhaseGuard {
-        let (generation, replaced, snapshot) = {
+    fn configure(&self, worker_id: &str, max_slots: usize) {
+        self.lock_state().worker_id = worker_id.to_owned();
+        crate::core_metrics::configured(worker_id, max_slots);
+    }
+
+    fn claim(
+        &self,
+        run_id: String,
+        slot_scaling: Option<ServerSlotScalingHint>,
+        slot_id: usize,
+    ) -> WorkerSlotPhaseGuard {
+        let (generation, replaced, snapshot, worker_id, at_ms) = {
             let mut state = self.lock_state();
             let generation = state.next_generation;
             state.next_generation = state.next_generation.wrapping_add(1);
@@ -130,17 +155,28 @@ impl WorkerSlotPhases {
                     run_id.clone(),
                     WorkerSlotEntry {
                         generation,
+                        slot_id,
                         phase: WorkerSlotPhase::ClaimedNotStarted,
                         claimed_at: Instant::now(),
+                        slot_scaling,
                     },
                 )
                 .is_some();
-            (generation, replaced, state.snapshot())
+            (
+                generation,
+                replaced,
+                state.snapshot(),
+                state.worker_id.clone(),
+                crate::core_metrics::now_ms(),
+            )
         };
         if replaced {
             warn!(run_id, "Replacing duplicate active pull-slot phase entry");
         }
         Self::publish(snapshot);
+        crate::core_metrics::worker_event(
+            "claimed", &worker_id, &run_id, slot_id, generation, at_ms,
+        );
         WorkerSlotPhaseGuard {
             phases: self.clone(),
             run_id,
@@ -159,19 +195,42 @@ impl WorkerSlotPhases {
             }
             entry.phase = WorkerSlotPhase::Executing;
             let claim_to_start = entry.claimed_at.elapsed();
+            let slot_scaling = entry.slot_scaling;
+            let slot_id = entry.slot_id;
+            let generation = entry.generation;
             let notifier = state.started_notifier.clone();
-            (claim_to_start, notifier, state.snapshot())
+            (
+                claim_to_start,
+                slot_scaling,
+                notifier,
+                state.snapshot(),
+                state.worker_id.clone(),
+                slot_id,
+                crate::core_metrics::now_ms(),
+                generation,
+            )
         };
         crate::telemetry::record_worker_claim_to_start("pull", transition.0.as_secs_f64());
-        Self::publish(transition.2);
-        if let Some(notifier) = transition.1 {
-            let active_started = transition.2.executing + transition.2.terminalizing;
-            let _ = notifier.send(ParkedSlotEvent::Started { active_started });
+        Self::publish(transition.3);
+        crate::core_metrics::worker_event(
+            "started",
+            &transition.4,
+            run_id,
+            transition.5,
+            transition.7,
+            transition.6,
+        );
+        if let Some(notifier) = transition.2 {
+            let active_started = transition.3.executing + transition.3.terminalizing;
+            let _ = notifier.send(ParkedSlotEvent::Started {
+                active_started,
+                slot_scaling: transition.1,
+            });
         }
     }
 
     fn mark_terminalizing(&self, run_id: &str) {
-        let snapshot = {
+        let (snapshot, worker_id, slot_id, at_ms, generation) = {
             let mut state = self.lock_state();
             let Some(entry) = state.entries.get_mut(run_id) else {
                 return;
@@ -180,9 +239,25 @@ impl WorkerSlotPhases {
                 return;
             }
             entry.phase = WorkerSlotPhase::Terminalizing;
-            state.snapshot()
+            let slot_id = entry.slot_id;
+            let generation = entry.generation;
+            (
+                state.snapshot(),
+                state.worker_id.clone(),
+                slot_id,
+                crate::core_metrics::now_ms(),
+                generation,
+            )
         };
         Self::publish(snapshot);
+        crate::core_metrics::worker_event(
+            "handler_finished",
+            &worker_id,
+            run_id,
+            slot_id,
+            generation,
+            at_ms,
+        );
     }
 
     fn finish(&self, run_id: &str, generation: u64) {
@@ -195,11 +270,21 @@ impl WorkerSlotPhases {
                 return;
             }
             let residency = entry.claimed_at.elapsed();
+            let slot_id = entry.slot_id;
             state.entries.remove(run_id);
-            (residency, state.snapshot())
+            (
+                residency,
+                state.snapshot(),
+                state.worker_id.clone(),
+                slot_id,
+                crate::core_metrics::now_ms(),
+            )
         };
         crate::telemetry::record_worker_slot_residency("pull", result.0.as_secs_f64());
         Self::publish(result.1);
+        crate::core_metrics::worker_event(
+            "released", &result.2, run_id, result.3, generation, result.4,
+        );
     }
 
     #[cfg(test)]
@@ -331,7 +416,7 @@ impl ParkedWorkerSessionRegistration {
                 max_slots: self.max_slots as u32,
                 target_cpu_usage: 0.75,
                 target_memory_usage: 0.80,
-                ramp_throttle_ms: 1_000,
+                ramp_throttle_ms: PARKED_SLOT_RAMP_THROTTLE_MS as i64,
             }),
             capabilities: self.capabilities.clone(),
             components: self.components.clone(),
@@ -2003,6 +2088,7 @@ async fn complete_or_forward_parked_response(
         return false;
     } else {
         let elapsed = started.elapsed();
+        crate::core_metrics::acknowledged(&job_id);
         if elapsed > Duration::from_millis(500) {
             warn!(
                 "Parked poll slot {} CompleteJob was slow: job_id={} elapsed_ms={}",
@@ -2183,6 +2269,7 @@ fn spawn_parked_capacity_reporter(
             tokio::select! {
                 _ = shutdown_rx.recv() => return,
                 _ = interval.tick() => {
+                    crate::core_metrics::configured(&worker_id, effective_max_slots);
                     let current_session_id = worker_session_id.lock().await.clone();
                     report_worker_capacity_with_client(
                         &mut client,
@@ -2200,12 +2287,23 @@ fn spawn_parked_capacity_reporter(
     })
 }
 
-fn is_worker_session_inactive_error(error: &SdkError) -> bool {
-    // Keep in sync with runtime's `Status::permission_denied("worker session is not active")`.
-    error
-        .to_string()
-        .to_ascii_lowercase()
-        .contains("worker session is not active")
+fn is_worker_session_refresh_required_error(error: &SdkError) -> bool {
+    // Keep these exact fragments in sync with runtime worker-session validation.
+    // Every case means the current token can no longer make progress, while a
+    // fresh RegisterWorkerSession request can establish current authority.
+    let error = error.to_string().to_ascii_lowercase();
+    [
+        "worker session is not active",
+        "worker session is superseded or inactive",
+        "worker session route is not available at this edge",
+        "worker session token is malformed",
+        "worker session token signature is invalid",
+        "worker session token identity does not match",
+        "worker session token scope is invalid",
+        "worker session token is expired",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
 }
 
 fn is_parked_worker_session_registration_rejection(error: &SdkError) -> bool {
@@ -2407,6 +2505,57 @@ struct ParkedPollContext {
     claim_timeout_ms: i64,
     min_slots: usize,
     retire_empty_polls: usize,
+    server_slot_scaling: Arc<ServerSlotScalingGate>,
+}
+
+struct ServerSlotScalingGate {
+    last_change: std::sync::Mutex<Option<Instant>>,
+    throttle: Duration,
+}
+
+impl ServerSlotScalingGate {
+    fn new(throttle: Duration) -> Self {
+        Self {
+            last_change: std::sync::Mutex::new(None),
+            throttle,
+        }
+    }
+
+    fn try_change(&self) -> bool {
+        let now = Instant::now();
+        let mut last = self
+            .last_change
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if last.is_some_and(|last| now.duration_since(last) < self.throttle) {
+            return false;
+        }
+        *last = Some(now);
+        true
+    }
+}
+
+fn negotiated_slot_scaling_hint(
+    server_slot_scaling_negotiated: bool,
+    hint: Option<&SlotScalingHint>,
+) -> Option<ServerSlotScalingHint> {
+    if !server_slot_scaling_negotiated {
+        return None;
+    }
+    let hint = hint?;
+    match hint.decision() {
+        SlotScalingDecision::Hold => Some(ServerSlotScalingHint::Hold),
+        SlotScalingDecision::ScaleUp if hint.suggested_delta > 0 => Some(
+            ServerSlotScalingHint::ScaleUp(hint.suggested_delta as usize),
+        ),
+        SlotScalingDecision::ScaleDown if hint.suggested_delta > 0 => Some(
+            ServerSlotScalingHint::ScaleDown(hint.suggested_delta as usize),
+        ),
+        SlotScalingDecision::ScaleUp | SlotScalingDecision::ScaleDown => {
+            Some(ServerSlotScalingHint::Hold)
+        }
+        SlotScalingDecision::Unspecified => None,
+    }
 }
 
 /// How many new slots to spawn when a parked slot goes busy: grow the fleet
@@ -2419,6 +2568,21 @@ fn parked_ramp_spawn_count(total_slots: usize, busy_slots: usize, max_slots: usi
         .saturating_mul(2)
         .min(max_slots)
         .saturating_sub(total_slots)
+}
+
+fn parked_hint_spawn_count(
+    total_slots: usize,
+    active_started: usize,
+    max_slots: usize,
+    slot_scaling: Option<ServerSlotScalingHint>,
+) -> usize {
+    match slot_scaling {
+        Some(ServerSlotScalingHint::ScaleUp(delta)) => {
+            delta.min(max_slots.saturating_sub(total_slots))
+        }
+        Some(_) => 0,
+        None => parked_ramp_spawn_count(total_slots, active_started, max_slots),
+    }
 }
 
 /// Retire one surplus slot, but only while at least `min_slots` *idle* pollers
@@ -2496,7 +2660,39 @@ where
 
         match poll_result {
             Ok(resp) => {
+                let slot_scaling = negotiated_slot_scaling_hint(
+                    client.negotiated_protocol_capability(
+                        crate::client::SERVER_SLOT_SCALING_V1_CAPABILITY,
+                    ),
+                    resp.slot_scaling.as_ref(),
+                );
                 let Some(job) = resp.job else {
+                    if let Some(hint) = slot_scaling {
+                        // A negotiated server decision is authoritative for
+                        // this response. HOLD prevents a ready-but-unfilled
+                        // poll from being mistaken for an empty queue. A
+                        // SCALE_UP uses the shared throttle in the supervisor.
+                        // Every slot receiving SCALE_DOWN may retire: the
+                        // atomic active-plus-idle floor is the authoritative
+                        // bound and lets an idle fleet converge in one poll
+                        // cycle instead of one slot every 30 seconds.
+                        consecutive_empty = 0;
+                        if matches!(hint, ServerSlotScalingHint::ScaleDown(delta) if delta > 0)
+                            && try_retire_parked_slot(
+                                &ctx.total_slots,
+                                &ctx.busy_slots,
+                                ctx.min_slots,
+                            )
+                        {
+                            debug!(
+                                "Parked poll slot {} retiring from server scaling hint",
+                                slot_id
+                            );
+                            let _ = ctx.events_tx.send(ParkedSlotEvent::Retired);
+                            return;
+                        }
+                        continue;
+                    }
                     consecutive_empty += 1;
                     if consecutive_empty >= retire_threshold
                         && try_retire_parked_slot(&ctx.total_slots, &ctx.busy_slots, ctx.min_slots)
@@ -2534,7 +2730,7 @@ where
                         continue;
                     }
                 };
-                let _slot_phase = ctx.slot_phases.claim(run_id.clone());
+                let _slot_phase = ctx.slot_phases.claim(run_id.clone(), slot_scaling, slot_id);
                 stamp_execution_authority_metadata(
                     &mut runtime_message,
                     &ctx.worker_id,
@@ -2764,7 +2960,7 @@ where
                     let _ = handle.await;
                 }
             }
-            Err(e) if is_worker_session_inactive_error(&e) => {
+            Err(e) if is_worker_session_refresh_required_error(&e) => {
                 consecutive_empty = 0;
                 warn!("Parked poll slot {} error: {}", slot_id, e);
                 if !refresh_parked_worker_session(
@@ -5739,11 +5935,17 @@ impl Worker {
             let worker_session_id = Arc::new(TokioMutex::new(initial_session_id));
 
             eprintln!(
-                "[INFO] Parked polling started (deployment={}, min_slots={}, max_slots={})",
-                deployment_id, min_slots, max_slots
+                "[INFO] Parked polling started (deployment={}, min_slots={}, max_slots={}, server_slot_scaling={})",
+                deployment_id,
+                min_slots,
+                max_slots,
+                client.negotiated_protocol_capability(
+                    crate::client::SERVER_SLOT_SCALING_V1_CAPABILITY
+                )
             );
 
             let open_poll_slots = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            slot_phases.configure(&worker_id, max_slots);
             let total_slots = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let busy_slots = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let capacity_reporter = spawn_parked_capacity_reporter(
@@ -5787,6 +5989,9 @@ impl Worker {
                 claim_timeout_ms,
                 min_slots,
                 retire_empty_polls,
+                server_slot_scaling: Arc::new(ServerSlotScalingGate::new(Duration::from_millis(
+                    PARKED_SLOT_RAMP_THROTTLE_MS,
+                ))),
             });
 
             let mut slots = tokio::task::JoinSet::new();
@@ -5806,12 +6011,25 @@ impl Worker {
                     }
                     // `ctx` holds an `events_tx` clone, so recv() never yields None here.
                     event = events_rx.recv() => {
-                        if let Some(ParkedSlotEvent::Started { active_started }) = event {
-                            let spawn = parked_ramp_spawn_count(
-                                total_slots.load(std::sync::atomic::Ordering::Relaxed),
-                                active_started,
-                                max_slots,
-                            );
+                        if let Some(ParkedSlotEvent::Started {
+                            active_started,
+                            slot_scaling,
+                        }) = event {
+                            let total = total_slots.load(std::sync::atomic::Ordering::Relaxed);
+                            let spawn = if matches!(
+                                slot_scaling,
+                                Some(ServerSlotScalingHint::ScaleUp(_))
+                            ) && (total >= max_slots || !ctx.server_slot_scaling.try_change())
+                            {
+                                0
+                            } else {
+                                parked_hint_spawn_count(
+                                    total,
+                                    active_started,
+                                    max_slots,
+                                    slot_scaling,
+                                )
+                            };
                             for _ in 0..spawn {
                                 spawn_parked_slot(
                                     &mut slots,
@@ -5822,9 +6040,10 @@ impl Worker {
                             }
                             if spawn > 0 {
                                 debug!(
-                                    "Parked poll ramp: spawned {} slot(s) (total={})",
+                                    "Parked poll ramp: spawned {} slot(s) (total={}, server_hint={:?})",
                                     spawn,
-                                    total_slots.load(std::sync::atomic::Ordering::Relaxed)
+                                    total_slots.load(std::sync::atomic::Ordering::Relaxed),
+                                    slot_scaling
                                 );
                             }
                         }
@@ -5975,7 +6194,8 @@ mod tests {
         complete_job_request_from_polled_completion, complete_job_with_retry,
         deployment_artifact_sha256, durable_suspension_service_message, execution_is_revoked,
         is_cancelled_worker_response, is_parked_worker_session_registration_rejection,
-        is_terminal_worker_response, is_worker_session_inactive_error, parked_ramp_spawn_count,
+        is_terminal_worker_response, is_worker_session_refresh_required_error,
+        negotiated_slot_scaling_hint, parked_hint_spawn_count, parked_ramp_spawn_count,
         parked_runtime_service_response, parked_worker_session_was_refreshed,
         polled_job_completion_from_service_message, polled_job_suspension_request,
         record_groups_by_run, require_engine_endpoint, resolve_engine_endpoint,
@@ -5985,8 +6205,8 @@ mod tests {
         try_retire_parked_slot, uncommitted_records_in_reverse, valid_activation_artifact_sha256,
         wait_for_parked_run_events_flush, worker_capabilities, ActiveLeaseAuthority,
         ActiveLeaseSession, AppendGroupProgress, CompleteJobSender, EntityStateSender,
-        ParkedSlotEvent, ParkedWorkerSessionRegistration, RunFlushLocks, Worker, WorkerConfig,
-        WorkerSlotPhaseSnapshot, WorkerSlotPhases,
+        ParkedSlotEvent, ParkedWorkerSessionRegistration, RunFlushLocks, ServerSlotScalingGate,
+        ServerSlotScalingHint, Worker, WorkerConfig, WorkerSlotPhaseSnapshot, WorkerSlotPhases,
     };
     use crate::error::{ErrorCode, SdkError};
     use crate::journal_queue::{JournalEventMessage, JournalEventQueue, JournalQueueConfig};
@@ -5995,7 +6215,7 @@ mod tests {
         runtime_service_response, service_message, CompleteJobRequest, CompleteJobResponse,
         DispatchComponentResponse, EntityStateSaveRequest, GetEntityStateRequest,
         GetEntityStateResponse, JobAssignment, PutEntityStateRequest, PutEntityStateResponse,
-        RuntimeServiceRequest, ServiceMessage, WorkerMode,
+        RuntimeServiceRequest, ServiceMessage, SlotScalingDecision, SlotScalingHint, WorkerMode,
     };
     use std::collections::{HashMap, VecDeque};
     use std::time::Duration;
@@ -7457,14 +7677,34 @@ mod tests {
     }
 
     #[test]
-    fn worker_session_inactive_errors_are_detected() {
-        let error = SdkError::Connection {
-            message: "PollJob failed: code: 'The caller does not have permission to execute the specified operation', message: \"worker session is not active\"".to_string(),
+    fn worker_session_refresh_required_errors_are_detected() {
+        for message in [
+            "worker session is not active",
+            "worker session is superseded or inactive",
+            "worker session route is not available at this edge",
+            "worker session token is malformed",
+            "worker session token signature is invalid",
+            "worker session token identity does not match",
+            "worker session token scope is invalid",
+            "worker session token is expired",
+        ] {
+            let error = SdkError::Connection {
+                message: format!(
+                    "PollJob failed: code: 'The caller does not have permission to execute the specified operation', message: \"{message}\""
+                ),
+                code: ErrorCode::ConnectionFailed,
+                source: None,
+            };
+
+            assert!(is_worker_session_refresh_required_error(&error));
+        }
+
+        let unrelated = SdkError::Connection {
+            message: "PollJob failed: code: 'The service is currently unavailable'".to_string(),
             code: ErrorCode::ConnectionFailed,
             source: None,
         };
-
-        assert!(is_worker_session_inactive_error(&error));
+        assert!(!is_worker_session_refresh_required_error(&unrelated));
     }
 
     #[test]
@@ -7519,6 +7759,53 @@ mod tests {
         assert_eq!(parked_ramp_spawn_count(4, 0, 10), 0);
     }
 
+    #[test]
+    fn server_slot_hints_require_negotiation_and_absence_preserves_fallback() {
+        let up = SlotScalingHint {
+            decision: SlotScalingDecision::ScaleUp as i32,
+            suggested_delta: 3,
+        };
+        assert_eq!(negotiated_slot_scaling_hint(false, Some(&up)), None);
+        assert_eq!(negotiated_slot_scaling_hint(true, None), None);
+        assert_eq!(
+            negotiated_slot_scaling_hint(true, Some(&up)),
+            Some(ServerSlotScalingHint::ScaleUp(3))
+        );
+
+        let malformed = SlotScalingHint {
+            decision: SlotScalingDecision::ScaleDown as i32,
+            suggested_delta: 0,
+        };
+        assert_eq!(
+            negotiated_slot_scaling_hint(true, Some(&malformed)),
+            Some(ServerSlotScalingHint::Hold)
+        );
+    }
+
+    #[test]
+    fn server_slot_hint_spawn_is_bounded_and_absence_keeps_local_ramp() {
+        assert_eq!(parked_hint_spawn_count(2, 2, 8, None), 2);
+        assert_eq!(
+            parked_hint_spawn_count(2, 2, 8, Some(ServerSlotScalingHint::Hold)),
+            0
+        );
+        assert_eq!(
+            parked_hint_spawn_count(7, 7, 8, Some(ServerSlotScalingHint::ScaleUp(4))),
+            1
+        );
+        assert_eq!(
+            parked_hint_spawn_count(8, 8, 8, Some(ServerSlotScalingHint::ScaleUp(1))),
+            0
+        );
+    }
+
+    #[test]
+    fn worker_local_gate_collapses_duplicate_ha_scale_hints() {
+        let gate = ServerSlotScalingGate::new(Duration::from_secs(60));
+        assert!(gate.try_change());
+        assert!(!gate.try_change());
+    }
+
     #[tokio::test]
     async fn stalled_claim_does_not_signal_slot_ramp_before_language_start() {
         let phases = WorkerSlotPhases::default();
@@ -7529,7 +7816,7 @@ mod tests {
         // claimed, but none has emitted run.started. The supervisor must
         // receive no ramp signal in this state.
         let guards: Vec<_> = (0..4)
-            .map(|index| phases.claim(format!("slow-run-{index}")))
+            .map(|index| phases.claim(format!("slow-run-{index}"), None, index))
             .collect();
         assert_eq!(
             phases.snapshot(),
@@ -7547,8 +7834,18 @@ mod tests {
 
         phases.mark_started("slow-run-0");
         let event = events_rx.recv().await;
-        assert_eq!(event, Some(ParkedSlotEvent::Started { active_started: 1 }));
-        let Some(ParkedSlotEvent::Started { active_started }) = event else {
+        assert_eq!(
+            event,
+            Some(ParkedSlotEvent::Started {
+                active_started: 1,
+                slot_scaling: None,
+            })
+        );
+        let Some(ParkedSlotEvent::Started {
+            active_started,
+            slot_scaling: None,
+        }) = event
+        else {
             unreachable!();
         };
         assert_eq!(parked_ramp_spawn_count(4, active_started, 16), 0);

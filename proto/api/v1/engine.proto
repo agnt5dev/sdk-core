@@ -1617,8 +1617,23 @@ message PollJobRequest {
   int64 claim_timeout_ms = 4;  // lease duration
 }
 
+enum SlotScalingDecision {
+  SLOT_SCALING_DECISION_UNSPECIFIED = 0;
+  SLOT_SCALING_DECISION_HOLD = 1;
+  SLOT_SCALING_DECISION_SCALE_UP = 2;
+  SLOT_SCALING_DECISION_SCALE_DOWN = 3;
+}
+
+message SlotScalingHint {
+  SlotScalingDecision decision = 1;
+  uint32 suggested_delta = 2;
+}
+
 message PollJobResponse {
   JobAssignment job = 1;       // absent means timeout
+  // Present only when server_slot_scaling_v1 was negotiated. Older workers
+  // ignore this additive field and retain their local slot policy.
+  SlotScalingHint slot_scaling = 2;
 }
 
 // JobAssignment represents a single job assigned to a worker.

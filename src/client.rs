@@ -401,6 +401,9 @@ pub const DURABLE_SUSPENSION_V1_CAPABILITY: &str = "durable_suspension_v1";
 /// `CompleteJob` instead of appending them one RPC at a time. Always optional;
 /// `AGNT5_PULL_COMPLETION_LIFECYCLE=disabled` stops advertising it.
 pub const PULL_COMPLETION_LIFECYCLE_V1_CAPABILITY: &str = "pull_completion_lifecycle_v1";
+/// Enables authoritative slot feedback in `PollJobResponse.slot_scaling`.
+/// Optional so new workers preserve local scaling against older runtimes.
+pub const SERVER_SLOT_SCALING_V1_CAPABILITY: &str = "server_slot_scaling_v1";
 
 fn pull_completion_lifecycle_enabled() -> bool {
     !std::env::var("AGNT5_PULL_COMPLETION_LIFECYCLE")
@@ -433,6 +436,7 @@ pub fn worker_protocol_capabilities() -> (Vec<String>, Vec<String>) {
     if pull_completion_lifecycle_enabled() {
         supported.push(PULL_COMPLETION_LIFECYCLE_V1_CAPABILITY.to_string());
     }
+    supported.push(SERVER_SLOT_SCALING_V1_CAPABILITY.to_string());
     (supported, required)
 }
 
@@ -1012,7 +1016,10 @@ impl WorkerCoordinatorClient {
             Err(e) => {
                 if is_idle_poll_timeout(&e) {
                     debug!("PollJob idle timeout: {}", e);
-                    return Ok(PollJobResponse { job: None });
+                    return Ok(PollJobResponse {
+                        job: None,
+                        slot_scaling: None,
+                    });
                 }
                 debug!("PollJob RPC failed: {}", e);
                 return Err(SdkError::Connection {
@@ -1395,9 +1402,21 @@ impl EngineClient {
         &mut self,
         request: BeginActivationRequest,
     ) -> Result<BeginActivationResponse> {
+        let mut timer = crate::core_metrics::RpcTimer::new(&request.run_id, "begin");
         for attempt in 0..ENGINE_ACTIVATION_RPC_ATTEMPTS {
             match self.next_client().begin_activation(request.clone()).await {
-                Ok(response) => return Ok(response.into_inner()),
+                Ok(response) => {
+                    let response = response.into_inner();
+                    timer.outcome(match response.outcome {
+                        1 => "execute",
+                        2 => "replay",
+                        3 => "wait",
+                        4 => "conflict",
+                        5 => "cancelled",
+                        _ => "unknown",
+                    });
+                    return Ok(response);
+                }
                 Err(status) if should_retry_activation_status(&status, attempt) => {
                     debug!(
                         attempt = attempt + 1,
@@ -1406,7 +1425,10 @@ impl EngineClient {
                     );
                     sleep_engine_retry(attempt).await;
                 }
-                Err(status) => return Err(activation_status("BeginActivation", status)),
+                Err(status) => {
+                    timer.outcome("error");
+                    return Err(activation_status("BeginActivation", status));
+                }
             }
         }
         unreachable!("activation retry loop always returns")
@@ -1417,13 +1439,26 @@ impl EngineClient {
         &mut self,
         request: CompleteActivationRequest,
     ) -> Result<CompleteActivationResponse> {
+        let mut timer = crate::core_metrics::RpcTimer::new(&request.run_id, "complete");
         for attempt in 0..ENGINE_ACTIVATION_RPC_ATTEMPTS {
             match self
                 .next_client()
                 .complete_activation(request.clone())
                 .await
             {
-                Ok(response) => return Ok(response.into_inner()),
+                Ok(response) => {
+                    let response = response.into_inner();
+                    timer.outcome(if response.accepted {
+                        if response.replayed {
+                            "replay"
+                        } else {
+                            "success"
+                        }
+                    } else {
+                        "unknown"
+                    });
+                    return Ok(response);
+                }
                 Err(status) if should_retry_activation_status(&status, attempt) => {
                     debug!(
                         attempt = attempt + 1,
@@ -1432,7 +1467,10 @@ impl EngineClient {
                     );
                     sleep_engine_retry(attempt).await;
                 }
-                Err(status) => return Err(activation_status("CompleteActivation", status)),
+                Err(status) => {
+                    timer.outcome("error");
+                    return Err(activation_status("CompleteActivation", status));
+                }
             }
         }
         unreachable!("activation retry loop always returns")
@@ -1443,9 +1481,18 @@ impl EngineClient {
         &mut self,
         request: FailActivationRequest,
     ) -> Result<FailActivationResponse> {
+        let mut timer = crate::core_metrics::RpcTimer::new(&request.run_id, "fail");
         for attempt in 0..ENGINE_ACTIVATION_RPC_ATTEMPTS {
             match self.next_client().fail_activation(request.clone()).await {
-                Ok(response) => return Ok(response.into_inner()),
+                Ok(response) => {
+                    let response = response.into_inner();
+                    timer.outcome(if response.accepted {
+                        "success"
+                    } else {
+                        "unknown"
+                    });
+                    return Ok(response);
+                }
                 Err(status) if should_retry_activation_status(&status, attempt) => {
                     debug!(
                         attempt = attempt + 1,
@@ -1454,7 +1501,10 @@ impl EngineClient {
                     );
                     sleep_engine_retry(attempt).await;
                 }
-                Err(status) => return Err(activation_status("FailActivation", status)),
+                Err(status) => {
+                    timer.outcome("error");
+                    return Err(activation_status("FailActivation", status));
+                }
             }
         }
         unreachable!("activation retry loop always returns")
@@ -1843,6 +1893,36 @@ mod tests {
             ),
             vec![DURABLE_ACTIVATION_V1_CAPABILITY.to_string()]
         );
+    }
+
+    #[test]
+    fn server_slot_scaling_is_optional_and_additive() {
+        let (supported, required) = worker_protocol_capabilities();
+        assert!(supported.contains(&SERVER_SLOT_SCALING_V1_CAPABILITY.to_string()));
+        assert!(!required.contains(&SERVER_SLOT_SCALING_V1_CAPABILITY.to_string()));
+
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct LegacyPollJobResponse {
+            #[prost(message, optional, tag = "1")]
+            job: Option<crate::pb::JobAssignment>,
+        }
+
+        let legacy_bytes = prost::Message::encode_to_vec(&LegacyPollJobResponse { job: None });
+        let decoded_new = <PollJobResponse as prost::Message>::decode(legacy_bytes.as_slice())
+            .expect("new worker must decode an old response");
+        assert!(decoded_new.slot_scaling.is_none());
+
+        let new_bytes = prost::Message::encode_to_vec(&PollJobResponse {
+            job: None,
+            slot_scaling: Some(crate::pb::SlotScalingHint {
+                decision: crate::pb::SlotScalingDecision::ScaleUp as i32,
+                suggested_delta: 2,
+            }),
+        });
+        let decoded_legacy =
+            <LegacyPollJobResponse as prost::Message>::decode(new_bytes.as_slice())
+                .expect("old worker must ignore a new response field");
+        assert!(decoded_legacy.job.is_none());
     }
 }
 
