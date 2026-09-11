@@ -1409,6 +1409,10 @@ message BeginActivationRequest {
   // Optional plaintext JSON input rendered on the journal record. Never
   // feeds input_digest; bounded to 64 KiB.
   bytes input_data = 14;
+  // Optional reader-only ancestry for model/tool activations inside agents.
+  // Never participates in activation identity, input/definition digests, or
+  // replay decisions. Bounded to 256 UTF-8 bytes.
+  string display_parent_correlation_id = 15;
 }
 
 // ActivationConflictReceipt describes deterministic-key reuse with new semantics.
