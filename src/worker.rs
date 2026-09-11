@@ -8029,3 +8029,7 @@ mod tests {
         assert!(metadata.contains_key("parent_correlation_id"));
     }
 }
+
+#[cfg(test)]
+#[path = "worker_checkpoint_contract_tests.rs"]
+mod checkpoint_contract_tests;
