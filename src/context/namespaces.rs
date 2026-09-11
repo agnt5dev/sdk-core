@@ -448,6 +448,7 @@ fn durable_timer_plan(
         lease_authority: lease_authority.into_bytes(),
         child: None,
         display_name: timer_key.clone(),
+        display_parent_correlation_id: String::new(),
         input_data: serde_json::to_vec(&serde_json::json!({
             "delay_ms": delay_ms,
             "timer_key": timer_key,
