@@ -31,7 +31,7 @@ Add the crate to a Rust project:
 
 ```toml
 [dependencies]
-agnt5-sdk-core = "0.2.6"
+agnt5-sdk-core = "0.3.0"
 ```
 
 The default build contains the portable SDK foundation. Optional capabilities
@@ -39,7 +39,7 @@ can be enabled with Cargo features:
 
 ```toml
 [dependencies]
-agnt5-sdk-core = { version = "0.2.6", features = ["libsql-memory"] }
+agnt5-sdk-core = { version = "0.3.0", features = ["libsql-memory"] }
 ```
 
 | Feature | Purpose |
@@ -49,10 +49,10 @@ agnt5-sdk-core = { version = "0.2.6", features = ["libsql-memory"] }
 
 ## Worker assignment mode
 
-Workers default to pull assignment when `AGNT5_WORKER_MODE` is unset or empty.
+Starting with sdk-core 0.3.0, workers default to pull assignment when `AGNT5_WORKER_MODE` is unset or empty.
 Set `AGNT5_WORKER_MODE=push` explicitly to retain coordinator-push dispatch.
 Python/TypeScript worker options and Go `WithWorkerMode` override the environment.
-This default change belongs in the next minor SDK release.
+Language SDKs adopt this behavior in their coordinated minor releases.
 
 ## Worker runtime endpoint
 
