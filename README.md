@@ -47,6 +47,13 @@ agnt5-sdk-core = { version = "0.2.6", features = ["libsql-memory"] }
 | `libsql-memory` | Embedded libSQL-backed vector memory |
 | `wasm-sandbox` | Embedded Wasmtime sandbox execution |
 
+## Worker assignment mode
+
+Workers default to pull assignment when `AGNT5_WORKER_MODE` is unset or empty.
+Set `AGNT5_WORKER_MODE=push` explicitly to retain coordinator-push dispatch.
+Python/TypeScript worker options and Go `WithWorkerMode` override the environment.
+This default change belongs in the next minor SDK release.
+
 ## Worker runtime endpoint
 
 Workers persist lifecycle events and durable checkpoints through the current

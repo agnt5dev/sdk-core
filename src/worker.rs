@@ -819,6 +819,13 @@ impl WorkerConfig {
     }
 }
 
+fn resolve_worker_mode(value: Option<&str>) -> WorkerMode {
+    match value {
+        None | Some("") | Some("pull") | Some("PULL") => WorkerMode::Pull,
+        _ => WorkerMode::Push,
+    }
+}
+
 fn resolve_engine_endpoint(
     explicit_endpoint: Option<String>,
     coordinator_endpoint: &str,
@@ -4551,19 +4558,17 @@ impl Worker {
             metadata.insert("activation_artifact_sha256".to_string(), artifact);
         }
 
-        // declare data-path mode. Default PUSH;
+        // Declare data-path mode. Unspecified workers use PULL;
         // `AGNT5_WORKER_MODE=pull` now means parked long-poll assignment
         // (`RegisterWorkerSession` + `PollJob`). The legacy batch `PollJobs`
         // loop is intentionally gone.
-        let is_pull_mode = matches!(
-            std::env::var("AGNT5_WORKER_MODE").ok().as_deref(),
-            Some("pull") | Some("PULL")
+        let mode = resolve_worker_mode(std::env::var("AGNT5_WORKER_MODE").ok().as_deref());
+        let is_pull_mode = mode == WorkerMode::Pull;
+        metadata.insert(
+            "AGNT5_WORKER_MODE".to_string(),
+            if is_pull_mode { "pull" } else { "push" }.to_string(),
         );
-        let mode = if is_pull_mode {
-            crate::pb::WorkerMode::Pull as i32
-        } else {
-            crate::pb::WorkerMode::Push as i32
-        };
+        let mode = mode as i32;
         // Stamp the connection-bound deployment into the coordinator's typed
         // registration field. Local workers retain their configured metadata;
         // external workers use the authenticated discovery authority.
@@ -6880,6 +6885,16 @@ mod tests {
             retryable_uncommitted_records_in_reverse(vec![0, 1], &[false, false], &error),
             vec![1, 0]
         );
+    }
+
+    #[test]
+    fn worker_mode_defaults_to_pull_and_preserves_explicit_push() {
+        for value in [None, Some(""), Some("pull"), Some("PULL")] {
+            assert_eq!(super::resolve_worker_mode(value), WorkerMode::Pull);
+        }
+        for value in [Some("push"), Some("PUSH")] {
+            assert_eq!(super::resolve_worker_mode(value), WorkerMode::Push);
+        }
     }
 
     #[test]
