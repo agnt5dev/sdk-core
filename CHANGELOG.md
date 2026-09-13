@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.1 - 2026-09-13
+
+### Fixed
+
+- Drain accepted pull assignments through their handler and completion acknowledgement on intentional shutdown (AGNT5-1129), within one shared 25-second budget.
+- Route Unix SIGTERM through graceful shutdown, stop idle polls promptly, and retain existing lease fencing and expiry when a grant outcome is ambiguous.
+- Stop pending registration and poll setup when shutdown has already been requested; cancel remaining handlers and renewal tasks if the drain deadline expires.
+
 ## 0.3.0
 
 ### Changed
