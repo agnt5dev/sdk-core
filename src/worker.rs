@@ -31,6 +31,9 @@ const PARKED_COMPLETION_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 const PARKED_COMPLETE_JOB_ATTEMPTS: usize = 3;
 const PARKED_COMPLETE_JOB_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 const PARKED_COMPLETE_JOB_RETRY_DELAY: Duration = Duration::from_millis(100);
+// One budget for all received pull assignments and their terminal acknowledgements.
+// Leave cleanup time inside the operator's default 30 seconds after preStop.
+const PULL_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(25);
 const DEPLOYMENT_ARTIFACT_DOMAIN: &[u8] = b"agnt5.deployment-artifact.v1\0";
 const ASSIGNMENT_AUTHORED_RETRY_METADATA_KEYS: &[&str] = &[
     "attempt",
@@ -1290,9 +1293,67 @@ fn stamp_activation_dispatch_metadata(
     Ok(())
 }
 
+// Tokio JoinHandles detach on drop. Background work owned by a pull slot or
+// supervisor must stop when that owner is aborted, including an in-progress RPC.
+struct AbortTaskOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortTaskOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn wait_for_worker_shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await
+}
+
+async fn wait_for_pull_stop(stop: &mut tokio::sync::watch::Receiver<bool>) {
+    let _ = stop.wait_for(|stopping| *stopping).await;
+}
+
+async fn wait_for_poll_or_shutdown<T>(
+    poll: impl Future<Output = T>,
+    stop: &mut tokio::sync::watch::Receiver<bool>,
+) -> Option<T> {
+    tokio::select! {
+        // Keep an assignment already available locally when shutdown races its
+        // reply. Cancelling an unresolved poll does not prove no lease exists;
+        // any unknown grant retains its ordinary runtime expiry and fences.
+        biased;
+        result = poll => Some(result),
+        _ = wait_for_pull_stop(stop) => None,
+    }
+}
+
+fn revoke_active_pull_slots(
+    slot_phases: &WorkerSlotPhases,
+    revoked_executions: &Arc<std::sync::Mutex<HashSet<String>>>,
+    cancel_tokens: &Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
+    cancel_hook: &Arc<std::sync::Mutex<Option<Box<dyn Fn(String) + Send + Sync>>>>,
+) {
+    let runs = slot_phases
+        .lock_state()
+        .entries
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    for run_id in runs {
+        revoke_execution_authority(&run_id, revoked_executions, cancel_tokens, cancel_hook);
+    }
+}
+
 // RAII guard so the in-flight count is decremented even if a handler panics or
-// is cancelled. Parked polling uses this same guard so each parked slot maps to
-// one active handler invocation, not one queued local message.
+// is cancelled. Parked polling also uses it for outstanding poll counts.
 struct InFlightGuard(Arc<std::sync::atomic::AtomicUsize>);
 
 impl InFlightGuard {
@@ -2253,7 +2314,7 @@ fn spawn_parked_capacity_reporter(
     active_slots: Arc<std::sync::atomic::AtomicUsize>,
     desired_slots: Arc<std::sync::atomic::AtomicUsize>,
     effective_max_slots: usize,
-    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     let interval_ms = env_usize("AGNT5_CAPACITY_REPORT_INTERVAL_MS")
         .unwrap_or(5_000)
@@ -2274,7 +2335,7 @@ fn spawn_parked_capacity_reporter(
         let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
         loop {
             tokio::select! {
-                _ = shutdown_rx.recv() => return,
+                _ = wait_for_pull_stop(&mut shutdown_rx) => return,
                 _ = interval.tick() => {
                     crate::core_metrics::configured(&worker_id, effective_max_slots);
                     let current_session_id = worker_session_id.lock().await.clone();
@@ -2509,6 +2570,7 @@ struct ParkedPollContext {
     /// slot polling with a rejected session. Held across the whole refresh so
     /// losers observe the winner's session and skip re-registering.
     session_refresh_lock: Arc<TokioMutex<()>>,
+    stop_polling: tokio::sync::watch::Receiver<bool>,
     claim_timeout_ms: i64,
     min_slots: usize,
     retire_empty_polls: usize,
@@ -2650,20 +2712,27 @@ where
     // Deterministic jitter so surplus slots don't all retire on the same tick.
     let retire_threshold = ctx.retire_empty_polls + (slot_id % 2);
     let mut consecutive_empty = 0usize;
+    let mut stop_polling = ctx.stop_polling.clone();
     loop {
+        if *stop_polling.borrow() {
+            return;
+        }
         let current_session_id = ctx.worker_session_id.lock().await.clone();
-        ctx.open_poll_slots
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let poll_result = client
-            .poll_job(PollJobRequest {
+        let poll_guard = InFlightGuard::enter(&ctx.open_poll_slots);
+        let poll_result = wait_for_poll_or_shutdown(
+            client.poll_job(PollJobRequest {
                 worker_id: ctx.worker_id.clone(),
                 worker_session_id: current_session_id.clone(),
                 wait_ms: 30_000,
                 claim_timeout_ms: ctx.claim_timeout_ms,
-            })
-            .await;
-        ctx.open_poll_slots
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }),
+            &mut stop_polling,
+        )
+        .await;
+        drop(poll_guard);
+        let Some(poll_result) = poll_result else {
+            return;
+        };
 
         match poll_result {
             Ok(resp) => {
@@ -2821,6 +2890,10 @@ where
                     renew_handle,
                 );
 
+                let _renewal_abort = renewal
+                    .as_ref()
+                    .map(|handle| AbortTaskOnDrop(handle.abort_handle()));
+
                 let (slot_response_tx, slot_response_rx) = flume::unbounded::<ServiceMessage>();
                 let handler_future = execute_runtime_message_for_response(
                     &worker_name,
@@ -2970,16 +3043,22 @@ where
             Err(e) if is_worker_session_refresh_required_error(&e) => {
                 consecutive_empty = 0;
                 warn!("Parked poll slot {} error: {}", slot_id, e);
-                if !refresh_parked_worker_session(
-                    &mut client,
-                    &ctx.worker_session_id,
-                    &current_session_id,
-                    &ctx.registration,
-                    slot_id,
-                    &ctx.session_refresh_lock,
+                let refreshed = wait_for_poll_or_shutdown(
+                    refresh_parked_worker_session(
+                        &mut client,
+                        &ctx.worker_session_id,
+                        &current_session_id,
+                        &ctx.registration,
+                        slot_id,
+                        &ctx.session_refresh_lock,
+                    ),
+                    &mut stop_polling,
                 )
-                .await
-                {
+                .await;
+                let Some(refreshed) = refreshed else {
+                    return;
+                };
+                if !refreshed {
                     exit_parked_worker_process(
                         "RegisterWorkerSession retry was rejected after 3 attempts; exiting worker process",
                     );
@@ -2988,7 +3067,15 @@ where
             Err(e) => {
                 consecutive_empty = 0;
                 warn!("Parked poll slot {} error: {}", slot_id, e);
-                tokio::time::sleep(Duration::from_millis(1_000)).await;
+                if wait_for_poll_or_shutdown(
+                    tokio::time::sleep(Duration::from_millis(1_000)),
+                    &mut stop_polling,
+                )
+                .await
+                .is_none()
+                {
+                    return;
+                }
             }
         }
     }
@@ -4363,8 +4450,11 @@ impl Worker {
         // Spawn signal handler that broadcasts immediate notification
         let shutdown_tx_clone = shutdown_tx.clone();
         tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            info!("Received shutdown signal (Ctrl+C)");
+            if let Err(error) = wait_for_worker_shutdown_signal().await {
+                warn!("Worker shutdown signal listener failed: {}", error);
+                return;
+            }
+            info!("Received worker shutdown signal");
             let _ = shutdown_tx_clone.send(()); // Broadcast to all receivers
         });
 
@@ -4773,8 +4863,15 @@ impl Worker {
 
         // Pull workers own the parked long-poll task; PUSH workers never
         // spawn it. The legacy batch PollJobs path has been removed.
+        // A broadcast can arrive during connection/event-stream setup. Seed a
+        // persistent pull stop state before spawning, rather than resubscribing
+        // after that notification and accidentally opening fresh polls.
+        let mut graceful_shutdown = matches!(
+            shutdown_rx.try_recv(),
+            Ok(()) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_))
+        );
+        let (poll_shutdown_tx, poll_shutdown) = tokio::sync::watch::channel(graceful_shutdown);
         let poll_task = if is_pull_mode {
-            let poll_shutdown = shutdown_rx.resubscribe();
             Some(self.spawn_parked_poll_task(
                 response_tx.clone(),
                 message_handler.clone(),
@@ -4788,8 +4885,13 @@ impl Worker {
             None
         };
 
+        // Only an explicit local shutdown requests a pull drain. A superseded
+        // identity or ambiguous connection loss must not be mistaken for one.
         // Main dispatch loop
         let dispatch_result = loop {
+            if graceful_shutdown {
+                break Ok(());
+            }
             tokio::select! {
                 // Dispatch incoming messages to worker pool
                 result = rx.recv_async() => {
@@ -5090,14 +5192,37 @@ impl Worker {
                 // Wait for shutdown signal
                 _ = shutdown_rx.recv() => {
                     info!("Worker {} received shutdown signal, stopping gracefully", self.config.worker_id);
+                    graceful_shutdown = true;
                     break Ok(());
                 }
             }
         };
 
-        // Cancel poll task
-        if let Some(task) = poll_task {
-            task.abort();
+        if let Some(mut task) = poll_task {
+            if graceful_shutdown {
+                let _ = poll_shutdown_tx.send(true);
+                // Also bounds connection/session setup before the supervisor can
+                // receive shutdown. This is one deadline, never one per slot.
+                if tokio::time::timeout(PULL_SHUTDOWN_DRAIN_TIMEOUT, &mut task)
+                    .await
+                    .is_err()
+                {
+                    warn!(
+                        "Pull worker drain deadline reached; cancelling remaining local execution"
+                    );
+                    revoke_active_pull_slots(
+                        &self.slot_phases,
+                        &self.revoked_executions,
+                        &self.cancel_tokens,
+                        &self.cancel_hook,
+                    );
+                    task.abort();
+                    let _ = task.await;
+                }
+            } else {
+                task.abort();
+                let _ = task.await;
+            }
         }
 
         // Cleanup: close channels and wait for workers
@@ -5840,7 +5965,7 @@ impl Worker {
         &self,
         response_tx: flume::Sender<ServiceMessage>,
         message_handler: F,
-        mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
         max_concurrency: usize,
         in_flight: Arc<std::sync::atomic::AtomicUsize>,
         supported_protocol_capabilities: Vec<String>,
@@ -5891,6 +6016,9 @@ impl Worker {
             .unwrap_or(2);
 
         tokio::spawn(async move {
+            if *shutdown_rx.borrow() {
+                return;
+            }
             if project_id.is_empty() {
                 eprintln!("[INFO] Parked polling disabled (project authority not set)");
                 return;
@@ -5900,9 +6028,15 @@ impl Worker {
                 return;
             }
 
-            let mut client = match WorkerCoordinatorClient::connect(endpoint.clone()).await {
-                Ok(c) => c,
-                Err(e) => {
+            let mut client = match wait_for_poll_or_shutdown(
+                WorkerCoordinatorClient::connect(endpoint.clone()),
+                &mut shutdown_rx,
+            )
+            .await
+            {
+                Some(Ok(c)) => c,
+                None => return,
+                Some(Err(e)) => {
                     eprintln!("[WARN] Parked poll task failed to connect: {}", e);
                     return;
                 }
@@ -5921,18 +6055,28 @@ impl Worker {
                 supported_protocol_capabilities,
                 required_protocol_capabilities,
             };
-            let initial_session_id = match register_parked_worker_session_with_retries(
-                &mut client,
-                &registration,
-                "RegisterWorkerSession",
+            if *shutdown_rx.borrow() {
+                return;
+            }
+            let initial_session_id = match wait_for_poll_or_shutdown(
+                register_parked_worker_session_with_retries(
+                    &mut client,
+                    &registration,
+                    "RegisterWorkerSession",
+                ),
+                &mut shutdown_rx,
             )
             .await
             {
-                ParkedWorkerSessionRegistrationResult::Registered(session_id) => session_id,
-                ParkedWorkerSessionRegistrationResult::Rejected => exit_parked_worker_process(
+                Some(ParkedWorkerSessionRegistrationResult::Registered(session_id)) => session_id,
+                None => return,
+                Some(ParkedWorkerSessionRegistrationResult::Rejected) => exit_parked_worker_process(
                     "RegisterWorkerSession was rejected after 3 attempts; exiting worker process",
                 ),
             };
+            if *shutdown_rx.borrow() {
+                return;
+            }
             if crate::client::remote_worker_bootstrap_enabled() {
                 eprintln!("[INFO] worker registered through remote bootstrap");
                 eprintln!("[INFO] worker ready");
@@ -5961,9 +6105,10 @@ impl Worker {
                 busy_slots.clone(),
                 total_slots.clone(),
                 max_slots,
-                shutdown_rx.resubscribe(),
+                shutdown_rx.clone(),
             );
 
+            let _capacity_abort = AbortTaskOnDrop(capacity_reporter.abort_handle());
             let (events_tx, mut events_rx) =
                 tokio::sync::mpsc::unbounded_channel::<ParkedSlotEvent>();
             slot_phases.set_started_notifier(events_tx.clone());
@@ -5991,6 +6136,7 @@ impl Worker {
                 busy_slots: busy_slots.clone(),
                 events_tx,
                 session_refresh_lock: Arc::new(TokioMutex::new(())),
+                stop_polling: shutdown_rx.clone(),
                 claim_timeout_ms,
                 min_slots,
                 retire_empty_polls,
@@ -6007,10 +6153,16 @@ impl Worker {
 
             loop {
                 tokio::select! {
-                    _ = shutdown_rx.recv() => {
-                        info!("Parked poll task shutting down");
-                        slots.abort_all();
-                        while slots.join_next().await.is_some() {}
+                    _ = wait_for_pull_stop(&mut shutdown_rx) => {
+                        info!("Parked poll task stopping polls and draining received assignments");
+                        if tokio::time::timeout(PULL_SHUTDOWN_DRAIN_TIMEOUT, async {
+                            while slots.join_next().await.is_some() {}
+                        }).await.is_err() {
+                            warn!("Pull slot drain deadline reached; cancelling remaining local execution");
+                            revoke_active_pull_slots(&ctx.slot_phases, &ctx.revoked_executions, &ctx.cancel_tokens, &ctx.cancel_hook);
+                            slots.abort_all();
+                            while slots.join_next().await.is_some() {}
+                        }
                         capacity_reporter.abort();
                         return;
                     }
@@ -8048,3 +8200,7 @@ mod tests {
 #[cfg(test)]
 #[path = "worker_checkpoint_contract_tests.rs"]
 mod checkpoint_contract_tests;
+
+#[cfg(test)]
+#[path = "worker_pull_shutdown_tests.rs"]
+mod pull_shutdown_tests;
