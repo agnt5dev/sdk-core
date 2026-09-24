@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.4 - 2026-09-24
+
+### Fixed
+
+- Treat the gpt-6 family as OpenAI reasoning models, like gpt-5 and the o-series: no `temperature` or `top_p` in the request and `max_completion_tokens` instead of `max_tokens`. gpt-6 rejects both with a 400, so every Python call to `gpt-6-luna` failed (AGNT5-1301).
+
 ## 0.3.3 - 2026-09-22
 
 ### Fixed

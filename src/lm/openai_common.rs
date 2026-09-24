@@ -17,11 +17,13 @@ use super::interface::{
     ToolChoice, ToolDefinition,
 };
 
-/// OpenAI reasoning models (gpt-5, o1, o3, o4 series) don't support sampling
-/// parameters (`temperature`, `top_p`) and require `max_completion_tokens`
-/// instead of `max_tokens`. Note: gpt-4o DOES support temperature.
+/// OpenAI reasoning models (gpt-5 and gpt-6 families, o1, o3, o4 series)
+/// don't support sampling parameters (`temperature`, `top_p`) and require
+/// `max_completion_tokens` instead of `max_tokens`. Note: gpt-4o DOES support
+/// temperature.
 pub(crate) fn is_reasoning_model(model: &str) -> bool {
     model.starts_with("gpt-5")
+        || model.starts_with("gpt-6")
         || model == "o1"
         || model.starts_with("o1-")
         || model == "o3"
@@ -795,6 +797,8 @@ mod tests {
             "gpt-5",
             "gpt-5-mini",
             "gpt-5-nano",
+            "gpt-6",
+            "gpt-6-luna",
             "o1",
             "o1-preview",
             "o3",
@@ -825,6 +829,22 @@ mod tests {
             ChatCompletionPayload::from_request(&request, "gpt-5-mini".to_string(), false);
         assert!(payload.temperature.is_none());
         assert!(payload.top_p.is_none());
+
+        // The gpt-6 family behaves the same: no sampling parameters, and the
+        // token limit travels as max_completion_tokens (AGNT5-1301).
+        let request = GenerateRequest::new("openai/gpt-6-luna")
+            .user_message("Hi")
+            .configure(|c| {
+                c.temperature = Some(0.7);
+                c.top_p = Some(0.9);
+                c.max_output_tokens = Some(256);
+            });
+        let payload =
+            ChatCompletionPayload::from_request(&request, "gpt-6-luna".to_string(), false);
+        assert!(payload.temperature.is_none());
+        assert!(payload.top_p.is_none());
+        assert!(payload.max_tokens.is_none());
+        assert_eq!(payload.max_completion_tokens, Some(256));
     }
 
     #[test]
