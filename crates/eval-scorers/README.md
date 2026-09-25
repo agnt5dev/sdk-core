@@ -36,5 +36,9 @@ Example: `size(output_json) == expected.expected_length`.
 
 Python and TypeScript local helpers require their matching native extension.
 TypeScript edge clients can submit scorer recipes for runtime execution; they do
-not execute this native scorer locally. Release the shared crate and SDK-core
-before publishing dependent native SDK packages.
+not execute this native scorer locally. Release automation publishes the shared crate before SDK-core, then dependent
+native SDK packages can use the registry version.
+
+`validate_online_config` parses every expression before an online policy is
+activated. Only input/output evidence is available online; reference-answer roots
+and expected-field bindings are rejected, including in short-circuited branches.
