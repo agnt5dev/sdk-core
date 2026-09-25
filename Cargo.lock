@@ -29,9 +29,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "agnt5-eval-scorers"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "agnt5-sdk-core"
 version = "0.3.3"
 dependencies = [
+ "agnt5-eval-scorers",
  "anyhow",
  "async-stream",
  "async-trait",
