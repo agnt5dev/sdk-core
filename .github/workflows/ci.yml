@@ -36,10 +36,10 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Lint
-        run: cargo clippy --all-targets --all-features --locked
+        run: cargo clippy --workspace --all-targets --all-features --locked
 
       - name: Test
-        run: cargo test --all-features --locked
+        run: cargo test --workspace --all-features --locked
 
       - name: Verify crates.io package
-        run: cargo publish --dry-run --locked
+        run: cargo publish --workspace --dry-run --locked
