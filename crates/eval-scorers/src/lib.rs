@@ -327,36 +327,27 @@ fn valid_structure(input: &Value) -> bool {
     true
 }
 
-/// Execute the version-one bounded JSON assertion language. Never evaluates host code.
-pub fn structured_assertions(input: &Value) -> Value {
-    if !valid_structure(input) {
-        return error("input_error", "JSON structure exceeds limits", vec![]);
-    }
-    let Some(config) = input.get("config").and_then(Value::as_object) else {
-        return error("config_error", "config must be an object", vec![]);
+struct CompiledConfig<'a> {
+    assertions: Vec<(String, &'a str, Expr)>,
+    threshold: f64,
+}
+
+fn compile_config(config: &Value) -> Result<CompiledConfig<'_>, &'static str> {
+    let Some(config) = config.as_object() else {
+        return Err("config must be an object");
     };
     let Some(assertions) = config
         .get("assertions")
         .and_then(Value::as_array)
         .filter(|v| !v.is_empty() && v.len() <= 64)
     else {
-        return error(
-            "config_error",
-            "assertions must contain 1..64 entries",
-            vec![],
-        );
+        return Err("assertions must contain 1..64 entries");
     };
     let threshold = match config.get("score_threshold") {
         None => 1.0,
         Some(v) => match v.as_f64().filter(|v| (0.0..=1.0).contains(v)) {
             Some(v) => v,
-            None => {
-                return error(
-                    "config_error",
-                    "score_threshold must be between 0 and 1",
-                    vec![],
-                )
-            }
+            None => return Err("score_threshold must be between 0 and 1"),
         },
     };
     let mut compiled = vec![];
@@ -365,21 +356,17 @@ pub fn structured_assertions(input: &Value) -> Value {
         let name = match a.get("name") {
             None => format!("assertion_{}", i + 1),
             Some(Value::String(s)) if !s.is_empty() && s.len() <= 256 => s.clone(),
-            _ => return error("config_error", "invalid assertion name", vec![]),
+            _ => return Err("invalid assertion name"),
         };
         if !names.insert(name.clone()) {
-            return error("config_error", "duplicate assertion name", vec![]);
+            return Err("duplicate assertion name");
         }
         let Some(expr) = a
             .get("expr")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty() && s.len() <= 4096)
         else {
-            return error(
-                "config_error",
-                "expression must contain 1..4096 bytes",
-                vec![],
-            );
+            return Err("expression must contain 1..4096 bytes");
         };
         let mut parser = Parser {
             text: expr,
@@ -387,23 +374,70 @@ pub fn structured_assertions(input: &Value) -> Value {
             depth: 0,
             operations: 0,
         };
-        let tree = match parser.expr(0) {
-            Ok(tree) => tree,
-            Err(e) => return error("config_error", e, vec![]),
-        };
+        let tree = parser.expr(0)?;
         parser.space();
         if parser.pos != expr.len() {
-            return error("config_error", "unexpected expression suffix", vec![]);
+            return Err("unexpected expression suffix");
         }
         compiled.push((name, expr, tree));
     }
+    Ok(CompiledConfig {
+        assertions: compiled,
+        threshold,
+    })
+}
+
+/// Validate all expressions before online activation. Online evidence includes
+/// input/output only: even short-circuited references to expected are rejected.
+pub fn validate_online_config(config: &Value) -> Result<(), &'static str> {
+    if !valid_structure(config) || serde_json::to_vec(config).map_or(true, |v| v.len() > 1_048_576)
+    {
+        return Err("scorer configuration exceeds JSON limits");
+    }
+    let compiled = compile_config(config)?;
+    if ["expected_field", "expected_type"]
+        .iter()
+        .any(|key| config.get(key).is_some())
+    {
+        return Err("online assertions cannot bind reference-answer evidence");
+    }
+    fn needs_reference(expr: &Expr) -> bool {
+        match expr {
+            Expr::Path(path) => matches!(path[0].as_str(), "expected" | "expected_json"),
+            Expr::Call(_, args) => args.iter().any(needs_reference),
+            Expr::Unary(value) => needs_reference(value),
+            Expr::Binary(_, left, right) => needs_reference(left) || needs_reference(right),
+            Expr::Literal(_) => false,
+        }
+    }
+    if compiled
+        .assertions
+        .iter()
+        .any(|(_, _, expr)| needs_reference(expr))
+    {
+        return Err("online assertions require unavailable reference-answer evidence");
+    }
+    Ok(())
+}
+
+/// Execute the version-one bounded JSON assertion language. Never evaluates host code.
+pub fn structured_assertions(input: &Value) -> Value {
+    if !valid_structure(input) {
+        return error("input_error", "JSON structure exceeds limits", vec![]);
+    }
+    let compiled = match compile_config(input.get("config").unwrap_or(&Value::Null)) {
+        Ok(compiled) => compiled,
+        Err(message) => return error("config_error", message, vec![]),
+    };
+    let count = compiled.assertions.len();
+    let threshold = compiled.threshold;
     if serde_json::to_vec(input).map_or(true, |v| v.len() > 1_048_576) {
         return error("input_error", "input exceeds 1 MiB", vec![]);
     }
     let mut results = vec![];
     let mut passed = 0;
     let mut budget = 100_000;
-    for (name, expr, tree) in compiled {
+    for (name, expr, tree) in compiled.assertions {
         match eval(&tree, input, &mut budget).and_then(boolean) {
             Ok(ok) => {
                 passed += usize::from(ok);
@@ -415,6 +449,6 @@ pub fn structured_assertions(input: &Value) -> Value {
             }
         }
     }
-    let score = passed as f64 / assertions.len() as f64;
-    json!({"score":score,"passed":score>=threshold,"label":if score>=threshold {"pass"} else {"fail"},"explanation":format!("{passed}/{} assertions passed",assertions.len()),"metadata":{"assertions":results}})
+    let score = passed as f64 / count as f64;
+    json!({"score":score,"passed":score>=threshold,"label":if score>=threshold {"pass"} else {"fail"},"explanation":format!("{passed}/{} assertions passed",count),"metadata":{"assertions":results}})
 }

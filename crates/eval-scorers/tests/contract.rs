@@ -76,3 +76,42 @@ fn malformed_expressions_never_panic_or_fall_through() {
         assert_eq!(score["passed"], false);
     }
 }
+
+#[test]
+fn online_validation_uses_parsed_evidence_dependencies() {
+    use serde_json::json;
+    for expr in [
+        "is_array(output_json)",
+        "size(output) > 0 && is_object(input)",
+        "output.expected == 1",
+        "output == \"expected_json\"",
+    ] {
+        assert!(
+            agnt5_eval_scorers::validate_online_config(&json!({"assertions":[{"expr":expr}]}))
+                .is_ok(),
+            "{expr}"
+        );
+    }
+    for expr in [
+        "output == expected",
+        "is_null(expected_json)",
+        "true || expected.value == 1",
+        "false && is_array(expected)",
+        "is_array(",
+        "unknown(output)",
+    ] {
+        assert!(
+            agnt5_eval_scorers::validate_online_config(&json!({"assertions":[{"expr":expr}]}))
+                .is_err(),
+            "{expr}"
+        );
+    }
+    assert!(agnt5_eval_scorers::validate_online_config(
+        &json!({"assertions":[{"expr":"true"}],"expected_field":"answer"})
+    )
+    .is_err());
+    assert!(agnt5_eval_scorers::validate_online_config(
+        &json!({"assertions":[{"expr":"true"}],"score_threshold":2})
+    )
+    .is_err());
+}
