@@ -1,0 +1,11 @@
+[package]
+name = "agnt5-eval-scorers"
+version = "0.1.0"
+edition = "2021"
+publish = ["crates-io"]
+license = "Apache-2.0"
+description = "Bounded deterministic scorer semantics shared by AGNT5 SDKs and runtime"
+repository = "https://github.com/agnt5dev/sdk-core"
+
+[dependencies]
+serde_json = "1"

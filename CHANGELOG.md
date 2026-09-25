@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.4 - 2026-09-25
+
+- Add the bounded structured assertions built-in shared by native SDKs and runtime.
+- Validate online recipes against parsed evidence requirements before activation.
+
 ## 0.3.3 - 2026-09-22
 
 ### Fixed

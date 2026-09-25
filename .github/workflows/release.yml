@@ -57,17 +57,26 @@ jobs:
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
+      - name: Test dependency publication gate
+        run: python3 -m unittest discover -s scripts -p "*_test.py"
+
       - name: Check formatting
         run: cargo fmt --all --check
 
       - name: Lint
-        run: cargo clippy --all-targets --all-features --locked
+        run: cargo clippy --workspace --all-targets --all-features --locked
 
       - name: Test
-        run: cargo test --all-features --locked
+        run: cargo test --workspace --all-features --locked
 
       - name: Verify crates.io package
-        run: cargo publish --dry-run --locked
+        run: cargo publish --workspace --dry-run --locked
+
+      - name: Publish shared scorer dependency when new
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          python3 scripts/publish-scorer-dependency.py
 
       - name: Publish to crates.io
         env:

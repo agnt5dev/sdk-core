@@ -1,0 +1,944 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "documented_recipe",
+      "input": {
+        "output": [
+          1,
+          2,
+          3
+        ],
+        "expected": {
+          "expected_length": 3
+        },
+        "input": null,
+        "config": {
+          "assertions": [
+            {
+              "name": "check_1",
+              "expr": "is_array(output_json)"
+            },
+            {
+              "name": "check_2",
+              "expr": "all(output_json, is_number)"
+            },
+            {
+              "name": "check_3",
+              "expr": "unique(output_json)"
+            },
+            {
+              "name": "check_4",
+              "expr": "size(output_json) == expected.expected_length"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "score": 1,
+        "passed": true,
+        "label": "pass"
+      }
+    },
+    {
+      "name": "encoded_json",
+      "input": {
+        "output": "[1,2]",
+        "expected": null,
+        "input": null,
+        "config": {
+          "assertions": [
+            {
+              "name": "check_1",
+              "expr": "is_array(output_json)"
+            },
+            {
+              "name": "check_2",
+              "expr": "size(output_json) == 2"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "score": 1,
+        "passed": true,
+        "label": "pass"
+      }
+    },
+    {
+      "name": "fractional_failure",
+      "input": {
+        "output": [
+          1,
+          1,
+          2
+        ],
+        "expected": null,
+        "input": null,
+        "config": {
+          "assertions": [
+            {
+              "name": "check_1",
+              "expr": "unique(output_json)"
+            },
+            {
+              "name": "check_2",
+              "expr": "size(output_json) == 3"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "score": 0.5,
+        "passed": false,
+        "label": "fail"
+      }
+    },
+    {
+      "name": "threshold",
+      "input": {
+        "output": null,
+        "expected": null,
+        "input": null,
+        "config": {
+          "assertions": [
+            {
+              "expr": "false"
+            },
+            {
+              "expr": "true"
+            }
+          ],
+          "score_threshold": 0.5
+        }
+      },
+      "expect": {
+        "score": 0.5,
+        "passed": true,
+        "label": "pass"
+      }
+    },
+    {
+      "name": "nested_paths_and_boolean",
+      "input": {
+        "output": {
+          "x": 4
+        },
+        "expected": {
+          "minimum": 3
+        },
+        "input": {
+          "ok": true
+        },
+        "config": {
+          "assertions": [
+            {
+              "name": "check_1",
+              "expr": "input.ok && (output.x >= expected.minimum || false)"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "score": 1,
+        "passed": true,
+        "label": "pass"
+      }
+    },
+    {
+      "name": "short_circuit",
+      "input": {
+        "output": {},
+        "expected": null,
+        "input": null,
+        "config": {
+          "assertions": [
+            {
+              "name": "check_1",
+              "expr": "false && output.absent"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "score": 0,
+        "passed": false,
+        "label": "fail"
+      }
+    },
+    {
+      "name": "unicode_size",
+      "input": {
+        "output": "😀a",
+        "expected": null,
+        "input": null,
+        "config": {
+          "assertions": [
+            {
+              "name": "check_1",
+              "expr": "size(output) == 2"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "score": 1,
+        "passed": true,
+        "label": "pass"
+      }
+    },
+    {
+      "name": "null_is_present",
+      "input": {
+        "output": {
+          "x": null
+        },
+        "expected": null,
+        "input": null,
+        "config": {
+          "assertions": [
+            {
+              "name": "check_1",
+              "expr": "is_null(output.x)"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "score": 1,
+        "passed": true,
+        "label": "pass"
+      }
+    },
+    {
+      "name": "numeric_equality",
+      "input": {
+        "output": [
+          1,
+          {
+            "n": 2.0
+          }
+        ],
+        "expected": [
+          1.0,
+          {
+            "n": 2
+          }
+        ],
+        "input": null,
+        "config": {
+          "assertions": [
+            {
+              "name": "check_1",
+              "expr": "output == expected"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "score": 1,
+        "passed": true,
+        "label": "pass"
+      }
+    },
+    {
+      "name": "empty_all_any",
+      "input": {
+        "output": [],
+        "expected": null,
+        "input": null,
+        "config": {
+          "assertions": [
+            {
+              "name": "check_1",
+              "expr": "all(output, is_number)"
+            },
+            {
+              "name": "check_2",
+              "expr": "!any(output, is_string)"
+            },
+            {
+              "name": "check_3",
+              "expr": "unique(output)"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "score": 1,
+        "passed": true,
+        "label": "pass"
+      }
+    },
+    {
+      "name": "missing",
+      "input": {
+        "output": {},
+        "expected": 9007199254740992,
+        "input": null,
+        "config": {
+          "assertions": [
+            {
+              "name": "check_1",
+              "expr": "output.missing == null"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "score": 0,
+        "passed": false,
+        "label": "input_error"
+      }
+    },
+    {
+      "name": "wrong_type",
+      "input": {
+        "output": true,
+        "expected": 9007199254740992,
+        "input": null,
+        "config": {
+          "assertions": [
+            {
+              "name": "check_1",
+              "expr": "size(output)"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "score": 0,
+        "passed": false,
+        "label": "input_error"
+      }
+    },
+    {
+      "name": "malformed_json",
+      "input": {
+        "output": "[",
+        "expected": 9007199254740992,
+        "input": null,
+        "config": {
+          "assertions": [
+            {
+              "name": "check_1",
+              "expr": "is_array(output_json)"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "score": 0,
+        "passed": false,
+        "label": "input_error"
+      }
+    },
+    {
+      "name": "not_boolean",
+      "input": {
+        "output": [],
+        "expected": 9007199254740992,
+        "input": null,
+        "config": {
+          "assertions": [
+            {
+              "name": "check_1",
+              "expr": "size(output)"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "score": 0,
+        "passed": false,
+        "label": "input_error"
+      }
+    },
+    {
+      "name": "unsafe_number",
+      "input": {
+        "output": 9007199254740992,
+        "expected": 9007199254740992,
+        "input": null,
+        "config": {
+          "assertions": [
+            {
+              "name": "check_1",
+              "expr": "output == expected"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "score": 0,
+        "passed": false,
+        "label": "input_error"
+      }
+    },
+    {
+      "name": "unknown_function",
+      "input": {
+        "output": [],
+        "expected": null,
+        "input": null,
+        "config": {
+          "assertions": [
+            {
+              "name": "check_1",
+              "expr": "eval(output)"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "score": 0,
+        "passed": false,
+        "label": "config_error"
+      }
+    },
+    {
+      "name": "injection",
+      "input": {
+        "output": [],
+        "expected": null,
+        "input": null,
+        "config": {
+          "assertions": [
+            {
+              "name": "check_1",
+              "expr": "output; process.exit()"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "score": 0,
+        "passed": false,
+        "label": "config_error"
+      }
+    },
+    {
+      "name": "bad_arity",
+      "input": {
+        "output": [],
+        "expected": null,
+        "input": null,
+        "config": {
+          "assertions": [
+            {
+              "name": "check_1",
+              "expr": "size(output, input)"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "score": 0,
+        "passed": false,
+        "label": "config_error"
+      }
+    },
+    {
+      "name": "unknown_predicate",
+      "input": {
+        "output": [],
+        "expected": null,
+        "input": null,
+        "config": {
+          "assertions": [
+            {
+              "name": "check_1",
+              "expr": "all(output, dangerous)"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "score": 0,
+        "passed": false,
+        "label": "config_error"
+      }
+    },
+    {
+      "name": "syntax",
+      "input": {
+        "output": [],
+        "expected": null,
+        "input": null,
+        "config": {
+          "assertions": [
+            {
+              "name": "check_1",
+              "expr": "size("
+            }
+          ]
+        }
+      },
+      "expect": {
+        "score": 0,
+        "passed": false,
+        "label": "config_error"
+      }
+    },
+    {
+      "name": "deep",
+      "input": {
+        "output": [],
+        "expected": null,
+        "input": null,
+        "config": {
+          "assertions": [
+            {
+              "name": "check_1",
+              "expr": "(((((((((((((((((((((((((((((((((true)))))))))))))))))))))))))))))))))"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "score": 0,
+        "passed": false,
+        "label": "config_error"
+      }
+    },
+    {
+      "name": "operators",
+      "input": {
+        "output": [],
+        "expected": null,
+        "input": null,
+        "config": {
+          "assertions": [
+            {
+              "name": "check_1",
+              "expr": "false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false || false"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "score": 0,
+        "passed": false,
+        "label": "config_error"
+      }
+    },
+    {
+      "name": "empty",
+      "input": {
+        "output": null,
+        "expected": null,
+        "input": null,
+        "config": {
+          "assertions": []
+        }
+      },
+      "expect": {
+        "score": 0,
+        "passed": false,
+        "label": "config_error"
+      }
+    },
+    {
+      "name": "too_many",
+      "input": {
+        "output": null,
+        "expected": null,
+        "input": null,
+        "config": {
+          "assertions": [
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            },
+            {
+              "expr": "true"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "score": 0,
+        "passed": false,
+        "label": "config_error"
+      }
+    },
+    {
+      "name": "duplicate",
+      "input": {
+        "output": null,
+        "expected": null,
+        "input": null,
+        "config": {
+          "assertions": [
+            {
+              "name": "x",
+              "expr": "true"
+            },
+            {
+              "name": "x",
+              "expr": "true"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "score": 0,
+        "passed": false,
+        "label": "config_error"
+      }
+    },
+    {
+      "name": "threshold_invalid",
+      "input": {
+        "output": null,
+        "expected": null,
+        "input": null,
+        "config": {
+          "assertions": [
+            {
+              "expr": "true"
+            }
+          ],
+          "score_threshold": 2
+        }
+      },
+      "expect": {
+        "score": 0,
+        "passed": false,
+        "label": "config_error"
+      }
+    },
+    {
+      "name": "no_config",
+      "input": {
+        "output": null,
+        "expected": null,
+        "input": null,
+        "config": {
+          "assertions": []
+        }
+      },
+      "expect": {
+        "score": 0,
+        "passed": false,
+        "label": "config_error"
+      }
+    },
+    {
+      "name": "keyword_field",
+      "input": {
+        "output": {
+          "type": "ok"
+        },
+        "input": null,
+        "expected": null,
+        "config": {
+          "assertions": [
+            {
+              "expr": "output.type == \"ok\""
+            }
+          ]
+        }
+      },
+      "expect": {
+        "score": 1,
+        "passed": true,
+        "label": "pass"
+      }
+    },
+    {
+      "name": "parenthesized_predicate",
+      "input": {
+        "output": [
+          1,
+          2
+        ],
+        "input": null,
+        "expected": null,
+        "config": {
+          "assertions": [
+            {
+              "expr": "all(output, (is_number))"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "score": 1,
+        "passed": true,
+        "label": "pass"
+      }
+    },
+    {
+      "name": "numeric_unique",
+      "input": {
+        "output": [
+          1,
+          1.0
+        ],
+        "input": null,
+        "expected": null,
+        "config": {
+          "assertions": [
+            {
+              "expr": "unique(output)"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "score": 0,
+        "passed": false,
+        "label": "fail"
+      }
+    },
+    {
+      "name": "unknown_short_circuit",
+      "input": {
+        "output": [],
+        "input": null,
+        "expected": null,
+        "config": {
+          "assertions": [
+            {
+              "expr": "true || unknown(output)"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "score": 0,
+        "passed": false,
+        "label": "config_error"
+      }
+    },
+    {
+      "name": "compact_numeric",
+      "input": {
+        "output": null,
+        "input": null,
+        "expected": null,
+        "config": {
+          "assertions": [
+            {
+              "expr": "1==1"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "score": 1,
+        "passed": true,
+        "label": "pass"
+      }
+    },
+    {
+      "name": "encoded_deep",
+      "input": {
+        "output": "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[null]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]",
+        "input": null,
+        "expected": null,
+        "config": {
+          "assertions": [
+            {
+              "expr": "is_array(output_json)"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "score": 0,
+        "passed": false,
+        "label": "input_error"
+      }
+    }
+  ]
+}

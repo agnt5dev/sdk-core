@@ -32,14 +32,17 @@ jobs:
         with:
           cache-on-failure: true
 
+      - name: Test dependency publication gate
+        run: python3 -m unittest discover -s scripts -p "*_test.py"
+
       - name: Check formatting
         run: cargo fmt --all --check
 
       - name: Lint
-        run: cargo clippy --all-targets --all-features --locked
+        run: cargo clippy --workspace --all-targets --all-features --locked
 
       - name: Test
-        run: cargo test --all-features --locked
+        run: cargo test --workspace --all-features --locked
 
       - name: Verify crates.io package
-        run: cargo publish --dry-run --locked
+        run: cargo publish --workspace --dry-run --locked

@@ -104,3 +104,42 @@ fn builtin_scorers_match_cross_language_goldens() {
         failures.join("\n  ")
     );
 }
+
+#[test]
+fn structured_assertions_are_intercepted_as_builtins() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../test-fixtures/eval/structured_assertions.json"
+    ))
+    .unwrap();
+    assert!(agnt5_sdk_core::eval::builtin_scorer::is_builtin_scorer(
+        "structured_assertions"
+    ));
+    assert!(agnt5_sdk_core::eval::builtin_scorer::can_execute_locally(
+        "structured_assertions"
+    ));
+    for case in fixture["cases"].as_array().unwrap() {
+        let result = execute(
+            "structured_assertions",
+            &serde_json::to_vec(&case["input"]).unwrap(),
+        )
+        .expect("builtin must not fall through");
+        assert_eq!(
+            result.score,
+            case["expect"]["score"].as_f64().unwrap(),
+            "{}",
+            case["name"]
+        );
+        assert_eq!(
+            result.passed,
+            case["expect"]["passed"].as_bool(),
+            "{}",
+            case["name"]
+        );
+        assert_eq!(
+            result.label.as_deref(),
+            case["expect"]["label"].as_str(),
+            "{}",
+            case["name"]
+        );
+    }
+}

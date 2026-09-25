@@ -14,6 +14,7 @@ use serde_json::Value;
 
 /// Names reserved by the cross-SDK built-in scorer contract.
 pub const BUILTIN_SCORER_NAMES: &[&str] = &[
+    "structured_assertions",
     "exact_match",
     "contains",
     "regex_match",
@@ -60,7 +61,8 @@ pub fn is_builtin_scorer(name: &str) -> bool {
 pub fn can_execute_locally(name: &str) -> bool {
     matches!(
         name,
-        "exact_match"
+        "structured_assertions"
+            | "exact_match"
             | "contains"
             | "regex_match"
             | "json_valid"
@@ -124,6 +126,13 @@ pub fn execute(scorer_name: &str, input_data: &[u8]) -> Option<ScorerResult> {
             });
         }
     };
+
+    if scorer_name == "structured_assertions" {
+        return Some(
+            serde_json::from_value(agnt5_eval_scorers::structured_assertions(&input_json))
+                .expect("shared scorer result schema"),
+        );
+    }
 
     let output = input_json.get("output").cloned().unwrap_or(Value::Null);
     let expected = input_json.get("expected").cloned();

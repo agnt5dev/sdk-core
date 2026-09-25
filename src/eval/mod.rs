@@ -259,3 +259,6 @@ mod tests {
         assert_eq!(event.name, Some("chat".into()));
     }
 }
+
+/// Shared deterministic assertion semantics used by SDK workers and runtime.
+pub use agnt5_eval_scorers::structured_assertions;
