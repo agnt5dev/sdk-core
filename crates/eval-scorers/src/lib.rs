@@ -99,13 +99,20 @@ impl<'a> Parser<'a> {
         let rest = &self.text[self.pos..];
         if rest.starts_with('"') {
             let mut stream = serde_json::Deserializer::from_str(rest).into_iter::<Value>();
-            let value = stream.next().ok_or("expected literal")?.map_err(|_| "invalid JSON literal")?;
+            let value = stream
+                .next()
+                .ok_or("expected literal")?
+                .map_err(|_| "invalid JSON literal")?;
             self.pos += stream.byte_offset();
             return Ok(Expr::Literal(value));
         }
         if rest.starts_with('-') || rest.as_bytes().first().is_some_and(u8::is_ascii_digit) {
-            let length = rest.bytes().take_while(|c| c.is_ascii_digit() || matches!(c, b'-' | b'+' | b'.' | b'e' | b'E')).count();
-            let value = serde_json::from_str(&rest[..length]).map_err(|_| "invalid JSON literal")?;
+            let length = rest
+                .bytes()
+                .take_while(|c| c.is_ascii_digit() || matches!(c, b'-' | b'+' | b'.' | b'e' | b'E'))
+                .count();
+            let value =
+                serde_json::from_str(&rest[..length]).map_err(|_| "invalid JSON literal")?;
             self.pos += length;
             return Ok(Expr::Literal(value));
         }
@@ -226,7 +233,9 @@ fn eval(expr: &Expr, input: &Value, budget: &mut usize) -> Result<Value, &'stati
             if root.ends_with("_json") {
                 if let Value::String(s) = value {
                     value = serde_json::from_str(&s).map_err(|_| "invalid encoded JSON")?;
-                    if !valid_structure(&value) { return Err("JSON structure exceeds limits"); }
+                    if !valid_structure(&value) {
+                        return Err("JSON structure exceeds limits");
+                    }
                 }
             }
             for key in &path[1..] {
