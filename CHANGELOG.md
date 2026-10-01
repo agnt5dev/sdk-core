@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.5 - 2026-10-01
+
+### Fixed
+
+- Populate the parsed structured `object` for non-streaming OpenAI responses when JSON or JSON-schema output is requested. Previously only the streaming path and other providers parsed it, so Python `structured_output` and TypeScript `structuredOutput` were empty for OpenAI models. Invalid JSON is logged and leaves `object` unset; the raw text is still returned (AGNT5-1371, AGNT5-1416).
+
 ## 0.3.4 - 2026-09-25
 
 - Add the bounded structured assertions built-in shared by native SDKs and runtime.

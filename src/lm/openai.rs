@@ -680,7 +680,14 @@ impl ResponsesApiResponse {
     }
 
     /// Convert to GenerateResponse (unified interface)
-    pub fn into_generate_response(self) -> SdkResult<GenerateResponse> {
+    ///
+    /// When `response_format` requests JSON, the aggregated text is parsed into
+    /// `object`. A parse failure is logged and leaves `object` as `None` so the
+    /// caller still receives the raw `text`.
+    pub fn into_generate_response(
+        self,
+        response_format: &ResponseFormat,
+    ) -> SdkResult<GenerateResponse> {
         if let Some(err) = self.status_error() {
             return Err(err);
         }
@@ -720,6 +727,7 @@ impl ResponsesApiResponse {
         }
 
         let text = text_parts.join("\n");
+        let object = parse_structured_object(&text, response_format);
 
         // Convert usage
         let usage = self.usage.map(|u| super::interface::TokenUsage {
@@ -742,10 +750,34 @@ impl ResponsesApiResponse {
             } else {
                 Some(tool_calls)
             },
-            object: None,
+            object,
             raw: None,
             metadata: None,
         })
+    }
+}
+
+/// Parse non-streaming response text into a structured object when JSON output
+/// was requested. Invalid JSON is logged and yields `None` rather than an error.
+fn parse_structured_object(text: &str, response_format: &ResponseFormat) -> Option<Value> {
+    match response_format {
+        ResponseFormat::Text => None,
+        ResponseFormat::Json | ResponseFormat::JsonSchema(_) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            match serde_json::from_str(trimmed) {
+                Ok(value) => Some(value),
+                Err(err) => {
+                    tracing::warn!(
+                        "OpenAI structured output was not valid JSON; leaving object unset: {}",
+                        err
+                    );
+                    None
+                }
+            }
+        }
     }
 }
 
@@ -1267,7 +1299,7 @@ impl LanguageModel for OpenAiProvider {
                     SdkError::Other(anyhow!("failed to parse OpenAI Responses response: {err}"))
                 })?;
 
-            let mut result = parsed.into_generate_response()?;
+            let mut result = parsed.into_generate_response(&request.config.response_format)?;
             result.metadata = Some(metadata);
             Ok(result)
         }
@@ -1612,7 +1644,9 @@ mod tests {
         }"#;
 
         let response: ResponsesApiResponse = serde_json::from_str(json).unwrap();
-        let err = response.into_generate_response().unwrap_err();
+        let err = response
+            .into_generate_response(&ResponseFormat::Text)
+            .unwrap_err();
 
         match err {
             SdkError::LmApiError {
@@ -1642,7 +1676,9 @@ mod tests {
         }"#;
 
         let response: ResponsesApiResponse = serde_json::from_str(json).unwrap();
-        let err = response.into_generate_response().unwrap_err();
+        let err = response
+            .into_generate_response(&ResponseFormat::Text)
+            .unwrap_err();
 
         match err {
             SdkError::LmApiError { message, .. } => {
@@ -1675,11 +1711,83 @@ mod tests {
         }"#;
 
         let response: ResponsesApiResponse = serde_json::from_str(json).unwrap();
-        let generated = response.into_generate_response().unwrap();
+        let generated = response
+            .into_generate_response(&ResponseFormat::Text)
+            .unwrap();
         let usage = generated.usage.unwrap();
 
         assert_eq!(usage.prompt_tokens, Some(1500));
         assert_eq!(usage.cached_tokens, Some(1024));
+    }
+
+    fn responses_api_response_with_text(text: &str) -> ResponsesApiResponse {
+        let json = serde_json::json!({
+            "id": "resp_structured",
+            "created_at": 1700000000,
+            "model": "gpt-4o-mini",
+            "status": "completed",
+            "output": [
+                {"type": "message", "content": [{"type": "output_text", "text": text}]}
+            ]
+        });
+        serde_json::from_value(json).unwrap()
+    }
+
+    fn person_schema_format() -> ResponseFormat {
+        ResponseFormat::JsonSchema(super::super::interface::JsonSchemaFormat::new(
+            "person",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"name": {"type": "string"}, "age": {"type": "integer"}},
+                "required": ["name", "age"]
+            }),
+        ))
+    }
+
+    #[test]
+    fn non_streaming_json_schema_populates_object() {
+        let response = responses_api_response_with_text(r#"{"name": "Ada", "age": 36}"#);
+        let generated = response
+            .into_generate_response(&person_schema_format())
+            .unwrap();
+
+        assert_eq!(generated.text, r#"{"name": "Ada", "age": 36}"#);
+        assert_eq!(
+            generated.object,
+            Some(serde_json::json!({"name": "Ada", "age": 36}))
+        );
+    }
+
+    #[test]
+    fn non_streaming_json_format_populates_object() {
+        let response = responses_api_response_with_text(" {\"ok\": true}\n");
+        let generated = response
+            .into_generate_response(&ResponseFormat::Json)
+            .unwrap();
+
+        assert_eq!(generated.object, Some(serde_json::json!({"ok": true})));
+    }
+
+    #[test]
+    fn non_streaming_invalid_json_leaves_object_none_without_error() {
+        let response = responses_api_response_with_text("not json at all");
+        let generated = response
+            .into_generate_response(&person_schema_format())
+            .unwrap();
+
+        assert_eq!(generated.text, "not json at all");
+        assert!(generated.object.is_none());
+    }
+
+    #[test]
+    fn non_streaming_text_format_leaves_object_none() {
+        let response = responses_api_response_with_text(r#"{"name": "Ada", "age": 36}"#);
+        let generated = response
+            .into_generate_response(&ResponseFormat::Text)
+            .unwrap();
+
+        assert_eq!(generated.text, r#"{"name": "Ada", "age": 36}"#);
+        assert!(generated.object.is_none());
     }
 
     #[test]
@@ -1718,7 +1826,9 @@ mod tests {
         }"#;
 
         let response: ResponsesApiResponse = serde_json::from_str(json).unwrap();
-        let generated = response.into_generate_response().unwrap();
+        let generated = response
+            .into_generate_response(&ResponseFormat::Text)
+            .unwrap();
         assert_eq!(generated.text.trim(), "Done.");
 
         let tool_calls = generated.tool_calls.unwrap();
