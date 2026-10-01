@@ -21,10 +21,14 @@ use super::interface::{
     GenerateResponse, LanguageModel, MessageRole, ResponseFormat, StreamChunk, StreamHandle,
     StreamRequest, TokenUsage, ToolCall, ToolChoice, ToolDefinition,
 };
+use super::model_caps;
+use super::openai_common::warn_dropped_sampling_params;
 
 const SERVICE_NAME: &str = "bedrock";
 const MODEL_PREFIX: &str = "bedrock";
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+// 10 minutes, matching the Anthropic and OpenAI providers: Claude thinking
+// models can take minutes to produce a non-streaming response.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 const DEFAULT_MAX_TOKENS: u32 = 1024;
 const ANTHROPIC_VERSION: &str = "bedrock-2023-05-31";
 const MAX_EVENT_MESSAGE_SIZE: usize = 32 * 1024 * 1024;
@@ -341,7 +345,7 @@ fn build_anthropic_payload(request: &GenerateRequest) -> SdkResult<Value> {
     let max_tokens = request
         .config
         .max_output_tokens
-        .unwrap_or(DEFAULT_MAX_TOKENS)
+        .unwrap_or_else(|| model_caps::claude_default_max_tokens(&request.model))
         .max(1);
 
     let mut payload = json!({
@@ -377,12 +381,16 @@ fn build_anthropic_payload(request: &GenerateRequest) -> SdkResult<Value> {
         payload["tool_choice"] = choice;
     }
 
-    if let Some(temp) = request.config.temperature {
-        payload["temperature"] = json!(temp);
-    }
-
-    if let Some(top_p) = request.config.top_p {
-        payload["top_p"] = json!(top_p);
+    // Claude after Opus 4.6 / Sonnet 4.6 rejects sampling parameters.
+    if model_caps::claude_rejects_sampling_params(&request.model) {
+        warn_dropped_sampling_params(&request.model, &request.config);
+    } else {
+        if let Some(temp) = request.config.temperature {
+            payload["temperature"] = json!(temp);
+        }
+        if let Some(top_p) = request.config.top_p {
+            payload["top_p"] = json!(top_p);
+        }
     }
 
     Ok(payload)
@@ -1841,6 +1849,27 @@ mod tests {
         assert_eq!(mistral_chat["messages"][0]["role"], "system");
         assert_eq!(mistral_chat["messages"][1]["role"], "user");
         assert!(mistral_chat.get("prompt").is_none());
+    }
+
+    #[test]
+    fn anthropic_payload_drops_sampling_for_models_that_reject_it() {
+        let opus =
+            GenerateRequest::new("bedrock/us-east-1/us.anthropic.claude-opus-4-7-20260115-v1:0")
+                .user_message("Hello")
+                .configure(|config| {
+                    config.temperature = Some(0.7);
+                    config.top_p = Some(0.9);
+                });
+        let payload = build_anthropic_payload(&opus).unwrap();
+        assert!(payload.get("temperature").is_none());
+        assert!(payload.get("top_p").is_none());
+        assert_eq!(payload["max_tokens"], 16_384);
+
+        // Claude 3.5 Sonnet still accepts both.
+        let payload = build_anthropic_payload(&request()).unwrap();
+        assert!(payload.get("temperature").is_some());
+        assert!(payload.get("top_p").is_some());
+        assert_eq!(payload["max_tokens"], 256);
     }
 
     #[test]

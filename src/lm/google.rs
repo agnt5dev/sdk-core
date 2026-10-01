@@ -933,7 +933,9 @@ fn response_json_schema(format: &ResponseFormat) -> Option<JsonValue> {
 fn thinking_config(effort: Option<&ReasoningEffort>) -> Option<GeminiThinkingConfig> {
     effort.map(|effort| GeminiThinkingConfig {
         thinking_level: match effort {
-            ReasoningEffort::Minimal => "minimal",
+            // Gemini has no level that turns thinking off; minimal is closest.
+            ReasoningEffort::None | ReasoningEffort::Minimal => "minimal",
+            ReasoningEffort::Low => "low",
             ReasoningEffort::Medium => "medium",
             ReasoningEffort::High => "high",
         },

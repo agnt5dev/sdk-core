@@ -20,12 +20,15 @@ use super::interface::{
     ResponseFormat, StreamChunk, StreamHandle, StreamRequest, TokenUsage, ToolChoice,
     ToolDefinition,
 };
+use super::model_caps;
+use super::openai_common::warn_dropped_sampling_params;
 use super::telemetry;
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const DEFAULT_VERSION: &str = "2023-06-01";
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_MAX_TOKENS: u32 = 1024;
+// 10 minutes, as in the official Anthropic SDK: a thinking model's non-streaming
+// response at the default max_tokens can take several minutes.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Configuration for the Anthropic provider.
 #[derive(Clone, Debug)]
@@ -536,9 +539,18 @@ impl MessagesPayload {
             timeout: _,
         } = request.config.clone();
 
-        let max_tokens = max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS).max(1);
-
         let model = normalize_model(&request.model)?;
+
+        let max_tokens = max_output_tokens
+            .unwrap_or_else(|| model_caps::claude_default_max_tokens(&model))
+            .max(1);
+
+        // Claude after Opus 4.6 / Sonnet 4.6 rejects sampling parameters with a
+        // 400, so drop them (with a one-time warning) rather than fail the call.
+        let rejects_sampling = model_caps::claude_rejects_sampling_params(&model);
+        if rejects_sampling {
+            warn_dropped_sampling_params(&model, &request.config);
+        }
 
         let system = augment_system_prompt(request.system_prompt.clone(), &response_format);
 
@@ -564,8 +576,8 @@ impl MessagesPayload {
             system,
             cache_control: build_cache_control(prompt_cache.as_ref()),
             max_tokens,
-            temperature,
-            top_p,
+            temperature: temperature.filter(|_| !rejects_sampling),
+            top_p: top_p.filter(|_| !rejects_sampling),
             stream: stream.then_some(true),
             tools,
             tool_choice,
@@ -1290,6 +1302,58 @@ mod tests {
         assert_eq!(normalized.total_tokens, Some(200));
         assert_eq!(normalized.cached_tokens, Some(50));
         assert_eq!(normalized.cache_creation_tokens, Some(30));
+    }
+
+    #[test]
+    fn sampling_params_dropped_for_models_that_reject_them() {
+        // Opus 4.7+, Sonnet 5, Opus 5 and Fable return a 400 for temperature
+        // and top_p, so the Agent's default temperature must not reach them
+        // (AGNT5-1403). Older models keep receiving both.
+        let configured = |model: &str| {
+            let request = GenerateRequest::new(model)
+                .user_message("What is 17 x 23?")
+                .configure(|c| {
+                    c.temperature = Some(0.7);
+                    c.top_p = Some(0.9);
+                });
+            serde_json::to_value(MessagesPayload::from_request(&request, false).unwrap()).unwrap()
+        };
+
+        for model in [
+            "anthropic/claude-opus-4-7",
+            "anthropic/claude-sonnet-5",
+            "anthropic/claude-opus-5",
+            "anthropic/claude-fable-5-1",
+        ] {
+            let value = configured(model);
+            assert!(
+                value.get("temperature").is_none(),
+                "{model} got temperature"
+            );
+            assert!(value.get("top_p").is_none(), "{model} got top_p");
+        }
+
+        let value = configured("anthropic/claude-haiku-4-5");
+        assert!((value["temperature"].as_f64().unwrap() - 0.7).abs() < 1e-6);
+        assert!((value["top_p"].as_f64().unwrap() - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn default_max_tokens_leaves_room_for_thinking() {
+        // max_tokens covers thinking plus the answer. The old 1024 default cut
+        // Opus 5 answers off mid-sentence (AGNT5-1403).
+        let max_tokens = |model: &str, explicit: Option<u32>| {
+            let request = GenerateRequest::new(model)
+                .user_message("Explain TCP congestion control.")
+                .configure(|c| c.max_output_tokens = explicit);
+            MessagesPayload::from_request(&request, false)
+                .unwrap()
+                .max_tokens
+        };
+
+        assert_eq!(max_tokens("anthropic/claude-opus-5", None), 16_384);
+        assert_eq!(max_tokens("anthropic/claude-haiku-4-5", None), 4_096);
+        assert_eq!(max_tokens("anthropic/claude-opus-5", Some(512)), 512);
     }
 
     #[test]

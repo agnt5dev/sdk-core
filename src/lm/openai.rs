@@ -468,7 +468,9 @@ impl ResponsesApiRequest {
         // Convert reasoning effort
         let reasoning = req.config.reasoning_effort.as_ref().map(|effort| {
             let effort_str = match effort {
+                ReasoningEffort::None => "none",
                 ReasoningEffort::Minimal => "minimal",
+                ReasoningEffort::Low => "low",
                 ReasoningEffort::Medium => "medium",
                 ReasoningEffort::High => "high",
             };

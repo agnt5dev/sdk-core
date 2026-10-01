@@ -350,8 +350,12 @@ impl JsonSchemaFormat {
 /// Provider-neutral control for how much compute a model uses for reasoning.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ReasoningEffort {
-    /// Minimal reasoning effort (fastest)
+    /// No reasoning (gpt-6; gpt-5 rejects it)
+    None,
+    /// Minimal reasoning effort (gpt-5; gpt-6 rejects it)
     Minimal,
+    /// Low reasoning effort
+    Low,
     /// Medium reasoning effort (balanced)
     Medium,
     /// High reasoning effort (most thorough)
