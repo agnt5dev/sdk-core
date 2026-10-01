@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Export trace spans with the worker resource (`service.name=agnt5-worker`, `service.version`, `agnt5.*`). The span filter did not forward the provider resource to the OTLP exporter, so Python and TypeScript traces had an empty resource and never appeared in trace listing (AGNT5-1388). The filter now also forwards `force_flush` and `shutdown_with_timeout`.
+
 ## 0.3.5 - 2026-10-01
 
 ### Fixed
