@@ -4,13 +4,13 @@
 
 ### Fixed
 
-- Drop `temperature` and `top_p` (with a one-time warning) for Claude models that reject them: Opus 4.7 and later, Sonnet 5, Opus 5 and Fable, including Bedrock and Vertex ids. A Python `Agent` with default settings failed with a 400 on all of them. New or unrecognised Claude models are treated as rejecting (AGNT5-1403).
-- Raise the default Anthropic `max_tokens` from 1024 to 16384 for those models (4096 for older ones), since thinking counts toward it; Opus 5 answers were cut off mid-sentence. The Anthropic and Bedrock request timeout default rises from 30 s to 10 minutes to match the OpenAI provider (AGNT5-1403).
-- OpenAI reasoning models are now every `gpt-N` with N ≥ 5 plus the o-series, from one shared rule (AGNT5-1456).
+- Drop `temperature` and `top_p` (with a one-time warning) for Claude models that reject them: Opus 4.7 and later, Sonnet 5, Opus 5 and Fable, including Bedrock and Vertex ids. A Python `Agent` with default settings failed with a 400 on all of them. New or unrecognised Claude models are treated as rejecting.
+- Raise the default Anthropic `max_tokens` from 1024 to 16384 for those models (4096 for older ones), since thinking counts toward it; Opus 5 answers were cut off mid-sentence. The Anthropic and Bedrock request timeout default rises from 30 s to 10 minutes to match the OpenAI provider.
+- OpenAI reasoning models are now every `gpt-N` with N ≥ 5 plus the o-series, from one shared rule.
 
 ### Added
 
-- `ReasoningEffort::None` and `ReasoningEffort::Low`. gpt-6 accepts `none`/`low`/`medium`/`high` and rejects `minimal`; gpt-5 keeps `minimal`. Gemini maps `none` to `minimal` (AGNT5-1456).
+- `ReasoningEffort::None` and `ReasoningEffort::Low`. gpt-6 accepts `none`/`low`/`medium`/`high` and rejects `minimal`; gpt-5 keeps `minimal`. Gemini maps `none` to `minimal`.
 
 ## 0.3.6 - 2026-10-01
 
