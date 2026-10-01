@@ -1,7 +1,9 @@
 use opentelemetry_sdk::error::OTelSdkError;
 /// Span filtering exporter to remove internal h2/HTTP2 spans from traces
 use opentelemetry_sdk::trace::{SpanData, SpanExporter};
+use opentelemetry_sdk::Resource;
 use std::fmt;
+use std::time::Duration;
 
 /// FilteringSpanExporter wraps another span exporter and filters out h2/HTTP2 internal spans
 #[derive(Debug)]
@@ -76,6 +78,20 @@ impl<E: SpanExporter + fmt::Debug> SpanExporter for FilteringSpanExporter<E> {
     fn shutdown(&mut self) -> Result<(), OTelSdkError> {
         self.inner.shutdown()
     }
+
+    fn shutdown_with_timeout(&mut self, timeout: Duration) -> Result<(), OTelSdkError> {
+        self.inner.shutdown_with_timeout(timeout)
+    }
+
+    fn force_flush(&mut self) -> Result<(), OTelSdkError> {
+        self.inner.force_flush()
+    }
+
+    // The trait default is a no-op, so without this the inner OTLP exporter
+    // keeps an empty resource and spans export without service.name (AGNT5-1388).
+    fn set_resource(&mut self, resource: &Resource) {
+        self.inner.set_resource(resource)
+    }
 }
 
 #[cfg(test)]
@@ -104,6 +120,48 @@ mod tests {
                 "hpack::decode"
             )
         );
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct ResourceRecorder {
+        resource: std::sync::Arc<std::sync::Mutex<Option<Resource>>>,
+    }
+
+    impl SpanExporter for ResourceRecorder {
+        async fn export(&self, _batch: Vec<SpanData>) -> Result<(), OTelSdkError> {
+            Ok(())
+        }
+
+        fn set_resource(&mut self, resource: &Resource) {
+            *self.resource.lock().unwrap() = Some(resource.clone());
+        }
+    }
+
+    #[test]
+    fn test_provider_resource_reaches_inner_exporter() {
+        let recorder = ResourceRecorder::default();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_resource(
+                Resource::builder()
+                    .with_service_name("agnt5-worker")
+                    .build(),
+            )
+            .with_simple_exporter(FilteringSpanExporter::new(recorder.clone()))
+            .build();
+
+        let resource = recorder
+            .resource
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("inner exporter never received the provider resource");
+        assert_eq!(
+            resource
+                .get(&opentelemetry::Key::new("service.name"))
+                .map(|v| v.to_string()),
+            Some("agnt5-worker".to_string())
+        );
+        let _ = provider.shutdown();
     }
 
     #[test]
