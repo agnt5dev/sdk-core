@@ -237,7 +237,34 @@ fn extract_region_and_model<'a>(
     }
 }
 
+const FAMILY_PREFIXES: [&str; 5] = [
+    "anthropic.",
+    "meta.llama",
+    "amazon.titan",
+    "cohere.",
+    "mistral.",
+];
+
+/// Foundation model id behind a cross-region inference profile id such as
+/// `us.anthropic.claude-opus-4-7-v1:0`: the leading geography (`us.`, `eu.`,
+/// `apac.`, `global.`, ...) is dropped. Other ids are returned unchanged.
+fn foundation_model_id(model_id: &str) -> &str {
+    match model_id.split_once('.') {
+        Some((geo, rest))
+            if !geo.is_empty()
+                && geo.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+                && FAMILY_PREFIXES
+                    .iter()
+                    .any(|prefix| rest.starts_with(prefix)) =>
+        {
+            rest
+        }
+        _ => model_id,
+    }
+}
+
 fn model_family(model_id: &str) -> SdkResult<BedrockModelFamily> {
+    let model_id = foundation_model_id(model_id);
     if model_id.starts_with("anthropic.") {
         Ok(BedrockModelFamily::Anthropic)
     } else if model_id.starts_with("meta.llama") {
@@ -1849,6 +1876,35 @@ mod tests {
         assert_eq!(mistral_chat["messages"][0]["role"], "system");
         assert_eq!(mistral_chat["messages"][1]["role"], "user");
         assert!(mistral_chat.get("prompt").is_none());
+    }
+
+    #[test]
+    fn cross_region_inference_profiles_route_to_their_family() {
+        let (_, model_id) = extract_region_and_model(
+            "bedrock/us-east-1/us.anthropic.claude-opus-4-7-20260115-v1:0",
+            None,
+        )
+        .unwrap();
+        assert_eq!(model_id, "us.anthropic.claude-opus-4-7-20260115-v1:0");
+        assert!(matches!(
+            model_family(model_id).unwrap(),
+            BedrockModelFamily::Anthropic
+        ));
+        for id in [
+            "eu.anthropic.claude-sonnet-5-v1:0",
+            "apac.anthropic.claude-haiku-4-5-20251001-v1:0",
+            "global.anthropic.claude-opus-5-v1:0",
+        ] {
+            assert!(
+                matches!(model_family(id).unwrap(), BedrockModelFamily::Anthropic),
+                "{id}"
+            );
+        }
+        assert!(matches!(
+            model_family("us.meta.llama3-1-70b-instruct-v1:0").unwrap(),
+            BedrockModelFamily::MetaLlama
+        ));
+        assert!(model_family("us.unknown.model-v1:0").is_err());
     }
 
     #[test]
