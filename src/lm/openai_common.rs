@@ -17,19 +17,11 @@ use super::interface::{
     ToolChoice, ToolDefinition,
 };
 
-/// OpenAI reasoning models (gpt-5 and gpt-6 families, o1, o3, o4 series)
-/// don't support sampling parameters (`temperature`, `top_p`) and require
-/// `max_completion_tokens` instead of `max_tokens`. Note: gpt-4o DOES support
-/// temperature.
+/// OpenAI reasoning models (gpt-5 and later, o-series) don't support sampling
+/// parameters (`temperature`, `top_p`) and require `max_completion_tokens`
+/// instead of `max_tokens`. See `model_caps`.
 pub(crate) fn is_reasoning_model(model: &str) -> bool {
-    model.starts_with("gpt-5")
-        || model.starts_with("gpt-6")
-        || model == "o1"
-        || model.starts_with("o1-")
-        || model == "o3"
-        || model.starts_with("o3-")
-        || model == "o4"
-        || model.starts_with("o4-")
+    super::model_caps::is_openai_reasoning_model(model)
 }
 
 /// Warn when configured sampling parameters are unsupported by the target

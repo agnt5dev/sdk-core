@@ -12,6 +12,7 @@ mod huggingface;
 mod interface;
 mod lepton;
 mod mistral;
+mod model_caps;
 mod moonshot;
 mod ollama;
 mod openai;
