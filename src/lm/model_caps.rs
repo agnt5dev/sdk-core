@@ -49,7 +49,8 @@ pub(crate) fn is_openai_reasoning_model(model: &str) -> bool {
 /// after Opus 4.6 / Sonnet 4.6 / Haiku 4.5, including Fable. Only versions we
 /// know accept sampling are allowed through, so a new or unrecognised Claude
 /// model defaults to rejecting: dropping a sampling parameter is a quiet
-/// degradation, sending one to a model that rejects it fails the call.
+/// degradation, sending one to a model that rejects it fails the call. The
+/// cutoff is per family: Opus and Sonnet accept up to 4.6, Haiku up to 4.5.
 pub(crate) fn claude_rejects_sampling_params(model: &str) -> bool {
     let name = bare_model(model);
     let Some(rest) = name.strip_prefix("claude-") else {
@@ -59,6 +60,7 @@ pub(crate) fn claude_rejects_sampling_params(model: &str) -> bool {
     // Ids look like claude-3-5-sonnet-20241022, claude-sonnet-4-6,
     // claude-opus-4-20250514, claude-2.1 or claude-instant-1.2.
     let mut version: Vec<u32> = Vec::new();
+    let mut family: Option<&str> = None;
     for token in rest.split(['-', '.']) {
         let is_version_part =
             !token.is_empty() && token.len() <= 2 && token.chars().all(|c| c.is_ascii_digit());
@@ -73,12 +75,19 @@ pub(crate) fn claude_rejects_sampling_params(model: &str) -> bool {
         if !version.is_empty() {
             break;
         }
+        family = Some(token);
     }
 
+    // Newest version in each family that still accepts sampling parameters.
+    // Version-first ids (claude-3-5-haiku) are all 3.x or older.
+    let last_accepting = match family {
+        Some("haiku") => (4, 5),
+        _ => (4, 6),
+    };
     match version.as_slice() {
         [] => true,
-        [major] => *major > 4,
-        [major, minor, ..] => (*major, *minor) > (4, 6),
+        [major] => (*major, 0) > last_accepting,
+        [major, minor, ..] => (*major, *minor) > last_accepting,
     }
 }
 
@@ -151,6 +160,8 @@ mod tests {
             "us.anthropic.claude-sonnet-5-20260301-v1:0",
             "claude-opus-4-7@20260115",
             "claude-newfamily-1",
+            "claude-haiku-4-6",
+            "claude-haiku-5",
         ] {
             assert!(
                 claude_rejects_sampling_params(model),
