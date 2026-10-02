@@ -579,11 +579,11 @@ fn build_mistral_chat_payload(request: &GenerateRequest) -> Value {
 }
 
 fn is_cohere_command_r(model_id: &str) -> bool {
-    model_id.starts_with("cohere.command-r")
+    foundation_model_id(model_id).starts_with("cohere.command-r")
 }
 
 fn is_mistral_chat(model_id: &str) -> bool {
-    model_id.contains("mistral-large-2407")
+    foundation_model_id(model_id).contains("mistral-large-2407")
 }
 
 fn system_instructions(request: &GenerateRequest) -> Vec<String> {
@@ -1905,6 +1905,9 @@ mod tests {
             BedrockModelFamily::MetaLlama
         ));
         assert!(model_family("us.unknown.model-v1:0").is_err());
+        // Subtype checks see the same foundation id as family routing.
+        assert!(is_cohere_command_r("us.cohere.command-r-v1:0"));
+        assert!(!is_cohere_command_r("us.cohere.command-text-v14"));
     }
 
     #[test]
