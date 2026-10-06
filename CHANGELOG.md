@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.8 - 2026-10-06
+
+### Fixed
+
+- Return a failure response when a worker handler returns an error, including a Python `BaseException` that escapes an executor. Previously the worker logged the error and dropped the response, leaving the invocation waiting for its lease to expire. Push and pull workers now preserve the invocation identity, attempt, and lease in the failure response. Cancellation, revocation, and durable suspension keep their existing behavior.
+
+### Upgrade
+
+- Python and TypeScript native bindings must adopt core 0.3.8 in their own releases to include this fix.
+
 ## 0.3.7 - 2026-10-02
 
 ### Fixed
