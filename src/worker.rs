@@ -1377,22 +1377,22 @@ impl Drop for InFlightGuard {
     }
 }
 
-struct DurableSuspensionEnvelope {
+struct DispatchResponseEnvelope {
     invocation_id: String,
     metadata: HashMap<String, String>,
     attempt: i32,
     lease_id: String,
 }
 
-fn durable_suspension_envelope(
+fn dispatch_response_envelope(
     runtime_message: &RuntimeMessage,
-) -> Option<DurableSuspensionEnvelope> {
+) -> Option<DispatchResponseEnvelope> {
     let crate::pb::runtime_message::MessageData::DispatchComponent(request) =
         runtime_message.message_data.as_ref()?
     else {
         return None;
     };
-    Some(DurableSuspensionEnvelope {
+    Some(DispatchResponseEnvelope {
         invocation_id: request.invocation_id.clone(),
         metadata: request.metadata.clone(),
         attempt: request.attempt,
@@ -1418,7 +1418,7 @@ where
     let _in_flight = InFlightGuard::enter(&in_flight);
     let tx_clone = response_tx.clone();
     stamp_dispatch_mode(&mut runtime_message, dispatch_mode);
-    let suspension_envelope = durable_suspension_envelope(&runtime_message);
+    let dispatch_envelope = dispatch_response_envelope(&runtime_message);
 
     let run_key = dispatch_run_key(&runtime_message);
     if run_key
@@ -1463,13 +1463,32 @@ where
         Some(Ok(Some(response))) => Some(response),
         Some(Ok(None)) => None,
         Some(Err(SdkError::DurableSuspension { suspension })) => {
-            suspension_envelope.as_ref().map(|envelope| {
+            dispatch_envelope.as_ref().map(|envelope| {
                 durable_suspension_service_message(response_worker_id, envelope, *suspension)
             })
         }
         Some(Err(e)) => {
             error!("Worker {} handler error: {}", worker_name, e);
-            None
+            dispatch_envelope.as_ref().map(|envelope| {
+                let mut metadata = envelope.metadata.clone();
+                metadata.insert("error_code".to_string(), "HANDLER_ERROR".to_string());
+                ServiceMessage {
+                    worker_id: response_worker_id.to_string(),
+                    metadata: HashMap::new(),
+                    message_type: Some(crate::pb::service_message::MessageType::FunctionResponse(
+                        DispatchComponentResponse {
+                            invocation_id: envelope.invocation_id.clone(),
+                            success: false,
+                            error_message: e.to_string(),
+                            metadata,
+                            event_type: "run.failed".to_string(),
+                            attempt: envelope.attempt,
+                            lease_id: envelope.lease_id.clone(),
+                            ..Default::default()
+                        },
+                    )),
+                }
+            })
         }
         None => {
             debug!("Worker {} invocation cancelled by request", worker_name);
@@ -1514,7 +1533,7 @@ async fn execute_runtime_message<F, Fut>(
 
 fn durable_suspension_service_message(
     worker_id: &str,
-    envelope: &DurableSuspensionEnvelope,
+    envelope: &DispatchResponseEnvelope,
     suspension: crate::pb::WorkerSuspension,
 ) -> ServiceMessage {
     ServiceMessage {
@@ -7574,7 +7593,7 @@ mod tests {
             delay_ms: 5_000,
             ..Default::default()
         };
-        let envelope = super::DurableSuspensionEnvelope {
+        let envelope = super::DispatchResponseEnvelope {
             invocation_id: "run-1".into(),
             metadata: HashMap::from([("project_id".into(), "project-1".into())]),
             attempt: 2,
@@ -7598,6 +7617,62 @@ mod tests {
                 suspension
             ))
         );
+    }
+
+    #[tokio::test]
+    async fn handler_error_returns_a_fenced_failure_response() {
+        for mode in ["push", "pull"] {
+            let request = crate::pb::DispatchComponentRequest {
+                invocation_id: "run-handler-error".into(),
+                component_name: "broken".into(),
+                component_type: crate::pb::ComponentType::Function as i32,
+                attempt: 2,
+                lease_id: "lease-2".into(),
+                metadata: HashMap::from([("project_id".into(), "project-1".into())]),
+                ..Default::default()
+            };
+            let message = crate::pb::RuntimeMessage {
+                message_data: Some(runtime_message::MessageData::DispatchComponent(request)),
+                ..Default::default()
+            };
+            let (tx, _rx) = flume::unbounded();
+            let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let message = super::execute_runtime_message_for_response(
+                "test-worker",
+                "worker-1",
+                message,
+                tx,
+                |_, _| async {
+                    Err(SdkError::Other(anyhow::anyhow!(
+                        "Python async execution failed: BaseException: escaped"
+                    )))
+                },
+                in_flight.clone(),
+                Default::default(),
+                Default::default(),
+                mode,
+            )
+            .await
+            .expect("handler error must produce a response");
+            assert_eq!(message.worker_id, "worker-1");
+            let Some(service_message::MessageType::FunctionResponse(response)) =
+                message.message_type
+            else {
+                panic!("expected function response");
+            };
+            assert!(!response.success);
+            assert_eq!(response.invocation_id, "run-handler-error");
+            assert_eq!(response.event_type, "run.failed");
+            assert_eq!(response.attempt, 2);
+            assert_eq!(response.lease_id, "lease-2");
+            assert!(response.error_message.contains("BaseException: escaped"));
+            assert_eq!(response.metadata.get("project_id").unwrap(), "project-1");
+            assert_eq!(
+                response.metadata.get("error_code").unwrap(),
+                "HANDLER_ERROR"
+            );
+            assert_eq!(in_flight.load(std::sync::atomic::Ordering::Relaxed), 0);
+        }
     }
 
     #[test]
