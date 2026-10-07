@@ -467,7 +467,6 @@ async fn unix_sigterm_drains_accepted_pull_work_in_a_child_process() {
         ])
         .env("AGNT5_TEST_PULL_SIGTERM_CHILD", "1")
         .env("AGNT5_WORKER_MODE", "pull")
-        .env("OTEL_SDK_DISABLED", "true")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
