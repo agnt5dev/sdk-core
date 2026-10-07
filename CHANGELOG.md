@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.9 - 2026-10-07
+
+### Maintenance
+
+- Remove an unused telemetry environment setting from the shutdown test. Runtime behavior is unchanged from 0.3.8, including fenced failure responses for escaped worker handler errors.
+
 ## 0.3.8 - 2026-10-06
 
 ### Fixed
