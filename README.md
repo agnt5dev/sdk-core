@@ -1,6 +1,11 @@
+<p align="center">
+  <a href="https://agnt5.com"><img src="https://agnt5.com/images/github/github-repo-sdk-banner.png" alt="AGNT5: the reliable platform for AI agents and workflows" width="100%"></a>
+</p>
+
 # AGNT5 SDK Core
 
-[![CI](https://github.com/agnt5dev/agnt5/actions/workflows/runtime-ci.yml/badge.svg)](https://github.com/agnt5dev/agnt5/actions/workflows/runtime-ci.yml)
+[![crates.io](https://img.shields.io/crates/v/agnt5-sdk-core)](https://crates.io/crates/agnt5-sdk-core)
+[![docs.rs](https://img.shields.io/docsrs/agnt5-sdk-core)](https://docs.rs/agnt5-sdk-core)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 `agnt5-sdk-core` is the shared Rust foundation for the AGNT5 language SDKs. It
