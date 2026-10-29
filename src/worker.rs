@@ -2262,6 +2262,19 @@ async fn complete_or_forward_parked_response(
     true
 }
 
+/// Lease a pull worker asks for on each claimed job when
+/// `AGNT5_CLAIM_TIMEOUT_MS` isn't set. A live worker renews at half the lease,
+/// so this mostly sets how long a crashed worker's runs wait before another
+/// worker takes them: about a minute rather than five.
+const DEFAULT_CLAIM_TIMEOUT_MS: i64 = 60_000;
+
+fn claim_timeout_ms_from(configured: Option<&str>) -> i64 {
+    configured
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_CLAIM_TIMEOUT_MS)
+}
+
 fn active_lease_renew_interval_ms(lease_timeout_ms: i64) -> u64 {
     let timeout_ms = lease_timeout_ms.max(2) as u64;
     (timeout_ms / 2).clamp(1, 60_000)
@@ -6107,11 +6120,8 @@ impl Worker {
             .min(100);
         let configured_min_slots = env_usize("AGNT5_MIN_SLOTS").unwrap_or(1);
         let min_slots = configured_min_slots.clamp(1, max_slots);
-        let claim_timeout_ms = std::env::var("AGNT5_CLAIM_TIMEOUT_MS")
-            .ok()
-            .and_then(|s| s.parse::<i64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(300_000);
+        let claim_timeout_ms =
+            claim_timeout_ms_from(std::env::var("AGNT5_CLAIM_TIMEOUT_MS").ok().as_deref());
         let retire_empty_polls = env_usize("AGNT5_SLOT_RETIRE_EMPTY_POLLS")
             .filter(|v| *v > 0)
             .unwrap_or(2);
@@ -7817,6 +7827,20 @@ mod tests {
             }
             _ => panic!("expected entity-state save result"),
         }
+    }
+
+    #[test]
+    fn a_crashed_worker_holds_its_jobs_for_a_minute_by_default() {
+        use super::{active_lease_renew_interval_ms, claim_timeout_ms_from};
+        assert_eq!(claim_timeout_ms_from(None), 60_000);
+        assert_eq!(claim_timeout_ms_from(Some("not-a-number")), 60_000);
+        assert_eq!(claim_timeout_ms_from(Some("0")), 60_000);
+        assert_eq!(claim_timeout_ms_from(Some("120000")), 120_000);
+        // A live worker renews twice inside the default lease.
+        assert_eq!(
+            active_lease_renew_interval_ms(claim_timeout_ms_from(None)),
+            30_000
+        );
     }
 
     #[tokio::test]
