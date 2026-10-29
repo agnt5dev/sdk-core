@@ -2093,15 +2093,24 @@ async fn complete_polled_job<S: CompleteJobSender>(
 }
 
 /// Turn a completion the runtime refused into a failure for the same lease
-/// and attempt. The refused request wrote nothing, so the held lifecycle
-/// records still ride along. The failure is final: running the run again
-/// produces the same result and the same refusal.
+/// and attempt. Keep the held lifecycle records, but discard the checkpoint
+/// that made the pause too large: copying it into the failure would make the
+/// failure too large as well. The failure is final because rerunning would
+/// produce the same result and refusal.
 fn refused_result_failure(mut request: CompleteJobRequest, refusal: &str) -> CompleteJobRequest {
     request.success = false;
     request.output_data = Vec::new();
     request.error_code = REFUSED_RESULT_ERROR_CODE.to_string();
     request.error_message = format!("The runtime could not save this run's result: {refusal}");
     request.metadata.remove("completion_event_type");
+    for key in [
+        "completed_steps",
+        "step_events",
+        "workflow_state",
+        "checkpoint_state",
+    ] {
+        request.metadata.remove(key);
+    }
     request
         .metadata
         .insert("error_type".to_string(), "ResultRefused".to_string());
@@ -7963,6 +7972,55 @@ mod tests {
 
         assert!(matches!(error, SdkError::InvalidArgument { .. }));
         assert_eq!(sender.requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn refused_pause_failure_fits_without_the_rejected_checkpoint() {
+        for checkpoint_key in [
+            "completed_steps",
+            "step_events",
+            "workflow_state",
+            "checkpoint_state",
+        ] {
+            let mut request = paused_completion_request();
+            request
+                .metadata
+                .insert(checkpoint_key.to_string(), "x".repeat(1_048_576));
+            request
+                .metadata
+                .insert("project_id".to_string(), "project-1".to_string());
+            let mut sender = ScriptedCompleteJobSender {
+                outcomes: VecDeque::from([
+                    Err(record_limit_refusal()),
+                    Ok(CompleteJobResponse {
+                        acknowledged: true,
+                        ..Default::default()
+                    }),
+                ]),
+                requests: Vec::new(),
+            };
+
+            complete_polled_job(&mut sender, request)
+                .await
+                .expect("the bounded failure should be acknowledged");
+
+            let failure = &sender.requests[1];
+            let metadata_bytes: usize = failure
+                .metadata
+                .iter()
+                .map(|(key, value)| key.len() + value.len())
+                .sum();
+            assert!(
+                metadata_bytes < 4096,
+                "fallback still carries {metadata_bytes} bytes after refusing {checkpoint_key}"
+            );
+            assert_eq!(
+                failure.metadata.get("project_id").map(String::as_str),
+                Some("project-1")
+            );
+            assert_eq!(failure.lease_id, "lease-7");
+            assert_eq!(failure.attempt, Some(0));
+        }
     }
 
     #[tokio::test]
