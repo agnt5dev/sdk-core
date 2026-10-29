@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Changed
+
+- Lower the default pull lease from 5 minutes to 60 seconds (`AGNT5_CLAIM_TIMEOUT_MS`). A live worker renews at half the lease, so only a crashed worker's runs see the difference: another worker takes them after about a minute instead of five. Set `AGNT5_CLAIM_TIMEOUT_MS`, or `claim_timeout_ms` / `claimTimeoutMs` on the worker, to keep the old value.
+
+## Unreleased
+
 ### Fixed
 
 - Fail a pull run with `RESULT_REFUSED` when the runtime refuses its result, for example a pause record over the 1 MB journal record limit. Previously the worker sent the same refused completion three times, gave up, and left the run `assigned` with the error only in the worker log, so Studio kept showing an approval nobody could answer. The failure carries the runtime's reason, keeps the lease, attempt and held lifecycle records, and is not retried, because a rerun produces the same result. A completion the runtime refuses is no longer resent; connection errors and timeouts still retry as before.
