@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Fail a pull run with `RESULT_REFUSED` when the runtime refuses its result, for example a pause record over the 1 MB journal record limit. Previously the worker sent the same refused completion three times, gave up, and left the run `assigned` with the error only in the worker log, so Studio kept showing an approval nobody could answer. The failure carries the runtime's reason, keeps the lease, attempt and held lifecycle records, and is not retried, because a rerun produces the same result. A completion the runtime refuses is no longer resent; connection errors and timeouts still retry as before.
+
 ## 0.3.9 - 2026-10-07
 
 ### Maintenance

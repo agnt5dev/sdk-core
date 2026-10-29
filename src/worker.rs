@@ -31,6 +31,7 @@ const PARKED_COMPLETION_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 const PARKED_COMPLETE_JOB_ATTEMPTS: usize = 3;
 const PARKED_COMPLETE_JOB_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 const PARKED_COMPLETE_JOB_RETRY_DELAY: Duration = Duration::from_millis(100);
+const REFUSED_RESULT_ERROR_CODE: &str = "RESULT_REFUSED";
 // One budget for all received pull assignments and their terminal acknowledgements.
 // Leave cleanup time inside the operator's default 30 seconds after preStop.
 const PULL_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(25);
@@ -1727,7 +1728,7 @@ async fn parked_runtime_service_response<S: EntityStateSender>(
 
 async fn complete_job_with_retry<S: CompleteJobSender>(
     sender: &mut S,
-    request: CompleteJobRequest,
+    request: &CompleteJobRequest,
     attempts: usize,
     attempt_timeout: Duration,
     retry_delay: Duration,
@@ -1746,6 +1747,9 @@ async fn complete_job_with_retry<S: CompleteJobSender>(
                     "CompleteJob was not acknowledged for job {job_id}"
                 )));
             }
+            // The runtime refused this request, so sending it again gets the
+            // same answer.
+            Ok(Err(error @ SdkError::InvalidArgument { .. })) => return Err(error),
             Ok(Err(error)) => {
                 last_error = Some(error);
             }
@@ -2042,15 +2046,7 @@ async fn complete_polled_job_with_client(
         completion,
         lifecycle_records,
     );
-    match complete_job_with_retry(
-        client,
-        request,
-        PARKED_COMPLETE_JOB_ATTEMPTS,
-        PARKED_COMPLETE_JOB_ATTEMPT_TIMEOUT,
-        PARKED_COMPLETE_JOB_RETRY_DELAY,
-    )
-    .await
-    {
+    match complete_polled_job(client, request).await {
         Ok(()) => {
             debug!("CompleteJob succeeded: job_id={}", job_id);
             Ok(())
@@ -2060,6 +2056,68 @@ async fn complete_polled_job_with_client(
             Err(e)
         }
     }
+}
+
+/// Send a polled job's completion. When the runtime refuses a run's result,
+/// for example a pause record over the journal record limit, the run fails
+/// with the runtime's reason instead. Otherwise it would stay assigned with no
+/// error anywhere but the worker log.
+async fn complete_polled_job<S: CompleteJobSender>(
+    sender: &mut S,
+    request: CompleteJobRequest,
+) -> Result<()> {
+    let refusal = match complete_job_with_retry(
+        sender,
+        &request,
+        PARKED_COMPLETE_JOB_ATTEMPTS,
+        PARKED_COMPLETE_JOB_ATTEMPT_TIMEOUT,
+        PARKED_COMPLETE_JOB_RETRY_DELAY,
+    )
+    .await
+    {
+        Err(SdkError::InvalidArgument { message, .. }) if request.success => message,
+        outcome => return outcome,
+    };
+    warn!(
+        "Runtime refused the result of job_id={}; failing the run: {}",
+        request.job_id, refusal
+    );
+    complete_job_with_retry(
+        sender,
+        &refused_result_failure(request, &refusal),
+        PARKED_COMPLETE_JOB_ATTEMPTS,
+        PARKED_COMPLETE_JOB_ATTEMPT_TIMEOUT,
+        PARKED_COMPLETE_JOB_RETRY_DELAY,
+    )
+    .await
+}
+
+/// Turn a completion the runtime refused into a failure for the same lease
+/// and attempt. Keep the held lifecycle records, but discard the checkpoint
+/// that made the pause too large: copying it into the failure would make the
+/// failure too large as well. The failure is final because rerunning would
+/// produce the same result and refusal.
+fn refused_result_failure(mut request: CompleteJobRequest, refusal: &str) -> CompleteJobRequest {
+    request.success = false;
+    request.output_data = Vec::new();
+    request.error_code = REFUSED_RESULT_ERROR_CODE.to_string();
+    request.error_message = format!("The runtime could not save this run's result: {refusal}");
+    request.metadata.remove("completion_event_type");
+    for key in [
+        "completed_steps",
+        "step_events",
+        "workflow_state",
+        "checkpoint_state",
+    ] {
+        request.metadata.remove(key);
+    }
+    request
+        .metadata
+        .insert("error_type".to_string(), "ResultRefused".to_string());
+    request
+        .metadata
+        .insert("workerless_retryable".to_string(), "false".to_string());
+    request
 }
 
 async fn complete_or_forward_parked_response(
@@ -6397,7 +6455,7 @@ mod tests {
         activation_definition_configs, active_lease_danger_retry_ms,
         active_lease_renew_interval_ms, active_lease_renew_interval_with_jitter_ms,
         await_checkpoint_ack, canonical_activation_component_config,
-        complete_job_request_from_polled_completion, complete_job_with_retry,
+        complete_job_request_from_polled_completion, complete_job_with_retry, complete_polled_job,
         deployment_artifact_sha256, durable_suspension_service_message, execution_is_revoked,
         is_cancelled_worker_response, is_parked_worker_session_registration_rejection,
         is_terminal_worker_response, is_worker_session_refresh_required_error,
@@ -7790,7 +7848,7 @@ mod tests {
 
         complete_job_with_retry(
             &mut sender,
-            request,
+            &request,
             3,
             std::time::Duration::from_millis(50),
             std::time::Duration::ZERO,
@@ -7803,6 +7861,166 @@ mod tests {
             .requests
             .iter()
             .all(|request| request.lease_id == "lease-7" && request.attempt == Some(7)));
+    }
+
+    fn record_limit_refusal() -> SdkError {
+        SdkError::InvalidArgument {
+            message: "journal record exceeds the 1048576 byte beta limit (got 2132347 bytes); \
+                      store large payloads by reference"
+                .to_string(),
+            argument: None,
+        }
+    }
+
+    fn paused_completion_request() -> CompleteJobRequest {
+        CompleteJobRequest {
+            job_id: "run-1".to_string(),
+            success: true,
+            output_data: vec![b'x'; 64],
+            lease_id: "lease-7".to_string(),
+            attempt: Some(0),
+            metadata: HashMap::from([
+                (
+                    "completion_event_type".to_string(),
+                    "workflow.paused".to_string(),
+                ),
+                ("max_attempts".to_string(), "3".to_string()),
+            ]),
+            lifecycle_records: vec![crate::pb::Record {
+                event_type: "workflow.step.paused".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn parked_completion_does_not_resend_a_refused_request() {
+        let mut sender = ScriptedCompleteJobSender {
+            outcomes: VecDeque::from([Err(record_limit_refusal())]),
+            requests: Vec::new(),
+        };
+
+        let error = complete_job_with_retry(
+            &mut sender,
+            &paused_completion_request(),
+            3,
+            std::time::Duration::from_millis(50),
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect_err("a refused request should fail");
+
+        assert!(matches!(error, SdkError::InvalidArgument { .. }));
+        assert_eq!(sender.requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn refused_result_fails_the_run_for_good() {
+        let mut sender = ScriptedCompleteJobSender {
+            outcomes: VecDeque::from([
+                Err(record_limit_refusal()),
+                Ok(CompleteJobResponse {
+                    acknowledged: true,
+                    ..Default::default()
+                }),
+            ]),
+            requests: Vec::new(),
+        };
+
+        complete_polled_job(&mut sender, paused_completion_request())
+            .await
+            .expect("the failure should be acknowledged");
+
+        assert_eq!(sender.requests.len(), 2);
+        let failure = &sender.requests[1];
+        assert!(!failure.success);
+        assert!(failure.output_data.is_empty());
+        assert_eq!(failure.error_code, "RESULT_REFUSED");
+        assert!(failure
+            .error_message
+            .contains("exceeds the 1048576 byte beta limit"));
+        assert_eq!(
+            failure.metadata.get("error_type").map(String::as_str),
+            Some("ResultRefused")
+        );
+        assert_eq!(
+            failure
+                .metadata
+                .get("workerless_retryable")
+                .map(String::as_str),
+            Some("false")
+        );
+        assert!(!failure.metadata.contains_key("completion_event_type"));
+        assert_eq!(failure.lease_id, "lease-7");
+        assert_eq!(failure.attempt, Some(0));
+        assert_eq!(failure.lifecycle_records.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn refused_failure_is_not_replaced() {
+        let mut sender = ScriptedCompleteJobSender {
+            outcomes: VecDeque::from([Err(record_limit_refusal())]),
+            requests: Vec::new(),
+        };
+        let mut request = paused_completion_request();
+        request.success = false;
+
+        let error = complete_polled_job(&mut sender, request)
+            .await
+            .expect_err("a refused failure should surface");
+
+        assert!(matches!(error, SdkError::InvalidArgument { .. }));
+        assert_eq!(sender.requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn refused_pause_failure_fits_without_the_rejected_checkpoint() {
+        for checkpoint_key in [
+            "completed_steps",
+            "step_events",
+            "workflow_state",
+            "checkpoint_state",
+        ] {
+            let mut request = paused_completion_request();
+            request
+                .metadata
+                .insert(checkpoint_key.to_string(), "x".repeat(1_048_576));
+            request
+                .metadata
+                .insert("project_id".to_string(), "project-1".to_string());
+            let mut sender = ScriptedCompleteJobSender {
+                outcomes: VecDeque::from([
+                    Err(record_limit_refusal()),
+                    Ok(CompleteJobResponse {
+                        acknowledged: true,
+                        ..Default::default()
+                    }),
+                ]),
+                requests: Vec::new(),
+            };
+
+            complete_polled_job(&mut sender, request)
+                .await
+                .expect("the bounded failure should be acknowledged");
+
+            let failure = &sender.requests[1];
+            let metadata_bytes: usize = failure
+                .metadata
+                .iter()
+                .map(|(key, value)| key.len() + value.len())
+                .sum();
+            assert!(
+                metadata_bytes < 4096,
+                "fallback still carries {metadata_bytes} bytes after refusing {checkpoint_key}"
+            );
+            assert_eq!(
+                failure.metadata.get("project_id").map(String::as_str),
+                Some("project-1")
+            );
+            assert_eq!(failure.lease_id, "lease-7");
+            assert_eq!(failure.attempt, Some(0));
+        }
     }
 
     #[tokio::test]

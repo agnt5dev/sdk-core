@@ -1128,6 +1128,15 @@ impl WorkerCoordinatorClient {
             .await
             .map_err(|e| {
                 error!("CompleteJob RPC failed: {}", e);
+                // The runtime refused the request itself, for example a result
+                // over the journal record limit. Keep that apart from a lost
+                // connection so the caller stops resending it.
+                if e.code() == tonic::Code::InvalidArgument {
+                    return SdkError::InvalidArgument {
+                        message: e.message().to_string(),
+                        argument: None,
+                    };
+                }
                 SdkError::Connection {
                     message: format!("CompleteJob failed: {}", e),
                     code: crate::error::ErrorCode::ConnectionFailed,
