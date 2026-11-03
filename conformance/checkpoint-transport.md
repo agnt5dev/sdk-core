@@ -49,6 +49,9 @@ callers receive only the outcome of their own group. Rejections retain their
 structured status, and retries retain identical records. Timeout, malformed ACK
 or another uncertain persistence failure blocks later writes and activation
 flushes for that execution until normal run recovery. No timeout implies success.
+Push lease renewal stops when an uncertain execution is blocked, so a suppressed
+response cannot leave its lease renewing indefinitely. Checkpoint waiters retain
+their original error instead of being cancelled by the language hook.
 
 The gated `worker::checkpoint_contract_tests` exercise the real worker interface
 and gRPC transport. They cover shared ACKs, prefix and explicit-barrier ordering,

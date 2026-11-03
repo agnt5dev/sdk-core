@@ -787,6 +787,83 @@ async fn acknowledged_checkpoint_preserves_subtenant_and_event_identity() {
     server.abort();
 }
 
+#[tokio::test]
+async fn uncertain_push_checkpoint_stops_lease_renewal_without_masking_timeout() {
+    let (mut worker, mut calls, _, server) = gated_worker().await;
+    worker
+        .metadata
+        .insert("dispatch_mode".into(), "push".into());
+    let client = WorkerCoordinatorClient::connect(worker.config.coordinator_endpoint.clone())
+        .await
+        .unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    worker
+        .lease_renewal_stops
+        .lock()
+        .unwrap()
+        .insert("run".into(), stop);
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancelled_by_hook = cancelled.clone();
+    worker.set_cancel_hook(move |_| {
+        cancelled_by_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    let renewal = spawn_active_lease_renewal(
+        client,
+        ActiveLeaseAuthority {
+            worker_id: "worker".into(),
+            project_id: "project".into(),
+            deployment_id: "deployment".into(),
+            run_id: "run".into(),
+            lease_id: "lease".into(),
+            attempt: 0,
+            lease_timeout_ms: 60_000,
+            lease_expires_at_ms: current_time_ms() + 60_000,
+            session: ActiveLeaseSession::Push,
+        },
+        worker.revoked_executions.clone(),
+        worker.cancel_tokens.clone(),
+        worker.cancel_hook.clone(),
+        stopped,
+    )
+    .unwrap();
+    let emitter = worker.clone();
+    let checkpoint = tokio::spawn(async move {
+        emitter
+            .emit_checkpoint_sync(
+                "run:child".into(),
+                "function.started".into(),
+                b"{}".to_vec(),
+                1,
+                HashMap::new(),
+                1,
+                20,
+            )
+            .await
+    });
+    let pending = next_append(&mut calls).await;
+    assert!(matches!(
+        checkpoint.await.unwrap().unwrap_err(),
+        SdkError::Timeout { .. }
+    ));
+    assert!(
+        !cancelled.load(std::sync::atomic::Ordering::SeqCst),
+        "original checkpoint failure must reach its waiter"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), renewal)
+            .await
+            .is_ok(),
+        "revoked push execution must stop renewing so its lease can expire for recovery"
+    );
+    assert!(!worker
+        .lease_renewal_stops
+        .lock()
+        .unwrap()
+        .contains_key("run"));
+    drop(pending);
+    server.abort();
+}
+
 #[derive(Clone, Default)]
 struct RecordingEngine(Arc<std::sync::Mutex<Vec<Record>>>);
 

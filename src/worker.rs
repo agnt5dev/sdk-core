@@ -3860,6 +3860,9 @@ impl Worker {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(run_id.to_string());
+                // A revoked push response is suppressed, so normal response
+                // cleanup cannot stop renewal. Let the lease expire for recovery.
+                self.stop_execution_lease_renewal(run_id);
             }
         }
         result
