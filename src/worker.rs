@@ -309,58 +309,9 @@ impl Drop for WorkerSlotPhaseGuard {
     }
 }
 
-/// Per-run ordering barriers for journal flushes and acknowledged checkpoints.
-/// Cross-run ordering is not part of the journal contract, so unrelated runs
-/// must not share a network-duration critical section.
-#[derive(Clone, Default)]
-struct RunFlushLocks {
-    locks: Arc<std::sync::Mutex<HashMap<String, std::sync::Weak<TokioMutex<()>>>>>,
-}
-
-impl RunFlushLocks {
-    fn lock_for_run(&self, run_id: &str) -> Arc<TokioMutex<()>> {
-        let mut locks = match self.locks.lock() {
-            Ok(locks) => locks,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-
-        if let Some(lock) = locks.get(run_id).and_then(std::sync::Weak::upgrade) {
-            return lock;
-        }
-
-        // Weak entries let completed runs disappear without coordinating a
-        // cleanup with the final guard. Compact stale keys opportunistically.
-        if locks.len() >= 4096 {
-            locks.retain(|_, lock| lock.strong_count() > 0);
-        }
-
-        let lock = Arc::new(TokioMutex::new(()));
-        locks.insert(run_id.to_string(), Arc::downgrade(&lock));
-        lock
-    }
-
-    async fn lock_run(&self, run_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
-        self.lock_for_run(run_id).lock_owned().await
-    }
-
-    async fn lock_runs<I>(&self, run_ids: I) -> Vec<tokio::sync::OwnedMutexGuard<()>>
-    where
-        I: IntoIterator<Item = String>,
-    {
-        let mut run_ids: Vec<_> = run_ids.into_iter().collect();
-        run_ids.sort_unstable();
-        run_ids.dedup();
-        let locks: Vec<_> = run_ids
-            .iter()
-            .map(|run_id| self.lock_for_run(run_id))
-            .collect();
-        let mut guards = Vec::with_capacity(locks.len());
-        for lock in locks {
-            guards.push(lock.lock_owned().await);
-        }
-        guards
-    }
-}
+#[path = "checkpoint_writer.rs"]
+mod checkpoint_writer;
+use checkpoint_writer::{CheckpointWrite, RunFlushLocks};
 
 async fn await_checkpoint_ack<F, T>(
     future: F,
@@ -3345,6 +3296,12 @@ impl Worker {
     /// hold for any later lifecycle records.
     pub async fn flush_run_events_before_durable_write(&self, run_id: &str) -> Result<()> {
         let _flush_guard = self.journal_flush_locks.lock_run(run_id).await;
+        let authority_run_id = run_id.split(':').next().unwrap_or(run_id);
+        if execution_is_revoked(&self.revoked_executions, authority_run_id) {
+            return Err(SdkError::Internal(format!(
+                "execution authority was revoked for run_id={authority_run_id}"
+            )));
+        }
         let pending = self.journal_queue.drain_run_events(run_id);
         if pending.is_empty() {
             return Ok(());
@@ -3783,10 +3740,12 @@ impl Worker {
         self.journal_queue.release_run(run_id);
     }
 
-    /// Emit a checkpoint event synchronously and wait for acknowledgement.
+    /// Persist a checkpoint and await the Engine's durability acknowledgement.
     ///
-    /// Sends a WriteCheckpoint unary RPC directly to the Execution Engine.
-    /// The RPC response serves as the acknowledgement — no stream round-trip needed.
+    /// Compatible lifecycle records already waiting in this run may share an
+    /// ordered AppendBatch. Each caller still waits for its own acknowledged
+    /// records, including in pull mode. Flush and completion barriers retain
+    /// their place in the same per-run ordering queue.
     ///
     /// # Arguments
     ///
@@ -3811,6 +3770,268 @@ impl Worker {
         source_timestamp_ns: i64,
         timeout_ms: u64,
     ) -> Result<()> {
+        if !JournalEventMessage::is_checkpoint_event_type(&event_type) {
+            return self
+                .emit_checkpoint_direct(
+                    run_id,
+                    event_type,
+                    event_data,
+                    sequence_number,
+                    metadata,
+                    source_timestamp_ns,
+                    timeout_ms,
+                )
+                .await;
+        }
+        let authority_run_id = run_id.split(':').next().unwrap_or(&run_id);
+        if execution_is_revoked(&self.revoked_executions, authority_run_id) {
+            return Err(SdkError::Internal(format!(
+                "execution authority was revoked for run_id={authority_run_id}"
+            )));
+        }
+        if event_type == "run.started" {
+            self.mark_execution_started(&run_id);
+        }
+        let mut merged = self.metadata_for_request(metadata);
+        let project_id = canonical_project_id_from_metadata(&merged).unwrap_or_default();
+        merged = with_project_metadata(merged, &project_id);
+        let mut compatibility = merged.clone();
+        for key in ["cid", "pcid", "correlation_id", "parent_correlation_id"] {
+            compatibility.remove(key);
+        }
+        let (cid, pcid) = take_correlation_ids(&mut merged);
+        let project_id = merged
+            .remove("project_id")
+            .or_else(|| merged.remove("tenant_id"))
+            .unwrap_or_default();
+        let batchable = ["function.", "agent.", "tool_call.", "lm.", "sandbox."]
+            .iter()
+            .any(|prefix| event_type.starts_with(prefix));
+        let record = client::build_engine_record(
+            project_id,
+            run_id,
+            event_type,
+            event_data,
+            source_timestamp_ns,
+            String::new(),
+            cid,
+            pcid,
+            merged,
+        );
+        self.journal_flush_locks
+            .checkpoint(
+                self,
+                CheckpointWrite {
+                    record,
+                    timeout_ms,
+                    sequence: sequence_number,
+                    batch_size: self.journal_queue.batch_size(),
+                    batchable,
+                    compatibility,
+                    queued_at: Instant::now(),
+                },
+            )
+            .await
+    }
+
+    async fn persist_checkpoint_writes(&self, writes: &[&CheckpointWrite]) -> Result<()> {
+        use futures::FutureExt;
+        let result = std::panic::AssertUnwindSafe(self.persist_checkpoint_group(writes))
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| {
+                Err(SdkError::Internal(
+                    "checkpoint writer panicked; persistence outcome is unknown".into(),
+                ))
+            });
+        if let Err(error) = &result {
+            *self.engine_client.lock().await = None;
+            if journal_append_error_is_retryable(error) || matches!(error, SdkError::Internal(_)) {
+                let run_id = writes[0]
+                    .record
+                    .run_id
+                    .split(':')
+                    .next()
+                    .unwrap_or(&writes[0].record.run_id);
+                // Keep later writes behind an uncertain durable prefix. Return
+                // the original error to waiters rather than cancelling them
+                // through the language hook before they receive that error.
+                self.revoked_executions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(run_id.to_string());
+                // A revoked push response is suppressed, so normal response
+                // cleanup cannot stop renewal. Let the lease expire for recovery.
+                self.stop_execution_lease_renewal(run_id);
+            }
+        }
+        result
+    }
+
+    async fn persist_checkpoint_group(&self, writes: &[&CheckpointWrite]) -> Result<()> {
+        let first = writes[0];
+        let run_id = &first.record.run_id;
+        let queue_wait_ms = first.queued_at.elapsed().as_secs_f64() * 1000.0;
+        let authority_run_id = run_id.split(':').next().unwrap_or(run_id);
+        if execution_is_revoked(&self.revoked_executions, authority_run_id) {
+            return Err(SdkError::Internal(format!(
+                "execution authority was revoked for run_id={authority_run_id}"
+            )));
+        }
+        let mut engine = self.ensure_engine_client().await?.ok_or_else(|| {
+            SdkError::Internal("Engine client is required for acknowledged checkpoints".into())
+        })?;
+        let metadata = HashMap::from([("project_id".to_string(), first.record.project_id.clone())]);
+        let prefix_started = Instant::now();
+        self.flush_checkpoint_prefix(&mut engine, run_id, &first.record.event_type, &metadata)
+            .await?;
+        let prefix_flush_ms = prefix_started.elapsed().as_secs_f64() * 1000.0;
+        let started = Instant::now();
+        debug!(
+            run_id,
+            count = writes.len(),
+            queue_wait_ms,
+            prefix_flush_ms,
+            "Persisting acknowledged checkpoint group"
+        );
+        let operation = if writes.len() == 1 {
+            "Engine.Append"
+        } else {
+            "Engine.AppendBatch"
+        };
+        let result = await_checkpoint_ack(
+            async {
+                if writes.len() == 1 {
+                    engine.append(first.record.clone()).await.map(|_| ())
+                } else {
+                    engine
+                        .append_batch(writes.iter().map(|write| write.record.clone()).collect())
+                        .await
+                        .map(|_| ())
+                }
+            },
+            first.timeout_ms,
+            operation,
+            run_id,
+            &first.record.event_type,
+            first.sequence,
+        )
+        .await
+        .and_then(|result| result);
+        for write in writes {
+            crate::telemetry::record_checkpoint(
+                &write.record.event_type,
+                started.elapsed().as_secs_f64(),
+                result.is_ok(),
+                write
+                    .record
+                    .metadata
+                    .get("experiment_id")
+                    .map(String::as_str),
+            );
+        }
+        if result.is_ok()
+            && (first.record.event_type == "run.completed"
+                || first.record.event_type == "run.failed")
+        {
+            self.cleanup_run_tracking(run_id);
+        }
+        result
+    }
+
+    async fn flush_checkpoint_prefix(
+        &self,
+        engine: &mut EngineClient,
+        run_id: &str,
+        event_type: &str,
+        metadata: &HashMap<String, String>,
+    ) -> Result<()> {
+        let pending = self.journal_queue.drain_run_events(&run_id);
+        if !pending.is_empty() {
+            let tenant_id = self
+                .routing_value_for_metadata("project_id", &metadata)
+                .unwrap_or_default();
+            let transient: Vec<_> = pending
+                .iter()
+                .filter(|event| event.is_sse_only)
+                .map(|event| EventStreamMessage {
+                    run_id: event.run_id.clone(),
+                    event_type: event.event_type.clone(),
+                    data: event.data.clone(),
+                    trace_id: event.correlation_id.clone(),
+                    span_id: event.parent_correlation_id.clone(),
+                    project_id: self
+                        .routing_value_for_metadata("project_id", &event.metadata)
+                        .unwrap_or_else(|| tenant_id.clone()),
+                    source_timestamp_ns: event.source_timestamp_ns,
+                    worker_id: self.config.worker_id.clone(),
+                })
+                .collect();
+            let durable_records: Vec<_> = pending
+                .iter()
+                .filter(|event| !event.is_sse_only)
+                .map(|e| {
+                    client::build_engine_record(
+                        tenant_id.clone(),
+                        e.run_id.clone(),
+                        e.event_type.clone(),
+                        e.data.clone(),
+                        e.source_timestamp_ns,
+                        String::new(),
+                        e.correlation_id.clone(),
+                        e.parent_correlation_id.clone(),
+                        self.metadata_for_request(e.metadata.clone()),
+                    )
+                })
+                .collect();
+            if let Err(error) = engine.stream_events(transient).await {
+                for event in pending.into_iter().rev() {
+                    self.journal_queue.push_front(event).ok();
+                }
+                self.journal_queue.record_error();
+                let mut guard = self.engine_client.lock().await;
+                *guard = None;
+                return Err(error);
+            }
+            if !durable_records.is_empty() {
+                if let Err(error) = engine.append_batch(durable_records).await {
+                    let durable_count = pending.iter().filter(|event| !event.is_sse_only).count();
+                    if journal_append_error_is_retryable(&error) {
+                        for event in pending.into_iter().rev().filter(|event| !event.is_sse_only) {
+                            self.journal_queue.push_front(event).ok();
+                        }
+                    } else {
+                        warn!(
+                            "Engine permanently rejected {} queued durable events for run_id={}; dropping them: {}",
+                            durable_count, run_id, error
+                        );
+                    }
+                    self.journal_queue.record_error();
+                    let mut guard = self.engine_client.lock().await;
+                    *guard = None;
+                    return Err(error);
+                }
+            }
+            debug!(
+                "Engine: flushed {} events before {} for run_id={}",
+                pending.len(),
+                event_type,
+                run_id
+            );
+        }
+        Ok(())
+    }
+
+    async fn emit_checkpoint_direct(
+        &self,
+        run_id: String,
+        event_type: String,
+        event_data: Vec<u8>,
+        sequence_number: i64,
+        metadata: HashMap<String, String>,
+        source_timestamp_ns: i64,
+        timeout_ms: u64,
+    ) -> Result<()> {
         let authority_run_id = run_id.split(':').next().unwrap_or(&run_id);
         if execution_is_revoked(&self.revoked_executions, authority_run_id) {
             return Err(SdkError::Internal(format!(
@@ -3822,98 +4043,14 @@ impl Worker {
         }
         let is_terminal = event_type == "run.completed" || event_type == "run.failed";
         let is_durable_checkpoint = JournalEventMessage::is_checkpoint_event_type(&event_type);
-        // A durable checkpoint is an ordering boundary for every transient
-        // event queued before it, not just for run.completed/run.failed.
-        // Holding the same per-run barrier as the periodic flush task prevents
-        // a drained, in-flight batch from being overtaken by the checkpoint.
-        let _journal_flush_guard = if is_durable_checkpoint {
-            Some(self.journal_flush_locks.lock_run(&run_id).await)
-        } else {
-            None
-        };
-
         // ── Engine path: when AGNT5_ENGINE_URL is set, route directly to engine ──
         if let Some(mut engine) = self.ensure_engine_client().await? {
             // Publish pending transient events through EventStream and persist
             // queued durable boundaries before appending this checkpoint.
             // Both calls are acknowledged while this run's flush barrier is held.
             if is_durable_checkpoint {
-                let pending = self.journal_queue.drain_run_events(&run_id);
-                if !pending.is_empty() {
-                    let tenant_id = self
-                        .routing_value_for_metadata("project_id", &metadata)
-                        .unwrap_or_default();
-                    let transient: Vec<_> = pending
-                        .iter()
-                        .filter(|event| event.is_sse_only)
-                        .map(|event| EventStreamMessage {
-                            run_id: event.run_id.clone(),
-                            event_type: event.event_type.clone(),
-                            data: event.data.clone(),
-                            trace_id: event.correlation_id.clone(),
-                            span_id: event.parent_correlation_id.clone(),
-                            project_id: self
-                                .routing_value_for_metadata("project_id", &event.metadata)
-                                .unwrap_or_else(|| tenant_id.clone()),
-                            source_timestamp_ns: event.source_timestamp_ns,
-                            worker_id: self.config.worker_id.clone(),
-                        })
-                        .collect();
-                    let durable_records: Vec<_> = pending
-                        .iter()
-                        .filter(|event| !event.is_sse_only)
-                        .map(|e| {
-                            client::build_engine_record(
-                                tenant_id.clone(),
-                                e.run_id.clone(),
-                                e.event_type.clone(),
-                                e.data.clone(),
-                                e.source_timestamp_ns,
-                                String::new(),
-                                e.correlation_id.clone(),
-                                e.parent_correlation_id.clone(),
-                                self.metadata_for_request(e.metadata.clone()),
-                            )
-                        })
-                        .collect();
-                    if let Err(error) = engine.stream_events(transient).await {
-                        for event in pending.into_iter().rev() {
-                            self.journal_queue.push_front(event).ok();
-                        }
-                        self.journal_queue.record_error();
-                        let mut guard = self.engine_client.lock().await;
-                        *guard = None;
-                        return Err(error);
-                    }
-                    if !durable_records.is_empty() {
-                        if let Err(error) = engine.append_batch(durable_records).await {
-                            let durable_count =
-                                pending.iter().filter(|event| !event.is_sse_only).count();
-                            if journal_append_error_is_retryable(&error) {
-                                for event in
-                                    pending.into_iter().rev().filter(|event| !event.is_sse_only)
-                                {
-                                    self.journal_queue.push_front(event).ok();
-                                }
-                            } else {
-                                warn!(
-                                    "Engine permanently rejected {} queued durable events for run_id={}; dropping them: {}",
-                                    durable_count, run_id, error
-                                );
-                            }
-                            self.journal_queue.record_error();
-                            let mut guard = self.engine_client.lock().await;
-                            *guard = None;
-                            return Err(error);
-                        }
-                    }
-                    debug!(
-                        "Engine: flushed {} events before {} for run_id={}",
-                        pending.len(),
-                        event_type,
-                        run_id
-                    );
-                }
+                self.flush_checkpoint_prefix(&mut engine, &run_id, &event_type, &metadata)
+                    .await?;
             }
 
             let mut merged_metadata = self.metadata_for_request(metadata);
@@ -4289,6 +4426,14 @@ impl Worker {
             .lock_runs(run_ids.iter().cloned())
             .await;
 
+        for run_id in &run_ids {
+            let authority_run_id = run_id.split(':').next().unwrap_or(run_id);
+            if execution_is_revoked(&self.revoked_executions, authority_run_id) {
+                return Err(SdkError::Internal(format!(
+                    "execution authority was revoked for run_id={authority_run_id}"
+                )));
+            }
+        }
         if let Some(mut engine) = self.ensure_engine_client().await? {
             let worker_metadata = self.effective_metadata();
             // The batch is an ordering boundary just like a single acknowledged
