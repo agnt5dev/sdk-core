@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Batch compatible acknowledged lifecycle checkpoints waiting within one run, reducing cumulative acknowledgment round trips for concurrent work. Preserve pull-mode durability acknowledgments, queued-event ordering, and independent progress across runs.
+- Settle in-flight checkpoint groups independently of caller cancellation, retain structured errors for affected waiters, and block later writes after an uncertain persistence outcome.
+
 ## 0.3.10 - 2026-10-30
 
 ### Changed
