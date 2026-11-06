@@ -676,6 +676,19 @@ impl JournalEventQueue {
         }
     }
 
+    /// Account for an optional log handed to the bounded live stream, or dropped.
+    pub(crate) fn record_best_effort_log(&self, delivered: bool) {
+        if let Ok(mut metrics) = self.metrics.lock() {
+            metrics.events_queued += 1;
+            if delivered {
+                metrics.events_sent += 1;
+                metrics.sse_only_events_sent += 1;
+            } else {
+                metrics.events_dropped += 1;
+            }
+        }
+    }
+
     /// Get current metrics snapshot
     pub fn metrics(&self) -> JournalQueueMetrics {
         self.metrics.lock().map(|m| m.clone()).unwrap_or_default()
