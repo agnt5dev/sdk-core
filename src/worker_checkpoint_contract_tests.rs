@@ -433,39 +433,41 @@ async fn full_log_stream_does_not_block_checkpoint_or_its_ack() {
 
 #[tokio::test]
 async fn explicit_streaming_logs_retain_the_ordered_prefix() {
-    let (worker, mut calls, _, server) = gated_worker().await;
-    worker
-        .streaming_runs
-        .lock()
-        .unwrap()
-        .insert("run".into(), true);
-    let (logs, receiver) = flume::bounded(2);
-    *worker.event_stream_tx.lock().unwrap() = Some(logs);
-    worker
-        .queue_event(JournalEventMessage::new(
-            "run".into(),
-            "log.info".into(),
-            b"ordered".to_vec(),
-        ))
-        .unwrap();
-    assert!(
-        receiver.is_empty(),
-        "streamed logs must not overtake queued output"
-    );
-    assert!(worker.journal_queue.contains_run("run"));
-    assert!(
+    for run in ["run", "run:0"] {
+        let (worker, mut calls, _, server) = gated_worker().await;
         worker
-            .flush_run_events_before_durable_write("run")
-            .await
-            .is_err(),
-        "an unavailable ordered stream must still block the following durable operation"
-    );
-    assert!(
-        worker.journal_queue.contains_run("run"),
-        "unacknowledged prefix is retained"
-    );
-    assert!(calls.try_recv().is_err());
-    server.abort();
+            .streaming_runs
+            .lock()
+            .unwrap()
+            .insert("run".into(), true);
+        let (logs, receiver) = flume::bounded(2);
+        *worker.event_stream_tx.lock().unwrap() = Some(logs);
+        worker
+            .queue_event(JournalEventMessage::new(
+                run.into(),
+                "log.info".into(),
+                b"ordered".to_vec(),
+            ))
+            .unwrap();
+        assert!(
+            receiver.is_empty(),
+            "streamed logs must not overtake queued output"
+        );
+        assert!(worker.journal_queue.contains_run(run));
+        assert!(
+            worker
+                .flush_run_events_before_durable_write(run)
+                .await
+                .is_err(),
+            "an unavailable ordered stream must still block the following durable operation"
+        );
+        assert!(
+            worker.journal_queue.contains_run(run),
+            "unacknowledged prefix is retained"
+        );
+        assert!(calls.try_recv().is_err());
+        server.abort();
+    }
 }
 
 #[tokio::test]

@@ -3509,7 +3509,10 @@ impl Worker {
             && !self
                 .streaming_runs
                 .lock()
-                .map(|runs| runs.get(&event.run_id).copied().unwrap_or(false))
+                .map(|runs| {
+                    let run_id = event.run_id.split(':').next().unwrap_or(&event.run_id);
+                    runs.get(run_id).copied().unwrap_or(false)
+                })
                 .unwrap_or(true)
         {
             // Ordinary request logs are best-effort telemetry. Sending their SSE
