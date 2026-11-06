@@ -374,6 +374,170 @@ async fn queued_prefix_is_acknowledged_before_checkpoint() {
 }
 
 #[tokio::test]
+async fn optional_logs_do_not_require_transport_ack_before_activation() {
+    let (worker, mut calls, persisted, server) = gated_worker().await;
+    let (logs, receiver) = flume::bounded(2);
+    *worker.event_stream_tx.lock().unwrap() = Some(logs);
+    worker
+        .queue_event(JournalEventMessage::new(
+            "run".into(),
+            "log.debug".into(),
+            b"diagnostic".to_vec(),
+        ))
+        .unwrap();
+
+    worker
+        .flush_run_events_before_durable_write("run")
+        .await
+        .expect("optional log delivery must not become an activation prerequisite");
+    let log = receiver
+        .try_recv()
+        .expect("logs remain available to the live stream");
+    assert_eq!(log.event_type, "log.debug");
+    assert_eq!(log.data, b"diagnostic");
+    assert_eq!(log.run_id, "run");
+    assert_eq!(log.project_id, "project");
+    assert!(persisted.lock().unwrap().is_empty());
+    assert!(calls.try_recv().is_err());
+    server.abort();
+}
+
+#[tokio::test]
+async fn full_log_stream_does_not_block_checkpoint_or_its_ack() {
+    let (worker, mut calls, persisted, server) = gated_worker().await;
+    let (logs, receiver) = flume::bounded(1);
+    *worker.event_stream_tx.lock().unwrap() = Some(logs);
+    for message in ["first", "overflow"] {
+        worker
+            .queue_event(JournalEventMessage::new(
+                "run".into(),
+                "log.info".into(),
+                message.as_bytes().to_vec(),
+            ))
+            .unwrap();
+    }
+    let boundary = checkpoint(&worker, "run", 1);
+    let append = next_append(&mut calls).await;
+    assert_eq!(append.records[0].event_type, "function.started");
+    assert!(
+        !boundary.is_finished(),
+        "checkpoint still waits for its own durability ACK"
+    );
+    append.ack.send(Ok(())).unwrap();
+    boundary.await.unwrap().unwrap();
+    assert_eq!(persisted.lock().unwrap().len(), 1);
+    assert_eq!(receiver.len(), 1, "diagnostic transport stays bounded");
+    assert_eq!(worker.journal_queue.metrics().events_dropped, 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn explicit_streaming_logs_retain_the_ordered_prefix() {
+    let (worker, mut calls, _, server) = gated_worker().await;
+    worker
+        .streaming_runs
+        .lock()
+        .unwrap()
+        .insert("run".into(), true);
+    let (logs, receiver) = flume::bounded(2);
+    *worker.event_stream_tx.lock().unwrap() = Some(logs);
+    worker
+        .queue_event(JournalEventMessage::new(
+            "run".into(),
+            "log.info".into(),
+            b"ordered".to_vec(),
+        ))
+        .unwrap();
+    assert!(
+        receiver.is_empty(),
+        "streamed logs must not overtake queued output"
+    );
+    assert!(worker.journal_queue.contains_run("run"));
+    assert!(
+        worker
+            .flush_run_events_before_durable_write("run")
+            .await
+            .is_err(),
+        "an unavailable ordered stream must still block the following durable operation"
+    );
+    assert!(
+        worker.journal_queue.contains_run("run"),
+        "unacknowledged prefix is retained"
+    );
+    assert!(calls.try_recv().is_err());
+    server.abort();
+}
+
+#[tokio::test]
+async fn unavailable_log_stream_does_not_poison_other_runs_or_durable_prefixes() {
+    let (worker, mut calls, _, server) = gated_worker().await;
+    let (logs, receiver) = flume::bounded(1);
+    drop(receiver);
+    *worker.event_stream_tx.lock().unwrap() = Some(logs);
+    for run in ["run-a", "run-b"] {
+        worker
+            .queue_event(JournalEventMessage::new(
+                run.into(),
+                "log.error".into(),
+                b"observational".to_vec(),
+            ))
+            .unwrap();
+    }
+    let prefix =
+        JournalEventMessage::new("run-a".into(), "workflow.started".into(), b"{}".to_vec());
+    worker.queue_event(prefix).unwrap();
+    let flushing = {
+        let worker = worker.clone();
+        tokio::spawn(async move { worker.flush_run_events_before_durable_write("run-a").await })
+    };
+    let pending = next_append(&mut calls).await;
+    assert_eq!(pending.records[0].event_type, "workflow.started");
+    assert!(
+        !flushing.is_finished(),
+        "durable prefix still needs its ACK"
+    );
+    worker
+        .flush_run_events_before_durable_write("run-b")
+        .await
+        .unwrap();
+    pending.ack.send(Ok(())).unwrap();
+    flushing.await.unwrap().unwrap();
+    assert_eq!(worker.journal_queue.metrics().events_dropped, 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn explicitly_durable_log_records_keep_their_ack_barrier() {
+    let (worker, mut calls, persisted, server) = gated_worker().await;
+    worker
+        .queue_checkpoint(
+            "run".into(),
+            "log.info".into(),
+            b"durable record".to_vec(),
+            0,
+            HashMap::new(),
+            1,
+            "log-record".into(),
+            String::new(),
+        )
+        .unwrap();
+    let flushing = {
+        let worker = worker.clone();
+        tokio::spawn(async move { worker.flush_run_events_before_durable_write("run").await })
+    };
+    let pending = next_append(&mut calls).await;
+    assert_eq!(pending.records[0].event_type, "log.info");
+    assert!(
+        !flushing.is_finished(),
+        "durability is independent of event name"
+    );
+    pending.ack.send(Ok(())).unwrap();
+    flushing.await.unwrap().unwrap();
+    assert_eq!(persisted.lock().unwrap().len(), 1);
+    server.abort();
+}
+
+#[tokio::test]
 async fn checkpoint_timeout_fails_all_waiters_and_blocks_later_boundaries() {
     let (worker, mut calls, _, server) = gated_worker().await;
     let first = checkpoint(&worker, "run", 0);

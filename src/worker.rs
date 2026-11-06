@@ -3503,6 +3503,42 @@ impl Worker {
         if event.event_type == "run.started" {
             self.mark_execution_started(&event.run_id);
         }
+        let optional_log = event.is_sse_only
+            && (event.event_type == "log" || event.event_type.starts_with("log."));
+        if optional_log
+            && !self
+                .streaming_runs
+                .lock()
+                .map(|runs| runs.get(&event.run_id).copied().unwrap_or(false))
+                .unwrap_or(true)
+        {
+            // Ordinary request logs are best-effort telemetry. Sending their SSE
+            // copy must not take a run's durability lock or become an activation
+            // prerequisite. Explicit streaming runs keep the ordered flush path.
+            let sender = self
+                .event_stream_tx
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone());
+            let delivered = sender.is_some_and(|sender| {
+                sender
+                    .try_send(EventStreamMessage {
+                        project_id: self
+                            .routing_value_for_metadata("project_id", &event.metadata)
+                            .unwrap_or_default(),
+                        run_id: event.run_id,
+                        event_type: event.event_type,
+                        data: event.data,
+                        trace_id: event.correlation_id,
+                        span_id: event.parent_correlation_id,
+                        source_timestamp_ns: event.source_timestamp_ns,
+                        worker_id: self.config.worker_id.clone(),
+                    })
+                    .is_ok()
+            });
+            self.journal_queue.record_best_effort_log(delivered);
+            return Ok(());
+        }
         self.journal_queue.push(event).map_err(|e| {
             crate::error::SdkError::Internal(format!("Failed to queue journal event: {}", e))
         })?;

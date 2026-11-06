@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.12 - 2026-11-05
+
+### Fixed
+
+- Keep ordinary request log streaming off the durability path. Send SSE-only log copies through a bounded best-effort channel so a missing or full log transport cannot delay activations or checkpoints. Explicit streaming requests retain their ordered event flushes, and durable records still wait for their acknowledgments.
+
+### Upgrade
+
+- Python and TypeScript native bindings must adopt core 0.3.12 in their own patch releases to include this fix.
+
 ## 0.3.11 - 2026-11-03
 
 ### Fixed
