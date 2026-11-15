@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.13 - 2026-11-15
+
+### Fixed
+
+- Give self-hosted workers durable steps and sleeps without a configured artifact identity. When `AGNT5_ACTIVATION_ARTIFACT_SHA256` is unset, derive the identity from the deployment ID instead of falling back to legacy checkpoints, where a sleep restarts after a crash. A UUID deployment ID uses the control plane's canonical form, so hosted workers derive what the control plane would configure, and a configured identity always wins.
+
+### Upgrade
+
+- Python and TypeScript native bindings must adopt core 0.3.13 in their own patch releases to include this fix.
+
 ## 0.3.12 - 2026-11-05
 
 ### Fixed
