@@ -1062,6 +1062,19 @@ fn configured_activation_artifact_sha256(metadata: &HashMap<String, String>) -> 
         .filter(|value| !value.is_empty())
 }
 
+/// The artifact identity this worker presents: the configured one when the
+/// platform set it, otherwise one derived from the deployment ID.
+///
+/// The hosted platform always configures it. A self-hosted runtime has no
+/// control plane to do so, and without an identity the worker would silently
+/// fall back to legacy checkpoints, losing durable steps and sleeps. Deriving
+/// it from the deployment ID gives every worker of one deployment the same
+/// identity, which is all the run pinning compares.
+fn effective_activation_artifact_sha256(metadata: &HashMap<String, String>) -> Option<String> {
+    configured_activation_artifact_sha256(metadata)
+        .or_else(|| derived_deployment_artifact_sha256(metadata).map(hex::encode))
+}
+
 fn decode_activation_artifact_sha256(value: &str) -> Option<[u8; 32]> {
     use base64::Engine as _;
 
@@ -1093,6 +1106,36 @@ fn deployment_artifact_sha256(deployment_id: &str) -> Option<[u8; 32]> {
     Some(digest.finalize().into())
 }
 
+/// Artifact identity for a deployment ID of any shape. A UUID uses the same
+/// canonical form as the control plane, so the result matches what it would
+/// configure; any other non-empty ID, such as a self-hosted runtime's `local`,
+/// is hashed as given.
+fn any_deployment_artifact_sha256(deployment_id: &str) -> Option<[u8; 32]> {
+    let deployment_id = deployment_id.trim();
+    if deployment_id.is_empty() {
+        return None;
+    }
+    deployment_artifact_sha256(deployment_id).or_else(|| {
+        let mut digest = Sha256::new();
+        digest.update(DEPLOYMENT_ARTIFACT_DOMAIN);
+        digest.update(deployment_id.as_bytes());
+        Some(digest.finalize().into())
+    })
+}
+
+fn derived_deployment_artifact_sha256(metadata: &HashMap<String, String>) -> Option<[u8; 32]> {
+    ["AGNT5_DEPLOYMENT_ID", "deployment_id"]
+        .into_iter()
+        .filter_map(|key| metadata.get(key))
+        .map(String::as_str)
+        .find_map(any_deployment_artifact_sha256)
+        .or_else(|| {
+            std::env::var("AGNT5_DEPLOYMENT_ID")
+                .ok()
+                .and_then(|value| any_deployment_artifact_sha256(&value))
+        })
+}
+
 fn configured_deployment_artifact_sha256(metadata: &HashMap<String, String>) -> Option<[u8; 32]> {
     ["AGNT5_DEPLOYMENT_ID", "deployment_id"]
         .into_iter()
@@ -1116,7 +1159,7 @@ fn worker_protocol_capabilities_for_metadata(
     {
         return Ok((supported, required));
     }
-    if let Some(configured) = configured_activation_artifact_sha256(metadata) {
+    if let Some(configured) = effective_activation_artifact_sha256(metadata) {
         if valid_activation_artifact_sha256(&configured) {
             let configured = decode_activation_artifact_sha256(&configured)
                 .expect("validated activation artifact digest");
@@ -1128,7 +1171,7 @@ fn worker_protocol_capabilities_for_metadata(
         }
     }
 
-    let message = "durable_activation_v1 requires the control-plane deployment artifact identity";
+    let message = "durable_activation_v1 requires a deployment artifact identity; set AGNT5_ACTIVATION_ARTIFACT_SHA256 or AGNT5_DEPLOYMENT_ID";
     if required
         .iter()
         .any(|capability| capability == crate::client::DURABLE_ACTIVATION_V1_CAPABILITY)
@@ -1216,7 +1259,7 @@ fn stamp_activation_dispatch_metadata(
             .or_insert_with(|| value.clone());
     }
     let worker_artifact =
-        configured_activation_artifact_sha256(worker_metadata).ok_or_else(|| {
+        effective_activation_artifact_sha256(worker_metadata).ok_or_else(|| {
             SdkError::Activation {
                 message: "negotiated durable activation is missing the worker artifact identity"
                     .to_string(),
@@ -6648,23 +6691,26 @@ mod tests {
     use super::{
         activation_definition_configs, active_lease_danger_retry_ms,
         active_lease_renew_interval_ms, active_lease_renew_interval_with_jitter_ms,
-        await_checkpoint_ack, canonical_activation_component_config,
-        complete_job_request_from_polled_completion, complete_job_with_retry, complete_polled_job,
-        deployment_artifact_sha256, durable_suspension_service_message, execution_is_revoked,
-        is_cancelled_worker_response, is_parked_worker_session_registration_rejection,
-        is_terminal_worker_response, is_worker_session_refresh_required_error,
-        negotiated_slot_scaling_hint, parked_hint_spawn_count, parked_ramp_spawn_count,
-        parked_runtime_service_response, parked_worker_session_was_refreshed,
-        polled_job_completion_from_service_message, polled_job_suspension_request,
-        record_groups_by_run, require_engine_endpoint, resolve_engine_endpoint,
-        retryable_uncommitted_records_in_reverse, runtime_message_from_job_assignment,
-        stamp_activation_dispatch_metadata, stamp_dispatch_mode,
-        stamp_execution_authority_metadata, stamp_protocol_capability, take_correlation_ids,
-        try_retire_parked_slot, uncommitted_records_in_reverse, valid_activation_artifact_sha256,
-        wait_for_parked_run_events_flush, worker_capabilities, ActiveLeaseAuthority,
-        ActiveLeaseSession, AppendGroupProgress, CompleteJobSender, EntityStateSender,
-        ParkedSlotEvent, ParkedWorkerSessionRegistration, RunFlushLocks, ServerSlotScalingGate,
+        any_deployment_artifact_sha256, await_checkpoint_ack,
+        canonical_activation_component_config, complete_job_request_from_polled_completion,
+        complete_job_with_retry, complete_polled_job, deployment_artifact_sha256,
+        durable_suspension_service_message, effective_activation_artifact_sha256,
+        execution_is_revoked, is_cancelled_worker_response,
+        is_parked_worker_session_registration_rejection, is_terminal_worker_response,
+        is_worker_session_refresh_required_error, negotiated_slot_scaling_hint,
+        parked_hint_spawn_count, parked_ramp_spawn_count, parked_runtime_service_response,
+        parked_worker_session_was_refreshed, polled_job_completion_from_service_message,
+        polled_job_suspension_request, record_groups_by_run, require_engine_endpoint,
+        resolve_engine_endpoint, retryable_uncommitted_records_in_reverse,
+        runtime_message_from_job_assignment, stamp_activation_dispatch_metadata,
+        stamp_dispatch_mode, stamp_execution_authority_metadata, stamp_protocol_capability,
+        take_correlation_ids, try_retire_parked_slot, uncommitted_records_in_reverse,
+        valid_activation_artifact_sha256, wait_for_parked_run_events_flush, worker_capabilities,
+        worker_protocol_capabilities_for_metadata, ActiveLeaseAuthority, ActiveLeaseSession,
+        AppendGroupProgress, CompleteJobSender, EntityStateSender, ParkedSlotEvent,
+        ParkedWorkerSessionRegistration, RunFlushLocks, ServerSlotScalingGate,
         ServerSlotScalingHint, Worker, WorkerConfig, WorkerSlotPhaseSnapshot, WorkerSlotPhases,
+        DEPLOYMENT_ARTIFACT_DOMAIN,
     };
     use crate::error::{ErrorCode, SdkError};
     use crate::journal_queue::{JournalEventMessage, JournalEventQueue, JournalQueueConfig};
@@ -6675,6 +6721,7 @@ mod tests {
         GetEntityStateResponse, JobAssignment, PutEntityStateRequest, PutEntityStateResponse,
         RuntimeServiceRequest, ServiceMessage, SlotScalingDecision, SlotScalingHint, WorkerMode,
     };
+    use sha2::{Digest as _, Sha256};
     use std::collections::{HashMap, VecDeque};
     use std::time::Duration;
 
@@ -7211,6 +7258,57 @@ mod tests {
                 .map(String::as_str),
             Some("c51344c186e74ccb1ce5b5f6122362285d9dd3a4b125d442280de1dcacae8c9f")
         );
+    }
+
+    #[test]
+    fn artifact_identity_is_derived_from_any_deployment_id_when_not_configured() {
+        let uuid = "01234567-89AB-CDEF-0123-456789ABCDEF";
+        // A UUID derives exactly what the control plane would configure.
+        assert_eq!(
+            any_deployment_artifact_sha256(uuid),
+            deployment_artifact_sha256(uuid)
+        );
+        // A self-hosted deployment ID is hashed as given, domain-separated.
+        let local = any_deployment_artifact_sha256("local").expect("non-empty id");
+        let mut expected = Sha256::new();
+        expected.update(DEPLOYMENT_ARTIFACT_DOMAIN);
+        expected.update(b"local");
+        assert_eq!(local, <[u8; 32]>::from(expected.finalize()));
+        assert!(any_deployment_artifact_sha256("  ").is_none());
+
+        let metadata = HashMap::from([("deployment_id".to_string(), "local".to_string())]);
+        assert_eq!(
+            effective_activation_artifact_sha256(&metadata),
+            Some(hex::encode(local))
+        );
+    }
+
+    #[test]
+    fn configured_artifact_identity_wins_over_the_derived_one() {
+        let metadata = HashMap::from([
+            ("deployment_id".to_string(), "local".to_string()),
+            ("activation_artifact_sha256".to_string(), "22".repeat(32)),
+        ]);
+        assert_eq!(
+            effective_activation_artifact_sha256(&metadata),
+            Some("22".repeat(32))
+        );
+    }
+
+    #[test]
+    fn self_hosted_deployment_keeps_durable_activation() {
+        let metadata = HashMap::from([("deployment_id".to_string(), "local".to_string())]);
+        let (supported, _required) =
+            worker_protocol_capabilities_for_metadata(&metadata).expect("capabilities");
+        let (default_supported, _) = crate::client::worker_protocol_capabilities();
+        if default_supported
+            .iter()
+            .any(|capability| capability == crate::client::DURABLE_ACTIVATION_V1_CAPABILITY)
+        {
+            assert!(supported
+                .iter()
+                .any(|capability| capability == crate::client::DURABLE_ACTIVATION_V1_CAPABILITY));
+        }
     }
 
     #[test]
