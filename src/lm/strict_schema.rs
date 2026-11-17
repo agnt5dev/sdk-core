@@ -121,29 +121,26 @@ fn make_strict(node: &mut Value) {
     };
     wrap_in_any_of(schema);
 
-    let was_required = |name: &String| {
-        schema
-            .get("required")
-            .and_then(Value::as_array)
-            .is_some_and(|required| required.iter().any(|entry| entry == name))
-    };
-    let optional: Vec<String> = match schema.get("properties") {
-        Some(Value::Object(properties)) => properties
-            .keys()
-            .filter(|name| !was_required(name))
-            .cloned()
-            .collect(),
-        _ => Vec::new(),
-    };
+    let originally_required: Vec<Value> = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let required = match schema.get_mut("properties") {
         Some(Value::Object(properties)) => {
+            // A required name with no property of its own has no strict form:
+            // closing the object would forbid it. Leave the object as it is.
+            let closable = originally_required.iter().all(|name| {
+                name.as_str()
+                    .is_some_and(|name| properties.contains_key(name))
+            });
             for (name, property) in properties.iter_mut() {
-                if optional.contains(name) {
+                if closable && !originally_required.iter().any(|entry| entry == name) {
                     allow_null_for_optional_scalar(property);
                 }
                 make_strict(property);
             }
-            Some(properties.keys().cloned().map(Value::String).collect())
+            closable.then(|| properties.keys().cloned().map(Value::String).collect())
         }
         _ => None,
     };
@@ -528,6 +525,26 @@ mod tests {
 
         let once = to_strict_json_schema(&pydantic_person());
         assert_eq!(to_strict_json_schema(&once), once);
+    }
+
+    #[test]
+    fn required_names_without_a_property_are_left_alone() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "home": {"type": "object", "properties": {"city": {"type": "string"}}}
+            },
+            "required": ["name", "id"]
+        });
+
+        let strict = to_strict_json_schema(&schema);
+
+        assert_eq!(strict["required"], json!(["name", "id"]));
+        assert!(strict.get("additionalProperties").is_none());
+        assert_eq!(strict["properties"]["name"], json!({"type": "string"}));
+        // Nested objects are still rewritten.
+        assert_eq!(strict["properties"]["home"]["additionalProperties"], false);
     }
 
     #[test]
