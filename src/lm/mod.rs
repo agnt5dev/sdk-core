@@ -20,6 +20,7 @@ mod openai_chat;
 mod openai_common;
 mod openrouter;
 mod sse;
+mod strict_schema;
 mod telemetry;
 mod together;
 mod xai;

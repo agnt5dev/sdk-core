@@ -490,7 +490,7 @@ impl ResponsesApiRequest {
                 "format": {
                     "type": "json_schema",
                     "name": schema.name,
-                    "schema": schema.schema,
+                    "schema": super::strict_schema::request_schema(schema),
                     "strict": schema.strict
                 }
             })),
@@ -1744,6 +1744,23 @@ mod tests {
                 "required": ["name", "age"]
             }),
         ))
+    }
+
+    #[test]
+    fn responses_request_sends_strict_schemas_in_the_form_openai_accepts() {
+        let request = GenerateRequest::new("openai/gpt-4.1-mini")
+            .user_message("Hi")
+            .response_format(person_schema_format());
+
+        let payload = ResponsesApiRequest::from_request(&request, "gpt-4.1-mini".to_string());
+        let format = &payload.text.unwrap()["format"];
+
+        assert_eq!(format["strict"], true);
+        assert_eq!(
+            format["schema"]["required"],
+            serde_json::json!(["age", "name"])
+        );
+        assert_eq!(format["schema"]["additionalProperties"], false);
     }
 
     #[test]

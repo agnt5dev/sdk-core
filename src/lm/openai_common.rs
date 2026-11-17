@@ -150,7 +150,7 @@ impl ApiResponseFormat {
             r#type: ApiResponseFormatType::JsonSchema,
             json_schema: Some(ApiJsonSchema {
                 name: schema.name.clone(),
-                schema: schema.schema.clone(),
+                schema: super::strict_schema::request_schema(schema),
                 strict: schema.strict,
             }),
         }
@@ -837,6 +837,33 @@ mod tests {
         assert!(payload.top_p.is_none());
         assert!(payload.max_tokens.is_none());
         assert_eq!(payload.max_completion_tokens, Some(256));
+    }
+
+    #[test]
+    fn chat_payload_sends_strict_schemas_in_the_form_openai_accepts() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"name": {"type": "string"}, "email": {"type": "string"}},
+            "required": ["name"]
+        });
+        let format = JsonSchemaFormat::new("person", schema.clone());
+
+        let request = GenerateRequest::new("openai/gpt-4.1-mini")
+            .user_message("Hi")
+            .response_format(ResponseFormat::JsonSchema(format.clone()));
+        let payload = ChatCompletionPayload::from_request(&request, "gpt-4.1-mini".into(), false);
+        let sent = serde_json::to_value(payload).unwrap()["response_format"]["json_schema"].clone();
+        assert_eq!(sent["strict"], true);
+        assert_eq!(sent["schema"]["required"], json!(["email", "name"]));
+        assert_eq!(sent["schema"]["additionalProperties"], false);
+
+        let request = GenerateRequest::new("openai/gpt-4.1-mini")
+            .user_message("Hi")
+            .response_format(ResponseFormat::JsonSchema(format.with_strict(false)));
+        let payload = ChatCompletionPayload::from_request(&request, "gpt-4.1-mini".into(), false);
+        let sent = serde_json::to_value(payload).unwrap()["response_format"]["json_schema"].clone();
+        assert_eq!(sent["strict"], false);
+        assert_eq!(sent["schema"], schema);
     }
 
     #[test]
