@@ -6,17 +6,46 @@
 //! keywords. Pydantic models and hand-written schemas rarely meet all of that,
 //! so a strict request with them fails with a 400 before the model runs.
 //!
-//! The rewrite follows openai-python's `to_strict_json_schema`. It never
-//! widens what a schema accepts, so an answer still validates against the
-//! caller's schema. A property that was optional becomes required with its own
-//! type: to let the model leave it empty, its type has to allow `null`
-//! (`Optional[str] = None` in Pydantic, `["string", "null"]` by hand).
+//! The rewrite keeps what a schema means, so an answer validates against the
+//! caller's schema, with one exception noted below:
+//!
+//! - An object that declares `properties` is closed, and all of them are
+//!   listed in `required`. An optional property keeps its own type, so the
+//!   model fills it in; with a default, the default says what empty looks
+//!   like. The exception is an optional scalar with no default: it also
+//!   allows `null`, OpenAI's way of writing optional, so the model can say a
+//!   value isn't there instead of making one up. Arrays and objects can be
+//!   empty instead, and a Pydantic `default_factory` field must not get
+//!   `null`.
+//! - A one-entry `allOf`, and a `$ref` with sibling keywords, become a
+//!   one-entry `anyOf`, which means the same thing.
+//! - A `$ref` at the root, which Pydantic emits for recursive models and
+//!   zod-to-json-schema for every model, is replaced by the definition it
+//!   points to, since OpenAI wants an object there.
+//!
 //! Free-form objects such as `dict` fields have no strict form, so they are
 //! left for OpenAI to reject rather than narrowed to `{}`.
 
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 use super::interface::JsonSchemaFormat;
+
+/// Keywords that describe a schema without constraining what it accepts.
+const ANNOTATIONS: [&str; 8] = [
+    "title",
+    "description",
+    "default",
+    "examples",
+    "$comment",
+    "deprecated",
+    "readOnly",
+    "writeOnly",
+];
+
+/// Keywords OpenAI accepts next to a `$ref`.
+const REF_SIBLINGS: [&str; 3] = ["$defs", "definitions", "$schema"];
+
+const SCALAR_TYPES: [&str; 4] = ["string", "number", "integer", "boolean"];
 
 /// The schema to send for `format`: rewritten for strict mode when the format
 /// asks for it, unchanged otherwise.
@@ -31,23 +60,76 @@ pub(crate) fn request_schema(format: &JsonSchemaFormat) -> Value {
 /// Rewrites `schema` into the subset OpenAI accepts with `strict: true`.
 pub(crate) fn to_strict_json_schema(schema: &Value) -> Value {
     let mut strict = schema.clone();
-    make_strict(&mut strict, schema, &mut Vec::new());
+    if let Value::Object(root) = &mut strict {
+        inline_root_ref(root, schema);
+    }
+    make_strict(&mut strict);
     strict
 }
 
-/// `root` is the caller's schema, which `$ref`s resolve against. `inlining`
-/// holds the refs inlined on the way down to this node, to stop at recursion.
-fn make_strict(node: &mut Value, root: &Value, inlining: &mut Vec<String>) {
+/// Replaces a root `$ref` with the definition it points to. Only annotations,
+/// the definitions themselves and keywords the definition repeats (the Python
+/// SDK adds `"type": "object"`) may sit next to it, so nothing that constrains
+/// the answer is lost. The definition stays in place for any recursive refs
+/// to it.
+fn inline_root_ref(root: &mut Map<String, Value>, schema: &Value) {
+    // A ref can point at another ref; follow a short chain.
+    for _ in 0..8 {
+        let Some(Value::String(reference)) = root.get("$ref") else {
+            return;
+        };
+        let Some(Value::Object(target)) = reference
+            .strip_prefix('#')
+            .and_then(|pointer| schema.pointer(pointer))
+        else {
+            return;
+        };
+        let nothing_lost = root.iter().all(|(key, value)| {
+            key == "$ref"
+                || REF_SIBLINGS.contains(&key.as_str())
+                || ANNOTATIONS.contains(&key.as_str())
+                || target.get(key) == Some(value)
+        });
+        if !nothing_lost {
+            return;
+        }
+        let target = target.clone();
+        root.remove("$ref");
+        for (key, value) in target {
+            if !REF_SIBLINGS.contains(&key.as_str()) {
+                root.entry(key).or_insert(value);
+            }
+        }
+    }
+}
+
+fn make_strict(node: &mut Value) {
     let Value::Object(schema) = node else {
         return;
     };
-    let depth = inlining.len();
-    flatten(schema, root, inlining);
+    wrap_in_any_of(schema);
 
+    let was_required = |name: &String| {
+        schema
+            .get("required")
+            .and_then(Value::as_array)
+            .is_some_and(|required| required.iter().any(|entry| entry == name))
+    };
+    let optional: Vec<String> = match schema.get("properties") {
+        Some(Value::Object(properties)) => properties
+            .keys()
+            .filter(|name| !was_required(name))
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    };
     let required = match schema.get_mut("properties") {
         Some(Value::Object(properties)) => {
-            for property in properties.values_mut() {
-                make_strict(property, root, inlining);
+            for (name, property) in properties.iter_mut() {
+                if optional.contains(name) {
+                    allow_null_for_optional_scalar(property);
+                }
+                make_strict(property);
             }
             Some(properties.keys().cloned().map(Value::String).collect())
         }
@@ -62,79 +144,71 @@ fn make_strict(node: &mut Value, root: &Value, inlining: &mut Vec<String>) {
 
     for keyword in ["items", "prefixItems", "anyOf", "oneOf", "allOf"] {
         match schema.get_mut(keyword) {
-            Some(Value::Array(entries)) => {
-                for entry in entries {
-                    make_strict(entry, root, inlining);
-                }
-            }
-            Some(entry @ Value::Object(_)) => make_strict(entry, root, inlining),
+            Some(Value::Array(entries)) => entries.iter_mut().for_each(make_strict),
+            Some(entry @ Value::Object(_)) => make_strict(entry),
             _ => {}
         }
     }
     for keyword in ["$defs", "definitions"] {
         if let Some(Value::Object(definitions)) = schema.get_mut(keyword) {
-            for definition in definitions.values_mut() {
-                make_strict(definition, root, inlining);
-            }
+            definitions.values_mut().for_each(make_strict);
         }
     }
-
-    inlining.truncate(depth);
 }
 
-/// Unwraps a one-entry `allOf` (older Pydantic wraps a `$ref` in one to give
-/// it a description) and inlines a `$ref` that has sibling keywords. The
-/// node's own keywords win over the ones pulled in.
-fn flatten(schema: &mut Map<String, Value>, root: &Value, inlining: &mut Vec<String>) {
-    loop {
-        if let Some(Value::Array(all_of)) = schema.get("allOf") {
-            if let [Value::Object(entry)] = all_of.as_slice() {
-                let entry = entry.clone();
-                schema.remove("allOf");
-                merge_missing(schema, entry);
-                continue;
-            }
-        }
-
-        if schema.len() > 1 {
-            if let Some(Value::String(reference)) = schema.get("$ref") {
-                let reference = reference.clone();
-                if inlining.contains(&reference) {
-                    // A recursive definition can't be inlined, but a bare
-                    // `$ref` is allowed.
-                    schema.retain(|key, _| key == "$ref");
-                } else if let Some(Value::Object(target)) = resolve_ref(root, &reference) {
-                    schema.remove("$ref");
-                    merge_missing(schema, target.clone());
-                    inlining.push(reference);
-                    continue;
-                }
-            }
-        }
-
+/// Lets an optional scalar with no default answer `null`. See the module docs.
+fn allow_null_for_optional_scalar(property: &mut Value) {
+    let Value::Object(schema) = property else {
+        return;
+    };
+    let types: Vec<&str> = match schema.get("type") {
+        Some(Value::String(name)) => vec![name.as_str()],
+        Some(Value::Array(names)) => names.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    };
+    let listed = schema.contains_key("enum") || schema.contains_key("const");
+    let scalar = if types.is_empty() {
+        listed
+    } else {
+        types.iter().all(|name| SCALAR_TYPES.contains(name))
+    };
+    if !scalar || schema.contains_key("default") {
         return;
     }
+    if listed {
+        // `null` has to get past the enum too.
+        let inner = std::mem::take(property);
+        *property = json!({ "anyOf": [inner, { "type": "null" }] });
+    } else {
+        let mut nullable: Vec<Value> = types.into_iter().map(Value::from).collect();
+        nullable.push(Value::from("null"));
+        schema.insert("type".to_string(), Value::Array(nullable));
+    }
 }
 
-/// Resolves a local `$ref` such as `#/$defs/City` against the root schema.
-fn resolve_ref<'a>(root: &'a Value, reference: &str) -> Option<&'a Value> {
-    root.pointer(reference.strip_prefix('#')?)
-}
-
-/// Copies the keywords `schema` doesn't already have. Definitions stay at the
-/// root, where refs resolve.
-fn merge_missing(schema: &mut Map<String, Value>, from: Map<String, Value>) {
-    for (key, value) in from {
-        if key != "$defs" && key != "definitions" {
-            schema.entry(key).or_insert(value);
-        }
+/// Turns a one-entry `allOf` (older Pydantic wraps a `$ref` in one to give it
+/// a description), or a `$ref` with sibling keywords, into a one-entry
+/// `anyOf`. The siblings stay where they are, so every constraint still
+/// applies.
+fn wrap_in_any_of(schema: &mut Map<String, Value>) {
+    if schema.contains_key("anyOf") {
+        return;
+    }
+    if matches!(schema.get("allOf"), Some(Value::Array(entries)) if entries.len() == 1) {
+        let entries = schema.remove("allOf").unwrap_or_default();
+        schema.insert("anyOf".to_string(), entries);
+    } else if schema.contains_key("$ref")
+        && schema
+            .keys()
+            .any(|key| key != "$ref" && !REF_SIBLINGS.contains(&key.as_str()))
+    {
+        let reference = schema.remove("$ref").unwrap_or_default();
+        schema.insert("anyOf".to_string(), json!([{ "$ref": reference }]));
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-
     use super::*;
 
     /// What Pydantic 2 emits for a model with a nested model, an optional
@@ -175,20 +249,6 @@ mod tests {
         })
     }
 
-    fn strict_city() -> Value {
-        json!({
-            "description": "A city.",
-            "properties": {
-                "name": {"title": "Name", "type": "string"},
-                "country": {"title": "Country", "type": "string"}
-            },
-            "required": ["country", "name"],
-            "title": "City",
-            "type": "object",
-            "additionalProperties": false
-        })
-    }
-
     #[test]
     fn plain_object_lists_every_property_and_closes_the_object() {
         // The TypeScript SDK's own docs example.
@@ -209,7 +269,7 @@ mod tests {
                 "properties": {
                     "name": {"type": "string"},
                     "age": {"type": "number"},
-                    "email": {"type": "string", "format": "email"}
+                    "email": {"type": ["string", "null"], "format": "email"}
                 },
                 "required": ["age", "email", "name"],
                 "additionalProperties": false
@@ -219,64 +279,125 @@ mod tests {
 
     #[test]
     fn pydantic_model_with_nested_and_optional_fields() {
-        let strict = to_strict_json_schema(&pydantic_person());
+        let person = pydantic_person();
+        let strict = to_strict_json_schema(&person);
 
         assert_eq!(strict["additionalProperties"], false);
         assert_eq!(
             strict["required"],
             json!(["age", "email", "home", "name", "previous", "tags"])
         );
-        assert_eq!(strict["$defs"]["City"], strict_city());
+        let city = &strict["$defs"]["City"];
+        assert_eq!(city["additionalProperties"], false);
+        assert_eq!(city["required"], json!(["country", "name"]));
 
         let properties = &strict["properties"];
         // Optional fields keep their own type, defaults included.
+        for name in ["age", "tags", "email", "previous"] {
+            assert_eq!(properties[name], person["properties"][name], "{name}");
+        }
+        // A `$ref` with a description moves into a one-entry `anyOf`.
         assert_eq!(
-            properties["age"],
-            json!({"default": 0, "title": "Age", "type": "integer"})
+            properties["home"],
+            json!({"anyOf": [{"$ref": "#/$defs/City"}], "description": "Where they live"})
         );
-        assert_eq!(
-            properties["tags"],
-            json!({"items": {"type": "string"}, "title": "Tags", "type": "array"})
-        );
-        assert_eq!(
-            properties["email"],
-            pydantic_person()["properties"]["email"]
-        );
-        // A nullable nested model keeps its bare `$ref`.
-        assert_eq!(
-            properties["previous"],
-            pydantic_person()["properties"]["previous"]
-        );
-        // A `$ref` with a description is inlined, keeping the description.
-        let mut home = strict_city();
-        home["description"] = json!("Where they live");
-        assert_eq!(properties["home"], home);
     }
 
     #[test]
-    fn one_entry_all_of_is_unwrapped() {
+    fn optional_scalars_without_a_default_may_be_null() {
         let schema = json!({
             "type": "object",
             "properties": {
-                "home": {"allOf": [{"$ref": "#/$defs/City"}], "description": "Where they live"},
-                "work": {"allOf": [{"$ref": "#/$defs/City"}]}
+                "email": {"type": "string", "format": "email"},
+                "score": {"type": ["integer", "number"]},
+                "tier": {"enum": ["gold", "silver"]},
+                "nickname": {"type": "string", "default": ""},
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "address": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                },
+                "name": {"type": "string"}
             },
-            "$defs": {"City": pydantic_person()["$defs"]["City"]}
+            "required": ["name"]
+        });
+
+        let properties = to_strict_json_schema(&schema)["properties"].clone();
+
+        assert_eq!(
+            properties["email"],
+            json!({"type": ["string", "null"], "format": "email"})
+        );
+        assert_eq!(
+            properties["score"]["type"],
+            json!(["integer", "number", "null"])
+        );
+        assert_eq!(
+            properties["tier"],
+            json!({"anyOf": [{"enum": ["gold", "silver"]}, {"type": "null"}]})
+        );
+        // A default, an array, an object or a required field keeps its type.
+        for name in ["nickname", "tags", "name"] {
+            assert_eq!(properties[name], schema["properties"][name], "{name}");
+        }
+        assert_eq!(properties["address"]["type"], "object");
+    }
+
+    #[test]
+    fn root_ref_with_a_conflicting_sibling_is_left_for_openai() {
+        let schema = json!({
+            "$ref": "#/$defs/A",
+            "$defs": {"A": {"type": "object", "properties": {"a": {"type": "string"}}}},
+            "type": "array"
         });
 
         let strict = to_strict_json_schema(&schema);
 
-        let mut home = strict_city();
-        home["description"] = json!("Where they live");
-        assert_eq!(strict["properties"]["home"], home);
+        assert_eq!(strict["anyOf"], json!([{"$ref": "#/$defs/A"}]));
+        assert_eq!(strict["type"], "array");
+    }
+
+    #[test]
+    fn constraints_next_to_all_of_and_ref_still_apply() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "status": {
+                    "allOf": [{"type": "string", "enum": ["approved"]}],
+                    "enum": ["approved", "other"]
+                },
+                "children": {
+                    "type": "array",
+                    "items": {"$ref": "#/$defs/Node", "minItems": 1}
+                },
+                "home": {"allOf": [{"$ref": "#/$defs/Node"}], "description": "Where they live"}
+            },
+            "required": ["status", "children", "home"],
+            "$defs": {"Node": {"type": ["array", "null"]}}
+        });
+
+        let properties = to_strict_json_schema(&schema)["properties"].clone();
+
         assert_eq!(
-            strict["properties"]["work"],
-            json!({"$ref": "#/$defs/City"})
+            properties["status"],
+            json!({
+                "anyOf": [{"type": "string", "enum": ["approved"]}],
+                "enum": ["approved", "other"]
+            })
+        );
+        assert_eq!(
+            properties["children"]["items"],
+            json!({"anyOf": [{"$ref": "#/$defs/Node"}], "minItems": 1})
+        );
+        assert_eq!(
+            properties["home"],
+            json!({"anyOf": [{"$ref": "#/$defs/Node"}], "description": "Where they live"})
         );
     }
 
     #[test]
-    fn root_ref_with_definitions_is_inlined() {
+    fn root_ref_is_replaced_by_its_definition() {
         // zod-to-json-schema's default output.
         let schema = json!({
             "$ref": "#/definitions/Answer",
@@ -296,9 +417,51 @@ mod tests {
         assert_eq!(strict["type"], "object");
         assert_eq!(strict["required"], json!(["city"]));
         assert_eq!(strict["additionalProperties"], false);
+        assert_eq!(strict["$schema"], schema["$schema"]);
         assert_eq!(
             strict["definitions"]["Answer"]["additionalProperties"],
             false
+        );
+    }
+
+    #[test]
+    fn recursive_pydantic_model_keeps_its_definition_for_the_recursion() {
+        // Pydantic's output for a model that contains a list of itself.
+        let schema = json!({
+            "$defs": {
+                "Node": {
+                    "description": "A person and their reports.",
+                    "properties": {
+                        "name": {"title": "Name", "type": "string"},
+                        "reports": {
+                            "description": "Direct reports",
+                            "items": {"$ref": "#/$defs/Node"},
+                            "title": "Reports",
+                            "type": "array"
+                        }
+                    },
+                    "required": ["name"],
+                    "title": "Node",
+                    "type": "object"
+                }
+            },
+            "$ref": "#/$defs/Node",
+            "type": "object"
+        });
+
+        let strict = to_strict_json_schema(&schema);
+
+        assert!(strict.get("$ref").is_none());
+        assert_eq!(strict["type"], "object");
+        assert_eq!(strict["required"], json!(["name", "reports"]));
+        assert_eq!(
+            strict["properties"]["reports"]["items"],
+            json!({"$ref": "#/$defs/Node"})
+        );
+        assert_eq!(strict["$defs"]["Node"]["additionalProperties"], false);
+        assert_eq!(
+            strict["$defs"]["Node"]["required"],
+            json!(["name", "reports"])
         );
     }
 
@@ -378,27 +541,36 @@ mod tests {
     }
 
     #[test]
-    fn recursive_ref_with_siblings_keeps_a_bare_ref() {
-        let schema = json!({
-            "$ref": "#/$defs/Node",
-            "$defs": {
-                "Node": {
+    fn shared_and_recursive_refs_stay_references() {
+        // Each layer refers to the one before it twice, with a description.
+        let mut definitions = Map::new();
+        definitions.insert(
+            "L0".to_string(),
+            json!({"type": "object", "properties": {"v": {"type": "string"}}}),
+        );
+        for layer in 1..12 {
+            let previous = format!("#/$defs/L{}", layer - 1);
+            definitions.insert(
+                format!("L{layer}"),
+                json!({
                     "type": "object",
                     "properties": {
-                        "value": {"type": "string"},
-                        "next": {"$ref": "#/$defs/Node", "description": "The next node"}
+                        "left": {"$ref": previous, "description": "left"},
+                        "right": {"$ref": previous, "description": "right"},
+                        "self": {"$ref": format!("#/$defs/L{layer}"), "description": "itself"}
                     }
-                }
-            }
-        });
+                }),
+            );
+        }
+        let schema = json!({"$ref": "#/$defs/L11", "$defs": definitions});
 
         let strict = to_strict_json_schema(&schema);
 
+        assert!(strict.to_string().len() < 2 * schema.to_string().len());
         assert_eq!(
-            strict["properties"]["next"],
-            json!({"$ref": "#/$defs/Node"})
+            strict["$defs"]["L11"]["properties"]["self"],
+            json!({"anyOf": [{"$ref": "#/$defs/L11"}], "description": "itself"})
         );
-        assert_eq!(strict["$defs"]["Node"]["additionalProperties"], false);
     }
 
     #[test]

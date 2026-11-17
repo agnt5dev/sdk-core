@@ -151,7 +151,8 @@ impl LanguageModel for AzureOpenAiProvider {
     async fn generate(&self, request: GenerateRequest) -> SdkResult<GenerateResponse> {
         validate_request(&request)?;
         let deployment = self.normalize_model(&request.model)?;
-        let payload = ChatCompletionPayload::from_request(&request, deployment.clone(), false);
+        let payload = ChatCompletionPayload::from_request(&request, deployment.clone(), false)
+            .with_openai_strict_schema();
 
         let response = http::send_with_retry(
             || self.request(&deployment).json(&payload),
@@ -175,7 +176,8 @@ impl LanguageModel for AzureOpenAiProvider {
     async fn stream(&self, request: StreamRequest) -> SdkResult<StreamHandle> {
         validate_request(&request)?;
         let deployment = self.normalize_model(&request.model)?;
-        let payload = ChatCompletionPayload::from_request(&request, deployment.clone(), true);
+        let payload = ChatCompletionPayload::from_request(&request, deployment.clone(), true)
+            .with_openai_strict_schema();
 
         let response = http::send_with_retry(
             || {

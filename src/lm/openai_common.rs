@@ -127,6 +127,20 @@ impl ChatCompletionPayload {
 
         payload
     }
+
+    /// Rewrites a strict JSON schema into the form OpenAI's strict mode
+    /// accepts. Only for endpoints that enforce that form, OpenAI and Azure
+    /// OpenAI; other compatible backends take the schema as given.
+    pub(crate) fn with_openai_strict_schema(mut self) -> Self {
+        let json_schema = self
+            .response_format
+            .as_mut()
+            .and_then(|format| format.json_schema.as_mut());
+        if let Some(json_schema) = json_schema.filter(|json_schema| json_schema.strict) {
+            json_schema.schema = super::strict_schema::to_strict_json_schema(&json_schema.schema);
+        }
+        self
+    }
 }
 
 #[derive(Serialize)]
@@ -150,7 +164,7 @@ impl ApiResponseFormat {
             r#type: ApiResponseFormatType::JsonSchema,
             json_schema: Some(ApiJsonSchema {
                 name: schema.name.clone(),
-                schema: super::strict_schema::request_schema(schema),
+                schema: schema.schema.clone(),
                 strict: schema.strict,
             }),
         }
@@ -840,30 +854,34 @@ mod tests {
     }
 
     #[test]
-    fn chat_payload_sends_strict_schemas_in_the_form_openai_accepts() {
+    fn chat_payload_rewrites_strict_schemas_only_when_asked() {
         let schema = json!({
             "type": "object",
             "properties": {"name": {"type": "string"}, "email": {"type": "string"}},
             "required": ["name"]
         });
         let format = JsonSchemaFormat::new("person", schema.clone());
+        let sent = |format: JsonSchemaFormat, openai: bool| {
+            let request = GenerateRequest::new("openai_chat/gpt-4.1-mini")
+                .user_message("Hi")
+                .response_format(ResponseFormat::JsonSchema(format));
+            let mut payload =
+                ChatCompletionPayload::from_request(&request, "gpt-4.1-mini".into(), false);
+            if openai {
+                payload = payload.with_openai_strict_schema();
+            }
+            serde_json::to_value(payload).unwrap()["response_format"]["json_schema"].clone()
+        };
 
-        let request = GenerateRequest::new("openai/gpt-4.1-mini")
-            .user_message("Hi")
-            .response_format(ResponseFormat::JsonSchema(format.clone()));
-        let payload = ChatCompletionPayload::from_request(&request, "gpt-4.1-mini".into(), false);
-        let sent = serde_json::to_value(payload).unwrap()["response_format"]["json_schema"].clone();
-        assert_eq!(sent["strict"], true);
-        assert_eq!(sent["schema"]["required"], json!(["email", "name"]));
-        assert_eq!(sent["schema"]["additionalProperties"], false);
+        let rewritten = sent(format.clone(), true);
+        assert_eq!(rewritten["strict"], true);
+        assert_eq!(rewritten["schema"]["required"], json!(["email", "name"]));
+        assert_eq!(rewritten["schema"]["additionalProperties"], false);
 
-        let request = GenerateRequest::new("openai/gpt-4.1-mini")
-            .user_message("Hi")
-            .response_format(ResponseFormat::JsonSchema(format.with_strict(false)));
-        let payload = ChatCompletionPayload::from_request(&request, "gpt-4.1-mini".into(), false);
-        let sent = serde_json::to_value(payload).unwrap()["response_format"]["json_schema"].clone();
-        assert_eq!(sent["strict"], false);
-        assert_eq!(sent["schema"], schema);
+        // Other OpenAI-compatible backends, and non-strict formats, get the
+        // schema as given.
+        assert_eq!(sent(format.clone(), false)["schema"], schema);
+        assert_eq!(sent(format.with_strict(false), true)["schema"], schema);
     }
 
     #[test]

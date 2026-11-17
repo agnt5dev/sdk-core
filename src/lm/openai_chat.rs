@@ -160,6 +160,14 @@ impl OpenAiChatProvider {
         Self::new(config)
     }
 
+    /// Whether this provider talks to OpenAI's own API. Compatible backends
+    /// (Groq, Ollama, Together, ...) use this provider with their own base
+    /// URL and don't need OpenAI's strict-schema form.
+    fn is_openai_api(&self) -> bool {
+        reqwest::Url::parse(&self.config.base_url)
+            .is_ok_and(|url| url.host_str() == Some("api.openai.com"))
+    }
+
     fn request(&self) -> reqwest::RequestBuilder {
         let base = self.config.base_url.trim_end_matches('/');
         let path = self.config.chat_path.trim_start_matches('/');
@@ -279,7 +287,10 @@ impl LanguageModel for OpenAiChatProvider {
         let result: SdkResult<GenerateResponse> = async {
             validate_request(&request)?;
             let model = self.normalize_model(&request.model)?;
-            let payload = ChatCompletionPayload::from_request(&request, model, false);
+            let mut payload = ChatCompletionPayload::from_request(&request, model, false);
+            if self.is_openai_api() {
+                payload = payload.with_openai_strict_schema();
+            }
 
             let response = http::send_with_retry(
                 || self.request().json(&payload),
@@ -384,7 +395,10 @@ impl LanguageModel for OpenAiChatProvider {
         let result = async {
             validate_request(&request)?;
             let model = self.normalize_model(&request.model)?;
-            let payload = ChatCompletionPayload::from_request(&request, model, true);
+            let mut payload = ChatCompletionPayload::from_request(&request, model, true);
+            if self.is_openai_api() {
+                payload = payload.with_openai_strict_schema();
+            }
 
             let response = http::send_with_retry(
                 || {
@@ -436,4 +450,26 @@ fn validate_request(request: &GenerateRequest) -> SdkResult<()> {
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_openai_itself_gets_the_strict_schema_rewrite() {
+        for (base_url, expected) in [
+            ("https://api.openai.com/v1", true),
+            ("https://api.openai.com/v1/", true),
+            ("https://api.groq.com/openai/v1", false),
+            ("https://api.together.xyz/v1", false),
+            ("http://localhost:11434/v1", false),
+            ("not a url", false),
+        ] {
+            let provider =
+                OpenAiChatProvider::new(OpenAiChatConfig::new("key").with_base_url(base_url))
+                    .unwrap();
+            assert_eq!(provider.is_openai_api(), expected, "{base_url}");
+        }
+    }
 }
