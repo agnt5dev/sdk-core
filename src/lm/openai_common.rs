@@ -128,10 +128,18 @@ impl ChatCompletionPayload {
         payload
     }
 
-    /// Rewrites a strict JSON schema into the form OpenAI's strict mode
-    /// accepts. Only for endpoints that enforce that form, OpenAI and Azure
-    /// OpenAI; other compatible backends take the schema as given.
-    pub(crate) fn with_openai_strict_schema(mut self) -> Self {
+    /// Rewrites a strict JSON schema, and strict tools' parameters, into the
+    /// form OpenAI's strict mode accepts. Only for endpoints that enforce that
+    /// form, OpenAI and Azure OpenAI; other compatible backends take the
+    /// schemas as given.
+    pub(crate) fn with_openai_strict_schemas(mut self) -> Self {
+        for tool in &mut self.tools {
+            if tool.function.strict == Some(true) {
+                if let Some(parameters) = tool.function.parameters.as_mut() {
+                    *parameters = super::strict_schema::to_strict_json_schema(parameters);
+                }
+            }
+        }
         let json_schema = self
             .response_format
             .as_mut()
@@ -868,7 +876,7 @@ mod tests {
             let mut payload =
                 ChatCompletionPayload::from_request(&request, "gpt-4.1-mini".into(), false);
             if openai {
-                payload = payload.with_openai_strict_schema();
+                payload = payload.with_openai_strict_schemas();
             }
             serde_json::to_value(payload).unwrap()["response_format"]["json_schema"].clone()
         };
@@ -882,6 +890,44 @@ mod tests {
         // schema as given.
         assert_eq!(sent(format.clone(), false)["schema"], schema);
         assert_eq!(sent(format.with_strict(false), true)["schema"], schema);
+    }
+
+    #[test]
+    fn chat_payload_rewrites_strict_tools_only_when_asked() {
+        let parameters = json!({
+            "type": "object",
+            "properties": {"location": {"type": "string"}, "units": {"type": "string"}},
+            "required": ["location"]
+        });
+        let mut strict_tool = ToolDefinition::new("get_weather");
+        strict_tool.parameters = Some(parameters.clone());
+        strict_tool.strict = Some(true);
+        let mut loose_tool = strict_tool.clone();
+        loose_tool.name = "lookup".into();
+        loose_tool.strict = None;
+        let request = GenerateRequest::new("openai_chat/gpt-4.1-mini")
+            .user_message("Hi")
+            .tools(vec![strict_tool, loose_tool]);
+        let sent = |openai: bool| {
+            let mut payload =
+                ChatCompletionPayload::from_request(&request, "gpt-4.1-mini".into(), false);
+            if openai {
+                payload = payload.with_openai_strict_schemas();
+            }
+            serde_json::to_value(payload).unwrap()["tools"].clone()
+        };
+
+        let tools = sent(true);
+        assert_eq!(
+            tools[0]["function"]["parameters"]["required"],
+            json!(["location", "units"])
+        );
+        assert_eq!(
+            tools[0]["function"]["parameters"]["additionalProperties"],
+            false
+        );
+        assert_eq!(tools[1]["function"]["parameters"], parameters);
+        assert_eq!(sent(false)[0]["function"]["parameters"], parameters);
     }
 
     #[test]

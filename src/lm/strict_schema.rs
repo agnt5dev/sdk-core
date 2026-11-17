@@ -25,10 +25,13 @@
 //!
 //! Free-form objects such as `dict` fields have no strict form, so they are
 //! left for OpenAI to reject rather than narrowed to `{}`.
+//!
+//! OpenAI holds a strict tool's parameters to the same rules, so those are
+//! rewritten the same way.
 
 use serde_json::{json, Map, Value};
 
-use super::interface::JsonSchemaFormat;
+use super::interface::{JsonSchemaFormat, ToolDefinition};
 
 /// Keywords that describe a schema without constraining what it accepts.
 const ANNOTATIONS: [&str; 8] = [
@@ -54,6 +57,15 @@ pub(crate) fn request_schema(format: &JsonSchemaFormat) -> Value {
         to_strict_json_schema(&format.schema)
     } else {
         format.schema.clone()
+    }
+}
+
+/// A tool's parameters to send: rewritten for strict mode when the tool asks
+/// for it, unchanged otherwise.
+pub(crate) fn tool_parameters(tool: &ToolDefinition) -> Option<Value> {
+    match (&tool.parameters, tool.strict) {
+        (Some(parameters), Some(true)) => Some(to_strict_json_schema(parameters)),
+        (parameters, _) => parameters.clone(),
     }
 }
 
@@ -571,6 +583,34 @@ mod tests {
             strict["$defs"]["L11"]["properties"]["self"],
             json!({"anyOf": [{"$ref": "#/$defs/L11"}], "description": "itself"})
         );
+    }
+
+    #[test]
+    fn strict_tools_get_the_same_rewrite() {
+        let parameters = json!({
+            "type": "object",
+            "properties": {
+                "location": {"type": "string"},
+                "units": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+            },
+            "required": ["location"]
+        });
+        let mut tool = ToolDefinition::new("get_weather");
+        tool.parameters = Some(parameters.clone());
+
+        tool.strict = Some(true);
+        let sent = tool_parameters(&tool).unwrap();
+        assert_eq!(sent["required"], json!(["location", "units"]));
+        assert_eq!(sent["additionalProperties"], false);
+        assert_eq!(
+            sent["properties"]["units"],
+            json!({"anyOf": [{"type": "string", "enum": ["celsius", "fahrenheit"]}, {"type": "null"}]})
+        );
+
+        for strict in [None, Some(false)] {
+            tool.strict = strict;
+            assert_eq!(tool_parameters(&tool), Some(parameters.clone()));
+        }
     }
 
     #[test]

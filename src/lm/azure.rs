@@ -152,7 +152,7 @@ impl LanguageModel for AzureOpenAiProvider {
         validate_request(&request)?;
         let deployment = self.normalize_model(&request.model)?;
         let payload = ChatCompletionPayload::from_request(&request, deployment.clone(), false)
-            .with_openai_strict_schema();
+            .with_openai_strict_schemas();
 
         let response = http::send_with_retry(
             || self.request(&deployment).json(&payload),
@@ -177,7 +177,7 @@ impl LanguageModel for AzureOpenAiProvider {
         validate_request(&request)?;
         let deployment = self.normalize_model(&request.model)?;
         let payload = ChatCompletionPayload::from_request(&request, deployment.clone(), true)
-            .with_openai_strict_schema();
+            .with_openai_strict_schemas();
 
         let response = http::send_with_retry(
             || {

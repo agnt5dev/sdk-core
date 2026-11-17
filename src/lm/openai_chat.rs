@@ -289,7 +289,7 @@ impl LanguageModel for OpenAiChatProvider {
             let model = self.normalize_model(&request.model)?;
             let mut payload = ChatCompletionPayload::from_request(&request, model, false);
             if self.is_openai_api() {
-                payload = payload.with_openai_strict_schema();
+                payload = payload.with_openai_strict_schemas();
             }
 
             let response = http::send_with_retry(
@@ -397,7 +397,7 @@ impl LanguageModel for OpenAiChatProvider {
             let model = self.normalize_model(&request.model)?;
             let mut payload = ChatCompletionPayload::from_request(&request, model, true);
             if self.is_openai_api() {
-                payload = payload.with_openai_strict_schema();
+                payload = payload.with_openai_strict_schemas();
             }
 
             let response = http::send_with_retry(
