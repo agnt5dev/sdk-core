@@ -16,7 +16,8 @@
 //!   allows `null`, OpenAI's way of writing optional, so the model can say a
 //!   value isn't there instead of making one up. Arrays and objects can be
 //!   empty instead, and a Pydantic `default_factory` field must not get
-//!   `null`.
+//!   `null`. Nor does a property that a `$ref` points at, since the fields
+//!   that refer to it may be required.
 //! - A one-entry `allOf`, and a `$ref` with sibling keywords, become a
 //!   one-entry `anyOf`, which means the same thing.
 //! - A `$ref` at the root, which Pydantic emits for recursive models and
@@ -28,6 +29,8 @@
 //!
 //! OpenAI holds a strict tool's parameters to the same rules, so those are
 //! rewritten the same way.
+
+use std::collections::HashSet;
 
 use serde_json::{json, Map, Value};
 
@@ -75,7 +78,9 @@ pub(crate) fn to_strict_json_schema(schema: &Value) -> Value {
     if let Value::Object(root) = &mut strict {
         inline_root_ref(root, schema);
     }
-    make_strict(&mut strict);
+    let mut ref_targets = HashSet::new();
+    collect_ref_targets(schema, &mut ref_targets);
+    make_strict(&mut strict, "", &ref_targets);
     strict
 }
 
@@ -115,7 +120,9 @@ fn inline_root_ref(root: &mut Map<String, Value>, schema: &Value) {
     }
 }
 
-fn make_strict(node: &mut Value) {
+/// `path` is the node's JSON pointer in the caller's schema; `ref_targets`
+/// holds the pointers that local `$ref`s point at.
+fn make_strict(node: &mut Value, path: &str, ref_targets: &HashSet<String>) {
     let Value::Object(schema) = node else {
         return;
     };
@@ -135,10 +142,16 @@ fn make_strict(node: &mut Value) {
                     .is_some_and(|name| properties.contains_key(name))
             });
             for (name, property) in properties.iter_mut() {
-                if closable && !originally_required.iter().any(|entry| entry == name) {
+                let property_path = format!("{path}/properties/{}", escape_pointer(name));
+                // A `$ref` elsewhere may need this schema without `null`.
+                let referenced = ref_targets.iter().any(|target| {
+                    target == &property_path || target.starts_with(&format!("{property_path}/"))
+                });
+                if closable && !referenced && !originally_required.iter().any(|entry| entry == name)
+                {
                     allow_null_for_optional_scalar(property);
                 }
-                make_strict(property);
+                make_strict(property, &property_path, ref_targets);
             }
             closable.then(|| properties.keys().cloned().map(Value::String).collect())
         }
@@ -153,16 +166,52 @@ fn make_strict(node: &mut Value) {
 
     for keyword in ["items", "prefixItems", "anyOf", "oneOf", "allOf"] {
         match schema.get_mut(keyword) {
-            Some(Value::Array(entries)) => entries.iter_mut().for_each(make_strict),
-            Some(entry @ Value::Object(_)) => make_strict(entry),
+            Some(Value::Array(entries)) => {
+                for (index, entry) in entries.iter_mut().enumerate() {
+                    make_strict(entry, &format!("{path}/{keyword}/{index}"), ref_targets);
+                }
+            }
+            Some(entry @ Value::Object(_)) => {
+                make_strict(entry, &format!("{path}/{keyword}"), ref_targets)
+            }
             _ => {}
         }
     }
     for keyword in ["$defs", "definitions"] {
         if let Some(Value::Object(definitions)) = schema.get_mut(keyword) {
-            definitions.values_mut().for_each(make_strict);
+            for (name, definition) in definitions.iter_mut() {
+                let definition_path = format!("{path}/{keyword}/{}", escape_pointer(name));
+                make_strict(definition, &definition_path, ref_targets);
+            }
         }
     }
+}
+
+/// The JSON pointers that local `$ref`s point at, such as `/$defs/City`.
+fn collect_ref_targets(node: &Value, targets: &mut HashSet<String>) {
+    match node {
+        Value::Object(schema) => {
+            if let Some(Value::String(reference)) = schema.get("$ref") {
+                if let Some(pointer) = reference.strip_prefix('#') {
+                    targets.insert(pointer.to_string());
+                }
+            }
+            for value in schema.values() {
+                collect_ref_targets(value, targets);
+            }
+        }
+        Value::Array(entries) => {
+            for entry in entries {
+                collect_ref_targets(entry, targets);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Escapes a key for use in a JSON pointer.
+fn escape_pointer(key: &str) -> String {
+    key.replace('~', "~0").replace('/', "~1")
 }
 
 /// Lets an optional scalar with no default answer `null`. See the module docs.
@@ -525,6 +574,26 @@ mod tests {
 
         let once = to_strict_json_schema(&pydantic_person());
         assert_eq!(to_strict_json_schema(&once), once);
+    }
+
+    #[test]
+    fn a_property_that_a_ref_points_at_keeps_its_type() {
+        // zod-to-json-schema refers back to a reused schema this way.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "a": {"type": "string"},
+                "b": {"$ref": "#/properties/a"},
+                "c": {"type": "string"}
+            },
+            "required": ["b"]
+        });
+
+        let properties = to_strict_json_schema(&schema)["properties"].clone();
+
+        assert_eq!(properties["a"], json!({"type": "string"}));
+        assert_eq!(properties["b"], json!({"$ref": "#/properties/a"}));
+        assert_eq!(properties["c"], json!({"type": ["string", "null"]}));
     }
 
     #[test]
