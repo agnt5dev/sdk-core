@@ -21,7 +21,9 @@
 //!   not get `null`. A property that a `$ref` points at keeps its type, since
 //!   the fields that refer to it may be required.
 //! - A one-entry `allOf`, and a `$ref` with sibling keywords, become a
-//!   one-entry `anyOf`, which means the same thing.
+//!   one-entry `anyOf`, which means the same thing. An `allOf` that a `$ref`
+//!   points inside stays, for OpenAI to report: renaming it would leave that
+//!   reference pointing nowhere.
 //! - A `$ref` at the root, which Pydantic emits for recursive models and
 //!   zod-to-json-schema for every model, is replaced by the definition it
 //!   points to, since OpenAI wants an object there.
@@ -174,7 +176,7 @@ fn make_strict(node: &mut Value, path: &str, refs: &Refs) {
     let Value::Object(schema) = node else {
         return;
     };
-    wrap_in_any_of(schema);
+    wrap_in_any_of(schema, path, refs);
 
     let originally_required: Vec<Value> = schema
         .get("required")
@@ -321,11 +323,13 @@ fn allow_null_for_optional_recursion(property: &mut Value, refs: &Refs) {
 /// a description), or a `$ref` with sibling keywords, into a one-entry
 /// `anyOf`. The siblings stay where they are, so every constraint still
 /// applies.
-fn wrap_in_any_of(schema: &mut Map<String, Value>) {
+fn wrap_in_any_of(schema: &mut Map<String, Value>, path: &str, refs: &Refs) {
     if schema.contains_key("anyOf") {
         return;
     }
-    if matches!(schema.get("allOf"), Some(Value::Array(entries)) if entries.len() == 1) {
+    if matches!(schema.get("allOf"), Some(Value::Array(entries)) if entries.len() == 1)
+        && !refs.point_into(&format!("{path}/allOf"))
+    {
         let entries = schema.remove("allOf").unwrap_or_default();
         schema.insert("anyOf".to_string(), entries);
     } else if schema.contains_key("$ref")
@@ -524,6 +528,30 @@ mod tests {
         assert_eq!(
             properties["home"],
             json!({"anyOf": [{"$ref": "#/$defs/Node"}], "description": "Where they live"})
+        );
+    }
+
+    #[test]
+    fn all_of_that_a_ref_points_inside_is_left_alone() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "a": {"allOf": [{"type": "string"}]},
+                "b": {"$ref": "#/properties/a/allOf/0"}
+            },
+            "required": ["a", "b"]
+        });
+
+        let strict = to_strict_json_schema(&schema);
+
+        assert_eq!(strict["properties"]["a"], schema["properties"]["a"]);
+        assert_eq!(
+            strict.pointer("/properties/a/allOf/0"),
+            Some(&json!({"type": "string"}))
+        );
+        assert_eq!(
+            strict["properties"]["b"],
+            json!({"$ref": "#/properties/a/allOf/0"})
         );
     }
 
