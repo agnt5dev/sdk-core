@@ -12,12 +12,14 @@
 //! - An object that declares `properties` is closed, and all of them are
 //!   listed in `required`. An optional property keeps its own type, so the
 //!   model fills it in; with a default, the default says what empty looks
-//!   like. The exception is an optional scalar with no default: it also
-//!   allows `null`, OpenAI's way of writing optional, so the model can say a
-//!   value isn't there instead of making one up. Arrays and objects can be
-//!   empty instead, and a Pydantic `default_factory` field must not get
-//!   `null`. Nor does a property that a `$ref` points at, since the fields
-//!   that refer to it may be required.
+//!   like. The exception is where `null`, OpenAI's way of writing optional, is
+//!   the only honest way to leave a value out, so it's allowed too: an
+//!   optional scalar with no default, where the model would otherwise make a
+//!   value up, and an optional property that refers back into a recursive
+//!   definition, where the recursion could otherwise never end. Arrays and
+//!   objects can be empty instead, and a Pydantic `default_factory` field must
+//!   not get `null`. A property that a `$ref` points at keeps its type, since
+//!   the fields that refer to it may be required.
 //! - A one-entry `allOf`, and a `$ref` with sibling keywords, become a
 //!   one-entry `anyOf`, which means the same thing.
 //! - A `$ref` at the root, which Pydantic emits for recursive models and
@@ -78,10 +80,57 @@ pub(crate) fn to_strict_json_schema(schema: &Value) -> Value {
     if let Value::Object(root) = &mut strict {
         inline_root_ref(root, schema);
     }
-    let mut ref_targets = HashSet::new();
-    collect_ref_targets(schema, &mut ref_targets);
-    make_strict(&mut strict, "", &ref_targets);
+    make_strict(&mut strict, "", &Refs::of(schema));
     strict
+}
+
+/// What the rewrite needs to know about the caller's local `$ref`s.
+struct Refs {
+    /// The JSON pointers they point at, such as `/$defs/City`.
+    targets: HashSet<String>,
+    /// The targets on a reference cycle: following the refs inside one leads
+    /// back to it.
+    recursive: HashSet<String>,
+}
+
+impl Refs {
+    fn of(schema: &Value) -> Self {
+        let mut targets = HashSet::new();
+        collect_ref_targets(schema, &mut targets);
+        let recursive = targets
+            .iter()
+            .filter(|target| leads_back(schema, target, target, &mut HashSet::new()))
+            .cloned()
+            .collect();
+        Self { targets, recursive }
+    }
+
+    /// Whether a `$ref` points at the schema at `path`, or inside it.
+    fn point_into(&self, path: &str) -> bool {
+        self.targets
+            .iter()
+            .any(|target| target == path || target.starts_with(&format!("{path}/")))
+    }
+
+    fn is_recursive(&self, reference: &str) -> bool {
+        reference
+            .strip_prefix('#')
+            .is_some_and(|pointer| self.recursive.contains(pointer))
+    }
+}
+
+/// Whether following the `$ref`s inside the schema at `from` leads to
+/// `target`.
+fn leads_back(schema: &Value, from: &str, target: &str, seen: &mut HashSet<String>) -> bool {
+    let Some(node) = schema.pointer(from) else {
+        return false;
+    };
+    let mut next = HashSet::new();
+    collect_ref_targets(node, &mut next);
+    next.into_iter().any(|pointer| {
+        pointer == target
+            || (seen.insert(pointer.clone()) && leads_back(schema, &pointer, target, seen))
+    })
 }
 
 /// Replaces a root `$ref` with the definition it points to. Only annotations,
@@ -120,9 +169,8 @@ fn inline_root_ref(root: &mut Map<String, Value>, schema: &Value) {
     }
 }
 
-/// `path` is the node's JSON pointer in the caller's schema; `ref_targets`
-/// holds the pointers that local `$ref`s point at.
-fn make_strict(node: &mut Value, path: &str, ref_targets: &HashSet<String>) {
+/// `path` is the node's JSON pointer in the caller's schema.
+fn make_strict(node: &mut Value, path: &str, refs: &Refs) {
     let Value::Object(schema) = node else {
         return;
     };
@@ -143,15 +191,13 @@ fn make_strict(node: &mut Value, path: &str, ref_targets: &HashSet<String>) {
             });
             for (name, property) in properties.iter_mut() {
                 let property_path = format!("{path}/properties/{}", escape_pointer(name));
+                let optional = !originally_required.iter().any(|entry| entry == name);
                 // A `$ref` elsewhere may need this schema without `null`.
-                let referenced = ref_targets.iter().any(|target| {
-                    target == &property_path || target.starts_with(&format!("{property_path}/"))
-                });
-                if closable && !referenced && !originally_required.iter().any(|entry| entry == name)
-                {
+                if closable && optional && !refs.point_into(&property_path) {
                     allow_null_for_optional_scalar(property);
+                    allow_null_for_optional_recursion(property, refs);
                 }
-                make_strict(property, &property_path, ref_targets);
+                make_strict(property, &property_path, refs);
             }
             closable.then(|| properties.keys().cloned().map(Value::String).collect())
         }
@@ -168,11 +214,11 @@ fn make_strict(node: &mut Value, path: &str, ref_targets: &HashSet<String>) {
         match schema.get_mut(keyword) {
             Some(Value::Array(entries)) => {
                 for (index, entry) in entries.iter_mut().enumerate() {
-                    make_strict(entry, &format!("{path}/{keyword}/{index}"), ref_targets);
+                    make_strict(entry, &format!("{path}/{keyword}/{index}"), refs);
                 }
             }
             Some(entry @ Value::Object(_)) => {
-                make_strict(entry, &format!("{path}/{keyword}"), ref_targets)
+                make_strict(entry, &format!("{path}/{keyword}"), refs)
             }
             _ => {}
         }
@@ -181,7 +227,7 @@ fn make_strict(node: &mut Value, path: &str, ref_targets: &HashSet<String>) {
         if let Some(Value::Object(definitions)) = schema.get_mut(keyword) {
             for (name, definition) in definitions.iter_mut() {
                 let definition_path = format!("{path}/{keyword}/{}", escape_pointer(name));
-                make_strict(definition, &definition_path, ref_targets);
+                make_strict(definition, &definition_path, refs);
             }
         }
     }
@@ -242,6 +288,33 @@ fn allow_null_for_optional_scalar(property: &mut Value) {
         nullable.push(Value::from("null"));
         schema.insert("type".to_string(), Value::Array(nullable));
     }
+}
+
+/// Lets an optional property that refers back into a recursive definition
+/// answer `null`. Once the property is required, `null` is the only way the
+/// recursion can end.
+fn allow_null_for_optional_recursion(property: &mut Value, refs: &Refs) {
+    let Value::Object(schema) = property else {
+        return;
+    };
+    let recursive = matches!(
+        schema.get("$ref"),
+        Some(Value::String(reference)) if refs.is_recursive(reference)
+    );
+    if !recursive {
+        return;
+    }
+    // Annotations describe the property, so they stay outside, the way
+    // Pydantic writes an `Optional` model.
+    let mut nullable: Map<String, Value> = schema
+        .iter()
+        .filter(|(key, _)| ANNOTATIONS.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    schema.retain(|key, _| !ANNOTATIONS.contains(&key.as_str()));
+    let reference = Value::Object(std::mem::take(schema));
+    nullable.insert("anyOf".to_string(), json!([reference, { "type": "null" }]));
+    *schema = nullable;
 }
 
 /// Turns a one-entry `allOf` (older Pydantic wraps a `$ref` in one to give it
@@ -597,6 +670,71 @@ mod tests {
     }
 
     #[test]
+    fn an_optional_recursive_reference_can_end_with_null() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"name": {"type": "string"}, "child": {"$ref": "#"}},
+            "required": ["name"]
+        });
+
+        let strict = to_strict_json_schema(&schema);
+
+        assert_eq!(strict["required"], json!(["child", "name"]));
+        assert_eq!(
+            strict["properties"]["child"],
+            json!({"anyOf": [{"$ref": "#"}, {"type": "null"}]})
+        );
+
+        // Two definitions that refer to each other.
+        let schema = json!({
+            "type": "object",
+            "properties": {"a": {"$ref": "#/$defs/A"}},
+            "required": ["a"],
+            "$defs": {
+                "A": {"type": "object", "properties": {"b": {"$ref": "#/$defs/B"}}},
+                "B": {"type": "object", "properties": {"a": {"$ref": "#/$defs/A"}}}
+            }
+        });
+
+        let strict = to_strict_json_schema(&schema);
+
+        assert_eq!(strict["properties"]["a"], json!({"$ref": "#/$defs/A"}));
+        assert_eq!(
+            strict["$defs"]["A"]["properties"]["b"],
+            json!({"anyOf": [{"$ref": "#/$defs/B"}, {"type": "null"}]})
+        );
+        assert_eq!(
+            strict["$defs"]["B"]["properties"]["a"],
+            json!({"anyOf": [{"$ref": "#/$defs/A"}, {"type": "null"}]})
+        );
+    }
+
+    #[test]
+    fn an_optional_reference_to_a_plain_definition_keeps_its_type() {
+        // Pydantic's `Field(default_factory=City)` has no `default`, and its
+        // model rejects `None`.
+        let schema = json!({
+            "type": "object",
+            "properties": {"home": {"$ref": "#/$defs/City"}},
+            "$defs": {
+                "City": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}},
+                    "required": ["name"]
+                }
+            }
+        });
+
+        let strict = to_strict_json_schema(&schema);
+
+        assert_eq!(
+            strict["properties"]["home"],
+            json!({"$ref": "#/$defs/City"})
+        );
+        assert_eq!(strict["required"], json!(["home"]));
+    }
+
+    #[test]
     fn required_names_without_a_property_are_left_alone() {
         let schema = json!({
             "type": "object",
@@ -665,9 +803,10 @@ mod tests {
         let strict = to_strict_json_schema(&schema);
 
         assert!(strict.to_string().len() < 2 * schema.to_string().len());
+        // Optional and recursive, so it may also end with `null`.
         assert_eq!(
             strict["$defs"]["L11"]["properties"]["self"],
-            json!({"anyOf": [{"$ref": "#/$defs/L11"}], "description": "itself"})
+            json!({"anyOf": [{"$ref": "#/$defs/L11"}, {"type": "null"}], "description": "itself"})
         );
     }
 
