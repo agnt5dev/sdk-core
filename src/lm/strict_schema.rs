@@ -272,9 +272,19 @@ fn allow_null_for_optional_scalar(property: &mut Value) {
         Some(Value::Array(names)) => names.iter().filter_map(Value::as_str).collect(),
         _ => Vec::new(),
     };
-    let listed = schema.contains_key("enum") || schema.contains_key("const");
+    // The values an `enum` or `const` allows.
+    let values: Vec<&Value> = match (schema.get("enum"), schema.get("const")) {
+        (Some(Value::Array(values)), _) => values.iter().collect(),
+        (_, Some(value)) => vec![value],
+        _ => Vec::new(),
+    };
+    let listed = !values.is_empty();
     let scalar = if types.is_empty() {
+        // Without a `type`, the values say what kind of value it is.
         listed
+            && values
+                .iter()
+                .all(|value| value.is_string() || value.is_number() || value.is_boolean())
     } else {
         types.iter().all(|name| SCALAR_TYPES.contains(name))
     };
@@ -292,20 +302,16 @@ fn allow_null_for_optional_scalar(property: &mut Value) {
     }
 }
 
-/// Lets an optional property that refers back into a recursive definition
-/// answer `null`. Once the property is required, `null` is the only way the
-/// recursion can end.
+/// Lets an optional property that refers back into a recursive definition,
+/// directly or through a one-entry `allOf` or `anyOf`, answer `null`. Once
+/// the property is required, `null` is the only way the recursion can end.
 fn allow_null_for_optional_recursion(property: &mut Value, refs: &Refs) {
+    if !sole_ref(property).is_some_and(|reference| refs.is_recursive(reference)) {
+        return;
+    }
     let Value::Object(schema) = property else {
         return;
     };
-    let recursive = matches!(
-        schema.get("$ref"),
-        Some(Value::String(reference)) if refs.is_recursive(reference)
-    );
-    if !recursive {
-        return;
-    }
     // Annotations describe the property, so they stay outside, the way
     // Pydantic writes an `Optional` model.
     let mut nullable: Map<String, Value> = schema
@@ -317,6 +323,20 @@ fn allow_null_for_optional_recursion(property: &mut Value, refs: &Refs) {
     let reference = Value::Object(std::mem::take(schema));
     nullable.insert("anyOf".to_string(), json!([reference, { "type": "null" }]));
     *schema = nullable;
+}
+
+/// The `$ref` a schema comes down to: its own, or the one inside a one-entry
+/// `allOf` or `anyOf`.
+fn sole_ref(schema: &Value) -> Option<&str> {
+    if let Some(Value::String(reference)) = schema.get("$ref") {
+        return Some(reference);
+    }
+    ["allOf", "anyOf"]
+        .into_iter()
+        .find_map(|keyword| match schema.get(keyword) {
+            Some(Value::Array(entries)) if entries.len() == 1 => sole_ref(&entries[0]),
+            _ => None,
+        })
 }
 
 /// Turns a one-entry `allOf` (older Pydantic wraps a `$ref` in one to give it
@@ -734,6 +754,48 @@ mod tests {
         assert_eq!(
             strict["$defs"]["B"]["properties"]["a"],
             json!({"anyOf": [{"$ref": "#/$defs/A"}, {"type": "null"}]})
+        );
+    }
+
+    #[test]
+    fn an_optional_recursive_reference_inside_a_wrapper_can_end_with_null() {
+        // Older Pydantic wraps a described reference in a one-entry `allOf`.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "child": {"allOf": [{"$ref": "#"}], "description": "The next one"}
+            },
+            "required": ["name"]
+        });
+
+        let strict = to_strict_json_schema(&schema);
+        let child = &strict["properties"]["child"];
+
+        assert_eq!(strict["required"], json!(["child", "name"]));
+        assert_eq!(child["description"], "The next one");
+        assert_eq!(child["anyOf"][0], json!({"anyOf": [{"$ref": "#"}]}));
+        assert_eq!(child["anyOf"][1], json!({"type": "null"}));
+    }
+
+    #[test]
+    fn an_optional_enum_of_objects_keeps_its_type() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "plan": {"enum": [{"kind": "fixed"}]},
+                "fixed": {"const": {"kind": "fixed"}},
+                "tier": {"const": "gold"}
+            }
+        });
+
+        let properties = to_strict_json_schema(&schema)["properties"].clone();
+
+        assert_eq!(properties["plan"], schema["properties"]["plan"]);
+        assert_eq!(properties["fixed"], schema["properties"]["fixed"]);
+        assert_eq!(
+            properties["tier"],
+            json!({"anyOf": [{"const": "gold"}, {"type": "null"}]})
         );
     }
 
