@@ -1,14 +1,19 @@
 # Changelog
 
-## 0.3.13 - 2026-11-17
+## 0.3.13 - 2026-11-20
+
+### Security
+
+- Workers that AGNT5 runs send a runtime workload token on every worker call, as self-hosted workers already do. When `AGNT5_WORKLOAD_BROKER_URL` and `AGNT5_WORKLOAD_TOKEN_FILE` are both set and `AGNT5_API_KEY_FILE` is not, the worker trades the pod's identity token from `AGNT5_WORKLOAD_TOKEN_FILE` at the broker's `/internal/workload/token` endpoint for an `agnt5-runtime` token, and sends it as `authorization: Bearer` on `WorkerCoordinatorService`, `EngineService` and `ExecutionEngineService/EventStream` calls. It refreshes a minute before expiry, reading the identity file again so a rotated identity is picked up. If the broker is unreachable at startup, the worker logs a warning, connects without a token and keeps retrying. Self-hosted workers and local development are unchanged.
 
 ### Fixed
 
+- Structured output and tools marked `strict` work with OpenAI. Before, strict mode, the default for `JsonSchemaFormat`, failed with a 400 for most schemas. For the Responses API, Azure OpenAI and `OpenAiChatProvider` on `api.openai.com`, a strict schema is now rewritten into the form strict mode accepts: every object with `properties` gets `additionalProperties: false` and lists them all in `required`, a one-entry `allOf` or a `$ref` with siblings becomes a one-entry `anyOf`, and a root `$ref` is replaced by its definition. An optional scalar with no default, or an optional property that refers back into a recursive definition, also allows `null`, so the answer can hold `null` where the caller's schema left the property out. Other OpenAI-compatible providers and non-strict formats get the schema as given.
 - Give self-hosted workers durable steps and sleeps without a configured artifact identity. When `AGNT5_ACTIVATION_ARTIFACT_SHA256` is unset, derive the identity from the deployment ID instead of falling back to legacy checkpoints, where a sleep restarts after a crash. A UUID deployment ID uses the control plane's canonical form, so hosted workers derive what the control plane would configure, and a configured identity always wins.
 
 ### Upgrade
 
-- Python and TypeScript native bindings must adopt core 0.3.13 in their own patch releases to include this fix.
+- Python and TypeScript native bindings must adopt core 0.3.13 in their own patch releases to include these changes.
 
 ## 0.3.12 - 2026-11-05
 
