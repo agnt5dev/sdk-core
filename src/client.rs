@@ -143,11 +143,32 @@ struct ExternalWorkerBootstrap {
     authority: ExternalWorkerAuthority,
 }
 
+/// Where a self-hosted worker's service key comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceKeySource {
+    /// `AGNT5_API_KEY_FILE` names a file that holds the key.
+    File,
+    /// `AGNT5_API_KEY` holds the key itself. Hosts such as Railway and Render
+    /// set variables from their dashboards but don't mount files, so this is
+    /// the setting a worker there gets.
+    Env,
+}
+
+/// Settings that point a worker at a runtime directly. `agnt5 dev` sets them
+/// and also passes `AGNT5_API_KEY` for its own use, so an inline key turns on
+/// discovery only when none of these is set, as in the Go SDK.
+const DIRECT_ROUTING_ENV: [&str; 4] = [
+    "AGNT5_COORDINATOR_ENDPOINT",
+    "AGNT5_ENGINE_URL",
+    "AGNT5_PROJECT_ID",
+    "AGNT5_DEPLOYMENT_ID",
+];
+
 /// How a worker proves who it is to the runtime.
 #[derive(Debug, PartialEq, Eq)]
 enum WorkerAuth {
     /// Self-hosted: discovery, then a runtime token traded for the service key.
-    ServiceKey,
+    ServiceKey(ServiceKeySource),
     /// AGNT5-hosted: the pod's Kubernetes identity, traded at the workload
     /// broker. The runtime endpoint is the one the worker was configured with.
     Hosted(HostedWorkloadIdentity),
@@ -156,16 +177,23 @@ enum WorkerAuth {
 }
 
 impl WorkerAuth {
-    /// A service key wins, so a self-hosted worker that happens to run in a
-    /// pod with workload identity keeps its own project-bound authority.
+    /// A key file wins, so a self-hosted worker that happens to run in a pod
+    /// with workload identity keeps its own project-bound authority. An
+    /// inline key comes after workload identity: a hosted worker may carry
+    /// `AGNT5_API_KEY` to call AGNT5 APIs, and that mustn't change how it
+    /// connects.
     fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
-        if lookup("AGNT5_API_KEY_FILE").is_some_and(|value| !value.trim().is_empty()) {
-            return Self::ServiceKey;
+        let set = |name: &str| lookup(name).is_some_and(|value| !value.trim().is_empty());
+        if set("AGNT5_API_KEY_FILE") {
+            return Self::ServiceKey(ServiceKeySource::File);
         }
-        match HostedWorkloadIdentity::from_lookup(lookup) {
-            Some(identity) => Self::Hosted(identity),
-            None => Self::Unauthenticated,
+        if let Some(identity) = HostedWorkloadIdentity::from_lookup(&lookup) {
+            return Self::Hosted(identity);
         }
+        if set("AGNT5_API_KEY") && !DIRECT_ROUTING_ENV.iter().any(|name| set(name)) {
+            return Self::ServiceKey(ServiceKeySource::Env);
+        }
+        Self::Unauthenticated
     }
 
     fn from_env() -> Self {
@@ -174,7 +202,7 @@ impl WorkerAuth {
 }
 
 pub(crate) fn remote_worker_bootstrap_enabled() -> bool {
-    WorkerAuth::from_env() == WorkerAuth::ServiceKey
+    matches!(WorkerAuth::from_env(), WorkerAuth::ServiceKey(_))
 }
 
 /// What a runtime connection needs to authenticate: where to connect, the
@@ -192,9 +220,9 @@ struct ConnectionAuth {
 
 async fn connection_auth(endpoint: String) -> Result<ConnectionAuth> {
     match WorkerAuth::from_env() {
-        WorkerAuth::ServiceKey => {
+        WorkerAuth::ServiceKey(source) => {
             let (endpoint, interceptor, tls, worker_id, authority) =
-                external_worker_bootstrap().await?;
+                external_worker_bootstrap(source).await?;
             Ok(ConnectionAuth {
                 endpoint,
                 interceptor,
@@ -238,7 +266,42 @@ async fn hosted_worker_authorization() -> Option<MetadataValue<tonic::metadata::
     value
 }
 
-async fn external_worker_bootstrap() -> Result<(
+/// Reads a self-hosted worker's service key from where `source` says it is.
+fn read_service_key(source: ServiceKeySource) -> Result<String> {
+    let credential = match source {
+        ServiceKeySource::File => {
+            let key_path =
+                std::env::var("AGNT5_API_KEY_FILE").map_err(|_| SdkError::Connection {
+                    message: "AGNT5_API_KEY_FILE is required for external workers".to_string(),
+                    code: crate::error::ErrorCode::ConnectionFailed,
+                    source: None,
+                })?;
+            std::fs::read_to_string(&key_path).map_err(|error| SdkError::Connection {
+                message: format!("read external worker credential {}: {}", key_path, error),
+                code: crate::error::ErrorCode::ConnectionFailed,
+                source: None,
+            })?
+        }
+        ServiceKeySource::Env => std::env::var("AGNT5_API_KEY").unwrap_or_default(),
+    };
+    let credential = credential.trim().to_string();
+    if credential.is_empty() {
+        let message = match source {
+            ServiceKeySource::File => "external worker credential file is empty",
+            ServiceKeySource::Env => "AGNT5_API_KEY is empty",
+        };
+        return Err(SdkError::Connection {
+            message: message.to_string(),
+            code: crate::error::ErrorCode::ConnectionFailed,
+            source: None,
+        });
+    }
+    Ok(credential)
+}
+
+async fn external_worker_bootstrap(
+    source: ServiceKeySource,
+) -> Result<(
     String,
     BearerInterceptor,
     Option<ClientTlsConfig>,
@@ -250,30 +313,19 @@ async fn external_worker_bootstrap() -> Result<(
         .trim_end_matches('/')
         .to_string();
     crate::external_worker_identity::validate_identity_endpoint(&control_plane_url)?;
-    let key_path = std::env::var("AGNT5_API_KEY_FILE").map_err(|_| SdkError::Connection {
-        message: "AGNT5_API_KEY_FILE is required for external workers".to_string(),
-        code: crate::error::ErrorCode::ConnectionFailed,
-        source: None,
-    })?;
-    let credential = std::fs::read_to_string(&key_path)
-        .map_err(|error| SdkError::Connection {
-            message: format!("read external worker credential {}: {}", key_path, error),
-            code: crate::error::ErrorCode::ConnectionFailed,
-            source: None,
-        })?
-        .trim()
-        .to_string();
-    if credential.is_empty() {
-        return Err(SdkError::Connection {
-            message: "external worker credential file is empty".to_string(),
-            code: crate::error::ErrorCode::ConnectionFailed,
-            source: None,
-        });
-    }
+    let credential = read_service_key(source)?;
     let environment = std::env::var("AGNT5_ENVIRONMENT").unwrap_or_default();
     let ca_bundle = external_worker_ca_bundle()?;
     let http = crate::external_worker_identity::bootstrap_http_client()?;
     let rollout = crate::external_worker_identity::RolloutReadiness::from_env()?;
+    // Bootstrap mTLS takes its key from a file only, as the Go SDK does.
+    if rollout.ready && source == ServiceKeySource::Env {
+        return Err(SdkError::Connection {
+            message: "mTLS readiness requires AGNT5_API_KEY_FILE; set the key there instead of in AGNT5_API_KEY".to_string(),
+            code: crate::error::ErrorCode::ConnectionFailed,
+            source: None,
+        });
+    }
     let response = http
         .post(format!("{}{}", control_plane_url, EXTERNAL_DISCOVERY_PATH))
         .header("X-API-KEY", &credential)
@@ -1898,7 +1950,74 @@ mod tests {
                 ("AGNT5_WORKLOAD_BROKER_URL", "http://broker"),
                 ("AGNT5_WORKLOAD_TOKEN_FILE", "/run/agnt5-workload/token"),
             ])),
-            WorkerAuth::ServiceKey
+            WorkerAuth::ServiceKey(ServiceKeySource::File)
+        );
+    }
+
+    #[test]
+    fn worker_auth_uses_an_inline_key_when_nothing_routes_the_worker_directly() {
+        assert_eq!(
+            WorkerAuth::from_lookup(env(&[
+                ("AGNT5_API_KEY", "agnt5_sk_test"),
+                ("AGNT5_ENVIRONMENT", "production"),
+            ])),
+            WorkerAuth::ServiceKey(ServiceKeySource::Env)
+        );
+    }
+
+    #[test]
+    fn worker_auth_prefers_the_key_file_over_an_inline_key() {
+        assert_eq!(
+            WorkerAuth::from_lookup(env(&[
+                ("AGNT5_API_KEY_FILE", "/etc/agnt5/key"),
+                ("AGNT5_API_KEY", "agnt5_sk_test"),
+            ])),
+            WorkerAuth::ServiceKey(ServiceKeySource::File)
+        );
+    }
+
+    #[test]
+    fn worker_auth_ignores_an_inline_key_when_the_worker_is_routed_directly() {
+        // `agnt5 dev` passes AGNT5_API_KEY alongside the endpoints it sets.
+        for routing in [
+            "AGNT5_COORDINATOR_ENDPOINT",
+            "AGNT5_ENGINE_URL",
+            "AGNT5_PROJECT_ID",
+            "AGNT5_DEPLOYMENT_ID",
+        ] {
+            let lookup = move |name: &str| match name {
+                "AGNT5_API_KEY" => Some("agnt5_sk_test".to_string()),
+                name if name == routing => Some("http://localhost:34183".to_string()),
+                _ => None,
+            };
+            assert_eq!(
+                WorkerAuth::from_lookup(lookup),
+                WorkerAuth::Unauthenticated,
+                "{routing}"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_auth_prefers_workload_identity_over_an_inline_key() {
+        assert_eq!(
+            WorkerAuth::from_lookup(env(&[
+                ("AGNT5_API_KEY", "agnt5_sk_test"),
+                ("AGNT5_WORKLOAD_BROKER_URL", "http://broker"),
+                ("AGNT5_WORKLOAD_TOKEN_FILE", "/run/agnt5-workload/token"),
+            ])),
+            WorkerAuth::Hosted(HostedWorkloadIdentity {
+                broker_url: "http://broker".into(),
+                token_file: "/run/agnt5-workload/token".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn worker_auth_ignores_a_blank_inline_key() {
+        assert_eq!(
+            WorkerAuth::from_lookup(env(&[("AGNT5_API_KEY", "  ")])),
+            WorkerAuth::Unauthenticated
         );
     }
 
