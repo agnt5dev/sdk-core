@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Stop dropping run spans when trace export falls behind. Every h2, hyper, tonic and tower span from the worker's own gRPC connections, including the OTLP exporter's, used to become an OpenTelemetry span and was discarded only at export, so a handful of runs filled the batch span processor's 2048-span queue with them. Whenever export was slower than that traffic, the queue stayed full and the run spans ending behind it were dropped, with the single warning `BatchSpanProcessor dropped a Span due to queue full/internal errors`. Only the SDK's own `tracing` spans (`agnt5*` targets) become OpenTelemetry spans now, and spans created through the OpenTelemetry API, such as component spans, are unchanged. Set `AGNT5_OTEL_SPAN_FILTER` to an `EnvFilter` directive to choose the spans yourself, for example `agnt5=trace,h2=trace` to look at transport spans while debugging.
+
+### Upgrade
+
+- Python and TypeScript native bindings must adopt the next core release to include this fix.
+
 ## 0.3.13 - 2026-11-20
 
 ### Security
