@@ -1,14 +1,15 @@
 # Changelog
 
-## [Unreleased]
+## Unreleased
 
 ### Fixed
 
+- Self-hosted workers accept their service key in `AGNT5_API_KEY`, as Go workers already do. Hosts such as Railway and Render set variables from their dashboards but don't mount files, and a worker given only `AGNT5_API_KEY` used to skip discovery and connect without a token. The key turns on discovery only when `AGNT5_API_KEY_FILE` is unset, the worker has no AGNT5 workload identity, and none of `AGNT5_COORDINATOR_ENDPOINT`, `AGNT5_ENGINE_URL`, `AGNT5_PROJECT_ID` or `AGNT5_DEPLOYMENT_ID` is set, so `agnt5 dev` and workers that AGNT5 runs connect as before. `AGNT5_API_KEY_FILE` wins when both are set, and bootstrap mTLS still needs the key in a file.
 - Stop dropping run spans when trace export falls behind. Every h2, hyper, tonic and tower span from the worker's own gRPC connections, including the OTLP exporter's, used to become an OpenTelemetry span and was discarded only at export, so a handful of runs filled the batch span processor's 2048-span queue with them. Whenever export was slower than that traffic, the queue stayed full and the run spans ending behind it were dropped, with the single warning `BatchSpanProcessor dropped a Span due to queue full/internal errors`. Only the SDK's own `tracing` spans (`agnt5*` targets) become OpenTelemetry spans now, and spans created through the OpenTelemetry API, such as component spans, are unchanged. Set `AGNT5_OTEL_SPAN_FILTER` to an `EnvFilter` directive to choose the spans yourself, for example `agnt5=trace,h2=trace` to look at transport spans while debugging.
 
 ### Upgrade
 
-- Python and TypeScript native bindings must adopt the next core release to include this fix.
+- Python and TypeScript native bindings must adopt the next core release in their own patch releases to include these fixes.
 
 ## 0.3.13 - 2026-11-20
 
