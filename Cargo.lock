@@ -37,7 +37,7 @@ dependencies = [
 
 [[package]]
 name = "agnt5-sdk-core"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "agnt5-eval-scorers",
  "anyhow",

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.14 - 2026-11-20
 
 ### Fixed
 
@@ -9,7 +9,7 @@
 
 ### Upgrade
 
-- Python and TypeScript native bindings must adopt the next core release in their own patch releases to include these fixes.
+- Python and TypeScript native bindings must adopt core 0.3.14 in their own patch releases to include these fixes.
 
 ## 0.3.13 - 2026-11-20
 
