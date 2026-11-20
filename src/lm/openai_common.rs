@@ -127,6 +127,28 @@ impl ChatCompletionPayload {
 
         payload
     }
+
+    /// Rewrites a strict JSON schema, and strict tools' parameters, into the
+    /// form OpenAI's strict mode accepts. Only for endpoints that enforce that
+    /// form, OpenAI and Azure OpenAI; other compatible backends take the
+    /// schemas as given.
+    pub(crate) fn with_openai_strict_schemas(mut self) -> Self {
+        for tool in &mut self.tools {
+            if tool.function.strict == Some(true) {
+                if let Some(parameters) = tool.function.parameters.as_mut() {
+                    *parameters = super::strict_schema::to_strict_json_schema(parameters);
+                }
+            }
+        }
+        let json_schema = self
+            .response_format
+            .as_mut()
+            .and_then(|format| format.json_schema.as_mut());
+        if let Some(json_schema) = json_schema.filter(|json_schema| json_schema.strict) {
+            json_schema.schema = super::strict_schema::to_strict_json_schema(&json_schema.schema);
+        }
+        self
+    }
 }
 
 #[derive(Serialize)]
@@ -837,6 +859,75 @@ mod tests {
         assert!(payload.top_p.is_none());
         assert!(payload.max_tokens.is_none());
         assert_eq!(payload.max_completion_tokens, Some(256));
+    }
+
+    #[test]
+    fn chat_payload_rewrites_strict_schemas_only_when_asked() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"name": {"type": "string"}, "email": {"type": "string"}},
+            "required": ["name"]
+        });
+        let format = JsonSchemaFormat::new("person", schema.clone());
+        let sent = |format: JsonSchemaFormat, openai: bool| {
+            let request = GenerateRequest::new("openai_chat/gpt-4.1-mini")
+                .user_message("Hi")
+                .response_format(ResponseFormat::JsonSchema(format));
+            let mut payload =
+                ChatCompletionPayload::from_request(&request, "gpt-4.1-mini".into(), false);
+            if openai {
+                payload = payload.with_openai_strict_schemas();
+            }
+            serde_json::to_value(payload).unwrap()["response_format"]["json_schema"].clone()
+        };
+
+        let rewritten = sent(format.clone(), true);
+        assert_eq!(rewritten["strict"], true);
+        assert_eq!(rewritten["schema"]["required"], json!(["email", "name"]));
+        assert_eq!(rewritten["schema"]["additionalProperties"], false);
+
+        // Other OpenAI-compatible backends, and non-strict formats, get the
+        // schema as given.
+        assert_eq!(sent(format.clone(), false)["schema"], schema);
+        assert_eq!(sent(format.with_strict(false), true)["schema"], schema);
+    }
+
+    #[test]
+    fn chat_payload_rewrites_strict_tools_only_when_asked() {
+        let parameters = json!({
+            "type": "object",
+            "properties": {"location": {"type": "string"}, "units": {"type": "string"}},
+            "required": ["location"]
+        });
+        let mut strict_tool = ToolDefinition::new("get_weather");
+        strict_tool.parameters = Some(parameters.clone());
+        strict_tool.strict = Some(true);
+        let mut loose_tool = strict_tool.clone();
+        loose_tool.name = "lookup".into();
+        loose_tool.strict = None;
+        let request = GenerateRequest::new("openai_chat/gpt-4.1-mini")
+            .user_message("Hi")
+            .tools(vec![strict_tool, loose_tool]);
+        let sent = |openai: bool| {
+            let mut payload =
+                ChatCompletionPayload::from_request(&request, "gpt-4.1-mini".into(), false);
+            if openai {
+                payload = payload.with_openai_strict_schemas();
+            }
+            serde_json::to_value(payload).unwrap()["tools"].clone()
+        };
+
+        let tools = sent(true);
+        assert_eq!(
+            tools[0]["function"]["parameters"]["required"],
+            json!(["location", "units"])
+        );
+        assert_eq!(
+            tools[0]["function"]["parameters"]["additionalProperties"],
+            false
+        );
+        assert_eq!(tools[1]["function"]["parameters"], parameters);
+        assert_eq!(sent(false)[0]["function"]["parameters"], parameters);
     }
 
     #[test]

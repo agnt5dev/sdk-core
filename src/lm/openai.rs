@@ -409,7 +409,8 @@ impl ResponsesApiRequest {
                 tool_type: "function".to_string(),
                 name: tool.name.clone(),
                 description: tool.description.clone(),
-                parameters: tool.parameters.clone().unwrap_or(serde_json::json!({})),
+                parameters: super::strict_schema::tool_parameters(tool)
+                    .unwrap_or(serde_json::json!({})),
                 strict: tool.strict,
             };
             tools_array.push(serde_json::to_value(api_tool).unwrap());
@@ -490,7 +491,7 @@ impl ResponsesApiRequest {
                 "format": {
                     "type": "json_schema",
                     "name": schema.name,
-                    "schema": schema.schema,
+                    "schema": super::strict_schema::request_schema(schema),
                     "strict": schema.strict
                 }
             })),
@@ -1744,6 +1745,43 @@ mod tests {
                 "required": ["name", "age"]
             }),
         ))
+    }
+
+    #[test]
+    fn responses_request_sends_strict_schemas_in_the_form_openai_accepts() {
+        let request = GenerateRequest::new("openai/gpt-4.1-mini")
+            .user_message("Hi")
+            .response_format(person_schema_format());
+
+        let payload = ResponsesApiRequest::from_request(&request, "gpt-4.1-mini".to_string());
+        let format = &payload.text.unwrap()["format"];
+
+        assert_eq!(format["strict"], true);
+        assert_eq!(
+            format["schema"]["required"],
+            serde_json::json!(["age", "name"])
+        );
+        assert_eq!(format["schema"]["additionalProperties"], false);
+    }
+
+    #[test]
+    fn responses_request_sends_strict_tools_in_the_form_openai_accepts() {
+        let mut tool = super::super::interface::ToolDefinition::new("get_weather");
+        tool.parameters = Some(serde_json::json!({
+            "type": "object",
+            "properties": {"location": {"type": "string"}, "units": {"type": "string"}},
+            "required": ["location"]
+        }));
+        tool.strict = Some(true);
+        let request = GenerateRequest::new("openai/gpt-4.1-mini")
+            .user_message("Hi")
+            .tools(vec![tool]);
+
+        let payload = ResponsesApiRequest::from_request(&request, "gpt-4.1-mini".to_string());
+        let sent = &payload.tools.unwrap()[0]["parameters"];
+
+        assert_eq!(sent["required"], serde_json::json!(["location", "units"]));
+        assert_eq!(sent["additionalProperties"], false);
     }
 
     #[test]
