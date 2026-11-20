@@ -185,6 +185,9 @@ struct ConnectionAuth {
     tls: Option<ClientTlsConfig>,
     authoritative_worker_id: Option<String>,
     external_worker_authority: Option<ExternalWorkerAuthority>,
+    /// The bearer comes from the pod's workload identity, so it may still be
+    /// empty while the broker is unavailable.
+    workload_identity: bool,
 }
 
 async fn connection_auth(endpoint: String) -> Result<ConnectionAuth> {
@@ -198,6 +201,7 @@ async fn connection_auth(endpoint: String) -> Result<ConnectionAuth> {
                 tls,
                 authoritative_worker_id: worker_id,
                 external_worker_authority: Some(authority),
+                workload_identity: false,
             })
         }
         WorkerAuth::Hosted(identity) => Ok(ConnectionAuth {
@@ -208,6 +212,7 @@ async fn connection_auth(endpoint: String) -> Result<ConnectionAuth> {
             tls: None,
             authoritative_worker_id: None,
             external_worker_authority: None,
+            workload_identity: true,
         }),
         WorkerAuth::Unauthenticated => Ok(ConnectionAuth {
             endpoint,
@@ -217,6 +222,7 @@ async fn connection_auth(endpoint: String) -> Result<ConnectionAuth> {
             tls: None,
             authoritative_worker_id: None,
             external_worker_authority: None,
+            workload_identity: false,
         }),
     }
 }
@@ -635,6 +641,9 @@ pub struct WorkerCoordinatorClient {
     authoritative_worker_id: Option<String>,
     external_worker_authority: Option<ExternalWorkerAuthority>,
     identity_authorization: Option<Arc<RwLock<Option<MetadataValue<tonic::metadata::Ascii>>>>>,
+    /// An AGNT5-hosted worker's bearer, which is empty until the workload
+    /// broker first answers.
+    workload_authorization: Option<SharedBearer>,
 }
 
 async fn wait_for_identity_rotation(
@@ -678,6 +687,7 @@ impl WorkerCoordinatorClient {
             tls,
             authoritative_worker_id,
             external_worker_authority,
+            workload_identity,
         } = connection_auth(endpoint).await?;
         debug!("Connecting to Worker Coordinator at {}", endpoint);
 
@@ -708,6 +718,7 @@ impl WorkerCoordinatorClient {
         let identity_authorization = authoritative_worker_id
             .as_ref()
             .map(|_| interceptor.token.clone());
+        let workload_authorization = workload_identity.then(|| interceptor.token.clone());
         let engine_client = EngineServiceClient::with_interceptor(channel, interceptor);
 
         Ok(Self {
@@ -717,6 +728,19 @@ impl WorkerCoordinatorClient {
             authoritative_worker_id,
             external_worker_authority,
             identity_authorization,
+            workload_authorization,
+        })
+    }
+
+    /// Whether this is an AGNT5-hosted worker still waiting for its first
+    /// runtime token. The runtime refuses its calls until the token arrives,
+    /// which is a wait, not a reason to give up.
+    pub(crate) fn awaiting_workload_token(&self) -> bool {
+        self.workload_authorization.as_ref().is_some_and(|token| {
+            token
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_none()
         })
     }
 
@@ -1903,6 +1927,36 @@ mod tests {
             WorkerAuth::from_lookup(env(&[("AGNT5_WORKLOAD_BROKER_URL", "http://broker")])),
             WorkerAuth::Unauthenticated
         );
+    }
+
+    fn coordinator_client(workload_authorization: Option<SharedBearer>) -> WorkerCoordinatorClient {
+        let channel = Channel::from_static("http://127.0.0.1:1").connect_lazy();
+        let interceptor = BearerInterceptor {
+            token: Arc::new(RwLock::new(None)),
+        };
+        WorkerCoordinatorClient {
+            client: WorkerCoordinatorServiceClient::with_interceptor(
+                channel.clone(),
+                interceptor.clone(),
+            ),
+            engine_client: EngineServiceClient::with_interceptor(channel, interceptor),
+            negotiated_protocol_capabilities: Arc::new(RwLock::new(Vec::new())),
+            authoritative_worker_id: None,
+            external_worker_authority: None,
+            identity_authorization: None,
+            workload_authorization,
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_hosted_worker_without_a_token_awaits_one() {
+        assert!(!coordinator_client(None).awaiting_workload_token());
+
+        let token: SharedBearer = Arc::new(RwLock::new(None));
+        let hosted = coordinator_client(Some(token.clone()));
+        assert!(hosted.awaiting_workload_token());
+        *token.write().unwrap() = Some(bearer_metadata("runtime-jwt").unwrap());
+        assert!(!hosted.awaiting_workload_token());
     }
 
     #[test]
