@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Self-hosted workers accept their service key in `AGNT5_API_KEY`, as Go workers already do. Hosts such as Railway and Render set variables from their dashboards but don't mount files, and a worker given only `AGNT5_API_KEY` used to skip discovery and connect without a token. The key turns on discovery only when `AGNT5_API_KEY_FILE` is unset, the worker has no AGNT5 workload identity, and none of `AGNT5_COORDINATOR_ENDPOINT`, `AGNT5_ENGINE_URL`, `AGNT5_PROJECT_ID` or `AGNT5_DEPLOYMENT_ID` is set, so `agnt5 dev` and workers that AGNT5 runs connect as before. `AGNT5_API_KEY_FILE` wins when both are set, and bootstrap mTLS still needs the key in a file.
+
 ## 0.3.13 - 2026-11-20
 
 ### Security
