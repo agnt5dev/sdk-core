@@ -302,8 +302,13 @@ fn init_telemetry_inner(service_name: &str, service_version: &str) -> Result<(),
 
     global::set_text_map_propagator(composite_propagator);
 
-    // Set up tracing subscriber with OpenTelemetry layers
-    let telemetry_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+    // Set up tracing subscriber with OpenTelemetry layers. Only the SDK's own
+    // `tracing` spans become OpenTelemetry spans; see `span_export_filter`.
+    let telemetry_layer = tracing_opentelemetry::layer()
+        .with_tracer(tracer)
+        .with_filter(span_export_filter(
+            std::env::var("AGNT5_OTEL_SPAN_FILTER").ok(),
+        ));
 
     // Set up OpenTelemetry logs appender
     let log_appender =
@@ -382,6 +387,24 @@ fn init_telemetry_inner(service_name: &str, service_version: &str) -> Result<(),
     // This allows log::info!() calls to be forwarded to tracing (and thus OpenTelemetry)
     let _ = tracing_log::LogTracer::init();
     Ok(())
+}
+
+/// Which `tracing` spans the OpenTelemetry layer turns into exported spans,
+/// as an `EnvFilter` directive.
+///
+/// h2, hyper, tonic and tower open trace-level spans for every frame and poll
+/// on the worker's gRPC connections, including the OTLP exporter's own. They
+/// used to become OpenTelemetry spans and were dropped only at export time, so
+/// a few runs filled the batch processor's 2048-span queue with them, and the
+/// run spans ending after them were dropped whenever export fell behind.
+/// Keeping them out of the layer leaves the queue to the spans worth sending.
+const DEFAULT_SPAN_EXPORT_DIRECTIVE: &str = "off,agnt5=trace";
+
+/// The filter for the OpenTelemetry span layer. `AGNT5_OTEL_SPAN_FILTER`
+/// replaces the default directive, for example to look at transport spans
+/// while debugging.
+fn span_export_filter(directive: Option<String>) -> EnvFilter {
+    EnvFilter::new(directive.unwrap_or_else(|| DEFAULT_SPAN_EXPORT_DIRECTIVE.to_string()))
 }
 
 /// Extract trace context and baggage from runtime message metadata
@@ -1124,6 +1147,76 @@ pub fn record_checkpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_sdk_spans_reach_the_span_exporter() {
+        use opentelemetry_sdk::trace::InMemorySpanExporter;
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let layer = tracing_opentelemetry::layer()
+            .with_tracer(provider.tracer("test"))
+            .with_filter(span_export_filter(None));
+        let subscriber = Registry::default().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            // What h2, hyper and tonic open for each frame and poll on a
+            // worker connection.
+            for _ in 0..3 {
+                tracing::trace_span!(target: "h2::codec::framed_write", "FramedWrite::buffer")
+                    .in_scope(|| {});
+                tracing::trace_span!(target: "h2::proto::connection", "Connection").in_scope(|| {});
+                tracing::trace_span!(target: "hyper_util::client::legacy", "connect")
+                    .in_scope(|| {});
+                tracing::debug_span!(target: "tonic::transport", "poll_ready").in_scope(|| {});
+                tracing::debug_span!(target: "tower::buffer::worker", "worker").in_scope(|| {});
+            }
+            // The language bindings' execution spans.
+            tracing::info_span!(target: "agnt5_sdk_python::worker", "python_component_execution")
+                .in_scope(|| {
+                    tracing::trace_span!(target: "h2::proto::streams", "pop_frame").in_scope(|| {});
+                });
+            tracing::info_span!(target: "agnt5_sdk_core::worker", "core_span").in_scope(|| {});
+        });
+
+        let mut names: Vec<String> = exporter
+            .get_finished_spans()
+            .unwrap()
+            .into_iter()
+            .map(|span| span.name.to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["core_span", "python_component_execution"]);
+    }
+
+    #[test]
+    fn span_filter_can_be_overridden() {
+        use opentelemetry_sdk::trace::InMemorySpanExporter;
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let layer = tracing_opentelemetry::layer()
+            .with_tracer(provider.tracer("test"))
+            .with_filter(span_export_filter(Some("h2=trace".to_string())));
+        let subscriber = Registry::default().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::trace_span!(target: "h2::proto::connection", "Connection").in_scope(|| {});
+            tracing::info_span!(target: "agnt5_sdk_core::worker", "core_span").in_scope(|| {});
+        });
+
+        let names: Vec<String> = exporter
+            .get_finished_spans()
+            .unwrap()
+            .into_iter()
+            .map(|span| span.name.to_string())
+            .collect();
+        assert_eq!(names, vec!["Connection"]);
+    }
 
     #[tokio::test]
     async fn test_telemetry_init() {
