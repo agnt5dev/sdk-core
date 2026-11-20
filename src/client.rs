@@ -1,4 +1,5 @@
 use crate::error::{Result, SdkError};
+use crate::hosted_worker_identity::HostedWorkloadIdentity;
 use crate::pb::{
     engine_service_client::EngineServiceClient,
     execution_engine_service_client::ExecutionEngineServiceClient,
@@ -22,16 +23,20 @@ use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 use tonic::Code;
 use tonic::{Request, Status};
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 const EXTERNAL_DISCOVERY_PATH: &str = "/api/v1/worker-discovery";
 const EXTERNAL_TOKEN_PATH: &str = "/api/v1/worker-token";
 const AUTH_PROFILE_BOOTSTRAP_MTLS: &str = "bootstrap-mtls";
 const AUTH_PROFILE_TOKEN_AUTH: &str = "token-auth";
 
+/// The `authorization` value a worker sends, shared by all its connections so
+/// a refresh reaches every one of them.
+pub(crate) type SharedBearer = Arc<RwLock<Option<MetadataValue<tonic::metadata::Ascii>>>>;
+
 #[derive(Clone, Debug)]
 struct BearerInterceptor {
-    token: Arc<RwLock<Option<MetadataValue<tonic::metadata::Ascii>>>>,
+    token: SharedBearer,
 }
 
 impl tonic::service::Interceptor for BearerInterceptor {
@@ -44,6 +49,17 @@ impl tonic::service::Interceptor for BearerInterceptor {
 }
 
 type AuthenticatedChannel = InterceptedService<Channel, BearerInterceptor>;
+
+/// Run a request through the interceptor every worker channel uses.
+#[cfg(test)]
+pub(crate) fn authorize_request_for_test(token: &SharedBearer) -> Request<()> {
+    use tonic::service::Interceptor;
+    BearerInterceptor {
+        token: token.clone(),
+    }
+    .call(Request::new(()))
+    .unwrap()
+}
 
 #[derive(Clone, Debug, Deserialize)]
 struct ExternalWorkerAuthority {
@@ -127,8 +143,99 @@ struct ExternalWorkerBootstrap {
     authority: ExternalWorkerAuthority,
 }
 
+/// How a worker proves who it is to the runtime.
+#[derive(Debug, PartialEq, Eq)]
+enum WorkerAuth {
+    /// Self-hosted: discovery, then a runtime token traded for the service key.
+    ServiceKey,
+    /// AGNT5-hosted: the pod's Kubernetes identity, traded at the workload
+    /// broker. The runtime endpoint is the one the worker was configured with.
+    Hosted(HostedWorkloadIdentity),
+    /// Local development: no token.
+    Unauthenticated,
+}
+
+impl WorkerAuth {
+    /// A service key wins, so a self-hosted worker that happens to run in a
+    /// pod with workload identity keeps its own project-bound authority.
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        if lookup("AGNT5_API_KEY_FILE").is_some_and(|value| !value.trim().is_empty()) {
+            return Self::ServiceKey;
+        }
+        match HostedWorkloadIdentity::from_lookup(lookup) {
+            Some(identity) => Self::Hosted(identity),
+            None => Self::Unauthenticated,
+        }
+    }
+
+    fn from_env() -> Self {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+}
+
 pub(crate) fn remote_worker_bootstrap_enabled() -> bool {
-    std::env::var("AGNT5_API_KEY_FILE").is_ok_and(|value| !value.trim().is_empty())
+    WorkerAuth::from_env() == WorkerAuth::ServiceKey
+}
+
+/// What a runtime connection needs to authenticate: where to connect, the
+/// bearer to send, and, for self-hosted workers, discovery's authority.
+struct ConnectionAuth {
+    endpoint: String,
+    interceptor: BearerInterceptor,
+    tls: Option<ClientTlsConfig>,
+    authoritative_worker_id: Option<String>,
+    external_worker_authority: Option<ExternalWorkerAuthority>,
+    /// The bearer comes from the pod's workload identity, so it may still be
+    /// empty while the broker is unavailable.
+    workload_identity: bool,
+}
+
+async fn connection_auth(endpoint: String) -> Result<ConnectionAuth> {
+    match WorkerAuth::from_env() {
+        WorkerAuth::ServiceKey => {
+            let (endpoint, interceptor, tls, worker_id, authority) =
+                external_worker_bootstrap().await?;
+            Ok(ConnectionAuth {
+                endpoint,
+                interceptor,
+                tls,
+                authoritative_worker_id: worker_id,
+                external_worker_authority: Some(authority),
+                workload_identity: false,
+            })
+        }
+        WorkerAuth::Hosted(identity) => Ok(ConnectionAuth {
+            endpoint,
+            interceptor: BearerInterceptor {
+                token: crate::hosted_worker_identity::authorization(identity).await,
+            },
+            tls: None,
+            authoritative_worker_id: None,
+            external_worker_authority: None,
+            workload_identity: true,
+        }),
+        WorkerAuth::Unauthenticated => Ok(ConnectionAuth {
+            endpoint,
+            interceptor: BearerInterceptor {
+                token: Arc::new(RwLock::new(None)),
+            },
+            tls: None,
+            authoritative_worker_id: None,
+            external_worker_authority: None,
+            workload_identity: false,
+        }),
+    }
+}
+
+/// The runtime token for calls made outside the authenticated channels. Only
+/// hosted workers have one there; self-hosted pull workers don't make them.
+async fn hosted_worker_authorization() -> Option<MetadataValue<tonic::metadata::Ascii>> {
+    let WorkerAuth::Hosted(identity) = WorkerAuth::from_env() else {
+        return None;
+    };
+    let token = crate::hosted_worker_identity::authorization(identity).await;
+    let value = token.read().unwrap_or_else(|p| p.into_inner()).clone();
+    value
 }
 
 async fn external_worker_bootstrap() -> Result<(
@@ -261,13 +368,19 @@ async fn external_worker_bootstrap() -> Result<(
         authority,
     };
     let initial = exchange_external_worker_token(&http, &bootstrap).await?;
-    let token = bearer_metadata(&initial.workload_token)?;
+    let token = bearer_metadata(&initial.token)?;
     let shared = Arc::new(RwLock::new(Some(token)));
-    spawn_external_worker_token_refresh(
-        http,
-        bootstrap.clone(),
+    let refresh_bootstrap = bootstrap.clone();
+    spawn_token_refresh(
+        "External worker",
         shared.clone(),
-        initial.expires_at,
+        Some(initial.expires_at),
+        Duration::from_secs(5),
+        move || {
+            let http = http.clone();
+            let bootstrap = refresh_bootstrap.clone();
+            async move { exchange_external_worker_token(&http, &bootstrap).await }
+        },
     );
 
     eprintln!("[INFO] worker authenticated with token auth");
@@ -291,7 +404,7 @@ async fn external_worker_bootstrap() -> Result<(
 async fn exchange_external_worker_token(
     http: &reqwest::Client,
     bootstrap: &ExternalWorkerBootstrap,
-) -> Result<ExternalWorkerTokenResponse> {
+) -> Result<TokenGrant> {
     let response = http
         .post(format!(
             "{}{}",
@@ -316,14 +429,22 @@ async fn exchange_external_worker_token(
             source: None,
         });
     }
-    response.json().await.map_err(|error| SdkError::Connection {
-        message: format!("decode external worker token response: {}", error),
-        code: crate::error::ErrorCode::ConnectionFailed,
-        source: None,
+    let response: ExternalWorkerTokenResponse =
+        response
+            .json()
+            .await
+            .map_err(|error| SdkError::Connection {
+                message: format!("decode external worker token response: {}", error),
+                code: crate::error::ErrorCode::ConnectionFailed,
+                source: None,
+            })?;
+    Ok(TokenGrant {
+        token: response.workload_token,
+        expires_at: response.expires_at,
     })
 }
 
-fn bearer_metadata(token: &str) -> Result<MetadataValue<tonic::metadata::Ascii>> {
+pub(crate) fn bearer_metadata(token: &str) -> Result<MetadataValue<tonic::metadata::Ascii>> {
     format!("Bearer {}", token)
         .parse()
         .map_err(|error| SdkError::Connection {
@@ -333,33 +454,63 @@ fn bearer_metadata(token: &str) -> Result<MetadataValue<tonic::metadata::Ascii>>
         })
 }
 
-fn spawn_external_worker_token_refresh(
-    http: reqwest::Client,
-    bootstrap: ExternalWorkerBootstrap,
-    token: Arc<RwLock<Option<MetadataValue<tonic::metadata::Ascii>>>>,
-    mut expires_at: chrono::DateTime<chrono::Utc>,
-) {
+/// A runtime token and when it stops working.
+pub(crate) struct TokenGrant {
+    pub(crate) token: String,
+    pub(crate) expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+// Hand-written so a token never reaches a log through `{:?}`.
+impl std::fmt::Debug for TokenGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenGrant")
+            .field("token", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+/// Keep `token` current: fetch a new one a minute before `expires_at`, and
+/// after a failed fetch (or with no expiry yet) try again after `retry_after`.
+/// A failed fetch keeps the token that is there.
+pub(crate) fn spawn_token_refresh<F, Fut>(
+    label: &'static str,
+    token: SharedBearer,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    retry_after: Duration,
+    mut fetch: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<TokenGrant>> + Send,
+{
     tokio::spawn(async move {
+        let mut expires_at = expires_at;
         loop {
-            let delay = (expires_at - chrono::Utc::now() - chrono::Duration::seconds(60))
-                .to_std()
-                .unwrap_or(Duration::from_secs(1));
+            let delay = match expires_at {
+                Some(expires_at) => {
+                    (expires_at - chrono::Utc::now() - chrono::Duration::seconds(60))
+                        .to_std()
+                        .unwrap_or(Duration::from_secs(1))
+                }
+                None => retry_after,
+            };
             tokio::time::sleep(delay).await;
-            match exchange_external_worker_token(&http, &bootstrap).await {
-                Ok(refreshed) => match bearer_metadata(&refreshed.workload_token) {
-                    Ok(value) => {
-                        *token.write().unwrap_or_else(|p| p.into_inner()) = Some(value);
-                        expires_at = refreshed.expires_at;
-                    }
-                    Err(error) => error!("External worker token refresh rejected: {}", error),
-                },
+            let refreshed = fetch()
+                .await
+                .and_then(|grant| Ok((bearer_metadata(&grant.token)?, grant.expires_at)));
+            match refreshed {
+                Ok((value, next_expiry)) => {
+                    *token.write().unwrap_or_else(|p| p.into_inner()) = Some(value);
+                    expires_at = Some(next_expiry);
+                }
                 Err(error) => {
-                    error!("External worker token refresh failed: {}; retrying", error);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    warn!("{} token refresh failed: {}; retrying", label, error);
+                    expires_at = None;
                 }
             }
         }
-    });
+    })
 }
 
 pub const DURABLE_ACTIVATION_V1_CAPABILITY: &str = "durable_activation_v1";
@@ -490,6 +641,9 @@ pub struct WorkerCoordinatorClient {
     authoritative_worker_id: Option<String>,
     external_worker_authority: Option<ExternalWorkerAuthority>,
     identity_authorization: Option<Arc<RwLock<Option<MetadataValue<tonic::metadata::Ascii>>>>>,
+    /// An AGNT5-hosted worker's bearer, which is empty until the workload
+    /// broker first answers.
+    workload_authorization: Option<SharedBearer>,
 }
 
 async fn wait_for_identity_rotation(
@@ -527,22 +681,14 @@ fn is_idle_poll_timeout(status: &tonic::Status) -> bool {
 impl WorkerCoordinatorClient {
     /// Create a new client connected to the Worker Coordinator
     pub async fn connect(endpoint: String) -> Result<Self> {
-        let (endpoint, interceptor, tls, authoritative_worker_id, external_worker_authority) =
-            if remote_worker_bootstrap_enabled() {
-                let (endpoint, interceptor, tls, worker_id, authority) =
-                    external_worker_bootstrap().await?;
-                (endpoint, interceptor, tls, worker_id, Some(authority))
-            } else {
-                (
-                    endpoint,
-                    BearerInterceptor {
-                        token: Arc::new(RwLock::new(None)),
-                    },
-                    None,
-                    None,
-                    None,
-                )
-            };
+        let ConnectionAuth {
+            endpoint,
+            interceptor,
+            tls,
+            authoritative_worker_id,
+            external_worker_authority,
+            workload_identity,
+        } = connection_auth(endpoint).await?;
         debug!("Connecting to Worker Coordinator at {}", endpoint);
 
         let channel = Channel::from_shared(endpoint.clone()).map_err(|e| SdkError::Connection {
@@ -572,6 +718,7 @@ impl WorkerCoordinatorClient {
         let identity_authorization = authoritative_worker_id
             .as_ref()
             .map(|_| interceptor.token.clone());
+        let workload_authorization = workload_identity.then(|| interceptor.token.clone());
         let engine_client = EngineServiceClient::with_interceptor(channel, interceptor);
 
         Ok(Self {
@@ -581,6 +728,19 @@ impl WorkerCoordinatorClient {
             authoritative_worker_id,
             external_worker_authority,
             identity_authorization,
+            workload_authorization,
+        })
+    }
+
+    /// Whether this is an AGNT5-hosted worker still waiting for its first
+    /// runtime token. The runtime refuses its calls until the token arrives,
+    /// which is a wait, not a reason to give up.
+    pub(crate) fn awaiting_workload_token(&self) -> bool {
+        self.workload_authorization.as_ref().is_some_and(|token| {
+            token
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_none()
         })
     }
 
@@ -1199,9 +1359,17 @@ pub async fn create_ee_event_stream(
         }
     };
 
+    // The worker channel to the execution engine is shared with older
+    // callers and carries no interceptor, so authenticate this call itself.
+    let mut request = Request::new(stream);
+    if let Some(authorization) = hosted_worker_authorization().await {
+        request
+            .metadata_mut()
+            .insert("authorization", authorization);
+    }
     let mut client = ee_client.clone();
     tokio::spawn(async move {
-        match client.event_stream(stream).await {
+        match client.event_stream(request).await {
             Ok(response) => {
                 let ack = response.into_inner();
                 debug!(
@@ -1332,21 +1500,13 @@ pub struct EngineClient {
 impl EngineClient {
     /// Connect to the engine at the given endpoint with a pool of connections.
     pub async fn connect(endpoint: &str) -> Result<Self> {
-        let (endpoint, interceptor, tls, authoritative_worker_id) =
-            if remote_worker_bootstrap_enabled() {
-                let (endpoint, interceptor, tls, worker_id, _authority) =
-                    external_worker_bootstrap().await?;
-                (endpoint, interceptor, tls, worker_id)
-            } else {
-                (
-                    endpoint.to_string(),
-                    BearerInterceptor {
-                        token: Arc::new(RwLock::new(None)),
-                    },
-                    None,
-                    None,
-                )
-            };
+        let ConnectionAuth {
+            endpoint,
+            interceptor,
+            tls,
+            authoritative_worker_id,
+            ..
+        } = connection_auth(endpoint.to_string()).await?;
         debug!(
             "Connecting to Engine at {} (pool_size={})",
             endpoint, ENGINE_POOL_SIZE
@@ -1720,6 +1880,101 @@ pub fn build_engine_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn env(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.to_string())
+        }
+    }
+
+    #[test]
+    fn worker_auth_prefers_the_service_key_over_workload_identity() {
+        assert_eq!(
+            WorkerAuth::from_lookup(env(&[
+                ("AGNT5_API_KEY_FILE", "/etc/agnt5/key"),
+                ("AGNT5_WORKLOAD_BROKER_URL", "http://broker"),
+                ("AGNT5_WORKLOAD_TOKEN_FILE", "/run/agnt5-workload/token"),
+            ])),
+            WorkerAuth::ServiceKey
+        );
+    }
+
+    #[test]
+    fn worker_auth_uses_workload_identity_for_hosted_workers() {
+        assert_eq!(
+            WorkerAuth::from_lookup(env(&[
+                ("AGNT5_API_KEY_FILE", " "),
+                ("AGNT5_WORKLOAD_BROKER_URL", "http://broker"),
+                ("AGNT5_WORKLOAD_TOKEN_FILE", "/run/agnt5-workload/token"),
+            ])),
+            WorkerAuth::Hosted(HostedWorkloadIdentity {
+                broker_url: "http://broker".into(),
+                token_file: "/run/agnt5-workload/token".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn worker_auth_sends_no_token_without_a_key_or_a_complete_workload_identity() {
+        assert_eq!(
+            WorkerAuth::from_lookup(env(&[])),
+            WorkerAuth::Unauthenticated
+        );
+        assert_eq!(
+            WorkerAuth::from_lookup(env(&[("AGNT5_WORKLOAD_BROKER_URL", "http://broker")])),
+            WorkerAuth::Unauthenticated
+        );
+    }
+
+    fn coordinator_client(workload_authorization: Option<SharedBearer>) -> WorkerCoordinatorClient {
+        let channel = Channel::from_static("http://127.0.0.1:1").connect_lazy();
+        let interceptor = BearerInterceptor {
+            token: Arc::new(RwLock::new(None)),
+        };
+        WorkerCoordinatorClient {
+            client: WorkerCoordinatorServiceClient::with_interceptor(
+                channel.clone(),
+                interceptor.clone(),
+            ),
+            engine_client: EngineServiceClient::with_interceptor(channel, interceptor),
+            negotiated_protocol_capabilities: Arc::new(RwLock::new(Vec::new())),
+            authoritative_worker_id: None,
+            external_worker_authority: None,
+            identity_authorization: None,
+            workload_authorization,
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_hosted_worker_without_a_token_awaits_one() {
+        assert!(!coordinator_client(None).awaiting_workload_token());
+
+        let token: SharedBearer = Arc::new(RwLock::new(None));
+        let hosted = coordinator_client(Some(token.clone()));
+        assert!(hosted.awaiting_workload_token());
+        *token.write().unwrap() = Some(bearer_metadata("runtime-jwt").unwrap());
+        assert!(!hosted.awaiting_workload_token());
+    }
+
+    #[test]
+    fn interceptor_attaches_the_current_bearer_and_nothing_without_one() {
+        let token: SharedBearer = Arc::new(RwLock::new(None));
+        assert!(authorize_request_for_test(&token)
+            .metadata()
+            .get("authorization")
+            .is_none());
+        *token.write().unwrap() = Some(bearer_metadata("runtime-jwt").unwrap());
+        assert_eq!(
+            authorize_request_for_test(&token)
+                .metadata()
+                .get("authorization")
+                .unwrap(),
+            "Bearer runtime-jwt"
+        );
+    }
 
     #[tokio::test]
     async fn identity_rotation_wakes_connection_loop_only_after_invalidation() {

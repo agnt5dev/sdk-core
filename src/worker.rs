@@ -26,6 +26,9 @@ use uuid::Uuid;
 const PARKED_WORKER_SESSION_REGISTER_ATTEMPTS: usize = 3;
 const PARKED_WORKER_SESSION_REGISTER_RETRY_MS: u64 = 1_000;
 const PARKED_WORKER_SESSION_TRANSIENT_RETRY_MAX_MS: u64 = 32_000;
+// Matches the workload token refresh loop's retry, so a worker registers soon
+// after the broker recovers.
+const PARKED_WORKER_SESSION_TOKEN_WAIT_MAX: Duration = Duration::from_secs(5);
 const PARKED_SLOT_RAMP_THROTTLE_MS: u64 = 1_000;
 const PARKED_COMPLETION_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 const PARKED_COMPLETE_JOB_ATTEMPTS: usize = 3;
@@ -2480,6 +2483,34 @@ fn is_parked_worker_session_registration_rejection(error: &SdkError) -> bool {
     .any(|needle| error.contains(needle))
 }
 
+/// Whether the runtime refused a call for want of valid credentials. tonic
+/// renders the code by its description, not its name, so match both.
+fn is_authentication_failure(error: &SdkError) -> bool {
+    let error = error.to_string().to_ascii_lowercase();
+    error.contains("unauthenticated") || error.contains("valid authentication credentials")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ParkedWorkerSessionRegistrationFailure {
+    /// A hosted worker without its first runtime token yet: wait for it.
+    AwaitingWorkloadToken,
+    Rejected,
+    Transient,
+}
+
+fn classify_parked_worker_session_registration_failure(
+    error: &SdkError,
+    awaiting_workload_token: bool,
+) -> ParkedWorkerSessionRegistrationFailure {
+    if awaiting_workload_token && is_authentication_failure(error) {
+        ParkedWorkerSessionRegistrationFailure::AwaitingWorkloadToken
+    } else if is_parked_worker_session_registration_rejection(error) {
+        ParkedWorkerSessionRegistrationFailure::Rejected
+    } else {
+        ParkedWorkerSessionRegistrationFailure::Transient
+    }
+}
+
 fn parked_worker_session_was_refreshed(
     current_session_id: &str,
     observed_session_id: &str,
@@ -2502,6 +2533,7 @@ async fn register_parked_worker_session_with_retries(
     let mut rejection_attempts = 0;
     let mut transient_attempts = 0;
     let mut transient_delay = Duration::from_millis(PARKED_WORKER_SESSION_REGISTER_RETRY_MS);
+    let mut token_wait_delay = Duration::from_millis(PARKED_WORKER_SESSION_REGISTER_RETRY_MS);
     loop {
         match client.register_worker_session(registration.request()).await {
             Ok(session) => {
@@ -2521,6 +2553,23 @@ async fn register_parked_worker_session_with_retries(
                 return ParkedWorkerSessionRegistrationResult::Registered(
                     session.worker_session_id,
                 );
+            }
+            Err(e)
+                if classify_parked_worker_session_registration_failure(
+                    &e,
+                    client.awaiting_workload_token(),
+                ) == ParkedWorkerSessionRegistrationFailure::AwaitingWorkloadToken =>
+            {
+                // The broker was unavailable when the worker started. Its
+                // refresh loop keeps trying; exiting here would restart the
+                // pod instead of letting the token arrive.
+                warn!(
+                    "{} is waiting for a runtime token from the workload broker; retrying in {}ms",
+                    reason,
+                    token_wait_delay.as_millis()
+                );
+                tokio::time::sleep(token_wait_delay).await;
+                token_wait_delay = (token_wait_delay * 2).min(PARKED_WORKER_SESSION_TOKEN_WAIT_MAX);
             }
             Err(e) if is_parked_worker_session_registration_rejection(&e) => {
                 rejection_attempts += 1;
@@ -6692,10 +6741,10 @@ mod tests {
         activation_definition_configs, active_lease_danger_retry_ms,
         active_lease_renew_interval_ms, active_lease_renew_interval_with_jitter_ms,
         any_deployment_artifact_sha256, await_checkpoint_ack,
-        canonical_activation_component_config, complete_job_request_from_polled_completion,
-        complete_job_with_retry, complete_polled_job, deployment_artifact_sha256,
-        durable_suspension_service_message, effective_activation_artifact_sha256,
-        execution_is_revoked, is_cancelled_worker_response,
+        canonical_activation_component_config, classify_parked_worker_session_registration_failure,
+        complete_job_request_from_polled_completion, complete_job_with_retry, complete_polled_job,
+        deployment_artifact_sha256, durable_suspension_service_message,
+        effective_activation_artifact_sha256, execution_is_revoked, is_cancelled_worker_response,
         is_parked_worker_session_registration_rejection, is_terminal_worker_response,
         is_worker_session_refresh_required_error, negotiated_slot_scaling_hint,
         parked_hint_spawn_count, parked_ramp_spawn_count, parked_runtime_service_response,
@@ -6708,9 +6757,9 @@ mod tests {
         valid_activation_artifact_sha256, wait_for_parked_run_events_flush, worker_capabilities,
         worker_protocol_capabilities_for_metadata, ActiveLeaseAuthority, ActiveLeaseSession,
         AppendGroupProgress, CompleteJobSender, EntityStateSender, ParkedSlotEvent,
-        ParkedWorkerSessionRegistration, RunFlushLocks, ServerSlotScalingGate,
-        ServerSlotScalingHint, Worker, WorkerConfig, WorkerSlotPhaseSnapshot, WorkerSlotPhases,
-        DEPLOYMENT_ARTIFACT_DOMAIN,
+        ParkedWorkerSessionRegistration, ParkedWorkerSessionRegistrationFailure, RunFlushLocks,
+        ServerSlotScalingGate, ServerSlotScalingHint, Worker, WorkerConfig,
+        WorkerSlotPhaseSnapshot, WorkerSlotPhases, DEPLOYMENT_ARTIFACT_DOMAIN,
     };
     use crate::error::{ErrorCode, SdkError};
     use crate::journal_queue::{JournalEventMessage, JournalEventQueue, JournalQueueConfig};
@@ -8533,6 +8582,41 @@ mod tests {
 
         assert!(is_parked_worker_session_registration_rejection(&rejected));
         assert!(!is_parked_worker_session_registration_rejection(&transient));
+    }
+
+    #[test]
+    fn hosted_worker_waits_for_its_token_instead_of_exiting() {
+        // What the runtime sends a worker with no token, as the client wraps it.
+        let missing_token = SdkError::Connection {
+            message: format!(
+                "RegisterWorkerSession failed: {}",
+                tonic::Status::unauthenticated("workload token is required")
+            ),
+            code: ErrorCode::ConnectionFailed,
+            source: None,
+        };
+        let invalid = SdkError::Connection {
+            message:
+                "RegisterWorkerSession failed: code: 'Invalid argument', message: \"bad worker\""
+                    .to_string(),
+            code: ErrorCode::ConnectionFailed,
+            source: None,
+        };
+
+        assert_eq!(
+            classify_parked_worker_session_registration_failure(&missing_token, true),
+            ParkedWorkerSessionRegistrationFailure::AwaitingWorkloadToken
+        );
+        // With a token in hand, a refusal is the runtime's answer, not a wait.
+        assert_ne!(
+            classify_parked_worker_session_registration_failure(&missing_token, false),
+            ParkedWorkerSessionRegistrationFailure::AwaitingWorkloadToken
+        );
+        // Only authentication failures wait for the token.
+        assert_eq!(
+            classify_parked_worker_session_registration_failure(&invalid, true),
+            ParkedWorkerSessionRegistrationFailure::Rejected
+        );
     }
 
     #[test]
