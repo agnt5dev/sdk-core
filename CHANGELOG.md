@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Report the worker's CPU and memory use to the runtime. Capacity reports always sent 0 for both, so the runtime's check that stops adding slots to a worker at its CPU or memory target never fired, and a worker close to its memory limit kept taking more runs, any one of which could get the worker, and every run on it, killed. Each report now carries the container's memory working set (usage less reclaimable page cache) over its memory limit and its CPU time since the last report over its CPU quota, both read from the container's cgroup (v2, then v1). Without a cgroup or a limit, as on macOS or in an unlimited container, they stay 0, which the runtime treats as unknown.
+
+### Upgrade
+
+- Python and TypeScript native bindings must adopt this core release in their own patch releases to report usage.
+
 ## 0.3.14 - 2026-11-20
 
 ### Fixed

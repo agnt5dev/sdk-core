@@ -2371,6 +2371,7 @@ fn revoke_execution_authority(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn report_worker_capacity_with_client(
     client: &mut WorkerCoordinatorClient,
     worker_id: &str,
@@ -2379,6 +2380,7 @@ async fn report_worker_capacity_with_client(
     active_slots: Arc<std::sync::atomic::AtomicUsize>,
     desired_slots: Arc<std::sync::atomic::AtomicUsize>,
     effective_max_slots: usize,
+    resources: &mut crate::resource_usage::ResourceSampler,
 ) {
     let open_poll_slots = open_poll_slots.load(std::sync::atomic::Ordering::Relaxed) as u32;
     let active_slots = active_slots.load(std::sync::atomic::Ordering::Relaxed) as u32;
@@ -2391,8 +2393,8 @@ async fn report_worker_capacity_with_client(
             active_slots,
             desired_slots: desired_slots as u32,
             effective_max_slots: effective_max_slots as u32,
-            cpu_usage: 0.0,
-            memory_usage: 0.0,
+            cpu_usage: resources.cpu_usage(std::time::Instant::now()),
+            memory_usage: resources.memory_usage(),
             observed_at_ms: current_time_ms(),
         })
         .await
@@ -2415,6 +2417,9 @@ fn spawn_parked_capacity_reporter(
         .unwrap_or(5_000)
         .clamp(1_000, 60_000) as u64;
     tokio::spawn(async move {
+        // One sampler for the reporter's life: CPU use is measured from one
+        // report to the next.
+        let mut resources = crate::resource_usage::ResourceSampler::new();
         let current_session_id = worker_session_id.lock().await.clone();
         report_worker_capacity_with_client(
             &mut client,
@@ -2424,6 +2429,7 @@ fn spawn_parked_capacity_reporter(
             active_slots.clone(),
             desired_slots.clone(),
             effective_max_slots,
+            &mut resources,
         )
         .await;
 
@@ -2442,6 +2448,7 @@ fn spawn_parked_capacity_reporter(
                         active_slots.clone(),
                         desired_slots.clone(),
                         effective_max_slots,
+                        &mut resources,
                     )
                     .await;
                 }

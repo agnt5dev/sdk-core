@@ -31,6 +31,11 @@ cases:
   worker_observations: [claimed, started, business, handler_finished, acknowledged, released]
   expect:
     invariant: business timing excludes activation RPC and terminal acknowledgment latency
+- id: capacity_reports_carry_resource_usage
+  sdks: [python, typescript, go]
+  worker_observations: [capacity_reported]
+  expect:
+    invariant: a capacity report carries the container's CPU and memory working set as fractions of its limits, and 0 when a limit or reading is unavailable
 - id: telemetry_preserves_execution_outcomes
   sdks: [python, typescript, go]
   telemetry: unavailable
