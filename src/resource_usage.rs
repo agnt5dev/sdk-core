@@ -15,6 +15,10 @@ use std::time::Instant;
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 /// cgroup v1 reports an unset memory limit as a page-aligned `i64::MAX`.
 const V1_UNLIMITED_BYTES: u64 = 1 << 60;
+/// cgroup v1 usually mounts the `cpu` and `cpuacct` controllers together.
+/// Container runtimes link `cpu` and `cpuacct` to the combined directory,
+/// but not every host does, so it is read directly when they are missing.
+const V1_COMBINED_CPU_DIR: &str = "cpu,cpuacct";
 
 /// Samples the container's resource use between capacity reports. CPU use
 /// is a rate, so each sample measures from the one before it.
@@ -31,7 +35,10 @@ struct CpuSample {
 
 impl ResourceSampler {
     pub(crate) fn new() -> Self {
-        Self::at(CGROUP_ROOT)
+        Self::at(own_cgroup_dir(
+            Path::new(CGROUP_ROOT),
+            Path::new("/proc/self/cgroup"),
+        ))
     }
 
     fn at(root: impl Into<PathBuf>) -> Self {
@@ -83,7 +90,10 @@ impl ResourceSampler {
 
     fn cpu_usage_usec(&self) -> Option<u64> {
         read_stat(&self.root.join("cpu.stat"), "usage_usec").or_else(|| {
-            read_u64(&self.root.join("cpuacct").join("cpuacct.usage")).map(|nanos| nanos / 1_000)
+            ["cpuacct", V1_COMBINED_CPU_DIR]
+                .iter()
+                .find_map(|dir| read_u64(&self.root.join(dir).join("cpuacct.usage")))
+                .map(|nanos| nanos / 1_000)
         })
     }
 
@@ -98,14 +108,16 @@ impl ResourceSampler {
             Some(quota / period)
         };
         let v1 = || {
-            let dir = self.root.join("cpu");
-            let quota = read_trimmed(&dir.join("cpu.cfs_quota_us"))?
-                .parse::<f64>()
-                .ok()?;
-            let period = read_trimmed(&dir.join("cpu.cfs_period_us"))?
-                .parse::<f64>()
-                .ok()?;
-            Some(quota / period)
+            ["cpu", V1_COMBINED_CPU_DIR].iter().find_map(|dir| {
+                let dir = self.root.join(dir);
+                let quota = read_trimmed(&dir.join("cpu.cfs_quota_us"))?
+                    .parse::<f64>()
+                    .ok()?;
+                let period = read_trimmed(&dir.join("cpu.cfs_period_us"))?
+                    .parse::<f64>()
+                    .ok()?;
+                Some(quota / period)
+            })
         };
         v2().or_else(v1)
             .filter(|cores| cores.is_finite() && *cores > 0.0)
@@ -113,6 +125,24 @@ impl ResourceSampler {
                 std::thread::available_parallelism().map_or(1.0, |cores| cores.get() as f64)
             })
     }
+}
+
+/// The process's own cgroup v2 directory under `root`. A worker running on a
+/// host, under systemd say, sits in a nested cgroup that its `membership`
+/// file names. In a container the named path is `/` (its own cgroup
+/// namespace) or isn't under `root` (its cgroup mounted there), and `root`
+/// itself is the container's cgroup.
+fn own_cgroup_dir(root: &Path, membership: &Path) -> PathBuf {
+    fs::read_to_string(membership)
+        .ok()
+        .and_then(|raw| {
+            raw.lines().find_map(|line| {
+                let path = line.trim().strip_prefix("0::")?.trim_matches('/');
+                let dir = root.join(path);
+                (!path.is_empty() && dir.join("cgroup.controllers").is_file()).then_some(dir)
+            })
+        })
+        .unwrap_or_else(|| root.to_path_buf())
 }
 
 /// `used` over `limit`, clamped to `[0, 1]`, or 0 when there is no limit.
@@ -254,5 +284,58 @@ mod tests {
         sampler.cpu_usage(start);
         write(root, "cpuacct/cpuacct.usage", "250000000\n");
         assert_eq!(sampler.cpu_usage(start + Duration::from_secs(1)), 0.25);
+    }
+
+    #[test]
+    fn a_host_process_is_sampled_in_its_own_nested_cgroup() {
+        let cgroup = tempfile::tempdir().unwrap();
+        let root = cgroup.path();
+        let proc_dir = tempfile::tempdir().unwrap();
+        let membership = proc_dir.path().join("cgroup");
+        assert_eq!(own_cgroup_dir(root, &membership), root);
+
+        // A container with its own cgroup namespace sits at the root.
+        write(proc_dir.path(), "cgroup", "0::/\n");
+        assert_eq!(own_cgroup_dir(root, &membership), root);
+
+        // A container whose cgroup is mounted at the root names a path
+        // that isn't under it.
+        write(
+            proc_dir.path(),
+            "cgroup",
+            "0::/kubepods.slice/pod-1/worker\n",
+        );
+        assert_eq!(own_cgroup_dir(root, &membership), root);
+
+        // A systemd service on a host.
+        write(
+            root,
+            "system.slice/worker.service/cgroup.controllers",
+            "cpu memory\n",
+        );
+        write(
+            proc_dir.path(),
+            "cgroup",
+            "0::/system.slice/worker.service\n",
+        );
+        assert_eq!(
+            own_cgroup_dir(root, &membership),
+            root.join("system.slice/worker.service")
+        );
+    }
+
+    #[test]
+    fn cpu_reads_a_combined_cgroup_v1_mount_without_links() {
+        let cgroup = tempfile::tempdir().unwrap();
+        let root = cgroup.path();
+        write(root, "cpu,cpuacct/cpu.cfs_quota_us", "50000\n");
+        write(root, "cpu,cpuacct/cpu.cfs_period_us", "100000\n");
+        write(root, "cpu,cpuacct/cpuacct.usage", "0\n");
+        let mut sampler = ResourceSampler::at(root);
+        let start = Instant::now();
+        sampler.cpu_usage(start);
+        // A quarter CPU-second in one second, on a half-core quota.
+        write(root, "cpu,cpuacct/cpuacct.usage", "250000000\n");
+        assert_eq!(sampler.cpu_usage(start + Duration::from_secs(1)), 0.5);
     }
 }
